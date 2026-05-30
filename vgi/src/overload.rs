@@ -94,6 +94,22 @@ fn score_candidate(
         }
     }
 
+    // Score const VARARGS: every positional arg at or past the varargs spec's
+    // declared position must match the varargs type (so `repeat_value(2, 'a')`
+    // picks the string overload, not the int one).
+    if let Some(vs) = varargs_spec {
+        if vs.is_const && vs.position >= 0 {
+            for pos in (vs.position as usize)..num_pos {
+                if let Some(a) = args.arg(pos) {
+                    match score_type(a.data_type(), vs) {
+                        Some(s) => score += s,
+                        None => return None,
+                    }
+                }
+            }
+        }
+    }
+
     // Score non-const (column) args against the input schema fields.
     if let Some(schema) = input_schema {
         let fields = schema.fields();
