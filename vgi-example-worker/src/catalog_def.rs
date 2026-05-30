@@ -106,6 +106,14 @@ fn i64_arg(v: i64) -> ArrayRef {
     Arc::new(Int64Array::from(vec![v]))
 }
 
+/// WKB (little-endian) for `POINT(x y)` — the GEOMETRY internal blob format.
+fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+    let mut v = vec![0x01, 0x01, 0x00, 0x00, 0x00];
+    v.extend_from_slice(&x.to_le_bytes());
+    v.extend_from_slice(&y.to_le_bytes());
+    v
+}
+
 fn view(name: &str, def: &str) -> CatView {
     CatView {
         name: name.to_string(),
@@ -318,6 +326,25 @@ fn data_tables() -> Vec<CatTable> {
                 },
             ];
         }
+    }
+
+    // geo_points: a GEOMETRY (geoarrow.point) column with spatial bounding-box
+    // statistics (5x5 grid of points (0,0)..(4,4); stat min/max are WKB corner
+    // points the extension reinterprets as GEOMETRY → BOX(0 0, 4 4)).
+    {
+        let xy = DataType::Struct(
+            vec![Field::new("x", Float64, true), Field::new("y", Float64, true)].into(),
+        );
+        let geom = Field::new("geom", xy, true).with_metadata(std::collections::HashMap::from([
+            ("ARROW:extension:name".to_string(), "geoarrow.point".to_string()),
+        ]));
+        let mut t = dtable("geo_points", vec![f("id", Int64), geom],
+            "Geometry table with spatial bounding-box statistics");
+        t.statistics = vec![
+            stat("id", StatValue::Int64(1), StatValue::Int64(25), 25),
+            stat("geom", StatValue::Binary(wkb_point(0.0, 0.0)), StatValue::Binary(wkb_point(4.0, 4.0)), 25),
+        ];
+        tables.push(t);
     }
 
     // departments: PK(id), NOT NULL(id,name), UNIQUE(name), CHECK(budget>=0), default budget=0.

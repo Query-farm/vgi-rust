@@ -20,6 +20,9 @@ pub enum StatValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
+    /// Raw bytes — used for GEOMETRY stats (WKB; the extension reinterprets the
+    /// BLOB as the column's GEOMETRY type).
+    Binary(Vec<u8>),
 }
 impl StatValue {
     fn data_type(&self) -> DataType {
@@ -27,6 +30,7 @@ impl StatValue {
             StatValue::Int64(_) => DataType::Int64,
             StatValue::Float64(_) => DataType::Float64,
             StatValue::Utf8(_) => DataType::Utf8,
+            StatValue::Binary(_) => DataType::Binary,
         }
     }
     fn type_key(&self) -> u8 {
@@ -34,6 +38,7 @@ impl StatValue {
             StatValue::Int64(_) => 0,
             StatValue::Float64(_) => 1,
             StatValue::Utf8(_) => 2,
+            StatValue::Binary(_) => 3,
         }
     }
 }
@@ -84,6 +89,16 @@ fn build_union(stats: &[CatColStat], min: bool, order: &[StatValue]) -> Result<(
                 for s in stats {
                     match if min { &s.min } else { &s.max } {
                         StatValue::Float64(v) if proto.type_key() == 1 => b.append_value(*v),
+                        _ => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Binary => {
+                let mut b = arrow_array::builder::BinaryBuilder::new();
+                for s in stats {
+                    match if min { &s.min } else { &s.max } {
+                        StatValue::Binary(v) if proto.type_key() == 3 => b.append_value(v),
                         _ => b.append_null(),
                     }
                 }
