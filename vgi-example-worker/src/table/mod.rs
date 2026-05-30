@@ -19,6 +19,7 @@ use vgi_rpc::{Result, RpcError};
 /// Register all table fixtures.
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(SequenceFunction);
+    w.register_table(NestedSequenceFunction);
     w.register_table(TenThousandFunction);
     w.register_table(MakeSeries::Count);
     w.register_table(MakeSeries::Range);
@@ -170,6 +171,106 @@ impl TableFunction for SequenceFunction {
             batch_size,
             schema: schema_n(),
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// nested_sequence(count, history_size) -> {n, metadata:struct, history:list}
+// ---------------------------------------------------------------------------
+
+fn nested_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, false),
+        Field::new(
+            "metadata",
+            DataType::Struct(
+                vec![
+                    Field::new("index", DataType::Int64, true),
+                    Field::new("label", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        ),
+        Field::new(
+            "history",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+    ]))
+}
+
+pub struct NestedSequenceFunction;
+impl TableFunction for NestedSequenceFunction {
+    fn name(&self) -> &str {
+        "nested_sequence"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta(
+            "Generates a sequence with nested struct and list columns",
+            &["generator", "utility", "testing"],
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
+            ArgSpec::const_arg("history_size", -1, "int64", "Max items in history list"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: nested_schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let history_size = params.arguments.named_i64("history_size").unwrap_or(20).max(1);
+        Ok(Box::new(NestedSeqProducer { schema: nested_schema(), count, history_size, done: false }))
+    }
+}
+
+struct NestedSeqProducer {
+    schema: SchemaRef,
+    count: i64,
+    history_size: i64,
+    done: bool,
+}
+impl TableProducer for NestedSeqProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+        use arrow_array::{StringArray, StructArray};
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let n: Int64Array = (0..self.count).collect();
+        let index: Int64Array = (0..self.count).collect();
+        let label = StringArray::from((0..self.count).map(|i| format!("row_{i}")).collect::<Vec<_>>());
+        let DataType::Struct(meta_fields) = self.schema.field(1).data_type().clone() else {
+            unreachable!()
+        };
+        let metadata = StructArray::new(
+            meta_fields,
+            vec![Arc::new(index) as _, Arc::new(label) as _],
+            None,
+        );
+        let mut hist = ListBuilder::new(Int64Builder::new());
+        for i in 0..self.count {
+            let start = (i - self.history_size + 1).max(0);
+            for v in start..=i {
+                hist.values().append_value(v);
+            }
+            hist.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(n), Arc::new(metadata), Arc::new(hist.finish())],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(batch))
     }
 }
 

@@ -72,6 +72,11 @@ struct FilterSpec {
     children: Vec<FilterSpec>,
     #[serde(default)]
     child_filter: Option<Box<FilterSpec>>,
+    /// For `struct` filters: which struct field the child filter targets.
+    #[serde(default)]
+    child_index: i64,
+    #[serde(default)]
+    child_name: String,
 }
 
 /// A parsed, evaluable set of pushdown filters.
@@ -228,7 +233,7 @@ impl PushdownFilters {
             }
             "struct" => match &spec.child_filter {
                 Some(child) => {
-                    let nested = format!("{}.{}", spec.column_name, child.column_name);
+                    let nested = format!("{}.{}", spec.column_name, spec.child_name);
                     self.format_one(child, Some(&nested))
                 }
                 None => col.to_string(),
@@ -359,14 +364,17 @@ impl PushdownFilters {
                     .child_filter
                     .as_ref()
                     .ok_or_else(|| RpcError::value_error("struct filter missing child"))?;
+                // The targeted struct field is named by the *struct* spec's
+                // `child_name`/`child_index`, not by the child filter (whose
+                // column ref still points at the outer struct column).
                 let field = sa
-                    .column_by_name(&child.column_name)
-                    .or_else(|| sa.columns().get(child.column_index as usize))
+                    .column_by_name(&spec.child_name)
+                    .or_else(|| sa.columns().get(spec.child_index as usize))
                     .ok_or_else(|| RpcError::value_error("struct child field not found"))?
                     .clone();
                 let sub = RecordBatch::try_new(
                     Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                        &child.column_name,
+                        &spec.child_name,
                         field.data_type().clone(),
                         true,
                     )])),
@@ -393,6 +401,8 @@ fn clone_spec(s: &FilterSpec) -> FilterSpec {
         keys_column: s.keys_column.clone(),
         children: s.children.iter().map(clone_spec).collect(),
         child_filter: s.child_filter.as_ref().map(|c| Box::new(clone_spec(c))),
+        child_index: s.child_index,
+        child_name: s.child_name.clone(),
     }
 }
 
