@@ -498,6 +498,21 @@ impl TableFunction for DoubleSequenceFunction {
         let c = p.arguments.const_i64(0)?;
         Some(vgi::table_function::TableCardinality { estimate: Some(c), max: Some(c) })
     }
+    fn statistics(&self, p: &BindParams) -> Option<Vec<vgi::statistics::CatColStat>> {
+        let count = p.arguments.const_i64(0)?.max(0);
+        let inc = p.arguments.named_f64("increment").unwrap_or(1.0);
+        let max = if count == 0 { 0.0 } else { (count - 1) as f64 * inc };
+        Some(vec![vgi::statistics::CatColStat {
+            column_name: "n".to_string(),
+            min: vgi::statistics::StatValue::Float64(0.0_f64.min(max)),
+            max: vgi::statistics::StatValue::Float64(0.0_f64.max(max)),
+            has_null: false,
+            has_not_null: true,
+            distinct_count: Some(count),
+            contains_unicode: None,
+            max_string_length: None,
+        }])
+    }
     fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = p.arguments.const_i64(0).unwrap_or(0).max(0);
         let inc = p.arguments.named_f64("increment").unwrap_or(1.0);

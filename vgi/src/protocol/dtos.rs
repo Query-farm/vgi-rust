@@ -90,6 +90,14 @@ pub struct CatalogAttachRequest {
     pub implementation_version: Option<String>,
 }
 
+/// Request for `table_function_cardinality` / `table_function_statistics`
+/// (boxes an IPC-serialized `BindRequest`).
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CardinalityRequest {
+    pub bind_call: Bytes,
+    pub bind_opaque_data: Option<Bytes>,
+}
+
 /// One physical source backing a (possibly multi-branch) table scan.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {

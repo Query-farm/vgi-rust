@@ -139,6 +139,21 @@ impl TableFunction for SequenceFunction {
             max: Some(count),
         })
     }
+    fn statistics(&self, params: &BindParams) -> Option<Vec<vgi::statistics::CatColStat>> {
+        let count = params.arguments.const_i64(0)?.max(0);
+        let increment = params.arguments.named_i64("increment").unwrap_or(1);
+        let max = if count == 0 { 0 } else { (count - 1) * increment };
+        Some(vec![vgi::statistics::CatColStat {
+            column_name: "n".to_string(),
+            min: vgi::statistics::StatValue::Int64(0.min(max)),
+            max: vgi::statistics::StatValue::Int64(0.max(max)),
+            has_null: false,
+            has_not_null: true,
+            distinct_count: Some(count),
+            contains_unicode: None,
+            max_string_length: None,
+        }])
+    }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         validate_sequence_args(&params.arguments)?;
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);

@@ -65,6 +65,10 @@ pub trait TableFunction: Send + Sync {
     fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {
         None
     }
+    /// Optional per-column optimizer statistics for this call.
+    fn statistics(&self, _params: &BindParams) -> Option<Vec<crate::statistics::CatColStat>> {
+        None
+    }
     /// Build the per-execution producer. `params.output_schema` is the
     /// (possibly projection-narrowed) schema to emit.
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>>;

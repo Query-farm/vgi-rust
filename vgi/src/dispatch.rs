@@ -763,6 +763,21 @@ impl Dispatcher {
         Ok(Some(wire::to_result_batch(catalog::scan_function_result(t)?)?))
     }
 
+    /// Per-call statistics for a function-backed table scan (e.g. `sequence`).
+    pub fn handle_table_function_statistics(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+        let dto: CardinalityRequest = boxed(req)?;
+        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bp = self.bind_params(&bind_call, ctx)?;
+        let stats = self
+            .tables
+            .get(&bind_call.function_name)
+            .and_then(|v| v.first())
+            .and_then(|f| f.statistics(&bp))
+            .unwrap_or_default();
+        let bytes = crate::statistics::serialize_column_statistics(&stats)?;
+        Ok(Some(wire::result_batch_from_bytes(&bytes)?))
+    }
+
     /// Per-column optimizer statistics for a table. Returns the sparse-union
     /// IPC batch (result-wrapped), empty when the table declares no stats.
     pub fn handle_table_column_statistics_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
