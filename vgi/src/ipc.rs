@@ -17,9 +17,18 @@ use vgi_rpc::{Result, RpcError};
 
 /// Serialize a record batch to an Arrow IPC stream (schema + batch + EOS).
 pub fn write_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
+    write_batch_with_schema(batch, batch.schema().as_ref())
+}
+
+/// Like [`write_batch`] but emits the IPC schema message from `schema` instead
+/// of `batch.schema()`. The columns are written as-is. Used to declare a column
+/// non-nullable on the wire while its array still carries NULLs (arrow's safe
+/// constructors reject this, but the C++ extension requires it for inlined
+/// optimizer hints — see `catalog::serialize_items`).
+pub fn write_batch_with_schema(batch: &RecordBatch, schema: &Schema) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
-        let mut w = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+        let mut w = StreamWriter::try_new(&mut buf, schema)
             .map_err(|e| RpcError::runtime_error(format!("ipc writer: {e}")))?;
         w.write(batch)
             .map_err(|e| RpcError::runtime_error(format!("ipc write: {e}")))?;

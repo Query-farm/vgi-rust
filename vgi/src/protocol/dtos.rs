@@ -6,12 +6,60 @@
 //! item structs (`SchemaInfo`, `FunctionInfo`, …) are IPC-serialized into
 //! the `items: list<binary>` result via [`crate::ipc`].
 
-use vgi_rpc::{Bytes, DictString, LargeBytes, VgiArrow};
+use std::sync::Arc;
+
+use vgi_rpc::{Bytes, DictString, LargeBytes, Result, RpcError, VgiArrow};
 
 /// `map<utf8, utf8>` payload (Python-canonical `keys`/`values` child names).
 pub type StrMap = Vec<(String, String)>;
 /// `map<utf8, int64>` payload.
 pub type IntMap = Vec<(String, i64)>;
+
+/// An optionally-inlined `int64` whose wire field is declared **non-nullable**
+/// (the C++ extension's result-schema check requires `int64 not null`) yet may
+/// carry a NULL value. The extension reads it via `row[...].as<int64_t>()`,
+/// which yields `nullopt` for NULL — its signal for "not inlined, fire the RPC".
+/// Matches the vgi-go / vgi-python convention (null in a non-nullable column).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InlineI64(pub Option<i64>);
+
+impl From<Option<i64>> for InlineI64 {
+    fn from(v: Option<i64>) -> Self {
+        InlineI64(v)
+    }
+}
+
+impl VgiArrow for InlineI64 {
+    fn arrow_data_type() -> arrow_schema::DataType {
+        arrow_schema::DataType::Int64
+    }
+    // Built nullable (so `arrow`'s StructArray accepts the NULL child), then
+    // the serialized item's schema is tightened back to non-nullable by
+    // `serialize_items` to satisfy the C++ schema check — matching Go/Python,
+    // which emit NULL in a column the schema declares non-nullable.
+    fn nullable() -> bool {
+        true
+    }
+    fn describe_name() -> String {
+        "int".into()
+    }
+    fn read(arr: &dyn arrow_array::Array, idx: usize) -> Result<Self> {
+        use arrow_array::Array;
+        if arr.is_null(idx) {
+            return Ok(InlineI64(None));
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+            return Ok(InlineI64(Some(a.value(idx))));
+        }
+        if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int32Array>() {
+            return Ok(InlineI64(Some(a.value(idx) as i64)));
+        }
+        Err(RpcError::type_error("expected Int64/Int32 array"))
+    }
+    fn build_singleton(value: Self) -> Result<arrow_array::ArrayRef> {
+        Ok(Arc::new(arrow_array::Int64Array::from(vec![value.0])))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // bind
@@ -394,8 +442,12 @@ pub struct TableInfo {
     pub insert_function: Bytes,
     pub update_function: Bytes,
     pub delete_function: Bytes,
-    pub cardinality_estimate: i64,
-    pub cardinality_max: i64,
+    /// Inlined optimizer cardinality. `None` → NULL on the wire, which the C++
+    /// reads as "not inlined" → it fires the per-bind `table_function_cardinality`
+    /// RPC instead. Emitting a sentinel (e.g. -1) would be read as an inlined
+    /// value and wrongly skip the RPC.
+    pub cardinality_estimate: InlineI64,
+    pub cardinality_max: InlineI64,
     pub column_statistics: Bytes,
     pub bind_result: Bytes,
 }

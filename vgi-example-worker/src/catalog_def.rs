@@ -179,6 +179,11 @@ fn data_tables() -> Vec<CatTable> {
         inline(fn_table("large_sequence", &[("n", Int64)], "sequence",
             vec![i64_arg(1_000_000)], Some(1_000_000),
             "A large sequence of integers from 0 to 1,000,000")),
+        // Inlined scan_function (inlined_scan_function.test wants the scan
+        // trace + no scan_function_get RPC) but NO inlined cardinality: with
+        // cardinality=None the wire value is NULL, so the C++ still fires the
+        // per-bind table_function_cardinality RPC (ten_thousand returns 10000)
+        // and emits no cardinality-inlined trace (inlined_cardinality.test).
         inline(fn_table("ten_thousand_table", &[("n", Int64)], "ten_thousand",
             vec![], None, "Function-backed table over the no-arg ten_thousand function")),
         inline(fn_table("cardinality_inlined_table", &[("n", Int64)], "ten_thousand",

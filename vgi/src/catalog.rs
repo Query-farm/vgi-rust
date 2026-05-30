@@ -853,8 +853,8 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         insert_function: Bytes::from(Vec::new()),
         update_function: Bytes::from(Vec::new()),
         delete_function: Bytes::from(Vec::new()),
-        cardinality_estimate: t.cardinality.unwrap_or(-1),
-        cardinality_max: t.cardinality.unwrap_or(-1),
+        cardinality_estimate: t.cardinality.into(),
+        cardinality_max: t.cardinality.into(),
         column_statistics: Bytes::from(Vec::new()),
         bind_result: Bytes::from(Vec::new()),
     })
@@ -895,9 +895,33 @@ pub fn serialize_items<T: vgi_rpc::VgiArrow>(items: Vec<T>) -> Result<Vec<Bytes>
         .into_iter()
         .map(|item| {
             let batch = crate::wire::to_batch(item)?;
-            Ok(Bytes::from(ipc::write_batch(&batch)?))
+            let schema = tighten_inline_schema(&batch.schema());
+            Ok(Bytes::from(ipc::write_batch_with_schema(&batch, &schema)?))
         })
         .collect()
+}
+
+/// Mark the `cardinality_estimate` / `cardinality_max` columns non-nullable in
+/// the item schema (the C++ extension's `catalog_schema_contents_*` result-schema
+/// check requires `int64 not null`), while the arrays still carry any NULL
+/// values. `arrow`'s safe `RecordBatch`/`StructArray` constructors reject a
+/// non-nullable field with nulls, so these columns are built nullable and the
+/// declared wire schema is tightened only at IPC-write time — matching the
+/// vgi-go / vgi-python convention (NULL in a non-nullable column = "not inlined").
+fn tighten_inline_schema(schema: &Schema) -> Schema {
+    const TIGHTEN: [&str; 2] = ["cardinality_estimate", "cardinality_max"];
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if TIGHTEN.contains(&f.name().as_str()) {
+                Field::new(f.name(), f.data_type().clone(), false)
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new(fields)
 }
 
 /// Wrap a `DictString` enum value (re-export convenience).
