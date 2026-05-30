@@ -2,6 +2,7 @@
 
 mod batch_index;
 mod order_modes;
+mod settings_fixtures;
 mod static_scan;
 mod partition;
 mod filters;
@@ -30,6 +31,7 @@ pub fn register(w: &mut vgi::Worker) {
     partition::register(w);
     order_modes::register(w);
     static_scan::register(w);
+    settings_fixtures::register(w);
 }
 
 fn schema_n() -> SchemaRef {

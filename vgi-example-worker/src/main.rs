@@ -55,10 +55,20 @@ fn register_secrets_and_settings(worker: &mut Worker) {
         parameters_schema: Arc::new(params),
     });
 
+    let config_struct = DataType::Struct(
+        vec![
+            Field::new("start", DataType::Int64, true),
+            Field::new("step", DataType::Int64, true),
+            Field::new("label", DataType::Utf8, true),
+        ]
+        .into(),
+    );
     for (name, ty) in [
+        ("vgi_verbose_mode", DataType::Boolean),
+        ("greeting", DataType::Utf8),
         ("multiplier", DataType::Int64),
         ("threshold", DataType::Int64),
-        ("greeting", DataType::Utf8),
+        ("config", config_struct),
     ] {
         worker.register_setting(SettingSpec {
             name: name.to_string(),
