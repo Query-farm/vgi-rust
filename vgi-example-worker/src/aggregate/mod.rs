@@ -285,7 +285,11 @@ impl AggregateFunction for SumAllFunction {
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::any_column("columns", 0, "Numeric columns").varargs()]
     }
-    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+    fn on_bind(&self, p: &AggregateBindParams) -> Result<BindResponse> {
+        let ncols = p.input_schema.as_ref().map(|s| s.fields().len()).unwrap_or(0);
+        if ncols == 0 {
+            return Err(RpcError::value_error("vgi_sum_all requires at least 1 value"));
+        }
         Ok(BindResponse { output_schema: result_schema(DataType::Float64), opaque_data: Vec::new() })
     }
     fn initial_state(&self) -> Vec<u8> { le_f64(0.0) }

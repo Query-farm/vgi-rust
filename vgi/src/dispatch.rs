@@ -892,15 +892,20 @@ impl Dispatcher {
         let f = self.resolve_aggregate(&dto.function_name)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let (gids, columns) = split_group_ids(&batch)?;
-        // Pre-load states for the distinct gids present.
+        // Pre-load only EXISTING states from prior batches; do NOT seed
+        // `initial_state` for groups with no state yet. The function's
+        // `update` creates an entry (via `or_insert_with`) only when it
+        // actually folds in a value — so a group that received only NULLs
+        // (DEFAULT null handling) leaves no state and finalizes to NULL
+        // rather than a seeded 0.
         let mut states: HashMap<i64, Vec<u8>> = HashMap::new();
         for i in 0..gids.len() {
             let gid = gids.value(i);
-            states.entry(gid).or_insert_with(|| {
-                self.store
-                    .kv_get(&dto.execution_id.0, &Self::agg_key(gid))
-                    .unwrap_or_else(|| f.initial_state())
-            });
+            if !states.contains_key(&gid) {
+                if let Some(s) = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(gid)) {
+                    states.insert(gid, s);
+                }
+            }
         }
         f.update(&mut states, &gids, &columns)?;
         for (gid, state) in states {
@@ -929,15 +934,16 @@ impl Dispatcher {
         for i in 0..src.len() {
             let s = src.value(i);
             let t = tgt.value(i);
-            let source = self
-                .store
-                .kv_get(&dto.execution_id.0, &Self::agg_key(s))
-                .unwrap_or_else(|| f.initial_state());
-            let target = self
-                .store
-                .kv_get(&dto.execution_id.0, &Self::agg_key(t))
-                .unwrap_or_else(|| f.initial_state());
-            let merged = f.combine(target, source)?;
+            let source = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(s));
+            let target = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(t));
+            // Both absent (e.g. an all-NULL group under DEFAULT null handling):
+            // leave the target stateless so finalize yields NULL, not a seeded 0.
+            let merged = match (target, source) {
+                (None, None) => continue,
+                (Some(t), None) => t,
+                (None, Some(s)) => s,
+                (Some(t), Some(s)) => f.combine(t, s)?,
+            };
             self.store
                 .kv_put(&dto.execution_id.0, &Self::agg_key(t), &merged);
         }
