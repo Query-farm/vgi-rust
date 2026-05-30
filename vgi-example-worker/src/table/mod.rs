@@ -37,6 +37,39 @@ fn schema_value() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]))
 }
 
+/// Validate `sequence`/`make_series` args: count must be non-NULL; batch_size
+/// and increment, when supplied, must be non-NULL and (for batch_size) >= 1.
+fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
+    use arrow_array::Array;
+    // count (positional 0) is required and must not be NULL.
+    let count_null = a
+        .positional
+        .first()
+        .map(|o| o.as_ref().map(|c| c.is_empty() || c.is_null(0)).unwrap_or(true))
+        .unwrap_or(true);
+    if count_null {
+        return Err(RpcError::value_error("sequence: count cannot be NULL"));
+    }
+    for name in ["batch_size", "increment"] {
+        if let Some(arr) = a.named.get(name) {
+            if arr.is_null(0) {
+                return Err(RpcError::value_error(format!("sequence: {name} cannot be NULL")));
+            }
+        }
+    }
+    if let Some(bs) = a.named_i64("batch_size") {
+        if bs < 1 {
+            return Err(RpcError::value_error("sequence: batch_size must be >= 1"));
+        }
+    }
+    if let Some(inc) = a.named_i64("increment") {
+        if inc < 1 {
+            return Err(RpcError::value_error("sequence: increment must be >= 1"));
+        }
+    }
+    Ok(())
+}
+
 fn gen_meta(desc: &str, cats: &[&str]) -> FunctionMetadata {
     FunctionMetadata {
         description: desc.to_string(),
@@ -92,7 +125,8 @@ impl TableFunction for SequenceFunction {
             ArgSpec::const_arg("increment", -1, "int64", "Step between values"),
         ]
     }
-    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        validate_sequence_args(&params.arguments)?;
         Ok(BindResponse {
             output_schema: schema_n(),
             opaque_data: Vec::new(),
@@ -106,6 +140,7 @@ impl TableFunction for SequenceFunction {
         })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        validate_sequence_args(&params.arguments)?;
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let increment = params.arguments.named_i64("increment").unwrap_or(1);
         let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1000).max(1) as usize;
