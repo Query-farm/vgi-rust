@@ -7,6 +7,7 @@ mod static_scan;
 mod partition;
 mod filters;
 mod more;
+mod proj_repro;
 
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakeSeriesCsv);
     w.register_table(MakeSeriesFloat);
     more::register(w);
+    proj_repro::register(w);
     filters::register(w);
     batch_index::register(w);
     partition::register(w);
