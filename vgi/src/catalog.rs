@@ -607,7 +607,9 @@ impl CatTable {
     ) -> Result<Option<&TimeTravelVersion>> {
         let has_at = at_unit.is_some_and(|u| !u.is_empty());
         if self.time_travel.is_empty() {
-            if has_at {
+            // Multi-branch tables reject AT clauses downstream (C++ emits the
+            // "not supported on multi-branch" error) — pass through here.
+            if has_at && self.branches.is_none() {
                 return Err(vgi_rpc::RpcError::value_error(
                     "this table does not support time travel",
                 ));
