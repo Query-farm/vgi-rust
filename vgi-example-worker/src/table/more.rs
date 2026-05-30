@@ -387,7 +387,10 @@ pub struct SampleEchoFunction;
 impl TableFunction for SampleEchoFunction {
     fn name(&self) -> &str { "sample_echo" }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Echoes TABLESAMPLE pushdown hints in output", false)
+        FunctionMetadata {
+            sampling_pushdown: true,
+            ..gen_meta("Echoes TABLESAMPLE pushdown hints in output", false)
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
