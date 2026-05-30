@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
@@ -11,6 +11,7 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(FilterEchoFunction);
     w.register_table(ValuePruneFunction);
+    w.register_table(NamedParamsEchoFunction);
 }
 
 fn meta(desc: &str) -> FunctionMetadata {
@@ -208,6 +209,104 @@ impl TableFunction for ValuePruneFunction {
             resolved,
             cursor: 0,
             batch_size,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// named_params_echo(count, greeting:=, multiplier:=, scale:=, enabled:=)
+// ---------------------------------------------------------------------------
+
+fn named_params_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("greeting", DataType::Utf8, true),
+        Field::new("value", DataType::Int64, true),
+        Field::new("float_value", DataType::Float64, true),
+        Field::new("enabled", DataType::Boolean, true),
+    ]))
+}
+
+struct NamedParamsProducer {
+    schema: SchemaRef,
+    remaining: i64,
+    cursor: i64,
+    batch_size: i64,
+    greeting: String,
+    multiplier: i64,
+    scale: f64,
+    enabled: bool,
+}
+impl TableProducer for NamedParamsProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.remaining <= 0 {
+            return Ok(None);
+        }
+        let size = self.remaining.min(self.batch_size);
+        let ids: Vec<i64> = (self.cursor..self.cursor + size).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * self.multiplier).collect();
+        let floats: Vec<f64> = ids.iter().map(|i| *i as f64 * self.scale).collect();
+        let greetings: Vec<&str> = vec![self.greeting.as_str(); size as usize];
+        let enabled: Vec<bool> = vec![self.enabled; size as usize];
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(greetings)) as ArrayRef,
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+                Arc::new(Float64Array::from(floats)) as ArrayRef,
+                Arc::new(BooleanArray::from(enabled)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor += size;
+        self.remaining -= size;
+        Ok(Some(batch))
+    }
+}
+
+pub struct NamedParamsEchoFunction;
+impl TableFunction for NamedParamsEchoFunction {
+    fn name(&self) -> &str {
+        "named_params_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Echoes named parameter values in output columns".to_string(),
+            categories: vec!["generator".into(), "testing".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("greeting", -1, "varchar", "Greeting text echoed in output"),
+            ArgSpec::const_arg("multiplier", -1, "int64", "Multiplier for value column"),
+            ArgSpec::const_arg("scale", -1, "double", "Scale factor for float_value column"),
+            ArgSpec::const_arg("enabled", -1, "boolean", "Boolean echoed in output"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: named_params_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        Ok(Box::new(NamedParamsProducer {
+            schema: named_params_schema(),
+            remaining: count,
+            cursor: 0,
+            batch_size: 2048,
+            greeting: params.arguments.named_str("greeting").unwrap_or_else(|| "hello".to_string()),
+            multiplier: params.arguments.named_i64("multiplier").unwrap_or(1),
+            scale: params.arguments.named_f64("scale").unwrap_or(1.0),
+            enabled: params.arguments.named_bool("enabled").unwrap_or(true),
         }))
     }
 }
