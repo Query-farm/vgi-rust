@@ -169,18 +169,58 @@ fn data_tables() -> Vec<CatTable> {
             "Table with constraints that evolve across versions"),
     ];
 
-    // Multi-branch tables (registered for metadata; scans handled separately).
-    for (name, comment) in [
-        ("multi_branch_numbers", "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test"),
-        ("multi_branch_filtered_numbers", "Multi-branch with complementary branch_filters — exercises pruning"),
-        ("multi_branch_hetero", "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test"),
-        ("multi_branch_nopushdown", "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test"),
-        ("multi_branch_empty", "Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test"),
-        ("multi_branch_recon", "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test"),
-        ("multi_branch_two_writable", "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test"),
-    ] {
-        tables.push(dtable(name, vec![f("n", Int64)], comment));
-    }
+    // Multi-branch tables: each declares its physical branches.
+    let seq = |count: i64| vgi::catalog::CatBranch {
+        function_name: "sequence".to_string(),
+        scan_arguments: Arguments::serialize_scan_args(&[i64_arg(count)]).unwrap_or_default(),
+        branch_filter: None,
+        writable: false,
+    };
+    let native = |func: &str, path: &str| vgi::catalog::CatBranch {
+        function_name: func.to_string(),
+        scan_arguments: Arguments::serialize_scan_args(&[
+            std::sync::Arc::new(arrow_array::StringArray::from(vec![path])) as ArrayRef,
+        ])
+        .unwrap_or_default(),
+        branch_filter: None,
+        writable: false,
+    };
+    let mb = |name: &str, comment: &str, branches: Vec<vgi::catalog::CatBranch>| {
+        let mut t = dtable(name, vec![f("n", Int64)], comment);
+        t.branches = Some(branches);
+        t
+    };
+    tables.push(mb("multi_branch_numbers",
+        "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",
+        vec![seq(50), seq(50)]));
+    tables.push(mb("multi_branch_filtered_numbers",
+        "Multi-branch with complementary branch_filters — exercises pruning",
+        vec![
+            vgi::catalog::CatBranch { branch_filter: Some("n < 50".to_string()), ..seq(100) },
+            vgi::catalog::CatBranch { branch_filter: Some("n >= 50".to_string()), ..seq(100) },
+        ]));
+    tables.push(mb("multi_branch_hetero",
+        "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
+        vec![seq(50), native("read_parquet", "/tmp/vgi_hetero_branch.parquet")]));
+    tables.push(mb("multi_branch_nopushdown",
+        "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
+        vec![seq(50), native("read_csv_auto", "/tmp/vgi_nopushdown_branch.csv")]));
+    tables.push(mb("multi_branch_empty",
+        "Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test",
+        vec![]));
+    tables.push(mb("multi_branch_recon",
+        "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
+        vec![
+            native("read_parquet", "/tmp/vgi_recon_a_b.parquet"),
+            native("read_parquet", "/tmp/vgi_recon_b_a.parquet"),
+            native("read_parquet", "/tmp/vgi_recon_a_only.parquet"),
+        ]));
+    tables.push(mb("multi_branch_two_writable",
+        "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test",
+        vec![
+            vgi::catalog::CatBranch { writable: true, ..seq(10) },
+            vgi::catalog::CatBranch { writable: true, ..seq(10) },
+        ]));
 
     // departments: PK(id), NOT NULL(id,name), UNIQUE(name), CHECK(budget>=0), default budget=0.
     let mut departments = dtable("departments", vec![

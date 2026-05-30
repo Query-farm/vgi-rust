@@ -373,6 +373,18 @@ pub struct CatTable {
     /// the C++ extension skips `catalog_table_scan_function_get`. When false
     /// (default), the scan is resolved lazily via that RPC.
     pub inline_scan: bool,
+    /// Multi-branch sources. `Some` (even empty) overrides the single-branch
+    /// default in `catalog_table_scan_branches_get`.
+    pub branches: Option<Vec<CatBranch>>,
+}
+
+/// One physical branch of a multi-branch table.
+#[derive(Clone)]
+pub struct CatBranch {
+    pub function_name: String,
+    pub scan_arguments: Vec<u8>,
+    pub branch_filter: Option<String>,
+    pub writable: bool,
 }
 
 /// A foreign-key constraint (referenced table in the same schema by default).
@@ -444,6 +456,7 @@ impl CatTable {
             tags: Vec::new(),
             foreign_keys: Vec::new(),
             inline_scan: false,
+            branches: None,
         }
     }
 }

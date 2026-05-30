@@ -771,14 +771,33 @@ impl Dispatcher {
             .ok_or_else(|| {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
-        let branch = ScanBranch {
-            function_name: t.scan_function.clone(),
-            arguments: Bytes::from(t.scan_arguments.clone()),
-            branch_filter: None,
-            writable: false,
+        let mk = |b: ScanBranch| -> Result<Bytes> {
+            Ok(Bytes::from(ipc::write_batch(&wire::to_batch(b)?)?))
+        };
+        let branches: Vec<Bytes> = match &t.branches {
+            // Explicit multi-branch sources (possibly empty — the empty case
+            // exercises the C++ loud-fail rejection).
+            Some(defs) => defs
+                .iter()
+                .map(|d| {
+                    mk(ScanBranch {
+                        function_name: d.function_name.clone(),
+                        arguments: Bytes::from(d.scan_arguments.clone()),
+                        branch_filter: d.branch_filter.clone(),
+                        writable: d.writable,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            // Single-source default: one branch wrapping the scan function.
+            None => vec![mk(ScanBranch {
+                function_name: t.scan_function.clone(),
+                arguments: Bytes::from(t.scan_arguments.clone()),
+                branch_filter: None,
+                writable: false,
+            })?],
         };
         Ok(Some(wire::to_result_batch(ScanBranchesResult {
-            branches: vec![Bytes::from(ipc::write_batch(&wire::to_batch(branch)?)?)],
+            branches,
             required_extensions: Vec::new(),
         })?))
     }
