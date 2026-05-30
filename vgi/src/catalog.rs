@@ -421,6 +421,102 @@ pub struct CatalogModel {
     pub supported_data_versions: Vec<String>,
     /// The data version used when the client omits `data_version_spec`.
     pub default_data_version: Option<String>,
+    /// Concrete implementation versions accepted at ATTACH (npm-resolved when
+    /// `npm_version_resolution`). Empty → exact-match against
+    /// `implementation_version`.
+    pub supported_implementation_versions: Vec<String>,
+    /// Use npm-style spec resolution (exact / bare / `^` / `~`) instead of
+    /// exact-match for `data_version_spec` / `implementation_version`.
+    pub npm_version_resolution: bool,
+    /// Per-resolved-version schema sets. When non-empty the catalog's visible
+    /// objects vary by the resolved data version (encoded in attach_opaque_data).
+    pub version_schemas: std::collections::HashMap<String, Vec<CatSchema>>,
+}
+
+impl CatalogModel {
+    /// The schema set visible for a given resolved data `version` (or the base
+    /// schemas when the catalog is not version-shaped / the version is unknown).
+    pub fn schemas_for(&self, version: Option<&str>) -> &[CatSchema] {
+        version
+            .and_then(|v| self.version_schemas.get(v))
+            .map(|v| v.as_slice())
+            .unwrap_or(&self.schemas)
+    }
+}
+
+fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let mut it = v.split('.');
+    let a = it.next()?.parse().ok()?;
+    let b = it.next()?.parse().ok()?;
+    let c = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((a, b, c))
+}
+
+/// Resolve an npm-style version `spec` to a concrete `supported` version
+/// (exact `X.Y.Z`, bare `X` / `X.Y`, caret `^X.Y.Z`, tilde `~X.Y.Z`). Returns
+/// `default` when `spec` is `None`. `Err` when nothing matches.
+pub fn resolve_version_npm(
+    spec: Option<&str>,
+    supported: &[String],
+    default: &str,
+    label: &str,
+) -> Result<String> {
+    let spec = match spec {
+        None | Some("") => return Ok(default.to_string()),
+        Some(s) => s,
+    };
+    let mut sorted: Vec<((u32, u32, u32), &String)> =
+        supported.iter().filter_map(|v| parse_semver(v).map(|t| (t, v))).collect();
+    sorted.sort();
+    let unsupported =
+        || vgi_rpc::RpcError::value_error(format!("Unsupported {label} {spec:?}; this worker serves {supported:?}"));
+
+    // Exact X.Y.Z
+    if parse_semver(spec).is_some() {
+        return if supported.iter().any(|s| s == spec) {
+            Ok(spec.to_string())
+        } else {
+            Err(unsupported())
+        };
+    }
+    let nums: Vec<&str> = spec.trim_start_matches(['^', '~']).split('.').collect();
+    let prefix = spec.chars().next().unwrap_or(' ');
+    // Bare major `X`
+    if !matches!(prefix, '^' | '~') && nums.len() == 1 {
+        let major: u32 = nums[0].parse().map_err(|_| unsupported())?;
+        return sorted
+            .iter()
+            .filter(|(t, _)| t.0 == major)
+            .last()
+            .map(|(_, v)| v.to_string())
+            .ok_or_else(unsupported);
+    }
+    // Bare major.minor `X.Y` → pin to X.Y.0
+    if !matches!(prefix, '^' | '~') && nums.len() == 2 {
+        let pinned = format!("{}.{}.0", nums[0], nums[1]);
+        return if supported.iter().any(|s| *s == pinned) {
+            Ok(pinned)
+        } else {
+            Err(unsupported())
+        };
+    }
+    // Caret `^X.Y.Z` (same major, >= base) / Tilde `~X.Y.Z` (same major.minor, >= base)
+    if matches!(prefix, '^' | '~') {
+        if let Some(base) = parse_semver(spec.trim_start_matches(['^', '~'])) {
+            return sorted
+                .iter()
+                .filter(|(t, _)| {
+                    t.0 == base.0 && *t >= base && (prefix == '^' || t.1 == base.1)
+                })
+                .last()
+                .map(|(_, v)| v.to_string())
+                .ok_or_else(unsupported);
+        }
+    }
+    Err(unsupported())
 }
 
 #[derive(Clone)]

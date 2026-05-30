@@ -14,6 +14,36 @@ pub fn register(w: &mut vgi::Worker) {
     let s = |v: Vec<&str>| Arc::new(StringArray::from(v)) as ArrayRef;
     let f = |v: Vec<f64>| Arc::new(Float64Array::from(v)) as ArrayRef;
 
+    // versioned_tables data scans (one per (table, version-variant)).
+    w.register_table(StaticScan::new(
+        "versioned_tables_animals_scan",
+        &[("name", DataType::Utf8), ("legs", DataType::Int64), ("sound", DataType::Utf8)],
+        vec![
+            s(vec!["chicken", "cow", "horse", "pig", "sheep"]),
+            i(vec![2, 4, 4, 4, 4]),
+            s(vec!["cluck", "moo", "neigh", "oink", "baa"]),
+        ],
+    ));
+    w.register_table(StaticScan::new(
+        "versioned_tables_animals_color_scan",
+        &[("name", DataType::Utf8), ("legs", DataType::Int64), ("sound", DataType::Utf8), ("color", DataType::Utf8)],
+        vec![
+            s(vec!["chicken", "cow", "horse", "pig", "sheep"]),
+            i(vec![2, 4, 4, 4, 4]),
+            s(vec!["cluck", "moo", "neigh", "oink", "baa"]),
+            s(vec!["red", "brown", "black", "pink", "white"]),
+        ],
+    ));
+    w.register_table(StaticScan::new(
+        "versioned_tables_plants_scan",
+        &[("name", DataType::Utf8), ("kind", DataType::Utf8), ("height_m", DataType::Float64)],
+        vec![
+            s(vec!["oak", "pine", "rose", "tomato", "wheat"]),
+            s(vec!["tree", "tree", "flower", "vegetable", "grass"]),
+            f(vec![20.0, 25.0, 0.6, 1.5, 1.0]),
+        ],
+    ));
+
     w.register_table(StaticScan::new(
         "departments_scan",
         &[("id", DataType::Int64), ("name", DataType::Utf8), ("budget", DataType::Float64)],

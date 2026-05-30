@@ -675,8 +675,19 @@ impl Dispatcher {
         // worker serves, then echo the resolved concrete versions back.
         let (resolved_data_version, resolved_implementation_version) =
             self.resolve_versions(&dto)?;
+        // Version-shaped catalogs encode the resolved data version into the
+        // attach_opaque_data (`<version>\0<id>`) so per-request catalog handlers
+        // can select the right object set without server-side session state.
+        let attach_opaque_data = if !self.catalog.version_schemas.is_empty() {
+            let mut v = resolved_data_version.clone().unwrap_or_default().into_bytes();
+            v.push(0);
+            v.extend_from_slice(&self.attach_bytes());
+            v
+        } else {
+            self.attach_bytes()
+        };
         let result = CatalogAttachResult {
-            attach_opaque_data: Bytes::from(self.attach_bytes()),
+            attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
             supports_time_travel: self.catalog.supports_time_travel,
             catalog_version_frozen: false,
@@ -717,18 +728,37 @@ impl Dispatcher {
         dto: &CatalogAttachRequest,
     ) -> Result<(Option<String>, Option<String>)> {
         let cat = &self.catalog;
-        // Implementation version: exact-match when the worker declares one.
-        let resolved_impl = match (&dto.implementation_version, &cat.implementation_version) {
-            (Some(req), Some(have)) if req != have => {
-                return Err(RpcError::value_error(format!(
-                    "Unsupported implementation_version {req:?}; this worker serves {have:?}"
-                )));
+        // Implementation version: npm-resolved against the supported set when
+        // opted in, else exact-match against the single declared version.
+        let resolved_impl = if cat.npm_version_resolution
+            && !cat.supported_implementation_versions.is_empty()
+        {
+            Some(catalog::resolve_version_npm(
+                dto.implementation_version.as_deref(),
+                &cat.supported_implementation_versions,
+                cat.implementation_version.as_deref().unwrap_or(""),
+                "implementation_version",
+            )?)
+        } else {
+            match (&dto.implementation_version, &cat.implementation_version) {
+                (Some(req), Some(have)) if req != have => {
+                    return Err(RpcError::value_error(format!(
+                        "Unsupported implementation_version {req:?}; this worker serves {have:?}"
+                    )));
+                }
+                (_, have) => have.clone(),
             }
-            (_, have) => have.clone(),
         };
-        // Data version: must be a supported concrete version, else the default.
+        // Data version: npm-style resolution when opted in, else exact-match.
         let resolved_data = if cat.supported_data_versions.is_empty() {
             None
+        } else if cat.npm_version_resolution {
+            Some(catalog::resolve_version_npm(
+                dto.data_version_spec.as_deref(),
+                &cat.supported_data_versions,
+                cat.default_data_version.as_deref().unwrap_or(""),
+                "data_version_spec",
+            )?)
         } else if let Some(req) = &dto.data_version_spec {
             if !cat.supported_data_versions.contains(req) {
                 return Err(RpcError::value_error(format!(
@@ -741,6 +771,28 @@ impl Dispatcher {
             cat.default_data_version.clone()
         };
         Ok((resolved_data, resolved_impl))
+    }
+
+    /// Decode the resolved data version from a request's `attach_opaque_data`
+    /// column (`<version>\0<id>`). Returns `None` for non-version-shaped
+    /// catalogs or when the column is absent.
+    fn req_version(&self, req: &Request) -> Option<String> {
+        if self.catalog.version_schemas.is_empty() {
+            return None;
+        }
+        let bytes = read_binary_col(req, "attach_opaque_data")?;
+        let sep = bytes.iter().position(|&b| b == 0)?;
+        if sep == 0 {
+            return None;
+        }
+        String::from_utf8(bytes[..sep].to_vec()).ok()
+    }
+
+    /// Version-aware schema lookup: selects the object set for the request's
+    /// resolved data version (falls back to the base schemas).
+    fn schema_for_req<'a>(&'a self, req: &Request, name: &str) -> Option<&'a catalog::CatSchema> {
+        let v = self.req_version(req);
+        self.catalog.schemas_for(v.as_deref()).iter().find(|s| s.name == name)
     }
 
     pub fn handle_catalog_version(&self, _req: &Request) -> Result<Option<RecordBatch>> {
@@ -798,7 +850,7 @@ impl Dispatcher {
 
     pub fn handle_contents_tables(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let name = read_string_col(req, "name")?;
-        let infos: Vec<TableInfo> = match self.catalog.schema(&name) {
+        let infos: Vec<TableInfo> = match self.schema_for_req(req, &name) {
             Some(s) => s
                 .tables
                 .iter()
@@ -815,8 +867,7 @@ impl Dispatcher {
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
         let infos: Vec<TableInfo> = self
-            .catalog
-            .schema(&schema_name)
+            .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .map(|t| catalog::table_info(&schema_name, t))
             .transpose()?
@@ -833,8 +884,7 @@ impl Dispatcher {
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
         let t = self
-            .catalog
-            .schema(&schema_name)
+            .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
@@ -911,8 +961,7 @@ impl Dispatcher {
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
         let t = self
-            .catalog
-            .schema(&schema_name)
+            .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
@@ -1636,6 +1685,15 @@ fn read_string_col(req: &Request, name: &str) -> Result<String> {
         .column(name)
         .ok_or_else(|| RpcError::type_error(format!("request missing '{name}' column")))?;
     <String as VgiArrow>::read(col, 0)
+}
+
+/// Read a (binary) column's row-0 bytes from a request, if present and non-null.
+fn read_binary_col(req: &Request, name: &str) -> Option<Vec<u8>> {
+    let col = req.column(name)?;
+    col.as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .filter(|a| a.len() > 0 && a.is_valid(0))
+        .map(|a| a.value(0).to_vec())
 }
 
 fn parse_settings(field: &Option<Bytes>) -> Result<crate::settings::Settings> {

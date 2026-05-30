@@ -350,6 +350,9 @@ pub fn versioned() -> CatalogModel {
             "1.2.0".to_string(),
         ],
         default_data_version: Some("1.2.0".to_string()),
+        npm_version_resolution: false,
+        supported_implementation_versions: Vec::new(),
+        version_schemas: std::collections::HashMap::new(),
         comment: Some(
             "Example catalog demonstrating data_version_spec validation and cookie stickiness"
                 .to_string(),
@@ -366,11 +369,65 @@ pub fn versioned() -> CatalogModel {
     }
 }
 
+/// The `versioned_tables` catalog — visible tables vary by the resolved
+/// `data_version` (1.0=animals, 1.1=animals+color, 2.0=animals+plants, 3.0=plants).
+pub fn versioned_tables() -> CatalogModel {
+    use arrow_schema::DataType::{Float64, Int64, Utf8};
+    use std::collections::HashMap;
+    let main = |tables: Vec<CatTable>| CatSchema {
+        name: "main".to_string(),
+        comment: None,
+        views: Vec::new(),
+        macros: Vec::new(),
+        tables,
+    };
+    let animals = scan(
+        dtable("animals", vec![f("name", Utf8), f("legs", Int64), f("sound", Utf8)],
+            "Animals table for data_version 1.0.0"),
+        "versioned_tables_animals_scan",
+    );
+    let animals_color = scan(
+        dtable("animals", vec![f("name", Utf8), f("legs", Int64), f("sound", Utf8), f("color", Utf8)],
+            "Animals table for data_version 1.1.0 (with color)"),
+        "versioned_tables_animals_color_scan",
+    );
+    let plants = scan(
+        dtable("plants", vec![f("name", Utf8), f("kind", Utf8), f("height_m", Float64)],
+            "Plants table for data_version 2.0.0 and 3.0.0"),
+        "versioned_tables_plants_scan",
+    );
+    let mut version_schemas = HashMap::new();
+    version_schemas.insert("1.0.0".to_string(), vec![main(vec![animals.clone()])]);
+    version_schemas.insert("1.1.0".to_string(), vec![main(vec![animals_color.clone()])]);
+    version_schemas.insert("2.0.0".to_string(), vec![main(vec![animals.clone(), plants.clone()])]);
+    version_schemas.insert("3.0.0".to_string(), vec![main(vec![plants.clone()])]);
+    CatalogModel {
+        name: "versioned_tables".to_string(),
+        implementation_version: Some("11.0.0".to_string()),
+        data_version_spec: Some(">=1.0.0,<4.0.0".to_string()),
+        supported_data_versions: vec![
+            "1.0.0".to_string(),
+            "1.1.0".to_string(),
+            "2.0.0".to_string(),
+            "3.0.0".to_string(),
+        ],
+        default_data_version: Some("3.0.0".to_string()),
+        supported_implementation_versions: vec!["10.0.0".to_string(), "10.1.0".to_string(), "11.0.0".to_string()],
+        npm_version_resolution: true,
+        version_schemas,
+        comment: Some("Catalog whose visible tables depend on the resolved data version".to_string()),
+        tags: Vec::new(),
+        supports_time_travel: false,
+        schemas: vec![main(Vec::new())],
+    }
+}
+
 /// Select the catalog model by the `VGI_WORKER_CATALOG_NAME` env (default
 /// `example`), mirroring vgi-java's single-binary + wrapper approach.
 pub fn build_by_name(name: &str) -> CatalogModel {
     match name {
         "versioned" => versioned(),
+        "versioned_tables" => versioned_tables(),
         _ => build(),
     }
 }
@@ -382,6 +439,9 @@ pub fn build() -> CatalogModel {
         data_version_spec: None,
         supported_data_versions: Vec::new(),
         default_data_version: None,
+        npm_version_resolution: false,
+        supported_implementation_versions: Vec::new(),
+        version_schemas: std::collections::HashMap::new(),
         comment: Some("Example VGI catalog for testing".to_string()),
         tags: vec![
             ("source".to_string(), "vgi-fixture-worker".to_string()),
