@@ -340,6 +340,8 @@ pub struct CatView {
     pub name: String,
     pub definition: String,
     pub comment: Option<String>,
+    pub tags: Vec<(String, String)>,
+    pub column_comments: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -404,11 +406,11 @@ impl CatalogModel {
 pub fn view_info(schema: &str, v: &CatView) -> crate::protocol::dtos::ViewInfo {
     crate::protocol::dtos::ViewInfo {
         comment: v.comment.clone(),
-        tags: Vec::new(),
+        tags: v.tags.clone(),
         name: v.name.clone(),
         schema_name: schema.to_string(),
         definition: v.definition.clone(),
-        column_comments: Vec::new(),
+        column_comments: v.column_comments.clone(),
     }
 }
 
