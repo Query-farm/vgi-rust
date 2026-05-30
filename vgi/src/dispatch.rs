@@ -372,6 +372,12 @@ impl Dispatcher {
                     .with_header(header));
             }
             // Sink phase: emit nothing; data arrives via process RPCs.
+            // The process/combine RPCs carry no schema and may run in a
+            // different pooled worker, so persist the bound output schema
+            // (which may differ from the input, e.g. sum_all_columns) to the
+            // file-backed store keyed by execution_id for them to read.
+            self.store
+                .kv_put(&execution_id, b"outsc", &ipc::write_schema_ref(&output_schema)?);
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
@@ -774,14 +780,30 @@ impl Dispatcher {
 
     // -- table buffering RPCs ----------------------------------------------
 
+    /// The bound output schema for a buffering execution, persisted by the
+    /// sink init to the file-backed store (process/combine carry no schema and
+    /// may run in a different pooled worker). Falls back to `default` when no
+    /// schema was persisted (e.g. echo-style functions where it is unused).
+    fn buffering_output_schema(
+        &self,
+        execution_id: &[u8],
+        default: arrow_schema::SchemaRef,
+    ) -> arrow_schema::SchemaRef {
+        self.store
+            .kv_get(execution_id, b"outsc")
+            .and_then(|b| ipc::read_schema(&b).ok())
+            .unwrap_or(default)
+    }
+
     pub fn handle_buffering_process(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
+        let output_schema = self.buffering_output_schema(&dto.execution_id.0, batch.schema());
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
-            output_schema: batch.schema(),
+            output_schema,
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
         };
@@ -794,10 +816,12 @@ impl Dispatcher {
     pub fn handle_buffering_combine(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
+        let output_schema =
+            self.buffering_output_schema(&dto.execution_id.0, Arc::new(arrow_schema::Schema::empty()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
-            output_schema: Arc::new(arrow_schema::Schema::empty()),
+            output_schema,
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
         };
