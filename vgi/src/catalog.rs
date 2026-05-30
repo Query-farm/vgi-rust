@@ -368,6 +368,52 @@ pub struct CatTable {
     pub unique: Vec<Vec<i32>>,
     pub check: Vec<String>,
     pub tags: Vec<(String, String)>,
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// A foreign-key constraint (referenced table in the same schema by default).
+#[derive(Clone)]
+pub struct ForeignKey {
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+}
+
+/// Serialize a foreign key to its IPC `foreign_key_constraints` entry.
+pub fn serialize_foreign_key(schema: &str, fk: &ForeignKey) -> Result<Vec<u8>> {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    let list_of = |items: &[String]| -> ArrayRef {
+        let mut b = ListBuilder::new(StringBuilder::new());
+        for s in items {
+            b.values().append_value(s);
+        }
+        b.append(true);
+        Arc::new(b.finish())
+    };
+    let fields = vec![
+        Field::new(
+            "fk_columns",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new(
+            "pk_columns",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("referenced_table", DataType::Utf8, true),
+        Field::new("referenced_schema", DataType::Utf8, true),
+    ];
+    let cols: Vec<ArrayRef> = vec![
+        list_of(&fk.columns),
+        list_of(&fk.referenced_columns),
+        Arc::new(StringArray::from(vec![fk.referenced_table.clone()])),
+        Arc::new(StringArray::from(vec![schema.to_string()])),
+    ];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+        .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    ipc::write_batch(&batch)
 }
 
 impl CatTable {
@@ -392,6 +438,7 @@ impl CatTable {
             unique: Vec::new(),
             check: Vec::new(),
             tags: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 }
@@ -438,7 +485,11 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         unique_constraints: t.unique.clone(),
         check_constraints: t.check.clone(),
         primary_key_constraints: t.primary_key.clone(),
-        foreign_key_constraints: Vec::new(),
+        foreign_key_constraints: t
+            .foreign_keys
+            .iter()
+            .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema, fk)?)))
+            .collect::<Result<Vec<_>>>()?,
         supports_insert: false,
         supports_update: false,
         supports_delete: false,

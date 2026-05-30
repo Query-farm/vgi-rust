@@ -32,6 +32,12 @@ fn frow(name: &str, ty: DataType) -> Field {
 fn dtable(name: &str, fields: Vec<Field>, comment: &str) -> CatTable {
     CatTable::new(name, Arc::new(Schema::new(fields)), "sequence", Vec::new(), Some(comment.to_string()), None)
 }
+/// Override a table's backing scan function (a no-arg static scan).
+fn scan(mut t: CatTable, scan_fn: &str) -> CatTable {
+    t.scan_function = scan_fn.to_string();
+    t.scan_arguments = Vec::new();
+    t
+}
 
 /// A function-backed table whose scan is `scan_fn(positional...)`.
 fn fn_table(
@@ -110,8 +116,8 @@ fn data_tables() -> Vec<CatTable> {
         fn_table("funny_numbers", &[("n", Int64)], "sequence",
             vec![i64_arg(123456)], Some(123456),
             "123456 integers; stats served by the sequence function, not the table"),
-        dtable("colors", vec![f("id", Int64), f("color", Utf8), f("hex_code", Utf8)],
-            "Colors table with ENUM-derived statistics"),
+        scan(dtable("colors", vec![f("id", Int64), f("color", Utf8), f("hex_code", Utf8)],
+            "Colors table with ENUM-derived statistics"), "colors_scan"),
         dtable("generated_sequence", vec![
             f("n", Int64),
             fm("doubled", Int64, "generated_expression", "n * 2"),
@@ -156,6 +162,7 @@ fn data_tables() -> Vec<CatTable> {
     let mut departments = dtable("departments", vec![
         f("id", Int64), f("name", Utf8), fm("budget", Float64, "default", "0"),
     ], "Department reference table");
+    departments = scan(departments, "departments_scan");
     departments.primary_key = vec![vec![0]];
     departments.not_null = vec![0, 1];
     departments.unique = vec![vec![1]];
@@ -169,6 +176,7 @@ fn data_tables() -> Vec<CatTable> {
         fm("quantity", Int64, "default", "0"),
         fmm("price", Float64, &[("default", "9.99"), ("comment", "Unit price in USD")]),
     ], "Product table with column defaults");
+    products = scan(products, "products_scan");
     products.primary_key = vec![vec![0]];
     products.not_null = vec![0];
     tables.push(products);
@@ -177,17 +185,29 @@ fn data_tables() -> Vec<CatTable> {
     let mut employees = dtable("employees", vec![
         f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64),
     ], "Employee table with FK to departments");
+    employees = scan(employees, "employees_scan");
     employees.primary_key = vec![vec![0]];
     employees.not_null = vec![0, 1, 2];
     employees.unique = vec![vec![2]];
+    employees.foreign_keys = vec![vgi::catalog::ForeignKey {
+        columns: vec!["department_id".to_string()],
+        referenced_table: "departments".to_string(),
+        referenced_columns: vec!["id".to_string()],
+    }];
     tables.push(employees);
 
     // projects: composite PK, NOT NULL, FK→departments.
     let mut projects = dtable("projects", vec![
         f("department_id", Int64), f("project_code", Utf8), f("title", Utf8),
     ], "Projects with composite PK and FK to departments");
+    projects = scan(projects, "projects_scan");
     projects.primary_key = vec![vec![0, 1]];
     projects.not_null = vec![0, 1, 2];
+    projects.foreign_keys = vec![vgi::catalog::ForeignKey {
+        columns: vec!["department_id".to_string()],
+        referenced_table: "departments".to_string(),
+        referenced_columns: vec!["id".to_string()],
+    }];
     tables.push(projects);
 
     tables
