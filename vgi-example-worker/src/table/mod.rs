@@ -23,6 +23,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(NestedSequenceFunction);
     w.register_table(TxCachedValueFunction);
     w.register_table(ProfilingDemoFunction);
+    w.register_table(LateMaterializationFunction);
     w.register_table(TenThousandFunction);
     w.register_table(MakeSeries::Count);
     w.register_table(MakeSeries::Range);
@@ -285,6 +286,129 @@ impl TableProducer for ProfilingProducer {
             snap.extend_from_slice(&self.start_ns.to_le_bytes());
             store.kv_put(&self.exec, b"profiling", &snap);
         }
+        Ok(Some(batch))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// late_materialization(count) -> {row_id[is_row_id], ord, payload, pushed}
+// ---------------------------------------------------------------------------
+
+const SCRAMBLE: i64 = 2654435761;
+
+fn late_mat_schema() -> SchemaRef {
+    let rid = Field::new("row_id", DataType::Int64, true)
+        .with_metadata(std::collections::HashMap::from([("is_row_id".to_string(), String::new())]));
+    Arc::new(Schema::new(vec![
+        rid,
+        Field::new("ord", DataType::Int64, true),
+        Field::new("payload", DataType::Utf8, true),
+        Field::new("pushed", DataType::Utf8, true),
+    ]))
+}
+
+/// Summarize the pushed rowid filter as the `pushed` witness string.
+fn rowid_witness(params: &ProcessParams) -> String {
+    let pf = params
+        .pushdown_filters
+        .as_ref()
+        .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok());
+    match pf {
+        Some(pf) => {
+            let (n, lo, hi) = pf.column_summary("row_id");
+            let rng = if lo.is_some() || hi.is_some() {
+                let s = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "None".to_string());
+                format!("{}..{}", s(lo), s(hi))
+            } else {
+                "none".to_string()
+            };
+            format!("rid:in={n};rng={rng}")
+        }
+        None => "rid:in=0;rng=none".to_string(),
+    }
+}
+
+pub struct LateMaterializationFunction;
+impl TableFunction for LateMaterializationFunction {
+    fn name(&self) -> &str {
+        "late_materialization"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = gen_meta(
+            "Rowid generator that participates in late materialization",
+            &["generator", "diagnostic"],
+        );
+        m.late_materialization = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
+            ArgSpec::const_arg("dup_row_id", -1, "boolean", "Emit a non-unique row_id (index // 2)"),
+            ArgSpec::const_arg("null_ord_stride", -1, "int64", "Emit NULL ord every Nth row"),
+        ]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: late_mat_schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let c = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        let dup = params.arguments.named_bool("dup_row_id").unwrap_or(false);
+        let stride = params.arguments.named_i64("null_ord_stride").unwrap_or(0).max(0);
+        Ok(Box::new(LateMatProducer {
+            schema: late_mat_schema(),
+            count,
+            batch_size,
+            dup,
+            stride,
+            witness: rowid_witness(params),
+            offset: 0,
+        }))
+    }
+}
+
+struct LateMatProducer {
+    schema: SchemaRef,
+    count: i64,
+    batch_size: i64,
+    dup: bool,
+    stride: i64,
+    witness: String,
+    offset: i64,
+}
+impl TableProducer for LateMatProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        use arrow_array::StringArray;
+        if self.offset >= self.count {
+            return Ok(None);
+        }
+        let end = (self.offset + self.batch_size).min(self.count);
+        let rows: Vec<i64> = (self.offset..end).collect();
+        let row_id: Int64Array = rows.iter().map(|&i| if self.dup { i / 2 } else { i }).collect();
+        let ord: Int64Array = rows
+            .iter()
+            .map(|&i| {
+                if self.stride > 0 && i % self.stride == 0 {
+                    None
+                } else {
+                    Some((i.wrapping_mul(SCRAMBLE)).rem_euclid(1_000_000_007))
+                }
+            })
+            .collect();
+        let payload = StringArray::from(rows.iter().map(|&i| format!("payload_{i}")).collect::<Vec<_>>());
+        let pushed = StringArray::from(vec![self.witness.clone(); rows.len()]);
+        self.offset = end;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(row_id), Arc::new(ord), Arc::new(payload), Arc::new(pushed)],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
     }
 }

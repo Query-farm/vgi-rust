@@ -203,6 +203,8 @@ pub struct FunctionMetadata {
     /// Aggregate window / streaming opt-ins.
     pub supports_window: bool,
     pub streaming_partitioned: bool,
+    /// Rowid table participates in late-materialization (Top-N → SEMI rewrite).
+    pub late_materialization: bool,
     /// Settings the function requires (surfaced in `FunctionInfo`).
     pub required_settings: Vec<String>,
 }
@@ -227,6 +229,7 @@ impl Default for FunctionMetadata {
             requires_input_batch_index: false,
             supports_window: false,
             streaming_partitioned: false,
+            late_materialization: false,
             required_settings: Vec::new(),
         }
     }

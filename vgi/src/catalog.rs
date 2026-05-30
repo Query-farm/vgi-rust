@@ -281,6 +281,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.requires_input_batch_index = meta.requires_input_batch_index;
     fi.supports_window = meta.supports_window;
     fi.streaming_partitioned = meta.streaming_partitioned;
+    fi.late_materialization = Some(meta.late_materialization);
     fi.required_settings = meta.required_settings.clone();
 }
 

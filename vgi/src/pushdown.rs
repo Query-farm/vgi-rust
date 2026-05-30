@@ -135,6 +135,49 @@ impl PushdownFilters {
             .and_then(|c| self.join_keys.get(c))
     }
 
+    /// Summarize the filters on integer `column`: the total `IN`-list / join-key
+    /// value count, and the min/max range bounds (from `>`/`<`/`=` constants).
+    /// Used by late-materialization witnesses to report the pushed rowid filter.
+    pub fn column_summary(&self, column: &str) -> (usize, Option<i64>, Option<i64>) {
+        let mut in_count = 0usize;
+        let mut lo: Option<i64> = None;
+        let mut hi: Option<i64> = None;
+        let val_i64 = |a: &ArrayRef| -> Option<i64> {
+            arrow_cast::cast(a, &arrow_schema::DataType::Int64)
+                .ok()
+                .map(|c| c.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0))
+        };
+        let mut stack: Vec<&FilterSpec> = self.specs.iter().collect();
+        while let Some(spec) = stack.pop() {
+            match spec.kind.as_str() {
+                "and" | "or" => stack.extend(spec.children.iter()),
+                "in" if spec.column_name == column => {
+                    if let Some(r) = spec.value_ref {
+                        in_count += self.values.get(r).map(|a| a.len()).unwrap_or(0);
+                    }
+                }
+                "join_keys" if spec.column_name == column => {
+                    in_count += self.join_value(spec).map(|a| a.len()).unwrap_or(0);
+                }
+                "constant" if spec.column_name == column => {
+                    let v = spec.value_ref.and_then(|r| self.values.get(r)).and_then(val_i64);
+                    if let Some(v) = v {
+                        match spec.op.as_deref().unwrap_or("eq") {
+                            "gt" | "ge" | "gteq" | ">" | ">=" => lo = Some(lo.map_or(v, |l| l.min(v))),
+                            "lt" | "le" | "lteq" | "<" | "<=" => hi = Some(hi.map_or(v, |h| h.max(v))),
+                            _ => {
+                                lo = Some(v);
+                                hi = Some(v);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (in_count, lo, hi)
+    }
+
     /// Filter `batch` to the rows that satisfy all top-level filters.
     pub fn apply(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mask = self.evaluate(batch)?;

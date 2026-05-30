@@ -143,6 +143,21 @@ fn fmm(name: &str, ty: DataType, kvs: &[(&str, &str)]) -> Field {
 /// generated columns, column comments, rowid markers).
 fn data_tables() -> Vec<CatTable> {
     use DataType::{Float64, Int64, Utf8};
+    // A late-materialization table backed by `late_materialization(1000, …)`,
+    // inlined so the C++ Top-N→SEMI rewrite sees the rowid scan directly.
+    let lm = |name: &str, comment: &str, named: Vec<(&str, ArrayRef)>| -> CatTable {
+        let cols = vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)];
+        let mut t = CatTable::new(
+            name,
+            Arc::new(Schema::new(cols)),
+            "late_materialization",
+            Arguments::serialize_scan_args_named(&[i64_arg(1000)], &named).unwrap_or_default(),
+            Some(comment.to_string()),
+            Some(1000),
+        );
+        t.inline_scan = true;
+        t
+    };
     let row_struct = DataType::Struct(
         vec![Field::new("a", Int64, true), Field::new("b", Utf8, true)].into(),
     );
@@ -184,12 +199,11 @@ fn data_tables() -> Vec<CatTable> {
             "first", "string", "Table with string row_id"),
         rowid_table("rowid_struct", vec![frow("row_id", row_struct), f("value", Utf8)],
             "first", "struct", "Table with struct row_id"),
-        dtable("late_mat", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
-            "Late-materialization table (1000 rows, unique rowid)"),
-        dtable("late_mat_dup", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
-            "Late-materialization table with deliberately non-unique rowid (contract violation)"),
-        dtable("late_mat_nulls", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
-            "Late-materialization table with NULLs in the ord column"),
+        lm("late_mat", "Late-materialization table (1000 rows, unique rowid)", Vec::new()),
+        lm("late_mat_dup", "Late-materialization table with non-unique rowid (contract violation)",
+            vec![("dup_row_id", Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef)]),
+        lm("late_mat_nulls", "Late-materialization table with NULLs in the ord column",
+            vec![("null_ord_stride", i64_arg(7))]),
         tt_table("versioned_data", "Versioned data table demonstrating time travel with schema evolution", vec![
             ttv(1, vec![f("id", Int64)], "versioned_data_v1_scan", 2020),
             ttv(2, vec![f("id", Int64), f("name", Utf8), f("score", Float64), f("active", DataType::Boolean)], "versioned_data_v2_scan", 2021),
