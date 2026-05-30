@@ -1,5 +1,6 @@
 //! Table (producer) example fixtures.
 
+mod batch_index;
 mod filters;
 mod more;
 
@@ -20,6 +21,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakeSeries::Step);
     more::register(w);
     filters::register(w);
+    batch_index::register(w);
 }
 
 fn schema_n() -> SchemaRef {

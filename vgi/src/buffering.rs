@@ -161,6 +161,60 @@ impl BufferingStore {
     pub fn kv_del(&self, exec: &[u8], key: &[u8]) {
         let _ = std::fs::remove_file(self.kv_path(exec, key));
     }
+
+    fn queue_dir(&self, exec: &[u8]) -> PathBuf {
+        let mut p = self.base.clone();
+        p.push(hex(exec));
+        p.push("__queue__");
+        p
+    }
+
+    /// Push work items onto the per-execution queue (primary worker only, so
+    /// no push/push contention). Files are named by ascending push order.
+    pub fn queue_push(&self, exec: &[u8], items: &[Vec<u8>]) {
+        use std::io::Write;
+        let dir = self.queue_dir(exec);
+        let _ = std::fs::create_dir_all(&dir);
+        let mut id = self.max_id(&dir) + 1;
+        for item in items {
+            let path = dir.join(format!("{id:020}.bin"));
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                let _ = f.write_all(item);
+            }
+            id += 1;
+        }
+    }
+
+    /// Atomically claim the next queue item across pooled workers. Returns
+    /// `None` when the queue is empty. The claim is a `rename` (atomic on
+    /// POSIX): only one worker wins each item.
+    pub fn queue_pop(&self, exec: &[u8], claim_tag: &str) -> Option<Vec<u8>> {
+        let dir = self.queue_dir(exec);
+        let mut ids: Vec<i64> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".bin"))
+                    .and_then(|n| n.parse::<i64>().ok())
+            })
+            .collect();
+        ids.sort_unstable();
+        for id in ids {
+            let src = dir.join(format!("{id:020}.bin"));
+            let claimed = dir.join(format!("claimed_{claim_tag}_{id:020}.bin"));
+            if std::fs::rename(&src, &claimed).is_ok() {
+                let data = std::fs::read(&claimed).ok();
+                let _ = std::fs::remove_file(&claimed);
+                if data.is_some() {
+                    return data;
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Parameters for buffering process / combine / finalize.

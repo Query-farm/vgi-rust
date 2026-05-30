@@ -335,6 +335,7 @@ impl Dispatcher {
                 .clone()
                 .map(|v| v.into_iter().map(|b| b.0).collect())
                 .unwrap_or_default(),
+            storage: Some(self.store.clone()),
             order_by_column: dto.order_by_column_name.clone(),
             order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
             order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
@@ -438,6 +439,11 @@ impl Dispatcher {
             let max_workers = f.max_workers(&bp);
             let auto_apply = f.metadata().auto_apply_filters;
             let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            // Primary init (no execution_id on the request) runs the global
+            // OnInit hook once — e.g. to push a parallel-scan work queue.
+            if dto.execution_id.is_none() {
+                f.on_init(&params)?;
+            }
             let filters = if auto_apply {
                 params
                     .pushdown_filters
@@ -562,6 +568,7 @@ impl Dispatcher {
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
             join_keys: Vec::new(),
+            storage: None,
             order_by_column: None,
             order_by_direction: None,
             order_by_null_order: None,
@@ -1071,6 +1078,7 @@ impl vgi_rpc::ProducerState for TableProducerState {
                 Ok(())
             }
             Some(batch) => {
+                let meta = self.inner.last_metadata();
                 let batch = match &self.filters {
                     Some(f) => f.apply(&batch)?,
                     None => batch,
@@ -1079,7 +1087,10 @@ impl vgi_rpc::ProducerState for TableProducerState {
                     Some(ps) => crate::table_in_out::project_batch(&batch, ps)?,
                     None => batch,
                 };
-                out.emit(batch)
+                match meta {
+                    Some(m) => out.emit_with_metadata(batch, m),
+                    None => out.emit(batch),
+                }
             }
         }
     }

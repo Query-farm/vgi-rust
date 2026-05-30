@@ -35,6 +35,12 @@ pub trait TableProducer: Send {
     }
     /// Restore the scan position after rebuilding from an HTTP state token.
     fn restore_position(&mut self, _pos: u64) {}
+    /// Per-batch wire metadata for the batch just returned by `next_batch`
+    /// (e.g. `vgi_batch_index` for `supports_batch_index` functions). Default
+    /// none. Called once after each `next_batch` that returns `Some`.
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        None
+    }
 }
 
 /// A table (producer) VGI function.
@@ -47,6 +53,13 @@ pub trait TableFunction: Send + Sync {
     /// Worker parallelism hint (default single worker).
     fn max_workers(&self, _params: &BindParams) -> i64 {
         1
+    }
+    /// Primary-worker global init: runs once per execution (when DuckDB issues
+    /// the init without an execution_id) before any producer. Use it to push
+    /// work items onto `params.storage`'s queue for parallel-scan producers.
+    /// Secondary workers (init carrying an execution_id) skip it.
+    fn on_init(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
     }
     /// Optional cardinality estimate.
     fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {

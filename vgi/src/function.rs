@@ -288,6 +288,8 @@ pub struct ProcessParams {
     pub pushdown_filters: Option<Vec<u8>>,
     /// Side join-keys IPC batches referenced by `join_keys` filters.
     pub join_keys: Vec<Vec<u8>>,
+    /// Cross-process work-queue / kv store (for parallel-scan producers).
+    pub storage: Option<std::sync::Arc<crate::buffering::BufferingStore>>,
     /// ORDER BY pushdown hints.
     pub order_by_column: Option<String>,
     pub order_by_direction: Option<String>,
