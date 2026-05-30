@@ -378,6 +378,7 @@ impl Dispatcher {
             order_by_limit: dto.order_by_limit,
             tablesample_percentage: dto.tablesample_percentage,
             tablesample_seed: dto.tablesample_seed,
+            attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
         };
 
         // Table buffering: sink (header-only) or finalize source (producer).
@@ -619,6 +620,7 @@ impl Dispatcher {
             order_by_limit: None,
             tablesample_percentage: None,
             tablesample_seed: None,
+            attach_opaque_data: None,
         };
         if blob.kind == "table_in_out" {
             let f =
@@ -678,7 +680,34 @@ impl Dispatcher {
         // Version-shaped catalogs encode the resolved data version into the
         // attach_opaque_data (`<version>\0<id>`) so per-request catalog handlers
         // can select the right object set without server-side session state.
-        let attach_opaque_data = if !self.catalog.version_schemas.is_empty() {
+        let attach_opaque_data = if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
+            // Merge the user-supplied options over the declared defaults and
+            // encode the one-row result as `<16-byte id>\0<ipc batch>`.
+            let default_batch = ipc::read_batch(default_bytes)?;
+            let options = dto.options.as_ref().map(|b| ipc::read_batch(&b.0)).transpose()?;
+            let cols: Vec<arrow_array::ArrayRef> = default_batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| -> Result<arrow_array::ArrayRef> {
+                    match options.as_ref().and_then(|o| o.column_by_name(f.name())) {
+                        // Cast to the declared type to normalize nested field
+                        // names (DuckDB's list/struct field names differ).
+                        Some(c) => arrow_cast::cast(c, f.data_type())
+                            .map_err(|e| RpcError::runtime_error(e.to_string())),
+                        None => Ok(default_batch.column(i).clone()),
+                    }
+                })
+                .collect::<Result<_>>()?;
+            let merged = RecordBatch::try_new(default_batch.schema(), cols)
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+            let id = self.attach_bytes();
+            let mut v: Vec<u8> = id.iter().copied().chain(std::iter::repeat(0)).take(16).collect();
+            v.push(0);
+            v.extend_from_slice(&ipc::write_batch(&merged)?);
+            v
+        } else if !self.catalog.version_schemas.is_empty() {
             let mut v = resolved_data_version.clone().unwrap_or_default().into_bytes();
             v.push(0);
             v.extend_from_slice(&self.attach_bytes());

@@ -308,6 +308,8 @@ pub struct ProcessParams {
     /// TABLESAMPLE pushdown hints.
     pub tablesample_percentage: Option<f64>,
     pub tablesample_seed: Option<i64>,
+    /// The (plaintext) attach state for this call, when carried by the request.
+    pub attach_opaque_data: Option<Vec<u8>>,
 }
 
 /// A scalar VGI function: 1:1 row mapping, single `result` output column.

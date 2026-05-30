@@ -69,9 +69,13 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
         Arc::new(StringArray::from(vec![model.implementation_version.clone()])) as ArrayRef;
     let data_ver = Arc::new(StringArray::from(vec![model.data_version_spec.clone()])) as ArrayRef;
 
-    // attach_option_specs: list<binary>, one empty list.
+    // attach_option_specs: list<binary>, one list of the serialized specs.
     let aos_field = Arc::new(Field::new("item", DataType::Binary, true));
-    let aos = one_empty_list(aos_field, Arc::new(BinaryArray::from(Vec::<&[u8]>::new())));
+    let specs: Vec<&[u8]> = model.attach_option_specs.iter().map(|v| v.as_slice()).collect();
+    let aos_values = Arc::new(BinaryArray::from(specs)) as ArrayRef;
+    let aos_offsets =
+        OffsetBuffer::new(vec![0i32, model.attach_option_specs.len() as i32].into());
+    let aos = Arc::new(ListArray::new(aos_field, aos_offsets, aos_values, None)) as ArrayRef;
 
     // releases: list<struct{version,released_at,summary,notes_url}>, one empty.
     let rel_fields: arrow_schema::Fields = vec![
@@ -113,6 +117,43 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
         vec![name, impl_ver, data_ver, aos, releases, source_url],
     )
     .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    ipc::write_batch(&batch)
+}
+
+/// Serialize one `AttachOptionSpec` (discovery record for an ATTACH option).
+/// Schema `{name:str, description:str, type:binary (IPC schema of a single
+/// `value` field), default_value:binary? (IPC 1-row batch of the default)}`.
+pub fn serialize_attach_option_spec(
+    name: &str,
+    description: &str,
+    arrow_type: &DataType,
+    default: Option<&arrow_array::ArrayRef>,
+) -> Result<Vec<u8>> {
+    use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
+    let type_schema = Arc::new(Schema::new(vec![Field::new("value", arrow_type.clone(), true)]));
+    let type_bytes = ipc::write_schema_ref(&type_schema)?;
+    let default_bytes: Option<Vec<u8>> = match default {
+        Some(arr) => {
+            let b = RecordBatch::try_new(type_schema.clone(), vec![arr.clone()])
+                .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+            Some(ipc::write_batch(&b)?)
+        }
+        None => None,
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, false),
+        Field::new("type", DataType::Binary, false),
+        Field::new("default_value", DataType::Binary, true),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![name])),
+        Arc::new(StringArray::from(vec![description])),
+        Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])),
+        Arc::new(BinaryArray::from(vec![default_bytes.as_deref()])),
+    ];
+    let batch =
+        RecordBatch::try_new(schema, cols).map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)
 }
 
@@ -432,6 +473,12 @@ pub struct CatalogModel {
     /// Per-resolved-version schema sets. When non-empty the catalog's visible
     /// objects vary by the resolved data version (encoded in attach_opaque_data).
     pub version_schemas: std::collections::HashMap<String, Vec<CatSchema>>,
+    /// Serialized `AttachOptionSpec` records (discovery via `catalog_catalogs`).
+    pub attach_option_specs: Vec<Vec<u8>>,
+    /// IPC of the one-row default option batch (one column per declared option).
+    /// When set, `catalog_attach` merges the user `options` over it and encodes
+    /// the result into `attach_opaque_data` (`<16-byte id>\0<ipc>`).
+    pub attach_options_default_batch: Option<Vec<u8>>,
 }
 
 impl CatalogModel {
