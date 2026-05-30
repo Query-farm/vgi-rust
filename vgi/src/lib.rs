@@ -17,6 +17,7 @@ pub mod function;
 pub mod ipc;
 pub mod numeric;
 pub mod overload;
+pub mod partition;
 pub mod protocol;
 pub mod pushdown;
 pub mod secrets;

@@ -41,10 +41,10 @@ pub mod order_preservation {
 
 /// `PartitionKind`.
 pub mod partition_kind {
-    pub const NOT_PARTITIONED: &str = "not_partitioned";
-    pub const SINGLE_VALUE_PARTITIONS: &str = "single_value_partitions";
-    pub const OVERLAPPING_PARTITIONS: &str = "overlapping_partitions";
-    pub const DISJOINT_PARTITIONS: &str = "disjoint_partitions";
+    pub const NOT_PARTITIONED: &str = "NOT_PARTITIONED";
+    pub const SINGLE_VALUE_PARTITIONS: &str = "SINGLE_VALUE_PARTITIONS";
+    pub const OVERLAPPING_PARTITIONS: &str = "OVERLAPPING_PARTITIONS";
+    pub const DISJOINT_PARTITIONS: &str = "DISJOINT_PARTITIONS";
 }
 
 /// `OrderDependence`.

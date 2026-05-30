@@ -1,6 +1,7 @@
 //! Table (producer) example fixtures.
 
 mod batch_index;
+mod partition;
 mod filters;
 mod more;
 
@@ -22,6 +23,7 @@ pub fn register(w: &mut vgi::Worker) {
     more::register(w);
     filters::register(w);
     batch_index::register(w);
+    partition::register(w);
 }
 
 fn schema_n() -> SchemaRef {
