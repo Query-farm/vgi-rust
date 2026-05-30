@@ -118,11 +118,17 @@ fn data_tables() -> Vec<CatTable> {
             "123456 integers; stats served by the sequence function, not the table"),
         scan(dtable("colors", vec![f("id", Int64), f("color", Utf8), f("hex_code", Utf8)],
             "Colors table with ENUM-derived statistics"), "colors_scan"),
-        dtable("generated_sequence", vec![
-            f("n", Int64),
-            fm("doubled", Int64, "generated_expression", "n * 2"),
-            fm("label", Utf8, "generated_expression", "'item_' || CAST(n AS VARCHAR)"),
-        ], "Table with generated columns backed by sequence(10)"),
+        {
+            let mut t = dtable("generated_sequence", vec![
+                f("n", Int64),
+                fm("doubled", Int64, "generated_expression", "n * 2"),
+                fm("label", Utf8, "generated_expression", "'item_' || CAST(n AS VARCHAR)"),
+            ], "Table with generated columns backed by sequence(10)");
+            t.scan_function = "sequence".to_string();
+            t.scan_arguments = Arguments::serialize_scan_args(&[i64_arg(10)]).unwrap_or_default();
+            t.cardinality = Some(10);
+            t
+        },
         dtable("rowid_first", vec![frow("row_id", Int64), f("name", Utf8), f("value", Utf8)],
             "Table with row_id at column index 0"),
         dtable("rowid_middle", vec![f("name", Utf8), frow("row_id", Int64), f("value", Utf8)],
