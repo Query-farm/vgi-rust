@@ -44,6 +44,138 @@ pub fn register(w: &mut vgi::Worker) {
         &[("id", DataType::Int64), ("color", DataType::Utf8), ("hex_code", DataType::Utf8)],
         vec![i(vec![1, 2, 3]), s(vec!["blue", "green", "red"]), s(vec!["#0000FF", "#00FF00", "#FF0000"])],
     ));
+    w.register_table(RowIdSequenceFunction);
+}
+
+// ---------------------------------------------------------------------------
+// rowid_sequence(count, layout:=first|middle|last, row_id_type:=int64|string|struct)
+// ---------------------------------------------------------------------------
+
+use arrow_array::builder::{Int64Builder, StringBuilder, StructBuilder};
+
+pub struct RowIdSequenceFunction;
+
+impl RowIdSequenceFunction {
+    fn build_schema(layout: &str, row_id_type: &str) -> SchemaRef {
+        let rid_ty = match row_id_type {
+            "string" => DataType::Utf8,
+            "struct" => DataType::Struct(
+                vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)].into(),
+            ),
+            _ => DataType::Int64,
+        };
+        let rid = Field::new("row_id", rid_ty, true)
+            .with_metadata(std::collections::HashMap::from([("is_row_id".to_string(), String::new())]));
+        let name = Field::new("name", DataType::Utf8, true);
+        let value = Field::new("value", DataType::Utf8, true);
+        let fields = match layout {
+            "middle" => vec![name, rid, value],
+            "last" => vec![name, value, rid],
+            _ => vec![rid, name, value],
+        };
+        Arc::new(Schema::new(fields))
+    }
+}
+
+struct RowIdProducer {
+    schema: SchemaRef,
+    count: i64,
+    row_id_type: String,
+    emitted: bool,
+}
+impl TableProducer for RowIdProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let n = self.count.max(0);
+        let rid: ArrayRef = match self.row_id_type.as_str() {
+            "string" => Arc::new(StringArray::from(
+                (0..n).map(|i| format!("rid_{i}")).collect::<Vec<_>>(),
+            )),
+            "struct" => {
+                let mut b = StructBuilder::from_fields(
+                    vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)],
+                    n as usize,
+                );
+                for i in 0..n {
+                    b.field_builder::<Int64Builder>(0).unwrap().append_value(i);
+                    b.field_builder::<StringBuilder>(1).unwrap().append_value(format!("s_{i}"));
+                    b.append(true);
+                }
+                Arc::new(b.finish())
+            }
+            _ => Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+        };
+        let name: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("item_{i}")).collect::<Vec<_>>()));
+        let value: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("val_{i}")).collect::<Vec<_>>()));
+        // Assemble columns in the schema's field order (by name).
+        let cols: Vec<ArrayRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| match f.name().as_str() {
+                "row_id" => rid.clone(),
+                "name" => name.clone(),
+                _ => value.clone(),
+            })
+            .collect();
+        Ok(Some(
+            RecordBatch::try_new(self.schema.clone(), cols)
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+}
+
+impl TableFunction for RowIdSequenceFunction {
+    fn name(&self) -> &str {
+        "rowid_sequence"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Sequence with row_id column".to_string(),
+            categories: vec!["catalog".into()],
+            projection_pushdown: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows"),
+            ArgSpec::const_arg("layout", -1, "varchar", "Row ID column position"),
+            ArgSpec::const_arg("row_id_type", -1, "varchar", "Row ID type"),
+        ]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let layout = params.arguments.named_str("layout").unwrap_or_else(|| "first".to_string());
+        let row_id_type = params.arguments.named_str("row_id_type").unwrap_or_else(|| "int64".to_string());
+        if !["first", "middle", "last"].contains(&layout.as_str()) {
+            return Err(RpcError::value_error(format!(
+                "rowid_sequence: layout {layout:?} must be one of the allowed choices: first, middle, last"
+            )));
+        }
+        if !["int64", "string", "struct"].contains(&row_id_type.as_str()) {
+            return Err(RpcError::value_error(format!(
+                "rowid_sequence: row_id_type {row_id_type:?} must be one of the allowed choices: int64, string, struct"
+            )));
+        }
+        Ok(BindResponse { output_schema: Self::build_schema(&layout, &row_id_type), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let layout = params.arguments.named_str("layout").unwrap_or_else(|| "first".to_string());
+        let row_id_type = params.arguments.named_str("row_id_type").unwrap_or_else(|| "int64".to_string());
+        Ok(Box::new(RowIdProducer {
+            schema: Self::build_schema(&layout, &row_id_type),
+            count: params.arguments.const_i64(0).unwrap_or(0),
+            row_id_type,
+            emitted: false,
+        }))
+    }
 }
 
 pub struct StaticScan {

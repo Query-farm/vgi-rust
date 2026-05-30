@@ -38,6 +38,19 @@ fn scan(mut t: CatTable, scan_fn: &str) -> CatTable {
     t.scan_arguments = Vec::new();
     t
 }
+/// A rowid table backed by `rowid_sequence(20, layout, row_id_type)`.
+fn rowid_table(name: &str, fields: Vec<Field>, layout: &str, rid_type: &str, comment: &str) -> CatTable {
+    use std::sync::Arc as A;
+    let mut t = dtable(name, fields, comment);
+    t.scan_function = "rowid_sequence".to_string();
+    let named: Vec<(&str, ArrayRef)> = vec![
+        ("layout", A::new(arrow_array::StringArray::from(vec![layout])) as ArrayRef),
+        ("row_id_type", A::new(arrow_array::StringArray::from(vec![rid_type])) as ArrayRef),
+    ];
+    t.scan_arguments = Arguments::serialize_scan_args_named(&[i64_arg(20)], &named).unwrap_or_default();
+    t.cardinality = Some(20);
+    t
+}
 
 /// A function-backed table whose scan is `scan_fn(positional...)`.
 fn fn_table(
@@ -129,16 +142,16 @@ fn data_tables() -> Vec<CatTable> {
             t.cardinality = Some(10);
             t
         },
-        dtable("rowid_first", vec![frow("row_id", Int64), f("name", Utf8), f("value", Utf8)],
-            "Table with row_id at column index 0"),
-        dtable("rowid_middle", vec![f("name", Utf8), frow("row_id", Int64), f("value", Utf8)],
-            "Table with row_id at column index 1"),
-        dtable("rowid_last", vec![f("name", Utf8), f("value", Utf8), frow("row_id", Int64)],
-            "Table with row_id at column index 2"),
-        dtable("rowid_string", vec![frow("row_id", Utf8), f("value", Int64)],
-            "Table with string row_id"),
-        dtable("rowid_struct", vec![frow("row_id", row_struct), f("value", Utf8)],
-            "Table with struct row_id"),
+        rowid_table("rowid_first", vec![frow("row_id", Int64), f("name", Utf8), f("value", Utf8)],
+            "first", "int64", "Table with row_id at column index 0"),
+        rowid_table("rowid_middle", vec![f("name", Utf8), frow("row_id", Int64), f("value", Utf8)],
+            "middle", "int64", "Table with row_id at column index 1"),
+        rowid_table("rowid_last", vec![f("name", Utf8), f("value", Utf8), frow("row_id", Int64)],
+            "last", "int64", "Table with row_id at column index 2"),
+        rowid_table("rowid_string", vec![frow("row_id", Utf8), f("value", Int64)],
+            "first", "string", "Table with string row_id"),
+        rowid_table("rowid_struct", vec![frow("row_id", row_struct), f("value", Utf8)],
+            "first", "struct", "Table with struct row_id"),
         dtable("late_mat", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
             "Late-materialization table (1000 rows, unique rowid)"),
         dtable("late_mat_dup", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],

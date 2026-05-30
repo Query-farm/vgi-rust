@@ -123,16 +123,30 @@ impl Arguments {
     /// format: a flat IPC batch with columns `arg_0`, `arg_1`, … (NOT the
     /// `args` struct used for direct calls). Matches Go `serializeScanArgs`.
     pub fn serialize_scan_args(values: &[ArrayRef]) -> Result<Vec<u8>> {
+        Self::serialize_scan_args_named(values, &[])
+    }
+
+    /// Serialize positional (`arg_<i>`) plus named (bare-name) scan arguments
+    /// into the flat `ScanFunctionResult.arguments` batch (Go `serializeScanArgs`).
+    pub fn serialize_scan_args_named(
+        positional: &[ArrayRef],
+        named: &[(&str, ArrayRef)],
+    ) -> Result<Vec<u8>> {
         use arrow_array::RecordBatch;
-        if values.is_empty() {
+        if positional.is_empty() && named.is_empty() {
             return crate::ipc::write_schema(&Schema::empty());
         }
-        let fields: Vec<Field> = values
+        let mut fields: Vec<Field> = positional
             .iter()
             .enumerate()
             .map(|(i, a)| Field::new(format!("arg_{i}"), a.data_type().clone(), false))
             .collect();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), values.to_vec())
+        let mut cols: Vec<ArrayRef> = positional.to_vec();
+        for (name, a) in named {
+            fields.push(Field::new(*name, a.data_type().clone(), false));
+            cols.push(a.clone());
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
             .map_err(|e| RpcError::runtime_error(format!("serialize scan args: {e}")))?;
         crate::ipc::write_batch(&batch)
     }
