@@ -17,6 +17,102 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionedBatchIndexFunction);
     w.register_table(PartitionedBatchIndexMarkedFunction);
+    w.register_table(BrokenBatchIndexFunction { name: "broken_missing_batch_index_tag", mode: BrokenMode::Missing });
+    w.register_table(BrokenBatchIndexFunction { name: "broken_non_monotone_batch_index", mode: BrokenMode::NonMonotone });
+    w.register_table(BrokenBatchIndexFunction { name: "broken_batch_index_overflow", mode: BrokenMode::Overflow });
+}
+
+// ---------------------------------------------------------------------------
+// Deliberately-broken fixtures: exercise the C++ contract checks.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum BrokenMode {
+    Missing,     // emit with no vgi_batch_index metadata
+    NonMonotone, // emit tag=10 then tag=3
+    Overflow,    // emit tag=2^60
+}
+
+struct BrokenProducer {
+    schema: SchemaRef,
+    count: i64,
+    mode: BrokenMode,
+    step: u32,
+}
+impl TableProducer for BrokenProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        let mk = |vals: Vec<i64>, schema: &SchemaRef| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals)) as ArrayRef])
+                .map_err(|e| RpcError::runtime_error(e.to_string()))
+        };
+        match (self.mode, self.step) {
+            (BrokenMode::NonMonotone, 0) => {
+                self.step = 1;
+                Ok(Some(mk((0..self.count).collect(), &self.schema)?))
+            }
+            (BrokenMode::NonMonotone, 1) => {
+                self.step = 2;
+                Ok(Some(mk(vec![42], &self.schema)?))
+            }
+            (_, 0) => {
+                self.step = 1;
+                Ok(Some(mk((0..self.count).collect(), &self.schema)?))
+            }
+            _ => Ok(None),
+        }
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        match self.mode {
+            BrokenMode::Missing => None,
+            // step has already advanced past the emitted batch.
+            BrokenMode::NonMonotone => Some(HashMap::from([(
+                BATCH_TAG.to_string(),
+                if self.step <= 1 { "10" } else { "3" }.to_string(),
+            )])),
+            BrokenMode::Overflow => {
+                Some(HashMap::from([(BATCH_TAG.to_string(), (1i64 << 60).to_string())]))
+            }
+        }
+    }
+}
+
+pub struct BrokenBatchIndexFunction {
+    name: &'static str,
+    mode: BrokenMode,
+}
+impl TableFunction for BrokenBatchIndexFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Deliberately-broken batch_index fixture".to_string(),
+            categories: vec!["testing".into(), "broken".into()],
+            supports_batch_index: true,
+            order_preservation: Some(
+                vgi::protocol::enums::order_preservation::FIXED_ORDER.to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("count", 0, "int64", "Rows to generate")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(BrokenProducer {
+            schema: schema_n(),
+            count: params.arguments.const_i64(0).unwrap_or(1).max(0),
+            mode: self.mode,
+            step: 0,
+        }))
+    }
 }
 
 const BATCH_TAG: &str = "vgi_batch_index";
