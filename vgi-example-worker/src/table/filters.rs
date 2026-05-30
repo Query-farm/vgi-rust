@@ -13,6 +13,81 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(ValuePruneFunction);
     w.register_table(NamedParamsEchoFunction);
     w.register_table(FilterEchoPartitionedFunction);
+    w.register_table(DictFilterEchoFunction);
+}
+
+// ---------------------------------------------------------------------------
+// dict_filter_echo(count) -> {n, s: dictionary<int8, utf8>}
+// ---------------------------------------------------------------------------
+
+const DICT_VALUES: [&str; 3] = ["red", "green", "blue"];
+
+fn dict_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        ),
+    ]))
+}
+
+struct DictEchoProducer {
+    schema: SchemaRef,
+    remaining: i64,
+    cursor: i64,
+}
+impl TableProducer for DictEchoProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.remaining <= 0 {
+            return Ok(None);
+        }
+        let size = self.remaining.min(2048);
+        let ns: Vec<i64> = (self.cursor..self.cursor + size).collect();
+        let keys: Vec<i8> = ns.iter().map(|n| (n.rem_euclid(3)) as i8).collect();
+        let values = Arc::new(StringArray::from(DICT_VALUES.to_vec())) as ArrayRef;
+        let dict = arrow_array::DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+            arrow_array::Int8Array::from(keys),
+            values,
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(Int64Array::from(ns)) as ArrayRef, Arc::new(dict) as ArrayRef],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor += size;
+        self.remaining -= size;
+        Ok(Some(batch))
+    }
+}
+
+pub struct DictFilterEchoFunction;
+impl TableFunction for DictFilterEchoFunction {
+    fn name(&self) -> &str {
+        "dict_filter_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Emits a dictionary-encoded VARCHAR column for filter-pushdown testing")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: dict_schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(DictEchoProducer {
+            schema: dict_schema(),
+            remaining: params.arguments.const_i64(0).unwrap_or(0).max(0),
+            cursor: 0,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
