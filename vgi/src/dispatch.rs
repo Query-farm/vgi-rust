@@ -962,6 +962,10 @@ impl Dispatcher {
         };
         let bind = f.on_bind(&params)?;
         let execution_id = self.next_execution_id();
+        // Stash the raw bind-time arguments so `finalize` can rebuild const
+        // params (e.g. `vgi_percentile`'s percentile) — update/finalize RPCs
+        // don't resend arguments and may run in a different pooled worker.
+        self.store.kv_put(&execution_id, b"aggargs", &dto.arguments.0);
         Ok(Some(wire::to_result_batch(AggregateBindResponse {
             output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
             execution_id: Bytes::from(execution_id),
@@ -1045,7 +1049,15 @@ impl Dispatcher {
         let states: Vec<Option<Vec<u8>>> = (0..gids.len())
             .map(|i| self.store.kv_get(&dto.execution_id.0, &Self::agg_key(gids.value(i))))
             .collect();
-        let result = f.finalize(&output_schema, &gids, &states)?;
+        // Reload the bind-time arguments stashed at aggregate_bind, remapped
+        // to the function's declared positions, for ConstParam finalize.
+        let mut agg_args = self
+            .store
+            .kv_get(&dto.execution_id.0, b"aggargs")
+            .and_then(|b| crate::arguments::Arguments::parse(&b).ok())
+            .unwrap_or_default();
+        agg_args.remap_positional(&f.argument_specs());
+        let result = f.finalize_with_args(&output_schema, &gids, &states, &agg_args)?;
         Ok(Some(wire::to_result_batch(AggregateFinalizeResponse {
             result_batch: Bytes::from(ipc::write_batch(&result)?),
         })?))

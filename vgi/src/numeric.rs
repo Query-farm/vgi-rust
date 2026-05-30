@@ -43,6 +43,11 @@ pub fn array_value_f64(arr: &ArrayRef, i: usize) -> Option<f64> {
     Some(match arr.data_type() {
         Float32 => arr.as_primitive::<Float32Type>().value(i) as f64,
         Float64 => arr.as_primitive::<Float64Type>().value(i),
+        // DuckDB sends fractional literals (e.g. 0.5) as DECIMAL — cast.
+        Decimal128(_, _) | Decimal256(_, _) => {
+            let casted = arrow_cast::cast(&arr.slice(i, 1), &Float64).ok()?;
+            casted.as_primitive::<Float64Type>().value(0)
+        }
         _ => array_value_i64(arr, i)? as f64,
     })
 }

@@ -20,6 +20,99 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(GenericSumFunction);
     w.register_aggregate(SumAllFunction);
     w.register_aggregate(ListAggFunction);
+    w.register_aggregate(PercentileFunction);
+}
+
+/// `vgi_percentile(value, percentile)` — approximate percentile; the
+/// percentile is a ConstParam consumed only in finalize.
+pub struct PercentileFunction;
+fn pct_push(state: &[u8], v: f64) -> Vec<u8> {
+    let mut s = state.to_vec();
+    s.extend_from_slice(&v.to_le_bytes());
+    s
+}
+fn pct_vals(state: &[u8]) -> Vec<f64> {
+    state.chunks_exact(8).map(|c| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(c);
+        f64::from_le_bytes(a)
+    }).collect()
+}
+impl AggregateFunction for PercentileFunction {
+    fn name(&self) -> &str { "vgi_percentile" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Approximate percentile (demonstrates ConstParam)");
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::column("value", 0, "double", "Values"),
+            ArgSpec::const_arg("percentile", 1, "double", "Percentile (0-1)"),
+        ]
+    }
+    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: result_schema(DataType::Float64), opaque_data: Vec::new() })
+    }
+    fn initial_state(&self) -> Vec<u8> { Vec::new() }
+    fn update(&self, states: &mut HashMap<i64, Vec<u8>>, gids: &Int64Array, cols: &[ArrayRef]) -> Result<()> {
+        let v = arrow_cast::cast(&cols[0], &DataType::Float64)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let v = v.as_primitive::<Float64Type>();
+        for i in 0..gids.len() {
+            if v.is_null(i) { continue; }
+            let st = states.entry(gids.value(i)).or_default();
+            *st = pct_push(st, v.value(i));
+        }
+        Ok(())
+    }
+    fn combine(&self, mut target: Vec<u8>, source: Vec<u8>) -> Result<Vec<u8>> {
+        target.extend_from_slice(&source);
+        Ok(target)
+    }
+    fn finalize(&self, os: &Arc<Schema>, gids: &Int64Array, states: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        self.finalize_pct(os, gids, states, 0.5)
+    }
+    fn finalize_with_args(
+        &self,
+        os: &Arc<Schema>,
+        gids: &Int64Array,
+        states: &[Option<Vec<u8>>],
+        args: &vgi::arguments::Arguments,
+    ) -> Result<RecordBatch> {
+        // The percentile arg present but NULL is a distinct error from absent.
+        if let Some(Some(a)) = args.positional.get(1) {
+            if a.is_null(0) {
+                return Err(RpcError::value_error("vgi_percentile: percentile must not be NULL"));
+            }
+        }
+        let pct = args.const_f64(1).or_else(|| args.const_f64(0)).unwrap_or(0.5);
+        if pct.is_nan() || pct.is_infinite() {
+            return Err(RpcError::value_error(format!(
+                "vgi_percentile: percentile must be a finite number, got {pct}"
+            )));
+        }
+        if !(0.0..=1.0).contains(&pct) {
+            return Err(RpcError::value_error(format!(
+                "vgi_percentile: percentile must be in [0, 1], got {pct}"
+            )));
+        }
+        self.finalize_pct(os, gids, states, pct)
+    }
+}
+impl PercentileFunction {
+    fn finalize_pct(&self, os: &Arc<Schema>, gids: &Int64Array, states: &[Option<Vec<u8>>], pct: f64) -> Result<RecordBatch> {
+        let out: Float64Array = (0..gids.len()).map(|i| {
+            states[i].as_ref().filter(|s| !s.is_empty()).map(|s| {
+                let mut vals = pct_vals(s);
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let idx = ((pct * vals.len() as f64) as usize).min(vals.len() - 1);
+                vals[idx]
+            })
+        }).collect();
+        RecordBatch::try_new(os.clone(), vec![Arc::new(out)])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
 }
 
 fn agg_meta(desc: &str) -> FunctionMetadata {

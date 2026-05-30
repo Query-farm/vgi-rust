@@ -55,4 +55,16 @@ pub trait AggregateFunction: Send + Sync {
         group_ids: &Int64Array,
         states: &[Option<Vec<u8>>],
     ) -> Result<RecordBatch>;
+    /// Like [`finalize`], but with access to the bind-time arguments (stashed
+    /// at `aggregate_bind`, reloaded here). Override for `ConstParam(phase=
+    /// "finalize")` aggregates like `vgi_percentile`. The default ignores them.
+    fn finalize_with_args(
+        &self,
+        output_schema: &SchemaRef,
+        group_ids: &Int64Array,
+        states: &[Option<Vec<u8>>],
+        _args: &crate::arguments::Arguments,
+    ) -> Result<RecordBatch> {
+        self.finalize(output_schema, group_ids, states)
+    }
 }
