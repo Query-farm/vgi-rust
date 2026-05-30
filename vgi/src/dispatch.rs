@@ -218,6 +218,7 @@ impl Dispatcher {
             auth_principal: principal(ctx),
             attach_opaque_data: dto.attach_opaque_data.clone().map(|b| b.into()),
             transaction_opaque_data: dto.transaction_opaque_data.clone().map(|b| b.into()),
+            storage: Some(self.store.clone()),
         })
     }
 
@@ -739,8 +740,10 @@ impl Dispatcher {
     }
 
     pub fn handle_transaction_begin(&self, _req: &Request) -> Result<Option<RecordBatch>> {
+        // A fresh id per BEGIN so transaction-scoped caches (tx_cached_value)
+        // don't leak across transactions; in autocommit DuckDB passes None.
         Ok(Some(wire::to_result_batch(CatalogTransactionBeginResult {
-            transaction_opaque_data: Some(Bytes::from(b"vgi-txn".to_vec())),
+            transaction_opaque_data: Some(Bytes::from(self.next_execution_id())),
         })?))
     }
 

@@ -21,6 +21,7 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(SequenceFunction);
     w.register_table(NestedSequenceFunction);
+    w.register_table(TxCachedValueFunction);
     w.register_table(TenThousandFunction);
     w.register_table(MakeSeries::Count);
     w.register_table(MakeSeries::Range);
@@ -173,6 +174,64 @@ impl TableFunction for SequenceFunction {
             batch_size,
             schema: schema_n(),
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tx_cached_value(key, seed) -> {v: int64} cached per (transaction, key)
+// ---------------------------------------------------------------------------
+
+pub struct TxCachedValueFunction;
+impl TableFunction for TxCachedValueFunction {
+    fn name(&self) -> &str {
+        "tx_cached_value"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Return a value cached per (transaction_opaque_data, key)".to_string(),
+            categories: vec!["test".into(), "transaction-storage".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("key", 0, "varchar", "Cache key, scoped to the transaction"),
+            ArgSpec::const_arg("seed", 1, "int64", "Value to cache on first call"),
+        ]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let key = params.arguments.const_str(0).unwrap_or_default();
+        let seed = params.arguments.const_i64(1).unwrap_or(0);
+        // Cache the first seed per (transaction, key). Without a transaction
+        // (autocommit → transaction_opaque_data is None) every call is fresh.
+        let resolved = match (&params.transaction_opaque_data, &params.storage) {
+            (Some(txid), Some(store)) => {
+                let cache_key = [b"txcache:", key.as_bytes()].concat();
+                if let Some(existing) = store.kv_get(txid, &cache_key) {
+                    i64::from_le_bytes(existing[..8].try_into().unwrap_or_default())
+                } else {
+                    store.kv_put(txid, &cache_key, &seed.to_le_bytes());
+                    seed
+                }
+            }
+            _ => seed,
+        };
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            opaque_data: resolved.to_le_bytes().to_vec(),
+        })
+    }
+    fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {
+        Some(TableCardinality { estimate: Some(1), max: Some(1) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let v = params
+            .init_opaque_data
+            .get(..8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        Ok(Box::new(Countdown { values: vec![v], offset: 0, batch_size: 1, schema }))
     }
 }
 

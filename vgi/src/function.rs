@@ -251,6 +251,8 @@ pub struct BindParams {
     pub attach_opaque_data: Option<Vec<u8>>,
     /// Sealed transaction state.
     pub transaction_opaque_data: Option<Vec<u8>>,
+    /// Cross-process kv/work store (for transaction-scoped caching, etc.).
+    pub storage: Option<std::sync::Arc<crate::buffering::BufferingStore>>,
 }
 
 /// Result of `on_bind`.
