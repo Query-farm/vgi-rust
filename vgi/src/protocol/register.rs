@@ -100,6 +100,18 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
         let d = disp.clone();
         srv.register_unary("aggregate_window_destructor", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_destructor(req));
     }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_streaming_open", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_open(req));
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_streaming_chunk", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_chunk(req));
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_streaming_close", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_close(req));
+    }
 
     // --- table buffering ---
     {

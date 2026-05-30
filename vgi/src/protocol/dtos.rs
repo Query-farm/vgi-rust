@@ -157,6 +157,49 @@ pub struct AggregateWindowDestructorRequest {
     pub partition_id: i64,
 }
 
+/// `aggregate_streaming_open` — start a streaming-partitioned session.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateStreamingOpenRequest {
+    pub function_name: String,
+    pub arguments: Bytes,
+    pub input_schema: Bytes,
+    pub partition_key_count: i64,
+    pub order_key_count: i64,
+    pub output_schema: Bytes,
+    pub settings: Option<Bytes>,
+    pub secrets: Option<Bytes>,
+    pub attach_opaque_data: Option<Bytes>,
+}
+
+/// `aggregate_streaming_open` result — the session token.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateStreamingOpenResponse {
+    pub execution_id: Bytes,
+}
+
+/// `aggregate_streaming_chunk` — process one input chunk in a session.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateStreamingChunkRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub input_batch: Bytes,
+    pub attach_opaque_data: Option<Bytes>,
+}
+
+/// `aggregate_streaming_chunk` result — a same-length output batch.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateStreamingChunkResponse {
+    pub result_batch: Bytes,
+}
+
+/// `aggregate_streaming_close` — end a session and free its state.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateStreamingCloseRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub attach_opaque_data: Option<Bytes>,
+}
+
 /// One physical source backing a (possibly multi-branch) table scan.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {

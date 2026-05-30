@@ -70,6 +70,22 @@ pub trait AggregateFunction: Send + Sync {
         Err(RpcError::runtime_error("window() not supported by this aggregate"))
     }
 
+    /// Process one chunk of a streaming-partitioned session. The chunk's
+    /// columns are `[partition_key_cols.., order_key_cols.., value_cols..]`.
+    /// `states` is the cross-chunk per-partition state map (partition-key bytes
+    /// → opaque state bytes), loaded and persisted by the framework. Returns a
+    /// same-length output column. Only `streaming_partitioned` functions
+    /// override this; the default errors.
+    fn streaming_chunk(
+        &self,
+        _chunk: &RecordBatch,
+        _partition_key_count: usize,
+        _order_key_count: usize,
+        _states: &mut HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<ArrayRef> {
+        Err(RpcError::runtime_error("streaming_chunk() not supported by this aggregate"))
+    }
+
     /// Like [`finalize`], but with access to the bind-time arguments (stashed
     /// at `aggregate_bind`, reloaded here). Override for `ConstParam(phase=
     /// "finalize")` aggregates like `vgi_percentile`. The default ignores them.

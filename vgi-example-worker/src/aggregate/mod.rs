@@ -24,6 +24,98 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(WindowSumFunction);
     w.register_aggregate(WindowMedianFunction);
     w.register_aggregate(WindowListAggFunction);
+    w.register_aggregate(StreamingSumFunction);
+}
+
+/// Build a stable byte key from the partition-key columns at row `i`.
+fn stream_row_key(cols: &[&ArrayRef], i: usize) -> Vec<u8> {
+    use arrow_array::types::Int32Type;
+    let mut key = Vec::new();
+    for col in cols {
+        if col.is_null(i) {
+            key.push(0);
+            continue;
+        }
+        key.push(1);
+        match col.data_type() {
+            DataType::Int64 => key.extend_from_slice(&col.as_primitive::<Int64Type>().value(i).to_le_bytes()),
+            DataType::Int32 => key.extend_from_slice(&col.as_primitive::<Int32Type>().value(i).to_le_bytes()),
+            DataType::Utf8 => {
+                let s = col.as_string::<i32>().value(i);
+                key.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                key.extend_from_slice(s.as_bytes());
+            }
+            DataType::LargeUtf8 => {
+                let s = col.as_string::<i64>().value(i);
+                key.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                key.extend_from_slice(s.as_bytes());
+            }
+            _ => key.extend_from_slice(format!("{:?}@{i}", col.data_type()).as_bytes()),
+        }
+    }
+    key
+}
+
+/// `vgi_streaming_sum(value)` — cumulative running sum via the
+/// streaming-partitioned operator; also works in plain GROUP BY.
+pub struct StreamingSumFunction;
+impl AggregateFunction for StreamingSumFunction {
+    fn name(&self) -> &str { "vgi_streaming_sum" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta(
+            "Running sum across PARTITION BY keys via the streaming-partitioned protocol",
+        );
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m.streaming_partitioned = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "int64", "Column to sum")]
+    }
+    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: result_schema(DataType::Int64), opaque_data: Vec::new() })
+    }
+    fn initial_state(&self) -> Vec<u8> { le_i64(0) }
+    fn update(&self, states: &mut HashMap<i64, Vec<u8>>, gids: &Int64Array, cols: &[ArrayRef]) -> Result<()> {
+        let v = cast_i64(&cols[0])?;
+        for i in 0..gids.len() {
+            if v.is_null(i) { continue; }
+            let st = states.entry(gids.value(i)).or_insert_with(|| le_i64(0));
+            *st = le_i64(read_i64(st) + v.value(i));
+        }
+        Ok(())
+    }
+    fn combine(&self, t: Vec<u8>, s: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(le_i64(read_i64(&t) + read_i64(&s)))
+    }
+    fn finalize(&self, os: &Arc<Schema>, gids: &Int64Array, states: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        let out: Int64Array = (0..gids.len()).map(|i| states[i].as_ref().map(|s| read_i64(s))).collect();
+        RecordBatch::try_new(os.clone(), vec![Arc::new(out)]).map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn streaming_chunk(
+        &self,
+        chunk: &RecordBatch,
+        partition_key_count: usize,
+        order_key_count: usize,
+        states: &mut HashMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<ArrayRef> {
+        let value_idx = partition_key_count + order_key_count;
+        let v = cast_i64(chunk.column(value_idx))?;
+        let key_cols: Vec<&ArrayRef> = (0..partition_key_count).map(|i| chunk.column(i)).collect();
+        let n = chunk.num_rows();
+        let out: Int64Array = (0..n)
+            .map(|i| {
+                let key = stream_row_key(&key_cols, i);
+                let mut running = states.get(&key).map(|b| read_i64(b)).unwrap_or(0);
+                if !v.is_null(i) {
+                    running += v.value(i);
+                    states.insert(key, le_i64(running));
+                }
+                running
+            })
+            .collect();
+        Ok(Arc::new(out))
+    }
 }
 
 /// `vgi_window_median(value)` — non-incremental windowed median via window().
@@ -252,9 +344,10 @@ impl AggregateFunction for PercentileFunction {
         states: &[Option<Vec<u8>>],
         args: &vgi::arguments::Arguments,
     ) -> Result<RecordBatch> {
-        // The percentile arg present but NULL is a distinct error from absent.
+        // A literal NULL constant arrives as a `Null`-typed array (or an array
+        // whose first slot is null). Either way the percentile is missing.
         if let Some(Some(a)) = args.positional.get(1) {
-            if a.is_null(0) {
+            if *a.data_type() == DataType::Null || a.is_null(0) {
                 return Err(RpcError::value_error("vgi_percentile: percentile must not be NULL"));
             }
         }

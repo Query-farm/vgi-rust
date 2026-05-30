@@ -1248,6 +1248,106 @@ impl Dispatcher {
         Ok(Some(wire::empty_result_batch()?))
     }
 
+    // -- aggregate streaming-partitioned RPCs ------------------------------
+
+    fn ser_state_map(m: &std::collections::HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(m.len() as u64).to_le_bytes());
+        for (k, v) in m {
+            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            out.extend_from_slice(k);
+            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        out
+    }
+
+    fn de_state_map(b: &[u8]) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+        let mut m = std::collections::HashMap::new();
+        let rd = |b: &[u8], off: &mut usize, n: usize| -> Vec<u8> {
+            let s = b[*off..*off + n].to_vec();
+            *off += n;
+            s
+        };
+        if b.len() < 8 {
+            return m;
+        }
+        let mut off = 0usize;
+        let count = u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize;
+        off += 8;
+        for _ in 0..count {
+            if off + 8 > b.len() { break; }
+            let kl = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize;
+            off += 8;
+            let k = rd(b, &mut off, kl);
+            let vl = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize;
+            off += 8;
+            let v = rd(b, &mut off, vl);
+            m.insert(k, v);
+        }
+        m
+    }
+
+    pub fn handle_aggregate_streaming_open(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateStreamingOpenRequest = boxed(req)?;
+        self.resolve_aggregate(&dto.function_name)?;
+        let execution_id = self.next_execution_id();
+        self.store.kv_put(&execution_id, b"strm_pkc", &dto.partition_key_count.to_le_bytes());
+        self.store.kv_put(&execution_id, b"strm_okc", &dto.order_key_count.to_le_bytes());
+        self.store.kv_put(&execution_id, b"strm_sos", &dto.output_schema.0);
+        Ok(Some(wire::to_result_batch(AggregateStreamingOpenResponse {
+            execution_id: Bytes::from(execution_id),
+        })?))
+    }
+
+    pub fn handle_aggregate_streaming_chunk(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateStreamingChunkRequest = boxed(req)?;
+        let f = self.resolve_aggregate(&dto.function_name)?;
+        let chunk = ipc::read_batch(&dto.input_batch.0)?;
+        let pkc = self
+            .store
+            .kv_get(&dto.execution_id.0, b"strm_pkc")
+            .map(|b| i64::from_le_bytes(b[..8].try_into().unwrap()) as usize)
+            .unwrap_or(0);
+        let okc = self
+            .store
+            .kv_get(&dto.execution_id.0, b"strm_okc")
+            .map(|b| i64::from_le_bytes(b[..8].try_into().unwrap()) as usize)
+            .unwrap_or(0);
+        let output_schema = self
+            .store
+            .kv_get(&dto.execution_id.0, b"strm_sos")
+            .and_then(|b| ipc::read_schema(&b).ok());
+        let mut states = self
+            .store
+            .kv_get(&dto.execution_id.0, b"strm_state")
+            .map(|b| Self::de_state_map(&b))
+            .unwrap_or_default();
+        let col = f.streaming_chunk(&chunk, pkc, okc, &mut states)?;
+        self.store
+            .kv_put(&dto.execution_id.0, b"strm_state", &Self::ser_state_map(&states));
+        let schema = output_schema.unwrap_or_else(|| {
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "result",
+                col.data_type().clone(),
+                true,
+            )]))
+        });
+        let batch = RecordBatch::try_new(schema, vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(wire::to_result_batch(AggregateStreamingChunkResponse {
+            result_batch: Bytes::from(ipc::write_batch(&batch)?),
+        })?))
+    }
+
+    pub fn handle_aggregate_streaming_close(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateStreamingCloseRequest = boxed(req)?;
+        for k in [b"strm_pkc".as_slice(), b"strm_okc", b"strm_sos", b"strm_state"] {
+            self.store.kv_del(&dto.execution_id.0, k);
+        }
+        Ok(Some(wire::empty_result_batch()?))
+    }
+
     /// Empty `ItemsResult` for the contents/get methods not yet implemented.
     pub fn handle_empty_items(&self, _req: &Request) -> Result<Option<RecordBatch>> {
         Ok(Some(wire::to_result_batch(ItemsResult { items: Vec::new() })?))
