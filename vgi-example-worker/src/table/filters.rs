@@ -14,6 +14,96 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(NamedParamsEchoFunction);
     w.register_table(FilterEchoPartitionedFunction);
     w.register_table(DictFilterEchoFunction);
+    w.register_table(DynamicFilterEchoFunction);
+}
+
+/// `dynamic_filter_echo(count)` — descending integers; each batch's
+/// `pushed_filters` echoes the current (per-tick) dynamic pushdown filter, so a
+/// tightening `ORDER BY n LIMIT k` Top-N produces multiple distinct witnesses.
+pub struct DynamicFilterEchoFunction;
+impl TableFunction for DynamicFilterEchoFunction {
+    fn name(&self) -> &str {
+        "dynamic_filter_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Generates descending integers, echoes dynamic tick filter per batch"
+                .to_string(),
+            categories: vec!["generator".into(), "diagnostic".into()],
+            projection_pushdown: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
+        ]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("pushed_filters", DataType::Utf8, true),
+            ])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let c = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        // Init witness from the static filter (if any).
+        let witness = params
+            .pushdown_filters
+            .as_ref()
+            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .map(|f| f.format_repr())
+            .unwrap_or_default();
+        Ok(Box::new(DynFilterEchoProducer {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("pushed_filters", DataType::Utf8, true),
+            ])),
+            count,
+            batch_size,
+            offset: 0,
+            witness,
+        }))
+    }
+}
+
+struct DynFilterEchoProducer {
+    schema: SchemaRef,
+    count: i64,
+    batch_size: i64,
+    offset: i64,
+    witness: String,
+}
+impl TableProducer for DynFilterEchoProducer {
+    fn on_dynamic_filters(&mut self, filters: Option<&vgi::pushdown::PushdownFilters>) {
+        if let Some(f) = filters {
+            self.witness = f.format_repr();
+        }
+    }
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.offset >= self.count {
+            return Ok(None);
+        }
+        let end = (self.offset + self.batch_size).min(self.count);
+        // Descending order: first batch has the highest values.
+        let ns: Int64Array = (self.offset..end).map(|i| self.count - 1 - i).collect();
+        let pushed = StringArray::from(vec![self.witness.clone(); (end - self.offset) as usize]);
+        self.offset = end;
+        RecordBatch::try_new(self.schema.clone(), vec![Arc::new(ns), Arc::new(pushed)])
+            .map(Some)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------

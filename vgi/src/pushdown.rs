@@ -93,6 +93,16 @@ impl PushdownFilters {
         Self::parse_with_join_keys(bytes, &[])
     }
 
+    /// Parse a per-tick dynamic filter from the base64-encoded IPC carried in
+    /// the `vgi_pushdown_filters` request metadata. `None` for empty/invalid.
+    pub fn parse_b64(encoded: &str, join_keys: &[Vec<u8>]) -> Option<PushdownFilters> {
+        if encoded.is_empty() {
+            return None;
+        }
+        let raw = b64_decode(encoded)?;
+        Self::parse_with_join_keys(&raw, join_keys).ok()
+    }
+
     /// Parse the filter blob, resolving `join_keys` filters against the
     /// supplied side join-keys IPC batches (one column each).
     pub fn parse_with_join_keys(bytes: &[u8], join_keys: &[Vec<u8>]) -> Result<PushdownFilters> {
@@ -231,6 +241,60 @@ impl PushdownFilters {
             "(none)".to_string()
         } else {
             parts.join(" AND ")
+        }
+    }
+
+    /// Format the filters as the Python `repr(PushdownFilters)`:
+    /// `PushdownFilters([ConstantFilter(n < X), …])`. Returns `"(none)"` when
+    /// empty (matching the dynamic-filter witness fixtures).
+    pub fn format_repr(&self) -> String {
+        if self.specs.is_empty() {
+            return "(none)".to_string();
+        }
+        let parts: Vec<String> = self.specs.iter().map(|s| self.repr_one(s, None)).collect();
+        format!("PushdownFilters([{}])", parts.join(", "))
+    }
+
+    fn repr_one(&self, spec: &FilterSpec, col_override: Option<&str>) -> String {
+        let col = col_override.unwrap_or(&spec.column_name);
+        match spec.kind.as_str() {
+            "is_null" => format!("IsNullFilter({col} IS NULL)"),
+            "is_not_null" => format!("IsNotNullFilter({col} IS NOT NULL)"),
+            "constant" => {
+                let sym = op_symbol(spec.op.as_deref().unwrap_or("eq"));
+                let v = self.value(spec).ok().map(|a| fmt_scalar(a, 0)).unwrap_or_default();
+                format!("ConstantFilter({col} {sym} {v})")
+            }
+            "in" => match self.value(spec) {
+                Ok(vals) => {
+                    let items: Vec<String> = (0..vals.len()).map(|i| fmt_scalar(vals, i)).collect();
+                    format!("InFilter({col} IN [{}])", items.join(", "))
+                }
+                Err(_) => format!("InFilter({col} IN [])"),
+            },
+            "join_keys" => match self.join_value(spec) {
+                Some(vals) => {
+                    let items: Vec<String> = (0..vals.len()).map(|i| fmt_scalar(vals, i)).collect();
+                    format!("InFilter({col} IN [{}])", items.join(", "))
+                }
+                None => format!("InFilter({col} IN [])"),
+            },
+            "and" => {
+                let parts: Vec<String> = spec.children.iter().map(|c| self.repr_one(c, None)).collect();
+                format!("AndFilter({})", parts.join(" AND "))
+            }
+            "or" => {
+                let parts: Vec<String> = spec.children.iter().map(|c| self.repr_one(c, None)).collect();
+                format!("OrFilter({})", parts.join(" OR "))
+            }
+            "struct" => match &spec.child_filter {
+                Some(child) => {
+                    let nested = format!("{}.{}", spec.column_name, spec.child_name);
+                    self.repr_one(child, Some(&nested))
+                }
+                None => col.to_string(),
+            },
+            other => other.to_string(),
         }
     }
 
@@ -487,4 +551,34 @@ fn all_false(n: usize) -> BooleanArray {
 }
 fn cvt(e: arrow_schema::ArrowError) -> RpcError {
     RpcError::runtime_error(format!("filter: {e}"))
+}
+
+/// Standard base64 decode (ignores whitespace/padding). `None` on invalid char.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let clean: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let mut n = 0u32;
+        for &c in chunk {
+            n = (n << 6) | val(c)?;
+        }
+        n <<= 6 * (4 - chunk.len()) as u32;
+        for i in 0..chunk.len() - 1 {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    Some(out)
 }

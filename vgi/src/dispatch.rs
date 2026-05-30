@@ -1718,7 +1718,13 @@ struct TableProducerState {
 }
 
 impl vgi_rpc::ProducerState for TableProducerState {
-    fn produce(&mut self, out: &mut OutputCollector, _ctx: &CallContext) -> Result<()> {
+    fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
+        // Per-tick dynamic filter (e.g. a tightening Top-N) arrives in the
+        // request metadata; surface it to the producer and auto-apply it.
+        let dynamic = ctx
+            .tick_metadata("vgi_pushdown_filters")
+            .and_then(|enc| crate::pushdown::PushdownFilters::parse_b64(&enc, &[]));
+        self.inner.on_dynamic_filters(dynamic.as_ref());
         match self.inner.next_batch(out)? {
             None => {
                 out.finish();
@@ -1726,7 +1732,8 @@ impl vgi_rpc::ProducerState for TableProducerState {
             }
             Some(batch) => {
                 let meta = self.inner.last_metadata();
-                let batch = match &self.filters {
+                let active = dynamic.as_ref().or(self.filters.as_ref());
+                let batch = match active {
                     Some(f) => f.apply(&batch)?,
                     None => batch,
                 };

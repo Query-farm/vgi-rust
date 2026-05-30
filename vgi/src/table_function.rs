@@ -41,6 +41,10 @@ pub trait TableProducer: Send {
     fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
         None
     }
+    /// Called before each `next_batch` with the per-tick dynamic pushdown
+    /// filters (from the `vgi_pushdown_filters` request metadata), if any. Lets
+    /// a producer observe a tightening Top-N filter. Default ignores them.
+    fn on_dynamic_filters(&mut self, _filters: Option<&crate::pushdown::PushdownFilters>) {}
 }
 
 /// A table (producer) VGI function.
