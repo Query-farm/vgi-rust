@@ -90,6 +90,15 @@ pub struct CatalogAttachRequest {
     pub implementation_version: Option<String>,
 }
 
+/// Secret-type registration entry, IPC-serialized into
+/// `CatalogAttachResult.secret_types`.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct SecretTypeWire {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema: Bytes,
+}
+
 /// `CatalogAttachResult` — flat result of `catalog_attach`.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CatalogAttachResult {

@@ -80,6 +80,16 @@ impl Worker {
         self.disp.set_catalog(model);
     }
 
+    /// Register a secret type (surfaced via `catalog_attach`).
+    pub fn register_secret_type(&mut self, spec: crate::catalog::SecretTypeSpec) {
+        self.disp.register_secret_type(spec);
+    }
+
+    /// Register a custom setting (surfaced via `catalog_attach`).
+    pub fn register_setting(&mut self, spec: crate::catalog::SettingSpec) {
+        self.disp.register_setting(spec);
+    }
+
     /// Build the configured [`RpcServer`], registering every VGI method.
     pub fn build_server(self) -> RpcServer {
         let server_id = self

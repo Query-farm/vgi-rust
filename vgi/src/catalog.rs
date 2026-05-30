@@ -16,6 +16,59 @@ use crate::protocol::enums;
 /// The default schema name every registered function lives under.
 pub const MAIN_SCHEMA: &str = "main";
 
+/// A secret type the worker registers (surfaced in `catalog_attach`).
+#[derive(Clone)]
+pub struct SecretTypeSpec {
+    pub name: String,
+    pub description: String,
+    /// Parameter schema; mark sensitive fields with metadata `redact=true`.
+    pub parameters_schema: Arc<Schema>,
+}
+
+/// A DuckDB custom setting the worker registers (surfaced in `catalog_attach`).
+#[derive(Clone)]
+pub struct SettingSpec {
+    pub name: String,
+    pub description: String,
+    pub data_type: DataType,
+}
+
+/// Serialize a [`SecretTypeSpec`] to its IPC `secret_types` entry.
+pub fn serialize_secret_type(spec: &SecretTypeSpec) -> Result<Vec<u8>> {
+    use crate::protocol::dtos::SecretTypeWire;
+    let wire = SecretTypeWire {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        parameters_schema: Bytes::from(ipc::write_schema_ref(&spec.parameters_schema)?),
+    };
+    ipc::write_batch(&crate::wire::to_batch(wire)?)
+}
+
+/// Serialize a [`SettingSpec`] to its IPC `settings` entry. The batch schema is
+/// `{name: string, description: string, type: binary, default_value: binary?}`
+/// where `type` is the IPC schema of a single `value` field of the setting's
+/// type (matches Go `serializeSettingSpec`).
+pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
+    use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
+    let type_schema = Arc::new(Schema::new(vec![Field::new("value", spec.data_type.clone(), true)]));
+    let type_bytes = ipc::write_schema_ref(&type_schema)?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, false),
+        Field::new("type", DataType::Binary, false),
+        Field::new("default_value", DataType::Binary, true),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![spec.name.clone()])),
+        Arc::new(StringArray::from(vec![spec.description.clone()])),
+        Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])),
+        Arc::new(BinaryArray::from(vec![None as Option<&[u8]>])),
+    ];
+    let batch =
+        RecordBatch::try_new(schema, cols).map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    ipc::write_batch(&batch)
+}
+
 /// Build the wire arg schema (`FunctionInfo.arguments`) from arg specs,
 /// attaching `vgi_*` field-metadata markers exactly as Go's `BuildArgSchema`.
 pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {

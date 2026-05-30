@@ -28,6 +28,42 @@ fn main() {
     table_in_out::register(&mut worker);
     buffering::register(&mut worker);
     aggregate::register(&mut worker);
+    register_secrets_and_settings(&mut worker);
     worker.set_catalog(catalog_def::build());
     worker.run();
+}
+
+/// Register the `vgi_example` secret type and the custom settings the
+/// settings/secret fixtures exercise.
+fn register_secrets_and_settings(worker: &mut Worker) {
+    use arrow_schema::{DataType, Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use vgi::catalog::{SecretTypeSpec, SettingSpec};
+
+    let redact = || HashMap::from([("redact".to_string(), "true".to_string())]);
+    let params = Schema::new(vec![
+        Field::new("secret_string", DataType::Utf8, true).with_metadata(redact()),
+        Field::new("api_key", DataType::Utf8, true).with_metadata(redact()),
+        Field::new("port", DataType::Int32, true),
+        Field::new("use_ssl", DataType::Boolean, true),
+        Field::new("timeout", DataType::Float64, true),
+    ]);
+    worker.register_secret_type(SecretTypeSpec {
+        name: "vgi_example".to_string(),
+        description: "Example VGI secret for testing".to_string(),
+        parameters_schema: Arc::new(params),
+    });
+
+    for (name, ty) in [
+        ("multiplier", DataType::Int64),
+        ("threshold", DataType::Int64),
+        ("greeting", DataType::Utf8),
+    ] {
+        worker.register_setting(SettingSpec {
+            name: name.to_string(),
+            description: format!("{name} setting"),
+            data_type: ty,
+        });
+    }
 }

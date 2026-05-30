@@ -41,6 +41,10 @@ pub struct Dispatcher {
     pub store: Arc<BufferingStore>,
     /// Declarative catalog (views / macros / function-backed tables).
     pub catalog: catalog::CatalogModel,
+    /// Secret types registered by the worker (surfaced in `catalog_attach`).
+    pub secret_types: Vec<catalog::SecretTypeSpec>,
+    /// Custom settings registered by the worker.
+    pub settings: Vec<catalog::SettingSpec>,
     exec_counter: AtomicU64,
 }
 
@@ -55,12 +59,22 @@ impl Dispatcher {
             aggregates: HashMap::new(),
             store: Arc::new(BufferingStore::new()),
             catalog: catalog::CatalogModel::default(),
+            secret_types: Vec::new(),
+            settings: Vec::new(),
             exec_counter: AtomicU64::new(1),
         }
     }
 
     pub fn set_catalog(&mut self, model: catalog::CatalogModel) {
         self.catalog = model;
+    }
+
+    pub fn register_secret_type(&mut self, spec: catalog::SecretTypeSpec) {
+        self.secret_types.push(spec);
+    }
+
+    pub fn register_setting(&mut self, spec: catalog::SettingSpec) {
+        self.settings.push(spec);
     }
 
     /// Schema names exposed by the catalog (always includes `main`).
@@ -628,8 +642,16 @@ impl Dispatcher {
             catalog_version: 1,
             attach_opaque_data_required: true,
             default_schema: catalog::MAIN_SCHEMA.to_string(),
-            settings: Vec::new(),
-            secret_types: Vec::new(),
+            settings: self
+                .settings
+                .iter()
+                .map(|s| Ok(Bytes::from(catalog::serialize_setting(s)?)))
+                .collect::<Result<Vec<_>>>()?,
+            secret_types: self
+                .secret_types
+                .iter()
+                .map(|s| Ok(Bytes::from(catalog::serialize_secret_type(s)?)))
+                .collect::<Result<Vec<_>>>()?,
             comment: None,
             tags: Vec::new(),
             supports_column_statistics: false,
