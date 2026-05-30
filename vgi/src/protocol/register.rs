@@ -20,9 +20,18 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     }
     {
         let d = disp.clone();
-        srv.register_stream("init", MethodType::Dynamic, move |req, ctx| {
-            d.handle_init(req, ctx)
-        });
+        let dd = disp.clone();
+        let empty = Arc::new(arrow_schema::Schema::empty());
+        let info = vgi_rpc::MethodInfo::stream(
+            "init",
+            MethodType::Dynamic,
+            empty,
+            move |req, ctx| d.handle_init(req, ctx),
+        )
+        // HTTP continuations rebuild the (stateless) exchange handler from an
+        // AEAD state token; without a decoder the server 500s on /init/exchange.
+        .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
+        srv.register(info);
     }
 
     // --- catalog handshake ---

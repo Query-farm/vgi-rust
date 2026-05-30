@@ -89,6 +89,13 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
 /// Serve over HTTP: bind a TCP port, announce it with `PORT:<n>`, and serve
 /// the axum router. An optional `authenticate` callback enables bearer auth.
 pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenticate>) {
+    if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!("[VGI HTTP PANIC] {info}");
+            prev(info);
+        }));
+    }
     server.notify_transport(TransportKind::Http, TransportCapabilities::none());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -98,7 +105,12 @@ pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenti
         let mut builder = vgi_rpc::http::HttpState::builder()
             .server(server)
             // Sticky sessions for the versioned HTTP fixtures' cookie routing.
-            .enable_sticky(true);
+            .enable_sticky(true)
+            // Drain each producer entirely within the init response so table
+            // scans never require a stateless continuation token (only the
+            // stateless scalar/table-in-out exchange paths need a state
+            // decoder; producers carry scan position that we don't serialize).
+            .producer_batch_limit(0);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
         }

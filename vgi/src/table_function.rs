@@ -28,6 +28,13 @@ pub trait TableProducer: Send {
         &mut self,
         out: &mut vgi_rpc::OutputCollector,
     ) -> Result<Option<arrow_array::RecordBatch>>;
+    /// Serialize the scan position for stateless HTTP continuation (default
+    /// 0 — producers whose whole result fits in one HTTP response need none).
+    fn save_position(&self) -> u64 {
+        0
+    }
+    /// Restore the scan position after rebuilding from an HTTP state token.
+    fn restore_position(&mut self, _pos: u64) {}
 }
 
 /// A table (producer) VGI function.

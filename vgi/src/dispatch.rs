@@ -314,6 +314,7 @@ impl Dispatcher {
         let input_schema = bp.input_schema.clone();
         let execution_id = dto
             .execution_id
+            .clone()
             .map(|b| b.into())
             .unwrap_or_else(|| self.next_execution_id());
         let ft = normalize_function_type(&bind_call.function_type.0).unwrap_or_default();
@@ -394,12 +395,22 @@ impl Dispatcher {
                 None
             };
             let header = wire::to_batch(GlobalInitResponse {
-                execution_id: Bytes::from(execution_id),
+                execution_id: Bytes::from(execution_id.clone()),
                 max_workers: 1,
                 opaque_data: None,
             })?;
+            let blob = self.exchange_blob(
+                "table_in_out",
+                bind_call.function_name.clone(),
+                &output_schema,
+                input_schema.as_ref(),
+                &bind_call,
+                &dto,
+                &execution_id,
+                auto_apply,
+            )?;
             let in_schema = input_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-            let state = TableInOutExchangeState { func: f, params, filters };
+            let state = TableInOutExchangeState { func: f, params, filters, blob };
             return Ok(StreamResult::exchange(output_schema, in_schema, Box::new(state))
                 .with_header(header));
         }
@@ -439,14 +450,139 @@ impl Dispatcher {
         let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
 
         let header = wire::to_batch(GlobalInitResponse {
-            execution_id: Bytes::from(execution_id),
+            execution_id: Bytes::from(execution_id.clone()),
             max_workers: 1,
             opaque_data: None,
         })?;
 
-        let state = ScalarExchangeState { func: f, params };
+        let blob = self.exchange_blob(
+            "scalar",
+            bind_call.function_name.clone(),
+            &output_schema,
+            input_schema.as_ref(),
+            &bind_call,
+            &dto,
+            &execution_id,
+            false,
+        )?;
+        let state = ScalarExchangeState { func: f, params, blob };
         let in_schema = input_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
         Ok(StreamResult::exchange(output_schema, in_schema, Box::new(state)).with_header(header))
+    }
+
+    /// Build the encoded HTTP-continuation blob for a stateless exchange
+    /// stream (scalar / table-in-out). Carries everything needed to rebuild
+    /// the handler from an AEAD state token on any pooled HTTP worker.
+    #[allow(clippy::too_many_arguments)]
+    fn exchange_blob(
+        &self,
+        kind: &str,
+        function_name: String,
+        output_schema: &arrow_schema::SchemaRef,
+        input_schema: Option<&arrow_schema::SchemaRef>,
+        bind_call: &BindRequest,
+        dto: &InitRequest,
+        execution_id: &[u8],
+        auto_apply: bool,
+    ) -> Result<Vec<u8>> {
+        let blob = ExchangeBlob {
+            kind: kind.to_string(),
+            function_name,
+            output_schema: ipc::write_schema_ref(output_schema)?,
+            input_schema: match input_schema {
+                Some(s) => ipc::write_schema_ref(s)?,
+                None => Vec::new(),
+            },
+            arguments: bind_call.arguments.0.clone(),
+            settings: bind_call.settings.clone().map(|b| b.0).unwrap_or_default(),
+            secrets: bind_call.secrets.clone().map(|b| b.0).unwrap_or_default(),
+            execution_id: execution_id.to_vec(),
+            init_opaque: dto.bind_opaque_data.clone().map(|b| b.0).unwrap_or_default(),
+            pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0).unwrap_or_default(),
+            auto_apply,
+        };
+        vgi_rpc::stream_codec::bincode_encode(&blob)
+    }
+
+    /// Rebuild a stateless exchange stream from its HTTP-continuation blob.
+    /// Registered as the `init` method's state decoder so a pooled HTTP
+    /// worker can resume a scalar / table-in-out exchange from an AEAD token.
+    pub fn decode_init_state(&self, bytes: &[u8]) -> Result<vgi_rpc::stream::StreamStateKind> {
+        let blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
+        let output_schema = ipc::read_schema(&blob.output_schema)?;
+        let input_schema = if blob.input_schema.is_empty() {
+            None
+        } else {
+            Some(ipc::read_schema(&blob.input_schema)?)
+        };
+        let settings = if blob.settings.is_empty() {
+            crate::settings::Settings::default()
+        } else {
+            crate::settings::Settings::parse(&blob.settings)?
+        };
+        let secrets = if blob.secrets.is_empty() {
+            crate::secrets::Secrets::default()
+        } else {
+            crate::secrets::Secrets::parse(&blob.secrets)?
+        };
+        let pushdown = if blob.pushdown_filters.is_empty() {
+            None
+        } else {
+            Some(blob.pushdown_filters.clone())
+        };
+        let mut args = crate::arguments::Arguments::parse(&blob.arguments)?;
+        let make_params = |args: crate::arguments::Arguments| ProcessParams {
+            output_schema: output_schema.clone(),
+            input_schema: input_schema.clone(),
+            execution_id: blob.execution_id.clone(),
+            init_opaque_data: blob.init_opaque.clone(),
+            arguments: args,
+            settings: settings.clone(),
+            secrets: secrets.clone(),
+            auth_principal: None,
+            projection_ids: None,
+            pushdown_filters: pushdown.clone(),
+            order_by_column: None,
+            order_by_direction: None,
+            order_by_null_order: None,
+            order_by_limit: None,
+            tablesample_percentage: None,
+            tablesample_seed: None,
+        };
+        if blob.kind == "table_in_out" {
+            let f =
+                self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref())?;
+            args.remap_positional(&f.argument_specs());
+            let params = make_params(args);
+            let filters = if blob.auto_apply {
+                params
+                    .pushdown_filters
+                    .as_ref()
+                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
+                    .transpose()?
+            } else {
+                None
+            };
+            Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
+                TableInOutExchangeState {
+                    func: f,
+                    params,
+                    filters,
+                    blob: bytes.to_vec(),
+                },
+            )))
+        } else {
+            let f = self.resolve_scalar(&blob.function_name, &args, input_schema.as_ref())?;
+            args.remap_positional(&f.argument_specs());
+            let params = make_params(args);
+            Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
+                ScalarExchangeState {
+                    func: f,
+                    params,
+                    blob: bytes.to_vec(),
+                },
+            )))
+        }
     }
 
     // -- catalog ------------------------------------------------------------
@@ -798,10 +934,28 @@ impl Dispatcher {
     }
 }
 
+/// Serializable rebuild info for an exchange stream, so HTTP continuations can
+/// reconstruct the state from an AEAD token on any pooled worker.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ExchangeBlob {
+    pub kind: String, // "scalar" | "table_in_out"
+    pub function_name: String,
+    pub output_schema: Vec<u8>,
+    pub input_schema: Vec<u8>, // empty = none
+    pub arguments: Vec<u8>,
+    pub settings: Vec<u8>,
+    pub secrets: Vec<u8>,
+    pub execution_id: Vec<u8>,
+    pub init_opaque: Vec<u8>,
+    pub pushdown_filters: Vec<u8>, // empty = none
+    pub auto_apply: bool,
+}
+
 /// Per-batch scalar exchange: calls `process` and emits the result.
 struct ScalarExchangeState {
     func: Arc<dyn ScalarFunction>,
     params: ProcessParams,
+    blob: Vec<u8>,
 }
 
 impl ExchangeState for ScalarExchangeState {
@@ -817,7 +971,7 @@ impl ExchangeState for ScalarExchangeState {
     }
 
     fn encode_state(&self) -> Result<Vec<u8>> {
-        Ok(Vec::new())
+        Ok(self.blob.clone())
     }
 }
 
@@ -834,6 +988,7 @@ struct TableInOutExchangeState {
     func: Arc<dyn TableInOutFunction>,
     params: ProcessParams,
     filters: Option<crate::pushdown::PushdownFilters>,
+    blob: Vec<u8>,
 }
 
 impl ExchangeState for TableInOutExchangeState {
@@ -854,7 +1009,7 @@ impl ExchangeState for TableInOutExchangeState {
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
-        Ok(Vec::new())
+        Ok(self.blob.clone())
     }
 }
 
