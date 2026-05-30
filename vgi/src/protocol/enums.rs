@@ -34,9 +34,9 @@ pub mod null_handling {
 
 /// `OrderPreservation`.
 pub mod order_preservation {
-    pub const PRESERVES_ORDER: &str = "preserves_order";
-    pub const NO_ORDER_GUARANTEE: &str = "no_order_guarantee";
-    pub const FIXED_ORDER: &str = "fixed_order";
+    pub const PRESERVES_ORDER: &str = "PRESERVES_ORDER";
+    pub const NO_ORDER_GUARANTEE: &str = "NO_ORDER_GUARANTEE";
+    pub const FIXED_ORDER: &str = "FIXED_ORDER";
 }
 
 /// `PartitionKind`.
