@@ -21,6 +21,136 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::RegionYear);
     w.register_table(PartitionFunction::Override);
     w.register_table(PartitionFunction::Disjoint);
+    w.register_table(BrokenPartitionFunction { name: "broken_missing_partition_values", mode: BrokenPart::MissingMeta });
+    w.register_table(BrokenPartitionFunction { name: "broken_partition_min_neq_max", mode: BrokenPart::MinNeqMax });
+    w.register_table(BrokenPartitionFunction { name: "broken_partition_values_no_annotation", mode: BrokenPart::NoAnnotation });
+    w.register_table(BrokenPartitionFunction { name: "broken_partition_column_absent_from_batch", mode: BrokenPart::AbsentColumn });
+}
+
+// ---------------------------------------------------------------------------
+// Deliberately-broken partition fixtures for the contract test.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum BrokenPart {
+    MissingMeta,   // partition field but no vgi_partition_values metadata
+    MinNeqMax,     // SINGLE_VALUE with two distinct values in the chunk
+    NoAnnotation,  // partition_kind set but no partition_field in schema
+    AbsentColumn,  // partition field declared but absent from emitted batch
+}
+
+struct BrokenPartProducer {
+    schema: SchemaRef,
+    mode: BrokenPart,
+    meta: Option<HashMap<String, String>>,
+    done: bool,
+}
+impl TableProducer for BrokenPartProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        match self.mode {
+            BrokenPart::MissingMeta => {
+                let batch = RecordBatch::try_new(
+                    self.schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["AU"; 5])) as ArrayRef,
+                        Arc::new(Int64Array::from((0..5i64).collect::<Vec<_>>())) as ArrayRef,
+                    ],
+                )
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+                self.meta = None; // emit without partition metadata → C++ raises
+                Ok(Some(batch))
+            }
+            BrokenPart::MinNeqMax => {
+                // Two distinct countries in one chunk: auto min != max.
+                let batch = RecordBatch::try_new(
+                    self.schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["AU", "BR", "AU", "BR", "AU"])) as ArrayRef,
+                        Arc::new(Int64Array::from((0..5i64).collect::<Vec<_>>())) as ArrayRef,
+                    ],
+                )
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+                self.meta = vgi::partition::partition_metadata(&self.schema, &batch)?;
+                Ok(Some(batch))
+            }
+            BrokenPart::NoAnnotation => Err(RpcError::runtime_error(
+                "EmitPartitioned requires partition-annotated fields, but none were declared",
+            )),
+            BrokenPart::AbsentColumn => {
+                // Emit a batch missing the annotated `country` column; the
+                // partition-values computation raises the typed error.
+                let absent = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("sales", DataType::Int64, true)])),
+                    vec![Arc::new(Int64Array::from((0..5i64).collect::<Vec<_>>())) as ArrayRef],
+                )
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+                vgi::partition::partition_values_b64(&self.schema, &absent)?;
+                unreachable!("partition_values_b64 should have errored")
+            }
+        }
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+pub struct BrokenPartitionFunction {
+    name: &'static str,
+    mode: BrokenPart,
+}
+impl TableFunction for BrokenPartitionFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        // NoAnnotation leaves partition_kind at the default (NOT_PARTITIONED)
+        // so the C++ binder doesn't reject it — the worker raises at emit.
+        let partition_kind = match self.mode {
+            BrokenPart::NoAnnotation => None,
+            _ => Some(vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS.to_string()),
+        };
+        FunctionMetadata {
+            description: "Deliberately-broken partition fixture".to_string(),
+            categories: vec!["testing".into(), "broken".into()],
+            partition_kind,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("count", 0, "int64", "Rows to attempt to emit")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        // NoAnnotation: same columns but WITHOUT the partition marker.
+        let schema = match self.mode {
+            BrokenPart::NoAnnotation => Arc::new(Schema::new(vec![
+                Field::new("country", DataType::Utf8, true),
+                Field::new("sales", DataType::Int64, true),
+            ])),
+            _ => Arc::new(Schema::new(vec![
+                partition_field("country", DataType::Utf8),
+                Field::new("sales", DataType::Int64, true),
+            ])),
+        };
+        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+    }
+    fn producer(&self, _params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        // Use the function's full natural schema (with the partition marker)
+        // regardless of projection; the dispatch adapter narrows on emit.
+        let schema = Arc::new(Schema::new(vec![
+            partition_field("country", DataType::Utf8),
+            Field::new("sales", DataType::Int64, true),
+        ]));
+        Ok(Box::new(BrokenPartProducer {
+            schema,
+            mode: self.mode,
+            meta: None,
+            done: false,
+        }))
+    }
 }
 
 const COUNTRIES: [&str; 5] = ["AU", "BR", "CA", "FR", "US"];
