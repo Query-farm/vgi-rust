@@ -1142,6 +1142,112 @@ impl Dispatcher {
         Ok(Some(wire::empty_result_batch()?))
     }
 
+    // -- aggregate window RPCs ---------------------------------------------
+
+    fn win_key(partition_id: i64, suffix: &str) -> Vec<u8> {
+        format!("win_{partition_id}_{suffix}").into_bytes()
+    }
+
+    pub fn handle_aggregate_window_init(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateWindowInitRequest = boxed(req)?;
+        // Cache the partition (input columns + output schema + filter mask) so
+        // the window / window_batch calls — possibly in another pooled worker —
+        // can evaluate frames against it.
+        self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "p"), &dto.partition_batch.0);
+        self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "o"), &dto.output_schema.0);
+        if let Some(m) = &dto.filter_mask {
+            self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "m"), &m.0);
+        }
+        Ok(Some(wire::empty_result_batch()?))
+    }
+
+    /// Load the cached partition + output schema for a window call.
+    fn load_window_partition(
+        &self,
+        exec: &[u8],
+        partition_id: i64,
+    ) -> Result<(RecordBatch, SchemaRef, Option<Vec<bool>>)> {
+        let pb = self
+            .store
+            .kv_get(exec, &Self::win_key(partition_id, "p"))
+            .ok_or_else(|| RpcError::runtime_error(format!(
+                "aggregate_window: unknown partition_id={partition_id}"
+            )))?;
+        let os = self
+            .store
+            .kv_get(exec, &Self::win_key(partition_id, "o"))
+            .ok_or_else(|| RpcError::runtime_error("aggregate_window: missing output schema"))?;
+        let partition = ipc::read_batch(&pb)?;
+        let output_schema = ipc::read_schema(&os)?;
+        // `filter_mask` is an Arrow packed-bit boolean buffer (LSB-first),
+        // length == partition row count. Empty/absent means "all rows valid".
+        let n = partition.num_rows();
+        let mask = self
+            .store
+            .kv_get(exec, &Self::win_key(partition_id, "m"))
+            .filter(|b| !b.is_empty())
+            .map(|bytes| {
+                (0..n)
+                    .map(|i| bytes.get(i / 8).map(|byte| byte & (1 << (i % 8)) != 0).unwrap_or(true))
+                    .collect::<Vec<bool>>()
+            });
+        Ok((partition, output_schema, mask))
+    }
+
+    pub fn handle_aggregate_window(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateWindowRequest = boxed(req)?;
+        let f = self.resolve_aggregate(&dto.function_name)?;
+        let (partition, output_schema, mask) =
+            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        let frames: Vec<(i64, i64)> = dto
+            .frame_starts
+            .iter()
+            .zip(dto.frame_ends.iter())
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        let col = f.window(&partition, &output_schema, &[frames], mask.as_deref())?;
+        let batch = RecordBatch::try_new(output_schema, vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(wire::to_result_batch(AggregateWindowResponse {
+            result_batch: Bytes::from(ipc::write_batch(&batch)?),
+        })?))
+    }
+
+    pub fn handle_aggregate_window_batch(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateWindowBatchRequest = boxed(req)?;
+        let f = self.resolve_aggregate(&dto.function_name)?;
+        let (partition, output_schema, mask) =
+            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        // Split the flattened (start,end) arrays into per-row sub-frame lists.
+        let mut frames: Vec<Vec<(i64, i64)>> = Vec::with_capacity(dto.count as usize);
+        let mut off = 0usize;
+        for r in 0..dto.count as usize {
+            let n = dto.frames_per_row.get(r).copied().unwrap_or(0) as usize;
+            let mut subs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let s = dto.frame_starts.get(off).copied().unwrap_or(0);
+                let e = dto.frame_ends.get(off).copied().unwrap_or(0);
+                subs.push((s, e));
+                off += 1;
+            }
+            frames.push(subs);
+        }
+        let col = f.window(&partition, &output_schema, &frames, mask.as_deref())?;
+        let batch = RecordBatch::try_new(output_schema, vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(wire::to_result_batch(AggregateWindowResponse {
+            result_batch: Bytes::from(ipc::write_batch(&batch)?),
+        })?))
+    }
+
+    pub fn handle_aggregate_window_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let dto: AggregateWindowDestructorRequest = boxed(req)?;
+        for sfx in ["p", "o", "m"] {
+            self.store.kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, sfx));
+        }
+        Ok(Some(wire::empty_result_batch()?))
+    }
+
     /// Empty `ItemsResult` for the contents/get methods not yet implemented.
     pub fn handle_empty_items(&self, _req: &Request) -> Result<Option<RecordBatch>> {
         Ok(Some(wire::to_result_batch(ItemsResult { items: Vec::new() })?))

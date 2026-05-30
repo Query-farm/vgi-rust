@@ -200,6 +200,9 @@ pub struct FunctionMetadata {
     pub sink_order_dependent: bool,
     pub source_order_dependent: bool,
     pub requires_input_batch_index: bool,
+    /// Aggregate window / streaming opt-ins.
+    pub supports_window: bool,
+    pub streaming_partitioned: bool,
     /// Settings the function requires (surfaced in `FunctionInfo`).
     pub required_settings: Vec<String>,
 }
@@ -222,6 +225,8 @@ impl Default for FunctionMetadata {
             sink_order_dependent: false,
             source_order_dependent: false,
             requires_input_batch_index: false,
+            supports_window: false,
+            streaming_partitioned: false,
             required_settings: Vec::new(),
         }
     }

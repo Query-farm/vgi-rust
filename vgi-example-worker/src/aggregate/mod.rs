@@ -21,6 +21,178 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(SumAllFunction);
     w.register_aggregate(ListAggFunction);
     w.register_aggregate(PercentileFunction);
+    w.register_aggregate(WindowSumFunction);
+    w.register_aggregate(WindowMedianFunction);
+    w.register_aggregate(WindowListAggFunction);
+}
+
+/// `vgi_window_median(value)` — non-incremental windowed median via window().
+pub struct WindowMedianFunction;
+impl AggregateFunction for WindowMedianFunction {
+    fn name(&self) -> &str { "vgi_window_median" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Windowed median (window() callback demonstrates non-incremental aggregates)");
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m.supports_window = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "float64", "Column to compute median of")]
+    }
+    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: result_schema(DataType::Float64), opaque_data: Vec::new() })
+    }
+    fn initial_state(&self) -> Vec<u8> { Vec::new() }
+    fn update(&self, _s: &mut HashMap<i64, Vec<u8>>, _g: &Int64Array, _c: &[ArrayRef]) -> Result<()> { Ok(()) }
+    fn combine(&self, t: Vec<u8>, _s: Vec<u8>) -> Result<Vec<u8>> { Ok(t) }
+    fn finalize(&self, os: &Arc<Schema>, gids: &Int64Array, _states: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        let out: Float64Array = (0..gids.len()).map(|_| None).collect();
+        RecordBatch::try_new(os.clone(), vec![Arc::new(out)]).map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn window(&self, partition: &RecordBatch, _os: &Arc<Schema>, frames: &[Vec<(i64, i64)>], filter_mask: Option<&[bool]>) -> Result<ArrayRef> {
+        let v = cast_f64(partition.column(0))?;
+        let out: Float64Array = frames.iter().map(|subframes| {
+            let mut vals: Vec<f64> = Vec::new();
+            for &(begin, end) in subframes {
+                let (b, e) = (begin.max(0) as usize, end.max(0) as usize);
+                for i in b..e.min(v.len()) {
+                    if v.is_null(i) { continue; }
+                    if filter_mask.map(|m| m.get(i).copied().unwrap_or(true)).unwrap_or(true) {
+                        vals.push(v.value(i));
+                    }
+                }
+            }
+            if vals.is_empty() { return None; }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = vals.len();
+            let mid = n / 2;
+            Some(if n % 2 == 1 { vals[mid] } else { (vals[mid - 1] + vals[mid]) / 2.0 })
+        }).collect();
+        Ok(Arc::new(out))
+    }
+}
+
+/// `vgi_window_listagg(value)` — order-dependent windowed string concat.
+pub struct WindowListAggFunction;
+impl AggregateFunction for WindowListAggFunction {
+    fn name(&self) -> &str { "vgi_window_listagg" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Windowed string concat (ORDER_DEPENDENT; tests fallback handoff)");
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m.supports_window = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "string", "String column")]
+    }
+    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: result_schema(DataType::Utf8), opaque_data: Vec::new() })
+    }
+    fn initial_state(&self) -> Vec<u8> { Vec::new() }
+    fn update(&self, states: &mut HashMap<i64, Vec<u8>>, gids: &Int64Array, cols: &[ArrayRef]) -> Result<()> {
+        let v = cols[0].as_string::<i32>();
+        for i in 0..gids.len() {
+            if v.is_null(i) { continue; }
+            let st = states.entry(gids.value(i)).or_default();
+            if !st.is_empty() { st.push(b','); }
+            st.extend_from_slice(v.value(i).as_bytes());
+        }
+        Ok(())
+    }
+    fn combine(&self, mut t: Vec<u8>, s: Vec<u8>) -> Result<Vec<u8>> {
+        if s.is_empty() { return Ok(t); }
+        if t.is_empty() { return Ok(s); }
+        t.push(b','); t.extend_from_slice(&s); Ok(t)
+    }
+    fn finalize(&self, os: &Arc<Schema>, gids: &Int64Array, states: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        let out: arrow_array::StringArray = (0..gids.len()).map(|i| {
+            states[i].as_ref().filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned())
+        }).collect();
+        RecordBatch::try_new(os.clone(), vec![Arc::new(out)]).map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn window(&self, partition: &RecordBatch, _os: &Arc<Schema>, frames: &[Vec<(i64, i64)>], filter_mask: Option<&[bool]>) -> Result<ArrayRef> {
+        let v = partition.column(0).as_string::<i32>();
+        let out: arrow_array::StringArray = frames.iter().map(|subframes| {
+            let mut parts: Vec<&str> = Vec::new();
+            for &(begin, end) in subframes {
+                let (b, e) = (begin.max(0) as usize, end.max(0) as usize);
+                for i in b..e.min(v.len()) {
+                    if v.is_null(i) { continue; }
+                    if filter_mask.map(|m| m.get(i).copied().unwrap_or(true)).unwrap_or(true) {
+                        parts.push(v.value(i));
+                    }
+                }
+            }
+            if parts.is_empty() { None } else { Some(parts.join(",")) }
+        }).collect();
+        Ok(Arc::new(out))
+    }
+}
+
+/// `vgi_window_sum(value)` — windowed running sum via the window() callback;
+/// also works in plain GROUP BY (update/combine/finalize).
+pub struct WindowSumFunction;
+impl AggregateFunction for WindowSumFunction {
+    fn name(&self) -> &str { "vgi_window_sum" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Windowed sum that uses the per-partition window() callback");
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m.supports_window = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "int64", "Column to sum")]
+    }
+    fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: result_schema(DataType::Int64), opaque_data: Vec::new() })
+    }
+    fn initial_state(&self) -> Vec<u8> { le_i64(0) }
+    fn update(&self, states: &mut HashMap<i64, Vec<u8>>, gids: &Int64Array, cols: &[ArrayRef]) -> Result<()> {
+        let v = cast_i64(&cols[0])?;
+        for i in 0..gids.len() {
+            if v.is_null(i) { continue; }
+            let st = states.entry(gids.value(i)).or_insert_with(|| le_i64(0));
+            *st = le_i64(read_i64(st) + v.value(i));
+        }
+        Ok(())
+    }
+    fn combine(&self, t: Vec<u8>, s: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(le_i64(read_i64(&t) + read_i64(&s)))
+    }
+    fn finalize(&self, os: &Arc<Schema>, gids: &Int64Array, states: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        let out: Int64Array = (0..gids.len()).map(|i| states[i].as_ref().map(|s| read_i64(s))).collect();
+        RecordBatch::try_new(os.clone(), vec![Arc::new(out)]).map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn window(
+        &self,
+        partition: &RecordBatch,
+        _os: &Arc<Schema>,
+        frames: &[Vec<(i64, i64)>],
+        filter_mask: Option<&[bool]>,
+    ) -> Result<ArrayRef> {
+        let v = cast_i64(partition.column(0))?;
+        let out: Int64Array = frames
+            .iter()
+            .map(|subframes| {
+                let mut total = 0i64;
+                let mut any = false;
+                for &(begin, end) in subframes {
+                    let (b, e) = (begin.max(0) as usize, end.max(0) as usize);
+                    for i in b..e.min(v.len()) {
+                        if v.is_null(i) {
+                            continue;
+                        }
+                        if filter_mask.map(|m| m.get(i).copied().unwrap_or(true)).unwrap_or(true) {
+                            total += v.value(i);
+                            any = true;
+                        }
+                    }
+                }
+                any.then_some(total)
+            })
+            .collect();
+        Ok(Arc::new(out))
+    }
 }
 
 /// `vgi_percentile(value, percentile)` — approximate percentile; the

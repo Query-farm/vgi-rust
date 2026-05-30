@@ -84,6 +84,22 @@ srv.register_unary("aggregate_combine", wire::result_binary_schema(), move |req,
         let d = disp.clone();
 srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_destructor(req));
     }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_window_init", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_init(req));
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_window", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window(req));
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_window_batch", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_batch(req));
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary("aggregate_window_destructor", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_destructor(req));
+    }
 
     // --- table buffering ---
     {

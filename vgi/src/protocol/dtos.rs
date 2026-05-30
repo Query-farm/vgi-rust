@@ -105,6 +105,58 @@ pub struct CardinalityResponse {
     pub max: Option<i64>,
 }
 
+/// `aggregate_window_init` — caches a partition for windowed evaluation.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateWindowInitRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub partition_id: i64,
+    pub row_count: i64,
+    pub partition_batch: Bytes,
+    pub output_schema: Bytes,
+    pub filter_mask: Option<Bytes>,
+    pub frame_stats: Option<Bytes>,
+    pub all_valid: Option<Bytes>,
+}
+
+/// `aggregate_window` — evaluate one output row over its sub-frames.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateWindowRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub partition_id: i64,
+    pub rid: i64,
+    pub frame_starts: Vec<i64>,
+    pub frame_ends: Vec<i64>,
+}
+
+/// `aggregate_window_batch` — evaluate `count` consecutive output rows.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateWindowBatchRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub partition_id: i64,
+    pub row_idx: i64,
+    pub count: i64,
+    pub frames_per_row: Vec<i64>,
+    pub frame_starts: Vec<i64>,
+    pub frame_ends: Vec<i64>,
+}
+
+/// `aggregate_window` / `aggregate_window_batch` result.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateWindowResponse {
+    pub result_batch: Bytes,
+}
+
+/// `aggregate_window_destructor` — drops a cached partition.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AggregateWindowDestructorRequest {
+    pub function_name: String,
+    pub execution_id: Bytes,
+    pub partition_id: i64,
+}
+
 /// One physical source backing a (possibly multi-branch) table scan.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {

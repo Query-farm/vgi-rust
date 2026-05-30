@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
-use vgi_rpc::Result;
+use vgi_rpc::{Result, RpcError};
 
 use crate::arguments::Arguments;
 use crate::function::{ArgSpec, BindResponse, FunctionMetadata};
@@ -55,6 +55,21 @@ pub trait AggregateFunction: Send + Sync {
         group_ids: &Int64Array,
         states: &[Option<Vec<u8>>],
     ) -> Result<RecordBatch>;
+    /// Evaluate the windowed aggregate for each output row. `frames[i]` is the
+    /// list of `(begin, end)` sub-frames for output row `i` over the
+    /// `partition`'s input columns; returns the output column (one element per
+    /// row), matching `output_schema`. Only `supports_window` functions
+    /// override this; the default errors.
+    fn window(
+        &self,
+        _partition: &RecordBatch,
+        _output_schema: &SchemaRef,
+        _frames: &[Vec<(i64, i64)>],
+        _filter_mask: Option<&[bool]>,
+    ) -> Result<arrow_array::ArrayRef> {
+        Err(RpcError::runtime_error("window() not supported by this aggregate"))
+    }
+
     /// Like [`finalize`], but with access to the bind-time arguments (stashed
     /// at `aggregate_bind`, reloaded here). Override for `ConstParam(phase=
     /// "finalize")` aggregates like `vgi_percentile`. The default ignores them.
