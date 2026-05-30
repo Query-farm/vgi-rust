@@ -19,6 +19,7 @@ pub mod numeric;
 pub mod overload;
 pub mod partition;
 pub mod protocol;
+pub mod statistics;
 pub mod pushdown;
 pub mod secrets;
 pub mod settings;

@@ -380,6 +380,9 @@ pub struct CatTable {
     /// Multi-branch sources. `Some` (even empty) overrides the single-branch
     /// default in `catalog_table_scan_branches_get`.
     pub branches: Option<Vec<CatBranch>>,
+    /// Per-column optimizer statistics (served via
+    /// `catalog_table_column_statistics_get`).
+    pub statistics: Vec<crate::statistics::CatColStat>,
 }
 
 /// One physical branch of a multi-branch table.
@@ -461,6 +464,7 @@ impl CatTable {
             foreign_keys: Vec::new(),
             inline_scan: false,
             branches: None,
+            statistics: Vec::new(),
         }
     }
 }
@@ -524,7 +528,7 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         supports_update: false,
         supports_delete: false,
         supports_returning: false,
-        supports_column_statistics: false,
+        supports_column_statistics: !t.statistics.is_empty(),
         scan_function: Bytes::from(scan),
         insert_function: Bytes::from(Vec::new()),
         update_function: Bytes::from(Vec::new()),

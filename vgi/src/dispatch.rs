@@ -654,7 +654,12 @@ impl Dispatcher {
                 .collect::<Result<Vec<_>>>()?,
             comment: self.catalog.comment.clone(),
             tags: self.catalog.tags.clone(),
-            supports_column_statistics: false,
+            supports_column_statistics: self
+                .catalog
+                .schemas
+                .iter()
+                .flat_map(|s| &s.tables)
+                .any(|t| !t.statistics.is_empty()),
             resolved_data_version: None,
             resolved_implementation_version: None,
         };
@@ -756,6 +761,21 @@ impl Dispatcher {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
         Ok(Some(wire::to_result_batch(catalog::scan_function_result(t)?)?))
+    }
+
+    /// Per-column optimizer statistics for a table. Returns the sparse-union
+    /// IPC batch (result-wrapped), empty when the table declares no stats.
+    pub fn handle_table_column_statistics_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let schema_name = read_string_col(req, "schema_name")?;
+        let table_name = read_string_col(req, "name")?;
+        let stats = self
+            .catalog
+            .schema(&schema_name)
+            .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
+            .map(|t| t.statistics.clone())
+            .unwrap_or_default();
+        let bytes = crate::statistics::serialize_column_statistics(&stats)?;
+        Ok(Some(wire::result_batch_from_bytes(&bytes)?))
     }
 
     /// Multi-branch scan resolution. A single-source table returns one branch

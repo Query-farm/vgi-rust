@@ -44,6 +44,11 @@ pub fn register(w: &mut vgi::Worker) {
         &[("id", DataType::Int64), ("color", DataType::Utf8), ("hex_code", DataType::Utf8)],
         vec![i(vec![1, 2, 3]), s(vec!["blue", "green", "red"]), s(vec!["#0000FF", "#00FF00", "#FF0000"])],
     ));
+    w.register_table(StaticScan::new(
+        "versioned_data_scan",
+        &[("id", DataType::Int64), ("name", DataType::Utf8)],
+        vec![i(vec![1, 2, 3, 4]), s(vec!["alpha", "beta", "gamma", "delta"])],
+    ));
     w.register_table(RowIdSequenceFunction);
 }
 

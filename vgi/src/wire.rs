@@ -81,6 +81,14 @@ pub fn to_result_batch<T: VgiArrow>(value: T) -> Result<RecordBatch> {
         .map_err(|e| RpcError::runtime_error(format!("build result envelope: {e}")))
 }
 
+/// Wrap already-serialized IPC bytes in the `{result: binary}` envelope (for
+/// methods whose result is a pre-built batch, e.g. column statistics).
+pub fn result_batch_from_bytes(bytes: &[u8]) -> Result<RecordBatch> {
+    let arr = BinaryArray::from(vec![bytes]);
+    RecordBatch::try_new(result_binary_schema(), vec![Arc::new(arr)])
+        .map_err(|e| RpcError::runtime_error(format!("build result envelope: {e}")))
+}
+
 /// The `{result: binary}` envelope wrapping an empty (0-column) response —
 /// used by methods whose response DTO has no fields (aggregate update/combine).
 pub fn empty_result_batch() -> Result<RecordBatch> {

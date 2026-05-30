@@ -164,8 +164,8 @@ fn data_tables() -> Vec<CatTable> {
             "Late-materialization table with deliberately non-unique rowid (contract violation)"),
         dtable("late_mat_nulls", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
             "Late-materialization table with NULLs in the ord column"),
-        dtable("versioned_data", vec![f("id", Int64), f("name", Utf8)],
-            "Versioned data table demonstrating time travel with schema evolution"),
+        scan(dtable("versioned_data", vec![f("id", Int64), f("name", Utf8)],
+            "Versioned data table demonstrating time travel with schema evolution"), "versioned_data_scan"),
         dtable("versioned_constraints", vec![f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64)],
             "Table with constraints that evolve across versions"),
     ];
@@ -226,10 +226,54 @@ fn data_tables() -> Vec<CatTable> {
             vgi::catalog::CatBranch { writable: true, ..seq(10) },
         ]));
 
+    use vgi::statistics::{CatColStat, StatValue};
+    let stat = |name: &str, min: StatValue, max: StatValue, distinct: i64| CatColStat {
+        column_name: name.to_string(),
+        min,
+        max,
+        has_null: false,
+        has_not_null: true,
+        distinct_count: Some(distinct),
+        contains_unicode: None,
+        max_string_length: None,
+    };
+
+    // `numbers` carries DuckDB-extracted stats (value 0..99); `colors` carries
+    // ENUM-ordinal-derived stats (color: red(0)..blue(2)).
+    for t in tables.iter_mut() {
+        if t.name == "numbers" {
+            t.statistics = vec![stat("value", StatValue::Int64(0), StatValue::Int64(99), 100)];
+        }
+        if t.name == "colors" {
+            t.statistics = vec![
+                stat("id", StatValue::Int64(1), StatValue::Int64(3), 3),
+                CatColStat {
+                    contains_unicode: Some(false),
+                    max_string_length: Some(5),
+                    ..stat("color", StatValue::Utf8("red".into()), StatValue::Utf8("blue".into()), 3)
+                },
+                CatColStat {
+                    contains_unicode: Some(false),
+                    max_string_length: Some(7),
+                    ..stat("hex_code", StatValue::Utf8("#0000FF".into()), StatValue::Utf8("#FF0000".into()), 3)
+                },
+            ];
+        }
+    }
+
     // departments: PK(id), NOT NULL(id,name), UNIQUE(name), CHECK(budget>=0), default budget=0.
     let mut departments = dtable("departments", vec![
         f("id", Int64), f("name", Utf8), fm("budget", Float64, "default", "0"),
     ], "Department reference table");
+    departments.statistics = vec![
+        stat("id", StatValue::Int64(1), StatValue::Int64(10), 10),
+        CatColStat {
+            contains_unicode: Some(false),
+            max_string_length: Some(20),
+            ..stat("name", StatValue::Utf8("Accounting".into()), StatValue::Utf8("Sales".into()), 10)
+        },
+        stat("budget", StatValue::Float64(50000.0), StatValue::Float64(500000.0), 10),
+    ];
     departments = scan(departments, "departments_scan");
     departments.primary_key = vec![vec![0]];
     departments.not_null = vec![0, 1];
@@ -247,6 +291,16 @@ fn data_tables() -> Vec<CatTable> {
     products = scan(products, "products_scan");
     products.primary_key = vec![vec![0]];
     products.not_null = vec![0];
+    products.statistics = vec![
+        stat("id", StatValue::Int64(1), StatValue::Int64(100), 100),
+        CatColStat {
+            contains_unicode: Some(false),
+            max_string_length: Some(30),
+            ..stat("name", StatValue::Utf8("Anvil".into()), StatValue::Utf8("Zebra Tape".into()), 100)
+        },
+        CatColStat { has_null: true, ..stat("quantity", StatValue::Int64(0), StatValue::Int64(10000), 50) },
+        stat("price", StatValue::Float64(0.99), StatValue::Float64(999.99), 80),
+    ];
     tables.push(products);
 
     // employees: PK(id), NOT NULL(id,name,email), UNIQUE(email), FK→departments.
