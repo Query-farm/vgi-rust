@@ -92,7 +92,11 @@ pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
                 "table" => {
                     meta.insert("vgi_type".to_string(), "table".to_string());
                 }
-                "any" | "" => {
+                // Only treat as ANY when no explicit Arrow type was given
+                // (`column_typed` sets arrow_type="" but a concrete
+                // arrow_data_type — those must keep their real type so DuckDB
+                // can disambiguate overloads like `type_info(int32 vs int64)`).
+                "any" | "" if spec.arrow_data_type.is_none() => {
                     meta.insert("vgi_type".to_string(), "any".to_string());
                     ty = DataType::Null;
                 }

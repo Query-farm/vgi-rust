@@ -126,7 +126,13 @@ fn score_type(actual: &DataType, spec: &ArgSpec) -> Option<i64> {
         .arrow_data_type
         .clone()
         .unwrap_or_else(|| arg_type_to_arrow(&spec.arrow_type));
-    if spec.arrow_type == "any" || spec.arrow_type.is_empty() || expected == DataType::Null {
+    // A genuinely ANY-typed arg (no concrete `arrow_data_type`) matches
+    // anything with neutral score. `column_typed` leaves `arrow_type` empty
+    // but sets a concrete `arrow_data_type` — those must score by exact match
+    // so overloads like `type_info(int32)` vs `type_info(int64)` disambiguate.
+    if (spec.arrow_data_type.is_none() && (spec.arrow_type == "any" || spec.arrow_type.is_empty()))
+        || expected == DataType::Null
+    {
         return Some(0);
     }
     if *actual == expected {
