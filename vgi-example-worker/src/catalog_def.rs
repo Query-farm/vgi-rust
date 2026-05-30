@@ -5,7 +5,33 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::{DataType, Field, Schema};
 use vgi::arguments::Arguments;
-use vgi::catalog::{CatMacro, CatSchema, CatTable, CatView, CatalogModel};
+use vgi::catalog::{CatMacro, CatSchema, CatTable, CatView, CatalogModel, TimeTravelVersion};
+
+/// One time-travel version (schema + per-version scan function + valid-from year).
+fn ttv(version: i64, cols: Vec<Field>, scan_fn: &str, year: i32) -> TimeTravelVersion {
+    TimeTravelVersion {
+        version,
+        columns: Arc::new(Schema::new(cols)),
+        scan_function: scan_fn.to_string(),
+        scan_arguments: Vec::new(),
+        timestamp_year: Some(year),
+    }
+}
+
+/// A time-travel table: its current (highest-version) columns are the base
+/// schema; `catalog_table_get`/`scan_function_get` select per `at_value`.
+fn tt_table(name: &str, comment: &str, versions: Vec<TimeTravelVersion>) -> CatTable {
+    let current = versions.iter().max_by_key(|v| v.version).expect("≥1 version");
+    let mut t = dtable(
+        name,
+        current.columns.fields().iter().map(|f| f.as_ref().clone()).collect(),
+        comment,
+    );
+    t.scan_function = current.scan_function.clone();
+    t.inline_scan = true;
+    t.time_travel = versions;
+    t
+}
 
 fn col_schema(fields: &[(&str, DataType)]) -> Arc<Schema> {
     Arc::new(Schema::new(
@@ -164,10 +190,29 @@ fn data_tables() -> Vec<CatTable> {
             "Late-materialization table with deliberately non-unique rowid (contract violation)"),
         dtable("late_mat_nulls", vec![frow("row_id", Int64), f("ord", Int64), f("payload", Utf8), f("pushed", Utf8)],
             "Late-materialization table with NULLs in the ord column"),
-        scan(dtable("versioned_data", vec![f("id", Int64), f("name", Utf8)],
-            "Versioned data table demonstrating time travel with schema evolution"), "versioned_data_scan"),
-        dtable("versioned_constraints", vec![f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64)],
-            "Table with constraints that evolve across versions"),
+        tt_table("versioned_data", "Versioned data table demonstrating time travel with schema evolution", vec![
+            ttv(1, vec![f("id", Int64)], "versioned_data_v1_scan", 2020),
+            ttv(2, vec![f("id", Int64), f("name", Utf8), f("score", Float64), f("active", DataType::Boolean)], "versioned_data_v2_scan", 2021),
+            ttv(3, vec![f("id", Int64), f("score", Float64)], "versioned_data_v3_scan", 2022),
+        ]),
+        {
+            let mut t = tt_table("versioned_constraints", "Table with constraints that evolve across versions", vec![
+                ttv(1, vec![f("id", Int64), f("name", Utf8)], "versioned_constraints_v1_scan", 2020),
+                ttv(2, vec![f("id", Int64), f("name", Utf8), f("email", Utf8)], "versioned_constraints_v2_scan", 2021),
+                ttv(3, vec![f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64)], "versioned_constraints_v3_scan", 2022),
+            ]);
+            // V3 constraints (current): NOT NULL id/name, PK id, UNIQUE email,
+            // FK department_id → data.departments(id).
+            t.not_null = vec![0, 1];
+            t.primary_key = vec![vec![0]];
+            t.unique = vec![vec![2]];
+            t.foreign_keys = vec![vgi::catalog::ForeignKey {
+                columns: vec!["department_id".to_string()],
+                referenced_table: "departments".to_string(),
+                referenced_columns: vec!["id".to_string()],
+            }];
+            t
+        },
     ];
 
     // Multi-branch tables: each declares its physical branches.

@@ -13,6 +13,32 @@ pub fn register(w: &mut vgi::Worker) {
     let i = |v: Vec<i64>| Arc::new(Int64Array::from(v)) as ArrayRef;
     let s = |v: Vec<&str>| Arc::new(StringArray::from(v)) as ArrayRef;
     let f = |v: Vec<f64>| Arc::new(Float64Array::from(v)) as ArrayRef;
+    let b = |v: Vec<bool>| Arc::new(arrow_array::BooleanArray::from(v)) as ArrayRef;
+
+    // Time-travel data scans (versioned_data / versioned_constraints, per version).
+    w.register_table(StaticScan::new("versioned_data_v1_scan",
+        &[("id", DataType::Int64)], vec![i(vec![1, 2, 3])]));
+    w.register_table(StaticScan::new("versioned_data_v2_scan",
+        &[("id", DataType::Int64), ("name", DataType::Utf8), ("score", DataType::Float64), ("active", DataType::Boolean)],
+        vec![
+            i(vec![1, 2, 3, 4, 5]),
+            s(vec!["alice", "bob", "carol", "dave", "eve"]),
+            f(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+            b(vec![true, false, true, false, true]),
+        ]));
+    w.register_table(StaticScan::new("versioned_data_v3_scan",
+        &[("id", DataType::Int64), ("score", DataType::Float64)],
+        vec![i(vec![1, 2, 3, 4]), f(vec![15.0, 25.0, 35.0, 45.0])]));
+
+    w.register_table(StaticScan::new("versioned_constraints_v1_scan",
+        &[("id", DataType::Int64), ("name", DataType::Utf8)],
+        vec![i(vec![1, 2]), s(vec!["Alice", "Bob"])]));
+    w.register_table(StaticScan::new("versioned_constraints_v2_scan",
+        &[("id", DataType::Int64), ("name", DataType::Utf8), ("email", DataType::Utf8)],
+        vec![i(vec![1, 2, 3]), s(vec!["Alice", "Bob", "Carol"]), s(vec!["a@co", "b@co", "c@co"])]));
+    w.register_table(StaticScan::new("versioned_constraints_v3_scan",
+        &[("id", DataType::Int64), ("name", DataType::Utf8), ("email", DataType::Utf8), ("department_id", DataType::Int64)],
+        vec![i(vec![1, 2, 3]), s(vec!["Alice", "Bob", "Carol"]), s(vec!["a@co", "b@co", "c@co"]), i(vec![1, 2, 1])]));
 
     // versioned_tables data scans (one per (table, version-variant)).
     w.register_table(StaticScan::new(

@@ -866,10 +866,15 @@ impl Dispatcher {
     pub fn handle_table_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
+        let at_unit = read_opt_string_col(req, "at_unit");
+        let at_value = read_opt_string_col(req, "at_value");
         let infos: Vec<TableInfo> = self
             .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
-            .map(|t| catalog::table_info(&schema_name, t))
+            .map(|t| {
+                let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
+                catalog::table_info(&schema_name, &tt)
+            })
             .transpose()?
             .into_iter()
             .collect();
@@ -883,13 +888,44 @@ impl Dispatcher {
     pub fn handle_table_scan_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
+        let at_unit = read_opt_string_col(req, "at_unit");
+        let at_value = read_opt_string_col(req, "at_value");
         let t = self
             .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
-        Ok(Some(wire::to_result_batch(catalog::scan_function_result(t)?)?))
+        let t = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
+        Ok(Some(wire::to_result_batch(catalog::scan_function_result(&t)?)?))
+    }
+
+    /// Return the table view for a requested time-travel `AT` clause (the
+    /// version's columns + scan), or the table unchanged when not time-travel.
+    fn at_version(
+        t: &catalog::CatTable,
+        at_unit: Option<&str>,
+        at_value: Option<&str>,
+    ) -> Result<catalog::CatTable> {
+        match t.resolve_version(at_unit, at_value)? {
+            Some(v) => {
+                let mut tt = t.clone();
+                tt.columns = v.columns.clone();
+                tt.scan_function = v.scan_function.clone();
+                tt.scan_arguments = v.scan_arguments.clone();
+                // Constraints are defined against the current schema; drop them
+                // for historical versions whose columns differ.
+                if !t.is_current_version(v.version) {
+                    tt.not_null.clear();
+                    tt.primary_key.clear();
+                    tt.unique.clear();
+                    tt.check.clear();
+                    tt.foreign_keys.clear();
+                }
+                Ok(tt)
+            }
+            None => Ok(t.clone()),
+        }
     }
 
     /// Per-call cardinality for a function-backed table scan.
@@ -1685,6 +1721,15 @@ fn read_string_col(req: &Request, name: &str) -> Result<String> {
         .column(name)
         .ok_or_else(|| RpcError::type_error(format!("request missing '{name}' column")))?;
     <String as VgiArrow>::read(col, 0)
+}
+
+/// Read a nullable string column's row-0 value, if present and non-null.
+fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
+    let col = req.column(name)?;
+    if col.is_null(0) {
+        return None;
+    }
+    <String as VgiArrow>::read(col, 0).ok()
 }
 
 /// Read a (binary) column's row-0 bytes from a request, if present and non-null.

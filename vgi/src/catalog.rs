@@ -574,6 +574,84 @@ pub struct CatTable {
     /// Per-column optimizer statistics (served via
     /// `catalog_table_column_statistics_get`).
     pub statistics: Vec<crate::statistics::CatColStat>,
+    /// Time-travel versions (schema evolution). Empty = not time-travel.
+    /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
+    /// matching the request's `at_value` (or the highest version when absent).
+    pub time_travel: Vec<TimeTravelVersion>,
+}
+
+/// One historical version of a time-travel table.
+#[derive(Clone)]
+pub struct TimeTravelVersion {
+    pub version: i64,
+    pub columns: SchemaRef,
+    pub scan_function: String,
+    pub scan_arguments: Vec<u8>,
+    /// The calendar year this version became valid (for `AT (TIMESTAMP => …)`).
+    pub timestamp_year: Option<i32>,
+}
+
+impl CatTable {
+    /// Whether `v` is the current (highest) time-travel version.
+    pub fn is_current_version(&self, v: i64) -> bool {
+        self.time_travel.iter().map(|t| t.version).max() == Some(v)
+    }
+
+    /// Resolve the time-travel version for an `AT` clause: `VERSION` (exact),
+    /// `TIMESTAMP` (highest version whose `timestamp_year <= year`), or the
+    /// current version when no clause. `Ok(None)` = not a time-travel table.
+    pub fn resolve_version(
+        &self,
+        at_unit: Option<&str>,
+        at_value: Option<&str>,
+    ) -> Result<Option<&TimeTravelVersion>> {
+        let has_at = at_unit.is_some_and(|u| !u.is_empty());
+        if self.time_travel.is_empty() {
+            if has_at {
+                return Err(vgi_rpc::RpcError::value_error(
+                    "this table does not support time travel",
+                ));
+            }
+            return Ok(None);
+        }
+        let unit = at_unit.map(|u| u.to_uppercase());
+        match unit.as_deref() {
+            None | Some("") => Ok(self.time_travel.iter().max_by_key(|t| t.version)),
+            Some("VERSION") => {
+                let want: i64 = at_value
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT VERSION value"))?;
+                self.time_travel
+                    .iter()
+                    .find(|t| t.version == want)
+                    .map(Some)
+                    .ok_or_else(|| vgi_rpc::RpcError::value_error(format!("Unknown version: {want}")))
+            }
+            Some("TIMESTAMP") => {
+                let year: i32 = at_value
+                    .and_then(|v| v.get(..4))
+                    .and_then(|y| y.parse().ok())
+                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT TIMESTAMP value"))?;
+                self.time_travel
+                    .iter()
+                    .filter(|t| t.timestamp_year.is_some_and(|ty| ty <= year))
+                    .max_by_key(|t| t.version)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        let min_year = self
+                            .time_travel
+                            .iter()
+                            .filter_map(|t| t.timestamp_year)
+                            .min()
+                            .unwrap_or(0);
+                        vgi_rpc::RpcError::value_error(format!(
+                            "No version exists at timestamp {at_value:?}: table did not exist before {min_year}"
+                        ))
+                    })
+            }
+            Some(other) => Err(vgi_rpc::RpcError::value_error(format!("Unsupported at_unit: {other:?}"))),
+        }
+    }
 }
 
 /// One physical branch of a multi-branch table.
@@ -656,6 +734,7 @@ impl CatTable {
             inline_scan: false,
             branches: None,
             statistics: Vec::new(),
+            time_travel: Vec::new(),
         }
     }
 }
