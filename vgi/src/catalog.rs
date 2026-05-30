@@ -353,6 +353,8 @@ pub struct CatMacro {
     pub definition: String,
     pub table_macro: bool,
     pub comment: Option<String>,
+    /// Default values for trailing parameters: `(param_name, int64 default)`.
+    pub defaults: Vec<(String, i64)>,
 }
 
 /// A function-backed catalog table: scanned by `scan_function(scan_args)`.
@@ -543,9 +545,22 @@ pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInf
         schema_name: schema.to_string(),
         macro_type: DictString(if m.table_macro { "table".into() } else { "scalar".into() }),
         parameters: m.parameters.clone(),
-        parameter_default_values: Bytes::from(Vec::new()),
+        parameter_default_values: Bytes::from(build_macro_defaults(&m.defaults).unwrap_or_default()),
         definition: m.definition.clone(),
     }
+}
+
+/// Build the 1-row IPC batch of macro parameter defaults (column per param).
+fn build_macro_defaults(defaults: &[(String, i64)]) -> Result<Vec<u8>> {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    if defaults.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fields: Vec<Field> = defaults.iter().map(|(n, _)| Field::new(n, DataType::Int64, false)).collect();
+    let cols: Vec<ArrayRef> = defaults.iter().map(|(_, v)| Arc::new(Int64Array::from(vec![*v])) as ArrayRef).collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+        .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    ipc::write_batch(&batch)
 }
 
 use arrow_schema::SchemaRef;

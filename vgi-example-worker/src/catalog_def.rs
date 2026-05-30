@@ -99,6 +99,7 @@ fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
         definition: def.to_string(),
         table_macro: false,
         comment: None,
+        defaults: Vec::new(),
     }
 }
 fn tmacro(name: &str, params: &[&str], def: &str) -> CatMacro {
@@ -307,7 +308,10 @@ pub fn build() -> CatalogModel {
                 ],
                 macros: vec![
                     smacro("vgi_multiply", &["x", "y"], "x * y"),
-                    smacro("vgi_clamp", &["val", "lo", "hi"], "GREATEST(lo, LEAST(hi, val))"),
+                    CatMacro {
+                        defaults: vec![("lo".to_string(), 0), ("hi".to_string(), 100)],
+                        ..smacro("vgi_clamp", &["val", "lo", "hi"], "GREATEST(lo, LEAST(hi, val))")
+                    },
                     tmacro("vgi_range_table", &["n"], "SELECT * FROM range(n)"),
                 ],
                 tables: vec![],
