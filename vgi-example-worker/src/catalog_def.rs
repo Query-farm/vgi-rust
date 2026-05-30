@@ -200,7 +200,7 @@ fn data_tables() -> Vec<CatTable> {
         rowid_table("rowid_struct", vec![frow("row_id", row_struct), f("value", Utf8)],
             "first", "struct", "Table with struct row_id"),
         lm("late_mat", "Late-materialization table (1000 rows, unique rowid)", Vec::new()),
-        lm("late_mat_dup", "Late-materialization table with non-unique rowid (contract violation)",
+        lm("late_mat_dup", "Late-materialization table with deliberately non-unique rowid (contract violation)",
             vec![("dup_row_id", Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef)]),
         lm("late_mat_nulls", "Late-materialization table with NULLs in the ord column",
             vec![("null_ord_stride", i64_arg(7))]),
