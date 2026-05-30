@@ -74,16 +74,28 @@ else
         "~test/sql/integration/table_in_out/echo/nested_type_combinations.test")
 fi
 
+# Launcher transport: options_smoke (require-env VGI_REQUIRE_LAUNCHER_TRANSPORT)
+# only passes with a `launch:` LOCATION. Run the subprocess suite without that
+# env so launcher-only tests skip; pass LAUNCH=1 to test the launcher transport
+# (VGI_TEST_WORKER=launch:<wrapper>).
+LAUNCHER_ENV=()
+if [[ "${LAUNCH:-0}" == "1" ]]; then
+  TEST_WORKER="launch:$WRAP"
+  LAUNCHER_ENV=(VGI_REQUIRE_LAUNCHER_TRANSPORT=1)
+else
+  TEST_WORKER="$WRAP"
+fi
+
 echo "[harness] running: ${ARGS[*]}"
 env \
-  VGI_TEST_WORKER="$WRAP" \
+  "${LAUNCHER_ENV[@]}" \
+  VGI_TEST_WORKER="$TEST_WORKER" \
   VGI_VERSIONED_WORKER="$W_VERSIONED" \
   VGI_VERSIONED_TABLES_WORKER="$W_VERSIONED_TABLES" \
   VGI_ATTACH_OPTIONS_WORKER="$W_ATTACH_OPTIONS" \
   VGI_BAD_PROTOCOL_WORKER="$W_BAD_PROTOCOL" \
   VGI_TEST_BEARER_TOKEN="test-secret-token" \
   VGI_WORKER_SUPPORTS_DYNAMIC_CODE=1 \
-  VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
   "$UNITTEST" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
 RC=$?
 
