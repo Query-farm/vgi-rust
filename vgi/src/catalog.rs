@@ -320,6 +320,10 @@ pub fn schema_info(name: &str, comment: Option<&str>, attach_opaque_data: &[u8])
 #[derive(Default, Clone)]
 pub struct CatalogModel {
     pub schemas: Vec<CatSchema>,
+    /// Database-level comment (surfaced via `duckdb_databases().comment`).
+    pub comment: Option<String>,
+    /// Database-level tags (surfaced via `duckdb_databases().tags`).
+    pub tags: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -360,6 +364,34 @@ pub struct CatTable {
     pub not_null: Vec<i32>,
     pub primary_key: Vec<Vec<i32>>,
     pub unique: Vec<Vec<i32>>,
+    pub check: Vec<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+impl CatTable {
+    /// Constructor with the new metadata fields defaulted empty.
+    pub fn new(
+        name: &str,
+        columns: SchemaRef,
+        scan_function: &str,
+        scan_arguments: Vec<u8>,
+        comment: Option<String>,
+        cardinality: Option<i64>,
+    ) -> Self {
+        CatTable {
+            name: name.to_string(),
+            columns,
+            scan_function: scan_function.to_string(),
+            scan_arguments,
+            comment,
+            cardinality,
+            not_null: Vec::new(),
+            primary_key: Vec::new(),
+            unique: Vec::new(),
+            check: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 impl CatalogModel {
@@ -396,13 +428,13 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
     };
     Ok(TableInfo {
         comment: t.comment.clone(),
-        tags: Vec::new(),
+        tags: t.tags.clone(),
         name: t.name.clone(),
         schema_name: schema.to_string(),
         columns: Bytes::from(ipc::write_schema_ref(&t.columns)?),
         not_null_constraints: t.not_null.clone(),
         unique_constraints: t.unique.clone(),
-        check_constraints: Vec::new(),
+        check_constraints: t.check.clone(),
         primary_key_constraints: t.primary_key.clone(),
         foreign_key_constraints: Vec::new(),
         supports_insert: false,

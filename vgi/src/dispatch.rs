@@ -652,8 +652,8 @@ impl Dispatcher {
                 .iter()
                 .map(|s| Ok(Bytes::from(catalog::serialize_secret_type(s)?)))
                 .collect::<Result<Vec<_>>>()?,
-            comment: None,
-            tags: Vec::new(),
+            comment: self.catalog.comment.clone(),
+            tags: self.catalog.tags.clone(),
             supports_column_statistics: false,
             resolved_data_version: None,
             resolved_implementation_version: None,

@@ -22,17 +22,14 @@ fn fn_table(
     cardinality: Option<i64>,
     comment: &str,
 ) -> CatTable {
-    CatTable {
-        name: name.to_string(),
-        columns: col_schema(cols),
-        scan_function: scan_fn.to_string(),
-        scan_arguments: Arguments::serialize_scan_args(&positional).unwrap_or_default(),
-        comment: Some(comment.to_string()),
+    CatTable::new(
+        name,
+        col_schema(cols),
+        scan_fn,
+        Arguments::serialize_scan_args(&positional).unwrap_or_default(),
+        Some(comment.to_string()),
         cardinality,
-        not_null: Vec::new(),
-        primary_key: Vec::new(),
-        unique: Vec::new(),
-    }
+    )
 }
 
 fn i64_arg(v: i64) -> ArrayRef {
@@ -58,10 +55,15 @@ fn tmacro(name: &str, params: &[&str], def: &str) -> CatMacro {
 /// Build the `example` catalog model.
 pub fn build() -> CatalogModel {
     CatalogModel {
+        comment: Some("Example VGI catalog for testing".to_string()),
+        tags: vec![
+            ("source".to_string(), "vgi-fixture-worker".to_string()),
+            ("version".to_string(), "1".to_string()),
+        ],
         schemas: vec![
             CatSchema {
                 name: "main".to_string(),
-                comment: Some("Default schema containing all registered functions".to_string()),
+                comment: Some("Example functions for testing VGI".to_string()),
                 views: vec![
                     view("first_ten", "SELECT * FROM sequence(10)"),
                     view("even_numbers", "SELECT * FROM sequence(100) WHERE n % 2 = 0"),
