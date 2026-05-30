@@ -13,6 +13,133 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(EchoWitnessFunction);
     w.register_table_in_out(FilterBySettingFunction);
     w.register_table_in_out(RepeatInputsFunction);
+    w.register_table_in_out(SumAllColumnsSimpleDistributed);
+}
+
+/// `sum_all_columns_simple_distributed(input)` — distributed column-wise sum.
+/// `process` accumulates each batch's partial sums into shared storage and
+/// emits nothing; the `FINALIZE` phase merges all partials into one output row.
+pub struct SumAllColumnsSimpleDistributed;
+
+const DIST_NS: &[u8] = b"tio_partials";
+
+impl SumAllColumnsSimpleDistributed {
+    /// Numeric output schema: integers → int64, floats/decimals → float64.
+    fn output_schema(input: &arrow_schema::SchemaRef) -> arrow_schema::SchemaRef {
+        use arrow_schema::{DataType, Field, Schema};
+        let fields: Vec<Field> = input
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                let t = f.data_type();
+                let out = if t.is_integer() {
+                    DataType::Int64
+                } else if matches!(t, DataType::Float16 | DataType::Float32 | DataType::Float64)
+                    || matches!(t, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
+                {
+                    DataType::Float64
+                } else {
+                    return None;
+                };
+                Some(Field::new(f.name(), out, true))
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+    fn sum_one(field_type: &arrow_schema::DataType, col: &arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float64Type, Int64Type};
+        use arrow_array::{Float64Array, Int64Array};
+        let cast = arrow_cast::cast(col, field_type).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        match field_type {
+            arrow_schema::DataType::Int64 => {
+                let a = cast.as_primitive::<Int64Type>();
+                let s: i64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                Ok(Arc::new(Int64Array::from(vec![s])))
+            }
+            _ => {
+                let a = cast.as_primitive::<Float64Type>();
+                let s: f64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                Ok(Arc::new(Float64Array::from(vec![s])))
+            }
+        }
+    }
+}
+
+impl TableInOutFunction for SumAllColumnsSimpleDistributed {
+    fn name(&self) -> &str {
+        "sum_all_columns_simple_distributed"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Distributed sum using simple callback API".to_string(),
+            categories: vec!["aggregation".into(), "numeric".into(), "distributed".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![table_arg("data", 0)]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| RpcError::value_error("sum_all_columns_simple_distributed requires input"))?;
+        Ok(BindResponse { output_schema: Self::output_schema(&input), opaque_data: Vec::new() })
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        let out = &params.output_schema;
+        let mut cols = Vec::with_capacity(out.fields().len());
+        for f in out.fields() {
+            let col = batch
+                .column_by_name(f.name())
+                .ok_or_else(|| RpcError::runtime_error(format!("missing column {}", f.name())))?;
+            cols.push(Self::sum_one(f.data_type(), col)?);
+        }
+        let partial = RecordBatch::try_new(out.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        if let Some(store) = &params.storage {
+            store.append(&params.execution_id, DIST_NS, b"", vgi::ipc::write_batch(&partial)?);
+        }
+        // Emit nothing during processing (one empty batch satisfies the exchange).
+        Ok(vec![RecordBatch::new_empty(out.clone())])
+    }
+    fn finish(&self, params: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float64Type, Int64Type};
+        use arrow_array::{ArrayRef, Float64Array, Int64Array};
+        use arrow_schema::DataType;
+        let out = &params.output_schema;
+        let n = out.fields().len();
+        let mut int_acc = vec![0i64; n];
+        let mut flt_acc = vec![0.0f64; n];
+        if let Some(store) = &params.storage {
+            for (_id, blob) in store.scan(&params.execution_id, DIST_NS, b"", -1, usize::MAX) {
+                let pb = vgi::ipc::read_batch(&blob)?;
+                for (i, f) in out.fields().iter().enumerate() {
+                    match f.data_type() {
+                        DataType::Int64 => int_acc[i] += pb.column(i).as_primitive::<Int64Type>().value(0),
+                        _ => flt_acc[i] += pb.column(i).as_primitive::<Float64Type>().value(0),
+                    }
+                }
+            }
+        }
+        let cols: Vec<ArrayRef> = out
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| match f.data_type() {
+                DataType::Int64 => Arc::new(Int64Array::from(vec![int_acc[i]])) as ArrayRef,
+                _ => Arc::new(Float64Array::from(vec![flt_acc[i]])) as ArrayRef,
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(out.clone(), cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(vec![batch])
+    }
 }
 
 fn table_arg(name: &str, pos: i32) -> ArgSpec {

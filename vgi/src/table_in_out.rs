@@ -28,9 +28,24 @@ pub trait TableInOutFunction: Send + Sync {
         })
     }
     /// Transform one input batch into output batches. Default: project the
-    /// input to the (possibly narrowed) output schema by column name.
+    /// input to the (possibly narrowed) output schema by column name. A
+    /// distributed/accumulating function persists partial state to
+    /// `params.storage` here and returns an empty batch.
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
         Ok(vec![project_batch(batch, &params.output_schema)?])
+    }
+
+    /// Whether the function flushes accumulated state at end-of-stream (drives
+    /// the `FINALIZE` init phase). Default: no.
+    fn has_finish(&self) -> bool {
+        false
+    }
+
+    /// End-of-stream: drain accumulated per-worker partials from
+    /// `params.storage` and emit the final output batches. Only called when
+    /// `has_finish()` is true.
+    fn finish(&self, _params: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        Ok(Vec::new())
     }
 }
 

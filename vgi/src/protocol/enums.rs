@@ -62,6 +62,8 @@ pub mod distinct_dependence {
 /// `TableInOutFunctionInitPhase` — the `init` request `phase` enum.
 pub mod phase {
     pub const PROCESS: &str = "PROCESS";
+    pub const INPUT: &str = "INPUT";
+    pub const FINALIZE: &str = "FINALIZE";
     pub const TABLE_BUFFERING: &str = "TABLE_BUFFERING";
     pub const TABLE_BUFFERING_FINALIZE: &str = "TABLE_BUFFERING_FINALIZE";
 }

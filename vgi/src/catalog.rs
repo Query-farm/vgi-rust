@@ -369,7 +369,7 @@ pub fn table_in_out_function_info(
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::TABLE);
     apply_metadata(&mut fi, &meta);
-    fi.has_finalize = false;
+    fi.has_finalize = f.has_finish();
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);

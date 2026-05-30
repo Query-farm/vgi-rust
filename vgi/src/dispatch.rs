@@ -444,6 +444,22 @@ impl Dispatcher {
             bp.arguments.remap_positional(&f.argument_specs());
             let auto_apply = f.metadata().auto_apply_filters;
             let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            // FINALIZE phase: flush accumulated state as a producer stream.
+            let phase = dto.phase.as_ref().map(|d| d.0.clone()).unwrap_or_default();
+            if phase == crate::protocol::enums::phase::FINALIZE {
+                let header = wire::to_batch(GlobalInitResponse {
+                    execution_id: Bytes::from(execution_id.clone()),
+                    max_workers: 1,
+                    opaque_data: None,
+                })?;
+                let batches = f.finish(&params)?;
+                let state = TableProducerState {
+                    inner: Box::new(VecProducer { batches, pos: 0 }),
+                    filters: None,
+                    project_to: None,
+                };
+                return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
+            }
             let filters = if auto_apply {
                 params
                     .pushdown_filters
@@ -1614,6 +1630,21 @@ struct EmptyProducer;
 impl TableProducer for EmptyProducer {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
         Ok(None)
+    }
+}
+
+/// Emits a fixed list of batches (table-in-out FINALIZE flush).
+struct VecProducer {
+    batches: Vec<RecordBatch>,
+    pos: usize,
+}
+impl TableProducer for VecProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        let b = self.batches.get(self.pos).cloned();
+        if b.is_some() {
+            self.pos += 1;
+        }
+        Ok(b)
     }
 }
 
