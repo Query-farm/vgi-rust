@@ -7,19 +7,24 @@ use arrow_schema::{DataType, Field, Schema};
 use vgi::arguments::Arguments;
 use vgi::catalog::{CatMacro, CatSchema, CatTable, CatView, CatalogModel, TimeTravelVersion};
 
-/// One time-travel version (schema + per-version scan function + valid-from year).
+/// One time-travel version (schema + parameterized scan function `scan_fn(version)`
+/// + valid-from year). The single scan function returns the version-specific
+/// schema/rows based on its `version` const argument.
 fn ttv(version: i64, cols: Vec<Field>, scan_fn: &str, year: i32) -> TimeTravelVersion {
     TimeTravelVersion {
         version,
         columns: Arc::new(Schema::new(cols)),
         scan_function: scan_fn.to_string(),
-        scan_arguments: Vec::new(),
+        scan_arguments: Arguments::serialize_scan_args(&[i64_arg(version)]).unwrap_or_default(),
         timestamp_year: Some(year),
     }
 }
 
 /// A time-travel table: its current (highest-version) columns are the base
-/// schema; `catalog_table_get`/`scan_function_get` select per `at_value`.
+/// schema; `catalog_table_get`/`scan_function_get`/`scan_branches_get` select
+/// per `at_value`. The scan is NOT inlined — the C++ re-invokes the legacy scan
+/// path per query (carrying the AT clause), so each version resolves its own
+/// scan arguments without colliding in the inlined-scan bind cache.
 fn tt_table(name: &str, comment: &str, versions: Vec<TimeTravelVersion>) -> CatTable {
     let current = versions.iter().max_by_key(|v| v.version).expect("≥1 version");
     let mut t = dtable(
@@ -28,7 +33,8 @@ fn tt_table(name: &str, comment: &str, versions: Vec<TimeTravelVersion>) -> CatT
         comment,
     );
     t.scan_function = current.scan_function.clone();
-    t.inline_scan = true;
+    t.scan_arguments = current.scan_arguments.clone();
+    t.inline_scan = false;
     t.time_travel = versions;
     t
 }
@@ -213,15 +219,15 @@ fn data_tables() -> Vec<CatTable> {
         lm("late_mat_nulls", "Late-materialization table with NULLs in the ord column",
             vec![("null_ord_stride", i64_arg(7))]),
         tt_table("versioned_data", "Versioned data table demonstrating time travel with schema evolution", vec![
-            ttv(1, vec![f("id", Int64)], "versioned_data_v1_scan", 2020),
-            ttv(2, vec![f("id", Int64), f("name", Utf8), f("score", Float64), f("active", DataType::Boolean)], "versioned_data_v2_scan", 2021),
-            ttv(3, vec![f("id", Int64), f("score", Float64)], "versioned_data_v3_scan", 2022),
+            ttv(1, vec![f("id", Int64)], "versioned_data_scan", 2020),
+            ttv(2, vec![f("id", Int64), f("name", Utf8), f("score", Float64), f("active", DataType::Boolean)], "versioned_data_scan", 2021),
+            ttv(3, vec![f("id", Int64), f("score", Float64)], "versioned_data_scan", 2022),
         ]),
         {
             let mut t = tt_table("versioned_constraints", "Table with constraints that evolve across versions", vec![
-                ttv(1, vec![f("id", Int64), f("name", Utf8)], "versioned_constraints_v1_scan", 2020),
-                ttv(2, vec![f("id", Int64), f("name", Utf8), f("email", Utf8)], "versioned_constraints_v2_scan", 2021),
-                ttv(3, vec![f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64)], "versioned_constraints_v3_scan", 2022),
+                ttv(1, vec![f("id", Int64), f("name", Utf8)], "versioned_constraints_scan", 2020),
+                ttv(2, vec![f("id", Int64), f("name", Utf8), f("email", Utf8)], "versioned_constraints_scan", 2021),
+                ttv(3, vec![f("id", Int64), f("name", Utf8), f("email", Utf8), f("department_id", Int64)], "versioned_constraints_scan", 2022),
             ]);
             // V3 constraints (current): NOT NULL id/name, PK id, UNIQUE email,
             // FK department_id → data.departments(id).

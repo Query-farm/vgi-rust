@@ -23,15 +23,19 @@ fn main() {
     .format_timestamp_millis()
     .try_init();
 
+    let catalog_name = std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
+
     let mut worker = Worker::new();
     scalar::register(&mut worker);
-    table::register(&mut worker);
+    table::register(&mut worker, &catalog_name);
     table_in_out::register(&mut worker);
     buffering::register(&mut worker);
     aggregate::register(&mut worker);
     register_secrets_and_settings(&mut worker);
-    attach_options::register(&mut worker);
-    let catalog_name = std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
+    // `echo_attach_options` is only part of the attach_options catalog's surface.
+    if catalog_name == "attach_options" {
+        attach_options::register(&mut worker);
+    }
     let catalog = if catalog_name == "attach_options" {
         attach_options::catalog()
     } else {

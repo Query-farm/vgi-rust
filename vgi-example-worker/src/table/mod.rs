@@ -7,6 +7,8 @@ mod static_scan;
 mod partition;
 mod filters;
 mod more;
+mod versioned_scan;
+mod cancellable;
 mod proj_repro;
 
 use std::sync::Arc;
@@ -17,8 +19,8 @@ use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, Process
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
-/// Register all table fixtures.
-pub fn register(w: &mut vgi::Worker) {
+/// Register all table fixtures. `catalog_name` gates catalog-specific scans.
+pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     w.register_table(SequenceFunction);
     w.register_table(NestedSequenceFunction);
     w.register_table(TxCachedValueFunction);
@@ -31,13 +33,23 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakeSeriesCsv);
     w.register_table(MakeSeriesFloat);
     more::register(w);
-    proj_repro::register(w);
     filters::register(w);
+    cancellable::register(w);
     batch_index::register(w);
     partition::register(w);
     order_modes::register(w);
     static_scan::register(w);
+    versioned_scan::register(w);
     settings_fixtures::register(w);
+    // The versioned_tables catalog's per-table scan helpers only belong to
+    // that catalog's function surface.
+    if catalog_name == "versioned_tables" {
+        static_scan::register_versioned_tables(w);
+    }
+    // The `projection_repro` reproducer "app" (a separate catalog served by the
+    // same binary, selected by ATTACH name). Its functions are advertised only
+    // for that catalog — see Dispatcher function-advertisement filtering.
+    proj_repro::register(w);
 }
 
 fn schema_n() -> SchemaRef {
@@ -581,7 +593,7 @@ impl TableFunction for TenThousandFunction {
         "ten_thousand"
     }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Generates 10000 rows with integers from 0 to 9999", &["generator"])
+        gen_meta("Generates 10000 integers from 0 to 9999", &["generator"])
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![]
@@ -622,7 +634,12 @@ impl TableFunction for MakeSeries {
         "make_series"
     }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Generate a series of integers", &["generator"])
+        let desc = match self {
+            MakeSeries::Count => "Generate integers from 0 to count-1",
+            MakeSeries::Range => "Generate integers from start to stop-1",
+            MakeSeries::Step => "Generate integers from start to stop-1 with step",
+        };
+        gen_meta(desc, &["generator"])
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         match self {

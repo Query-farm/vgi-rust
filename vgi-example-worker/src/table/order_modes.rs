@@ -98,7 +98,7 @@ impl TableFunction for QueueSeqFunction {
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: "Queue-driven parallel sequence".to_string(),
+            description: "Generates a partitioned sequence for multi-worker execution".to_string(),
             categories: vec!["generator".into(), "utility".into()],
             order_preservation: self.order.map(|s| s.to_string()),
             ..Default::default()

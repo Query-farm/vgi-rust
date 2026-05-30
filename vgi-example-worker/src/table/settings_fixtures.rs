@@ -245,7 +245,7 @@ impl TableFunction for SettingsAwareFunction {
         "settings_aware"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta("Echoes setting values in output columns")
+        meta("Generates data demonstrating settings are passed")
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]
@@ -334,7 +334,7 @@ impl TableFunction for StructSettingsFunction {
         "struct_settings"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta("Sequence configured by a struct setting")
+        meta("Generate a sequence configured by a struct setting")
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]

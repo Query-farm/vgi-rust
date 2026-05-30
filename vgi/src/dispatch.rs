@@ -23,6 +23,12 @@ use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
 use crate::wire;
 
+/// The `projection_repro` reproducer app — a distinct catalog served by the
+/// example binary, selected by ATTACH name. Its functions (named with
+/// [`PROJ_REPRO_PREFIX`]) are advertised only for this catalog.
+const PROJ_REPRO_APP: &str = "projection_repro";
+const PROJ_REPRO_PREFIX: &str = "proj_repro";
+
 /// Shared dispatch state. Cloned (as `Arc`) into every RPC handler closure.
 pub struct Dispatcher {
     /// Catalog name → also the attach opaque-data plaintext.
@@ -728,6 +734,11 @@ impl Dispatcher {
             v.push(0);
             v.extend_from_slice(&self.attach_bytes());
             v
+        } else if dto.name == PROJ_REPRO_APP {
+            // The `projection_repro` reproducer is a distinct "app" served by the
+            // same binary, selected by ATTACH name. Echo it back so function
+            // advertisement (which is otherwise global) can scope to it.
+            PROJ_REPRO_APP.as_bytes().to_vec()
         } else {
             self.attach_bytes()
         };
@@ -1070,12 +1081,18 @@ impl Dispatcher {
         use crate::protocol::dtos::{ScanBranch, ScanBranchesResult};
         let schema_name = read_string_col(req, "schema_name")?;
         let table_name = read_string_col(req, "name")?;
-        let t = self
+        let at_unit = read_opt_string_col(req, "at_unit");
+        let at_value = read_opt_string_col(req, "at_value");
+        let base = self
             .schema_for_req(req, &schema_name)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
+        // Resolve the time-travel version so the default branch wraps the
+        // version's scan function + arguments (legacy non-inline path).
+        let resolved = Self::at_version(base, at_unit.as_deref(), at_value.as_deref())?;
+        let t = &resolved;
         let mk = |b: ScanBranch| -> Result<Bytes> {
             Ok(Bytes::from(ipc::write_batch(&wire::to_batch(b)?)?))
         };
@@ -1135,11 +1152,17 @@ impl Dispatcher {
         // rather than via a derived DTO (the derive can't emit a `type` field).
         let schema_name = read_string_col(req, "name")?;
         let type_filter = read_string_col(req, "type").unwrap_or_default();
+        // The `projection_repro` app's functions are advertised only for that
+        // catalog; every other catalog hides them (they share this binary).
+        let is_proj_repro = read_binary_col(req, "attach_opaque_data")
+            .map(|b| b == PROJ_REPRO_APP.as_bytes())
+            .unwrap_or(false);
+        let visible = |name: &str| name.starts_with(PROJ_REPRO_PREFIX) == is_proj_repro;
         let mut infos = Vec::new();
         if schema_name == catalog::MAIN_SCHEMA {
             let want = normalize_function_type(&type_filter);
             if want.as_deref() == Some("scalar") || want.is_none() {
-                let mut names: Vec<&String> = self.scalars.keys().collect();
+                let mut names: Vec<&String> = self.scalars.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
                     for f in &self.scalars[name] {
@@ -1149,21 +1172,21 @@ impl Dispatcher {
             }
             // Table-buffering functions also surface under a TABLE request.
             if matches!(want.as_deref(), Some("table") | Some("table_buffering")) || want.is_none() {
-                let mut names: Vec<&String> = self.tables.keys().collect();
+                let mut names: Vec<&String> = self.tables.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
                     for f in &self.tables[name] {
                         infos.push(catalog::table_function_info(f.as_ref())?);
                     }
                 }
-                let mut tio: Vec<&String> = self.tableinouts.keys().collect();
+                let mut tio: Vec<&String> = self.tableinouts.keys().filter(|n| visible(n)).collect();
                 tio.sort();
                 for name in tio {
                     for f in &self.tableinouts[name] {
                         infos.push(catalog::table_in_out_function_info(f.as_ref())?);
                     }
                 }
-                let mut buf: Vec<&String> = self.buffering.keys().collect();
+                let mut buf: Vec<&String> = self.buffering.keys().filter(|n| visible(n)).collect();
                 buf.sort();
                 for name in buf {
                     for f in &self.buffering[name] {
@@ -1172,7 +1195,7 @@ impl Dispatcher {
                 }
             }
             if matches!(want.as_deref(), Some("aggregate")) || want.is_none() {
-                let mut agg: Vec<&String> = self.aggregates.keys().collect();
+                let mut agg: Vec<&String> = self.aggregates.keys().filter(|n| visible(n)).collect();
                 agg.sort();
                 for name in agg {
                     for f in &self.aggregates[name] {

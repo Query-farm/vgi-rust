@@ -25,6 +25,9 @@ pub fn register(w: &mut vgi::Worker) {
         BufferInputFunction::new("crash_on_finalize")
             .finalize_error("Intentional exception during finalize()"),
     );
+    w.register_buffering(BufferInputFunction::new("crash_on_process").process_kill());
+    w.register_buffering(BufferInputFunction::new("hang_on_process").process_hang());
+    w.register_buffering(BufferInputFunction::new("slow_cancellable_buffering").pushdown());
     w.register_buffering(SumAllColumnsFunction::new("sum_all_columns"));
     w.register_buffering(
         SumAllColumnsFunction::new("exception_finalize")
@@ -96,6 +99,8 @@ pub struct BufferInputFunction {
     sink_ordered: bool,
     combine_error: Option<&'static str>,
     finalize_error: Option<&'static str>,
+    process_kill: bool,
+    process_hang: bool,
 }
 
 impl BufferInputFunction {
@@ -106,6 +111,8 @@ impl BufferInputFunction {
             sink_ordered: false,
             combine_error: None,
             finalize_error: None,
+            process_kill: false,
+            process_hang: false,
         }
     }
     fn pushdown(mut self) -> Self {
@@ -122,6 +129,16 @@ impl BufferInputFunction {
     }
     fn finalize_error(mut self, msg: &'static str) -> Self {
         self.finalize_error = Some(msg);
+        self
+    }
+    /// `crash_on_process` — SIGKILL the worker on the first `process()` call.
+    fn process_kill(mut self) -> Self {
+        self.process_kill = true;
+        self
+    }
+    /// `hang_on_process` — sleep indefinitely in `process()` (manual cancel test).
+    fn process_hang(mut self) -> Self {
+        self.process_hang = true;
         self
     }
 }
@@ -155,6 +172,14 @@ impl TableBufferingFunction for BufferInputFunction {
         })
     }
     fn process(&self, params: &BufferingParams, batch: &RecordBatch) -> Result<Vec<u8>> {
+        if self.process_kill {
+            // Abnormally terminate the worker (SIGABRT) — exercises the C++
+            // pool-drain/recovery path.
+            std::process::abort();
+        }
+        if self.process_hang {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
         params
             .storage
             .append(&params.execution_id, NS, b"", ipc::write_batch(batch)?);

@@ -15,6 +15,195 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(FilterEchoPartitionedFunction);
     w.register_table(DictFilterEchoFunction);
     w.register_table(DynamicFilterEchoFunction);
+    w.register_table(SpatialFilterExampleFunction);
+    w.register_table(ExpressionFilterTestFunction);
+}
+
+/// Little-endian WKB 2D point: byte_order=1, type=1 (Point), x, y.
+fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+    let mut v = vec![0x01, 0x01, 0x00, 0x00, 0x00];
+    v.extend_from_slice(&x.to_le_bytes());
+    v.extend_from_slice(&y.to_le_bytes());
+    v
+}
+
+/// `spatial_filter_example(count, batch_size := 1024)` — grid of points in
+/// [0,1)x[0,1) with a `geom` GEOMETRY (geoarrow.wkb) column for spatial filter
+/// pushdown testing. Point i: x=(i%cols)/cols, y=(i//cols)/cols, cols=ceil(sqrt(N)).
+pub struct SpatialFilterExampleFunction;
+impl SpatialFilterExampleFunction {
+    fn schema() -> SchemaRef {
+        let geom = Field::new("geom", DataType::Binary, true).with_metadata(
+            std::collections::HashMap::from([
+                ("ARROW:extension:name".to_string(), "geoarrow.wkb".to_string()),
+                ("ARROW:extension:metadata".to_string(), "{}".to_string()),
+            ]),
+        );
+        Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+            geom,
+        ]))
+    }
+}
+impl TableFunction for SpatialFilterExampleFunction {
+    fn name(&self) -> &str {
+        "spatial_filter_example"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Generates points on a grid with geometry for spatial filter testing"
+                .to_string(),
+            categories: vec!["generator".into(), "spatial".into(), "testing".into()],
+            projection_pushdown: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of points to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Rows per batch"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let c = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1024).max(1);
+        Ok(Box::new(SpatialProducer {
+            schema: Self::schema(),
+            total: count,
+            cols: ((count as f64).sqrt().ceil() as i64).max(1),
+            batch_size,
+            index: 0,
+        }))
+    }
+}
+
+struct SpatialProducer {
+    schema: SchemaRef,
+    total: i64,
+    cols: i64,
+    batch_size: i64,
+    index: i64,
+}
+impl TableProducer for SpatialProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        use arrow_array::BinaryArray;
+        if self.index >= self.total {
+            return Ok(None);
+        }
+        let size = (self.total - self.index).min(self.batch_size);
+        let ns: Vec<i64> = (self.index..self.index + size).collect();
+        let xs: Vec<f64> = ns.iter().map(|&i| (i % self.cols) as f64 / self.cols as f64).collect();
+        let ys: Vec<f64> = ns.iter().map(|&i| (i / self.cols) as f64 / self.cols as f64).collect();
+        let geoms: Vec<Vec<u8>> = xs.iter().zip(&ys).map(|(&x, &y)| wkb_point(x, y)).collect();
+        let geom_arr = BinaryArray::from_iter_values(geoms.iter().map(|g| g.as_slice()));
+        self.index += size;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ns)),
+                Arc::new(Float64Array::from(xs)),
+                Arc::new(Float64Array::from(ys)),
+                Arc::new(geom_arr),
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(batch))
+    }
+}
+
+/// `expression_filter_test(count, batch_size := 1024)` — rows with
+/// `{id, name='item_<i>', tags=['tag_<i%5>','tag_<(i+1)%5>'], score=i*1.1}` for
+/// non-spatial expression filter pushdown testing.
+pub struct ExpressionFilterTestFunction;
+impl ExpressionFilterTestFunction {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("score", DataType::Float64, true),
+        ]))
+    }
+}
+impl TableFunction for ExpressionFilterTestFunction {
+    fn name(&self) -> &str {
+        "expression_filter_test"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Generates rows for non-spatial expression filter testing".to_string(),
+            categories: vec!["generator".into(), "testing".into()],
+            projection_pushdown: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Rows per batch"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let c = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1024).max(1);
+        Ok(Box::new(ExprFilterProducer { schema: Self::schema(), total: count, batch_size, index: 0 }))
+    }
+}
+
+struct ExprFilterProducer {
+    schema: SchemaRef,
+    total: i64,
+    batch_size: i64,
+    index: i64,
+}
+impl TableProducer for ExprFilterProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        if self.index >= self.total {
+            return Ok(None);
+        }
+        let size = (self.total - self.index).min(self.batch_size);
+        let ids: Vec<i64> = (self.index..self.index + size).collect();
+        let names = StringArray::from(ids.iter().map(|i| format!("item_{i}")).collect::<Vec<_>>());
+        let scores = Float64Array::from(ids.iter().map(|&i| i as f64 * 1.1).collect::<Vec<_>>());
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        for &i in &ids {
+            tags.values().append_value(format!("tag_{}", i % 5));
+            tags.values().append_value(format!("tag_{}", (i + 1) % 5));
+            tags.append(true);
+        }
+        self.index += size;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(names), Arc::new(tags.finish()), Arc::new(scores)],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(batch))
+    }
 }
 
 /// `dynamic_filter_echo(count)` — descending integers; each batch's

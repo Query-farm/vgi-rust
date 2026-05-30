@@ -558,7 +558,14 @@ impl TableProducer for DoubleSeq {
 pub enum MakePairs { Int, Str, IntStr }
 impl TableFunction for MakePairs {
     fn name(&self) -> &str { "make_pairs" }
-    fn metadata(&self) -> FunctionMetadata { gen_meta("Generate pairs", false) }
+    fn metadata(&self) -> FunctionMetadata {
+        let desc = match self {
+            MakePairs::Int => "Generate integer pairs (i, i*2)",
+            MakePairs::Str => "Generate string pairs with prefix and suffix",
+            MakePairs::IntStr => "Generate mixed int/string pairs",
+        };
+        gen_meta(desc, false)
+    }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         match self {
             MakePairs::Int => vec![
