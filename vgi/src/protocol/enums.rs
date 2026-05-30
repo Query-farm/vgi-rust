@@ -21,9 +21,9 @@ pub mod function_type {
 
 /// `FunctionStability`.
 pub mod stability {
-    pub const CONSISTENT: &str = "consistent";
-    pub const VOLATILE: &str = "volatile";
-    pub const CONSISTENT_WITHIN_QUERY: &str = "consistent_within_query";
+    pub const CONSISTENT: &str = "CONSISTENT";
+    pub const VOLATILE: &str = "VOLATILE";
+    pub const CONSISTENT_WITHIN_QUERY: &str = "CONSISTENT_WITHIN_QUERY";
 }
 
 /// `NullHandling`.

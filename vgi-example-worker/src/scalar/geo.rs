@@ -107,7 +107,7 @@ impl ScalarFunction for GeoDistance {
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: format!("Euclidean distance between two {} points", self.0),
+            description: format!("Euclidean distance between two {} points", shape_phrase(self.0)),
             return_type: Some(DataType::Float64),
             ..Default::default()
         }
@@ -133,6 +133,14 @@ impl ScalarFunction for GeoDistance {
     }
 }
 
+/// Display phrase for a point-shape kind in function descriptions.
+fn shape_phrase(kind: &str) -> &str {
+    match kind {
+        "fixed" => "fixed-size list",
+        other => other,
+    }
+}
+
 /// `geo_centroid_<shape>(points...)` — average of N points → struct{lat,lon}.
 pub struct GeoCentroid(&'static str, DataType);
 impl ScalarFunction for GeoCentroid {
@@ -145,7 +153,7 @@ impl ScalarFunction for GeoCentroid {
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: format!("Centroid of N {} points", self.0),
+            description: format!("Centroid of N {} points", shape_phrase(self.0)),
             return_type: Some(point_struct_type()),
             ..Default::default()
         }

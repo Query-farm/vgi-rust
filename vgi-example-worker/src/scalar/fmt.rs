@@ -38,13 +38,19 @@ fn value_col(batch: &RecordBatch) -> Vec<Option<f64>> {
 pub enum FormatNumber { Default, Precision, Full }
 impl ScalarFunction for FormatNumber {
     fn name(&self) -> &str { "format_number" }
-    fn metadata(&self) -> FunctionMetadata { meta("Format a number") }
+    fn metadata(&self) -> FunctionMetadata {
+        meta(match self {
+            FormatNumber::Default => "Format number with default precision (0 decimals)",
+            FormatNumber::Precision => "Format number with specified precision",
+            FormatNumber::Full => "Format number with precision and prefix",
+        })
+    }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         match self {
-            FormatNumber::Default => vec![ArgSpec::any_column("value", 0, "Number")],
+            FormatNumber::Default => vec![ArgSpec::column("value", 0, "float64", "Number")],
             FormatNumber::Precision => vec![
                 ArgSpec::const_arg("precision", 0, "int64", "Decimals"),
-                ArgSpec::any_column("value", 1, "Number"),
+                ArgSpec::column("value", 1, "float64", "Number"),
             ],
             FormatNumber::Full => vec![
                 ArgSpec::const_arg("precision", 0, "int64", "Decimals"),
