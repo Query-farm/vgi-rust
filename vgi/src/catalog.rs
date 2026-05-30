@@ -362,9 +362,20 @@ pub fn aggregate_function_info(f: &dyn crate::aggregate::AggregateFunction) -> R
         input_schema: None,
         settings: crate::settings::Settings::default(),
     };
-    let out = match f.on_bind(&params) {
-        Ok(b) => b.output_schema,
-        Err(_) => Arc::new(Schema::new(vec![Field::new("result", DataType::Null, true)])),
+    // A fixed `return_type` in metadata wins (covers aggregates whose `on_bind`
+    // requires an input schema but still have a concrete output type).
+    let out = match (&meta.return_type, f.on_bind(&params)) {
+        (Some(ty), _) => Arc::new(Schema::new(vec![Field::new("result", ty.clone(), true)])),
+        (None, Ok(b)) => b.output_schema,
+        // on_bind needs the (unknown-at-registration) input schema — defer the
+        // type to bind via the `vgi:any` marker so DuckDB reports it as ANY.
+        (None, Err(_)) => {
+            let mut m = HashMap::new();
+            m.insert("vgi:any".to_string(), "true".to_string());
+            Arc::new(Schema::new(vec![
+                Field::new("result", DataType::Null, false).with_metadata(m),
+            ]))
+        }
     };
     fi.output_schema = Bytes::from(ipc::write_schema_ref(&out)?);
     Ok(fi)

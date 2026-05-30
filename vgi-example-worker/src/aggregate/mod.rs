@@ -24,6 +24,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(ListAggFunction);
     w.register_aggregate(PercentileFunction);
     w.register_aggregate(WindowSumFunction);
+    w.register_aggregate(WindowSumBatchFunction);
     w.register_aggregate(WindowMedianFunction);
     w.register_aggregate(WindowListAggFunction);
     w.register_aggregate(StreamingSumFunction);
@@ -289,6 +290,32 @@ impl AggregateFunction for WindowSumFunction {
             })
             .collect();
         Ok(Arc::new(out))
+    }
+}
+
+/// `vgi_window_sum_batch` — identical to `vgi_window_sum`, exercising the
+/// `window_batch` path (our `window()` already returns an `ArrayRef`).
+pub struct WindowSumBatchFunction;
+impl AggregateFunction for WindowSumBatchFunction {
+    fn name(&self) -> &str { "vgi_window_sum_batch" }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Windowed sum demonstrating window_batch returning pa.Array");
+        m.null_handling = Some(enums::null_handling::DEFAULT.into());
+        m.supports_window = true;
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> { WindowSumFunction.argument_specs() }
+    fn on_bind(&self, p: &AggregateBindParams) -> Result<BindResponse> { WindowSumFunction.on_bind(p) }
+    fn initial_state(&self) -> Vec<u8> { WindowSumFunction.initial_state() }
+    fn update(&self, s: &mut HashMap<i64, Vec<u8>>, g: &Int64Array, c: &[ArrayRef]) -> Result<()> {
+        WindowSumFunction.update(s, g, c)
+    }
+    fn combine(&self, t: Vec<u8>, s: Vec<u8>) -> Result<Vec<u8>> { WindowSumFunction.combine(t, s) }
+    fn finalize(&self, os: &Arc<Schema>, g: &Int64Array, st: &[Option<Vec<u8>>]) -> Result<RecordBatch> {
+        WindowSumFunction.finalize(os, g, st)
+    }
+    fn window(&self, p: &RecordBatch, os: &Arc<Schema>, f: &[Vec<(i64, i64)>], m: Option<&[bool]>) -> Result<ArrayRef> {
+        WindowSumFunction.window(p, os, f, m)
     }
 }
 
@@ -612,9 +639,13 @@ impl AggregateFunction for GenericSumFunction {
     }
     fn argument_specs(&self) -> Vec<ArgSpec> { vec![ArgSpec::any_column("value", 0, "Numeric value")] }
     fn on_bind(&self, p: &AggregateBindParams) -> Result<BindResponse> {
-        let ty = p.input_schema.as_ref()
+        // No input schema at registration → defer the type to bind (reported as
+        // ANY in FunctionInfo). At bind time the concrete input type is used.
+        let ty = p
+            .input_schema
+            .as_ref()
             .and_then(|s| s.fields().first().map(|f| f.data_type().clone()))
-            .unwrap_or(DataType::Float64);
+            .ok_or_else(|| RpcError::runtime_error("vgi_generic_sum: input type deferred to bind"))?;
         Ok(BindResponse { output_schema: result_schema(ty), opaque_data: Vec::new() })
     }
     fn initial_state(&self) -> Vec<u8> { le_f64(0.0) }
@@ -649,8 +680,8 @@ impl AggregateFunction for SumAllFunction {
         vec![ArgSpec::any_column("columns", 0, "Numeric columns").varargs()]
     }
     fn on_bind(&self, p: &AggregateBindParams) -> Result<BindResponse> {
-        let ncols = p.input_schema.as_ref().map(|s| s.fields().len()).unwrap_or(0);
-        if ncols == 0 {
+        let ncols = p.input_schema.as_ref().map(|s| s.fields().len());
+        if ncols == Some(0) {
             return Err(RpcError::value_error("vgi_sum_all requires at least 1 value"));
         }
         Ok(BindResponse { output_schema: result_schema(DataType::Float64), opaque_data: Vec::new() })
