@@ -142,6 +142,41 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
     register_void(srv, &disp, "catalog_transaction_rollback");
     register_void(srv, &disp, "catalog_detach");
 
+    // --- catalog-mutating DDL: accepted (pins the wire contract) then
+    //     rejected with `catalog is read-only` (the example catalog is r/o) ---
+    for name in [
+        "catalog_create",
+        "catalog_drop",
+        "catalog_schema_create",
+        "catalog_schema_drop",
+        "catalog_table_create",
+        "catalog_table_drop",
+        "catalog_table_rename",
+        "catalog_table_comment_set",
+        "catalog_table_column_add",
+        "catalog_table_column_drop",
+        "catalog_table_column_rename",
+        "catalog_table_column_type_change",
+        "catalog_table_column_default_set",
+        "catalog_table_column_default_drop",
+        "catalog_table_column_comment_set",
+        "catalog_table_not_null_set",
+        "catalog_table_not_null_drop",
+        "catalog_view_create",
+        "catalog_view_drop",
+        "catalog_view_rename",
+        "catalog_view_comment_set",
+        "catalog_macro_create",
+        "catalog_macro_drop",
+        "catalog_index_create",
+        "catalog_index_drop",
+    ] {
+        let d = disp.clone();
+        srv.register_unary(name, wire::result_binary_schema(), move |req, _ctx| {
+            d.handle_read_only(req)
+        });
+    }
+
     // --- schema discovery ---
     {
         let d = disp.clone();

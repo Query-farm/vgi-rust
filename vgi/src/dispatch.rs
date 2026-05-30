@@ -1404,6 +1404,13 @@ impl Dispatcher {
     pub fn handle_void(&self, _req: &Request) -> Result<Option<RecordBatch>> {
         Ok(None)
     }
+
+    /// Every catalog-mutating DDL RPC ends here: the example catalog is
+    /// read-only, so the request is accepted (proving the wire contract is
+    /// intact) and rejected with a clear `catalog is read-only` error.
+    pub fn handle_read_only(&self, _req: &Request) -> Result<Option<RecordBatch>> {
+        Err(RpcError::runtime_error("catalog is read-only"))
+    }
 }
 
 /// Serializable rebuild info for an exchange stream, so HTTP continuations can
