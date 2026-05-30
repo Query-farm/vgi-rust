@@ -170,6 +170,9 @@ pub struct BufferingParams {
     pub output_schema: SchemaRef,
     pub arguments: Arguments,
     pub settings: Settings,
+    /// DuckDB per-chunk batch index, when the function declares
+    /// `requires_input_batch_index` (only set on the process RPC).
+    pub batch_index: Option<i64>,
 }
 
 /// A table buffering (sink+source) function.

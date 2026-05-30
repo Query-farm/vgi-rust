@@ -196,6 +196,10 @@ pub struct FunctionMetadata {
     pub supports_batch_index: bool,
     pub partition_kind: Option<String>,
     pub order_preservation: Option<String>,
+    /// Table-buffering ordering knobs (surfaced in `FunctionInfo`).
+    pub sink_order_dependent: bool,
+    pub source_order_dependent: bool,
+    pub requires_input_batch_index: bool,
     /// Settings the function requires (surfaced in `FunctionInfo`).
     pub required_settings: Vec<String>,
 }
@@ -215,6 +219,9 @@ impl Default for FunctionMetadata {
             supports_batch_index: false,
             partition_kind: None,
             order_preservation: None,
+            sink_order_dependent: false,
+            source_order_dependent: false,
+            requires_input_batch_index: false,
             required_settings: Vec::new(),
         }
     }

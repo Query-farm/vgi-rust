@@ -356,6 +356,7 @@ impl Dispatcher {
                     output_schema: output_schema.clone(),
                     arguments: bp.arguments,
                     settings: bp.settings,
+                    batch_index: None,
                 };
                 let auto_apply = f.metadata().auto_apply_filters;
                 let filters = if auto_apply {
@@ -806,6 +807,7 @@ impl Dispatcher {
             output_schema,
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
+            batch_index: dto.batch_index,
         };
         let state_id = f.process(&params, &batch)?;
         Ok(Some(wire::to_result_batch(TableBufferingProcessResponse {
@@ -824,6 +826,7 @@ impl Dispatcher {
             output_schema,
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
+            batch_index: None,
         };
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();
         let finalize_ids = f.combine(&params, &state_ids)?;

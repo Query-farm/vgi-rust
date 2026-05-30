@@ -151,6 +151,9 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
         fi.partition_kind = enums::dict(pk);
     }
     fi.order_preservation = meta.order_preservation.as_deref().map(enums::dict);
+    fi.sink_order_dependent = meta.sink_order_dependent;
+    fi.source_order_dependent = meta.source_order_dependent;
+    fi.requires_input_batch_index = meta.requires_input_batch_index;
     fi.required_settings = meta.required_settings.clone();
 }
 
