@@ -69,6 +69,10 @@ pub trait TableFunction: Send + Sync {
     fn statistics(&self, _params: &BindParams) -> Option<Vec<crate::statistics::CatColStat>> {
         None
     }
+    /// Secret types this function needs (triggers the two-phase secret bind).
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        Vec::new()
+    }
     /// Build the per-execution producer. `params.output_schema` is the
     /// (possibly projection-narrowed) schema to emit.
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>>;

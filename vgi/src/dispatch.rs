@@ -265,6 +265,27 @@ impl Dispatcher {
         {
             let f = self.resolve_table(&dto.function_name, &params.arguments, params.input_schema.as_ref())?;
             params.arguments.remap_positional(&f.argument_specs());
+            // Two-phase secret bind: first pass requests the secret types; the
+            // C++ resolves them and re-binds with `resolved_secrets_provided`.
+            if !params.resolved_secrets_provided {
+                let lookups = f.secret_lookups(&params);
+                if !lookups.is_empty() {
+                    let resp = BindResponse {
+                        output_schema: Bytes::from(Vec::new()),
+                        opaque_data: Bytes::from(Vec::new()),
+                        lookup_secret_types: lookups.iter().map(|l| l.secret_type.clone()).collect(),
+                        lookup_scopes: lookups
+                            .iter()
+                            .map(|l| l.scope.clone().unwrap_or_default())
+                            .collect(),
+                        lookup_names: lookups
+                            .iter()
+                            .map(|l| l.name.clone().unwrap_or_default())
+                            .collect(),
+                    };
+                    return Ok(Some(wire::to_result_batch(resp)?));
+                }
+            }
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),

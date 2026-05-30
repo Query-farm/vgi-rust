@@ -14,6 +14,168 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(SettingsAwareFunction);
     w.register_table(StructSettingsFunction);
+    w.register_table(SecretDemoFunction);
+    w.register_table(ScopedSecretDemoFunction);
+}
+
+// ---------------------------------------------------------------------------
+// secret_demo() -> {key, value, arrow_type} from the vgi_example secret
+// ---------------------------------------------------------------------------
+
+fn arrow_type_of(field: &str) -> &'static str {
+    match field {
+        "port" => "int32",
+        "use_ssl" => "bool",
+        "timeout" => "double",
+        _ => "string",
+    }
+}
+
+struct SecretRows {
+    schema: SchemaRef,
+    rows: Vec<(String, String, String)>,
+    emitted: bool,
+}
+impl TableProducer for SecretRows {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        if self.rows.is_empty() {
+            return Ok(None);
+        }
+        let keys: Vec<&str> = self.rows.iter().map(|r| r.0.as_str()).collect();
+        let vals: Vec<&str> = self.rows.iter().map(|r| r.1.as_str()).collect();
+        let types: Vec<&str> = self.rows.iter().map(|r| r.2.as_str()).collect();
+        Ok(Some(
+            RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(keys)) as ArrayRef,
+                    Arc::new(StringArray::from(vals)) as ArrayRef,
+                    Arc::new(StringArray::from(types)) as ArrayRef,
+                ],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+}
+
+pub struct SecretDemoFunction;
+impl TableFunction for SecretDemoFunction {
+    fn name(&self) -> &str {
+        "secret_demo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Outputs secret contents as key-value rows")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![]
+    }
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
+        vec![vgi::secrets::SecretLookup { secret_type: "vgi_example".into(), scope: None, name: None }]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, true),
+                Field::new("value", DataType::Utf8, true),
+                Field::new("arrow_type", DataType::Utf8, true),
+            ])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let mut rows: Vec<(String, String, String)> = params
+            .secrets
+            .by_name
+            .get("vgi_example")
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.clone(), arrow_type_of(k).to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Box::new(SecretRows {
+            schema: params.output_schema.clone(),
+            rows,
+            emitted: false,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scoped_secret_demo(path) -> {scope, found, secret_keys}
+// ---------------------------------------------------------------------------
+
+struct ScopedRow {
+    schema: SchemaRef,
+    scope: String,
+    found: bool,
+    keys: String,
+    emitted: bool,
+}
+impl TableProducer for ScopedRow {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        Ok(Some(
+            RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![self.scope.clone()])) as ArrayRef,
+                    Arc::new(arrow_array::BooleanArray::from(vec![self.found])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![self.keys.clone()])) as ArrayRef,
+                ],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+}
+
+pub struct ScopedSecretDemoFunction;
+impl TableFunction for ScopedSecretDemoFunction {
+    fn name(&self) -> &str {
+        "scoped_secret_demo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Demo: resolves scoped secret based on argument")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("path", 0, "varchar", "Scope path for secret lookup")]
+    }
+    fn secret_lookups(&self, params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
+        let scope = params.arguments.const_str(0);
+        vec![vgi::secrets::SecretLookup { secret_type: "vgi_example".into(), scope, name: None }]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![
+                Field::new("scope", DataType::Utf8, true),
+                Field::new("found", DataType::Boolean, true),
+                Field::new("secret_keys", DataType::Utf8, true),
+            ])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let scope = params.arguments.const_str(0).unwrap_or_default();
+        let secret = params.secrets.by_name.get("vgi_example");
+        let found = secret.map(|m| !m.is_empty()).unwrap_or(false);
+        let mut keys: Vec<String> = secret.map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        keys.sort();
+        Ok(Box::new(ScopedRow {
+            schema: params.output_schema.clone(),
+            scope,
+            found,
+            keys: keys.join(","),
+            emitted: false,
+        }))
+    }
 }
 
 fn meta(desc: &str) -> FunctionMetadata {
