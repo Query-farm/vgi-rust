@@ -29,6 +29,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(StreamingSumFunction);
     w.register_aggregate(tensor::NestTensorFunction);
     w.register_scalar(tensor::UnnestTensorFunction);
+    w.register_table_in_out(tensor::UnnestTensorRowsFunction);
 }
 
 /// Build a stable byte key from the partition-key columns at row `i`.
