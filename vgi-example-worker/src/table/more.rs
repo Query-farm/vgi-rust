@@ -150,7 +150,18 @@ impl ConstantColumnsFunction {
         let mut fields = Vec::new();
         for i in 1..params.arguments.num_positional() {
             if let Some(a) = params.arguments.arg(i) {
-                fields.push(Field::new(format!("col_{}", i - 1), a.data_type().clone(), true));
+                let name = format!("col_{}", i - 1);
+                // Preserve any field-level metadata (e.g. DuckDB lossless
+                // `ARROW:extension:name` for HUGEINT/UUID) so the value decodes
+                // back to its original DuckDB type rather than a raw BLOB.
+                let meta = params
+                    .arguments
+                    .arg_field(i)
+                    .map(|f| f.metadata().clone())
+                    .unwrap_or_default();
+                fields.push(
+                    Field::new(name, a.data_type().clone(), true).with_metadata(meta),
+                );
             }
         }
         Arc::new(Schema::new(fields))

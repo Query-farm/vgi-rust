@@ -25,6 +25,9 @@ pub struct Arguments {
     pub named: HashMap<String, ArrayRef>,
     /// The schema of the positional args (field types), for bind-time use.
     pub schema: Option<SchemaRef>,
+    /// The original positional fields (with metadata, e.g. `ARROW:extension:name`),
+    /// indexed in lockstep with `positional`.
+    pub positional_fields: Vec<Option<Field>>,
 }
 
 impl Arguments {
@@ -64,8 +67,12 @@ impl Arguments {
             if !pos.is_empty() {
                 let max_idx = pos.iter().map(|(i, _)| *i).max().unwrap();
                 args.positional = vec![None; max_idx + 1];
+                args.positional_fields = vec![None; max_idx + 1];
                 for (i, a) in pos {
                     args.positional[i] = Some(a);
+                }
+                for (i, f) in &sfields {
+                    args.positional_fields[*i] = Some(f.clone());
                 }
                 sfields.sort_by_key(|(i, _)| *i);
                 let fields: Vec<Field> = sfields.into_iter().map(|(_, f)| f).collect();
@@ -154,6 +161,12 @@ impl Arguments {
     /// The 1-row array of the positional argument at `pos`, if present.
     pub fn arg(&self, pos: usize) -> Option<&ArrayRef> {
         self.positional.get(pos).and_then(|o| o.as_ref())
+    }
+
+    /// The original field (with metadata, e.g. extension names) of the
+    /// positional argument at `pos`, if present.
+    pub fn arg_field(&self, pos: usize) -> Option<&Field> {
+        self.positional_fields.get(pos).and_then(|o| o.as_ref())
     }
 
     fn nonnull(&self, pos: usize) -> Option<&ArrayRef> {
