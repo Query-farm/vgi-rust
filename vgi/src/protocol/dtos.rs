@@ -98,6 +98,13 @@ pub struct CardinalityRequest {
     pub bind_opaque_data: Option<Bytes>,
 }
 
+/// Response for `table_function_cardinality`.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CardinalityResponse {
+    pub estimate: Option<i64>,
+    pub max: Option<i64>,
+}
+
 /// One physical source backing a (possibly multi-branch) table scan.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {

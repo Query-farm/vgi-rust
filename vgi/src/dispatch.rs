@@ -784,6 +784,23 @@ impl Dispatcher {
         Ok(Some(wire::to_result_batch(catalog::scan_function_result(t)?)?))
     }
 
+    /// Per-call cardinality for a function-backed table scan.
+    pub fn handle_table_function_cardinality(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+        let dto: CardinalityRequest = boxed(req)?;
+        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bp = self.bind_params(&bind_call, ctx)?;
+        let card = self
+            .tables
+            .get(&bind_call.function_name)
+            .and_then(|v| v.first())
+            .and_then(|f| f.cardinality(&bp));
+        let resp = crate::protocol::dtos::CardinalityResponse {
+            estimate: Some(card.and_then(|c| c.estimate).unwrap_or(-1)),
+            max: Some(card.and_then(|c| c.max).unwrap_or(-1)),
+        };
+        Ok(Some(wire::to_result_batch(resp)?))
+    }
+
     /// Per-call statistics for a function-backed table scan (e.g. `sequence`).
     pub fn handle_table_function_statistics(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;

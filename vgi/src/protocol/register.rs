@@ -199,6 +199,14 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
             move |req, ctx| d.handle_table_function_statistics(req, ctx),
         );
     }
+    {
+        let d = disp.clone();
+        srv.register_unary(
+            "table_function_cardinality",
+            wire::result_binary_schema(),
+            move |req, ctx| d.handle_table_function_cardinality(req, ctx),
+        );
+    }
 
     // --- discovery methods that return empty lists for now ---
     for name in [
