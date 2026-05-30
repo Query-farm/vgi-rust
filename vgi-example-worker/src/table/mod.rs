@@ -22,6 +22,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(SequenceFunction);
     w.register_table(NestedSequenceFunction);
     w.register_table(TxCachedValueFunction);
+    w.register_table(ProfilingDemoFunction);
     w.register_table(TenThousandFunction);
     w.register_table(MakeSeries::Count);
     w.register_table(MakeSeries::Range);
@@ -174,6 +175,117 @@ impl TableFunction for SequenceFunction {
             batch_size,
             schema: schema_n(),
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// profiling_demo(count) -> {n: int64} + dynamic_to_string diagnostics
+// ---------------------------------------------------------------------------
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+pub struct ProfilingDemoFunction;
+impl TableFunction for ProfilingDemoFunction {
+    fn name(&self) -> &str {
+        "profiling_demo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta(
+            "Sequence generator publishing diagnostics under EXPLAIN ANALYZE",
+            &["generator", "utility"],
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+            ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
+            ArgSpec::const_arg("increment", -1, "int64", "Step between values"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let increment = params.arguments.named_i64("increment").unwrap_or(1);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1) as usize;
+        let values: Vec<i64> = (0..count).map(|i| i * increment).collect();
+        Ok(Box::new(ProfilingProducer {
+            values,
+            offset: 0,
+            batch_size,
+            schema: schema_n(),
+            store: params.storage.clone(),
+            exec: params.execution_id.clone(),
+            rows: 0,
+            batches: 0,
+            start_ns: now_nanos(),
+        }))
+    }
+    fn dynamic_to_string(
+        &self,
+        global_execution_id: &[u8],
+        storage: &vgi::buffering::BufferingStore,
+    ) -> Vec<(String, String)> {
+        let snap = storage.kv_get(global_execution_id, b"profiling");
+        let (rows, batches, start_ns) = match snap {
+            Some(b) if b.len() >= 24 => (
+                u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                u64::from_le_bytes(b[8..16].try_into().unwrap()),
+                u64::from_le_bytes(b[16..24].try_into().unwrap()),
+            ),
+            _ => (0, 0, now_nanos()),
+        };
+        let elapsed_ms = now_nanos().saturating_sub(start_ns) / 1_000_000;
+        vec![
+            ("rows_produced".to_string(), rows.to_string()),
+            ("batches_emitted".to_string(), batches.to_string()),
+            ("elapsed_ms".to_string(), elapsed_ms.to_string()),
+        ]
+    }
+}
+
+struct ProfilingProducer {
+    values: Vec<i64>,
+    offset: usize,
+    batch_size: usize,
+    schema: SchemaRef,
+    store: Option<Arc<vgi::buffering::BufferingStore>>,
+    exec: Vec<u8>,
+    rows: u64,
+    batches: u64,
+    start_ns: u64,
+}
+impl TableProducer for ProfilingProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.offset >= self.values.len() {
+            return Ok(None);
+        }
+        let end = (self.offset + self.batch_size).min(self.values.len());
+        let chunk = &self.values[self.offset..end];
+        let arr = Int64Array::from(chunk.to_vec());
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(arr)])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.rows += chunk.len() as u64;
+        self.batches += 1;
+        self.offset = end;
+        if let Some(store) = &self.store {
+            let mut snap = Vec::with_capacity(24);
+            snap.extend_from_slice(&self.rows.to_le_bytes());
+            snap.extend_from_slice(&self.batches.to_le_bytes());
+            snap.extend_from_slice(&self.start_ns.to_le_bytes());
+            store.kv_put(&self.exec, b"profiling", &snap);
+        }
+        Ok(Some(batch))
     }
 }
 

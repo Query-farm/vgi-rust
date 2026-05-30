@@ -76,6 +76,17 @@ pub trait TableFunction: Send + Sync {
     /// Build the per-execution producer. `params.output_schema` is the
     /// (possibly projection-narrowed) schema to emit.
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>>;
+
+    /// Post-execution diagnostics surfaced as Extra Info under EXPLAIN ANALYZE.
+    /// Reads whatever the producer persisted to `storage` keyed by
+    /// `global_execution_id`. Default: no extra info.
+    fn dynamic_to_string(
+        &self,
+        _global_execution_id: &[u8],
+        _storage: &crate::buffering::BufferingStore,
+    ) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// Narrow a full schema to the projected columns (`projection_ids`).

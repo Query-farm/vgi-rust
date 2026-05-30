@@ -157,6 +157,22 @@ pub struct AggregateWindowDestructorRequest {
     pub partition_id: i64,
 }
 
+/// `table_function_dynamic_to_string` — post-execution profiling info.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct DynamicToStringRequest {
+    pub bind_call: Bytes,
+    pub bind_opaque_data: Option<Bytes>,
+    pub global_execution_id: Bytes,
+}
+
+/// `table_function_dynamic_to_string` result — ordered key/value pairs
+/// surfaced as Extra Info under EXPLAIN ANALYZE.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct DynamicToStringResponse {
+    pub keys: Vec<String>,
+    pub values: Vec<String>,
+}
+
 /// `aggregate_streaming_open` — start a streaming-partitioned session.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct AggregateStreamingOpenRequest {

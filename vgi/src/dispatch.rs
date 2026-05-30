@@ -851,6 +851,21 @@ impl Dispatcher {
         Ok(Some(wire::to_result_batch(resp)?))
     }
 
+    /// Post-execution profiling info (EXPLAIN ANALYZE Extra Info).
+    pub fn handle_table_function_dynamic_to_string(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        use crate::protocol::dtos::{DynamicToStringRequest, DynamicToStringResponse};
+        let dto: DynamicToStringRequest = boxed(req)?;
+        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let pairs = self
+            .tables
+            .get(&bind_call.function_name)
+            .and_then(|v| v.first())
+            .map(|f| f.dynamic_to_string(&dto.global_execution_id.0, &self.store))
+            .unwrap_or_default();
+        let (keys, values): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
+        Ok(Some(wire::to_result_batch(DynamicToStringResponse { keys, values })?))
+    }
+
     /// Per-call statistics for a function-backed table scan (e.g. `sequence`).
     pub fn handle_table_function_statistics(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;

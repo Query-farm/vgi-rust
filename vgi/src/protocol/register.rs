@@ -270,6 +270,14 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
             move |req, ctx| d.handle_table_function_cardinality(req, ctx),
         );
     }
+    {
+        let d = disp.clone();
+        srv.register_unary(
+            "table_function_dynamic_to_string",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_table_function_dynamic_to_string(req),
+        );
+    }
 
     {
         let d = disp.clone();
