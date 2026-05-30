@@ -14,6 +14,38 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(FilterBySettingFunction);
     w.register_table_in_out(RepeatInputsFunction);
     w.register_table_in_out(SumAllColumnsSimpleDistributed);
+    w.register_table_in_out(SlowCancellableInOutFunction);
+}
+
+/// `slow_cancellable_inout(probe_path, input, sleep_ms)` — passthrough with a
+/// per-batch sleep and an `on_cancel` probe (the cancel path is exercised by
+/// the C++ extension; here it's a simple echo for registration + correctness).
+pub struct SlowCancellableInOutFunction;
+impl TableInOutFunction for SlowCancellableInOutFunction {
+    fn name(&self) -> &str {
+        "slow_cancellable_inout"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Slow table-in-out with on_cancel probe (test fixture)".to_string(),
+            categories: vec!["test".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("probe_path", 0, "varchar", "Path to append to when on_cancel fires"),
+            table_arg("data", 1),
+            ArgSpec::const_arg("sleep_ms", -1, "int64", "Sleep per batch (ms)"),
+        ]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        let ms = params.arguments.named_i64("sleep_ms").unwrap_or(50).max(0);
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms.min(50) as u64));
+        }
+        Ok(vec![project_batch(batch, &params.output_schema)?])
+    }
 }
 
 /// `sum_all_columns_simple_distributed(input)` — distributed column-wise sum.

@@ -452,8 +452,13 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         self.name
     }
     fn metadata(&self) -> FunctionMetadata {
+        let description = match self.name {
+            "exception_finalize" => "Test function that raises exception during finalize",
+            "exception_process" => "Test function that raises exception during process",
+            _ => "Computes column-wise sums across all batches",
+        };
         FunctionMetadata {
-            description: "Computes column-wise sums across all batches".to_string(),
+            description: description.to_string(),
             categories: vec!["aggregation".into(), "numeric".into()],
             ..Default::default()
         }
