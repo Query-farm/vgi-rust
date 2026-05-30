@@ -1,5 +1,6 @@
 //! Table (producer) example fixtures.
 
+mod filters;
 mod more;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakeSeries::Range);
     w.register_table(MakeSeries::Step);
     more::register(w);
+    filters::register(w);
 }
 
 fn schema_n() -> SchemaRef {

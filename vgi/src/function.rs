@@ -286,6 +286,8 @@ pub struct ProcessParams {
     pub projection_ids: Option<Vec<i64>>,
     /// Serialized pushdown filters (large_binary), if any.
     pub pushdown_filters: Option<Vec<u8>>,
+    /// Side join-keys IPC batches referenced by `join_keys` filters.
+    pub join_keys: Vec<Vec<u8>>,
     /// ORDER BY pushdown hints.
     pub order_by_column: Option<String>,
     pub order_by_direction: Option<String>,

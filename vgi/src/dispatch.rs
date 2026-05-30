@@ -330,6 +330,11 @@ impl Dispatcher {
             auth_principal: auth,
             projection_ids: dto.projection_ids.clone(),
             pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0),
+            join_keys: dto
+                .join_keys
+                .clone()
+                .map(|v| v.into_iter().map(|b| b.0).collect())
+                .unwrap_or_default(),
             order_by_column: dto.order_by_column_name.clone(),
             order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
             order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
@@ -368,7 +373,7 @@ impl Dispatcher {
                     None
                 };
                 let producer = f.finalize_producer(&bparams, fsid)?;
-                let state = TableProducerState { inner: producer, filters };
+                let state = TableProducerState { inner: producer, filters, project_to: None };
                 return Ok(StreamResult::producer(output_schema, Box::new(state))
                     .with_header(header));
             }
@@ -382,6 +387,7 @@ impl Dispatcher {
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
+                project_to: None,
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -396,7 +402,7 @@ impl Dispatcher {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
+                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
                     .transpose()?
             } else {
                 None
@@ -436,18 +442,24 @@ impl Dispatcher {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
+                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
                     .transpose()?
             } else {
                 None
             };
+            // Always narrow each emitted batch to the wire output schema by
+            // name: producers may emit their full natural schema (so an
+            // auto-applied filter can reference a projected-out column, e.g.
+            // `SELECT pushed_filters ... WHERE n != 5`), while DuckDB has
+            // pre-narrowed the output via projection pushdown.
+            let project_to = Some(output_schema.clone());
             let producer = f.producer(&params)?;
             let header = wire::to_batch(GlobalInitResponse {
                 execution_id: Bytes::from(execution_id),
                 max_workers,
                 opaque_data: None,
             })?;
-            let state = TableProducerState { inner: producer, filters };
+            let state = TableProducerState { inner: producer, filters, project_to };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
 
@@ -549,6 +561,7 @@ impl Dispatcher {
             auth_principal: None,
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
+            join_keys: Vec::new(),
             order_by_column: None,
             order_by_direction: None,
             order_by_null_order: None,
@@ -565,7 +578,7 @@ impl Dispatcher {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
+                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
                     .transpose()?
             } else {
                 None
@@ -1045,6 +1058,9 @@ impl ExchangeState for TableInOutExchangeState {
 struct TableProducerState {
     inner: Box<dyn TableProducer>,
     filters: Option<crate::pushdown::PushdownFilters>,
+    /// When set, narrow each (post-filter) batch to this projected schema —
+    /// the producer emitted the full schema so filters could see all columns.
+    project_to: Option<arrow_schema::SchemaRef>,
 }
 
 impl vgi_rpc::ProducerState for TableProducerState {
@@ -1057,6 +1073,10 @@ impl vgi_rpc::ProducerState for TableProducerState {
             Some(batch) => {
                 let batch = match &self.filters {
                     Some(f) => f.apply(&batch)?,
+                    None => batch,
+                };
+                let batch = match &self.project_to {
+                    Some(ps) => crate::table_in_out::project_batch(&batch, ps)?,
                     None => batch,
                 };
                 out.emit(batch)

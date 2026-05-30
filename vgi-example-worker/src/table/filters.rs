@@ -1,0 +1,213 @@
+//! Filter-pushdown diagnostic table fixtures (`filter_echo`, `value_prune`).
+
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
+use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi_rpc::{Result, RpcError};
+
+pub fn register(w: &mut vgi::Worker) {
+    w.register_table(FilterEchoFunction);
+    w.register_table(ValuePruneFunction);
+}
+
+fn meta(desc: &str) -> FunctionMetadata {
+    FunctionMetadata {
+        description: desc.to_string(),
+        categories: vec!["generator".into(), "diagnostic".into()],
+        projection_pushdown: true,
+        filter_pushdown: true,
+        auto_apply_filters: true,
+        ..Default::default()
+    }
+}
+
+/// The SQL-like string of whatever DuckDB pushed down ("(none)" if nothing).
+fn pushed_filter_str(params: &ProcessParams) -> String {
+    match &params.pushdown_filters {
+        Some(bytes) => vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
+            .map(|f| f.format_pushed())
+            .unwrap_or_else(|_| "(none)".to_string()),
+        None => "(none)".to_string(),
+    }
+}
+
+fn args_count_batchsize() -> Vec<ArgSpec> {
+    vec![
+        ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
+        ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// filter_echo(count) -> {n, s, pushed_filters}
+// ---------------------------------------------------------------------------
+
+fn filter_echo_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("s", DataType::Utf8, true),
+        Field::new("pushed_filters", DataType::Utf8, true),
+    ]))
+}
+
+struct FilterEchoProducer {
+    schema: SchemaRef,
+    remaining: i64,
+    cursor: i64,
+    batch_size: i64,
+    filter_str: String,
+}
+impl TableProducer for FilterEchoProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.remaining <= 0 {
+            return Ok(None);
+        }
+        let size = self.remaining.min(self.batch_size);
+        let ns: Vec<i64> = (self.cursor..self.cursor + size).collect();
+        let ss: Vec<String> = ns.iter().map(|i| format!("row_{i}")).collect();
+        let fs: Vec<&str> = vec![self.filter_str.as_str(); size as usize];
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ns)) as ArrayRef,
+                Arc::new(StringArray::from(ss)) as ArrayRef,
+                Arc::new(StringArray::from(fs)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor += size;
+        self.remaining -= size;
+        Ok(Some(batch))
+    }
+}
+
+pub struct FilterEchoFunction;
+impl TableFunction for FilterEchoFunction {
+    fn name(&self) -> &str {
+        "filter_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Echoes pushed-down filter predicates in output")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        args_count_batchsize()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: filter_echo_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        Ok(Box::new(FilterEchoProducer {
+            schema: filter_echo_schema(),
+            remaining: count,
+            cursor: 0,
+            batch_size,
+            filter_str: pushed_filter_str(params),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// value_prune(count) -> {n, resolved} — emits only get_column_values('n')
+// ---------------------------------------------------------------------------
+
+fn value_prune_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("resolved", DataType::Utf8, true),
+    ]))
+}
+
+struct ValuePruneProducer {
+    schema: SchemaRef,
+    values: Vec<i64>,
+    resolved: String,
+    cursor: usize,
+    batch_size: usize,
+}
+impl TableProducer for ValuePruneProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.cursor >= self.values.len() {
+            return Ok(None);
+        }
+        let end = (self.cursor + self.batch_size).min(self.values.len());
+        let chunk = &self.values[self.cursor..end];
+        let resolved: Vec<&str> = vec![self.resolved.as_str(); chunk.len()];
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(chunk.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(resolved)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor = end;
+        Ok(Some(batch))
+    }
+}
+
+pub struct ValuePruneFunction;
+impl TableFunction for ValuePruneFunction {
+    fn name(&self) -> &str {
+        "value_prune"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Prunes the key set via get_column_values('n'); echoes the resolved discrete values")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        args_count_batchsize()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: value_prune_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1) as usize;
+        let discrete = params
+            .pushdown_filters
+            .as_ref()
+            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .and_then(|f| f.get_column_values("n"));
+        let (values, resolved) = match discrete {
+            Some(mut vs) => {
+                vs.sort_unstable();
+                vs.dedup();
+                let resolved = vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+                let emit: Vec<i64> = vs.into_iter().filter(|&v| v >= 0 && v < count).collect();
+                (emit, resolved)
+            }
+            None => ((0..count).collect(), "(scan)".to_string()),
+        };
+        Ok(Box::new(ValuePruneProducer {
+            schema: value_prune_schema(),
+            values,
+            resolved,
+            cursor: 0,
+            batch_size,
+        }))
+    }
+}

@@ -8,12 +8,50 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, Scalar, StringArray};
 use arrow_buffer::BooleanBuffer;
 use serde::Deserialize;
 use vgi_rpc::{Result, RpcError};
 
 use crate::ipc;
+
+/// SQL comparison symbol for a VGI op token (matches Python `op.symbol`).
+fn op_symbol(op: &str) -> &'static str {
+    match op {
+        "eq" => "=",
+        "ne" => "!=",
+        "lt" => "<",
+        "le" => "<=",
+        "gt" => ">",
+        "ge" => ">=",
+        _ => "?",
+    }
+}
+
+/// Render a scalar at `i` the way the Python fixtures do: strings single-quoted,
+/// booleans as `True`/`False`, nulls as `NULL`, everything else via its display.
+fn fmt_scalar(arr: &ArrayRef, i: usize) -> String {
+    use arrow_schema::DataType;
+    if arr.is_null(i) {
+        return "NULL".to_string();
+    }
+    match arr.data_type() {
+        DataType::Utf8 => format!("'{}'", arr.as_string::<i32>().value(i)),
+        DataType::LargeUtf8 => format!("'{}'", arr.as_string::<i64>().value(i)),
+        DataType::Boolean => {
+            if arr.as_boolean().value(i) {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        _ => arrow_cast::cast(&arr.slice(i, 1), &DataType::Utf8)
+            .ok()
+            .map(|a| a.as_string::<i32>().value(0).to_string())
+            .unwrap_or_default(),
+    }
+}
 
 #[derive(Deserialize)]
 struct FilterSpec {
@@ -27,6 +65,9 @@ struct FilterSpec {
     op: Option<String>,
     #[serde(default)]
     value_ref: Option<usize>,
+    /// `join_keys` filters reference a column in the side join-keys batches.
+    #[serde(default)]
+    keys_column: Option<String>,
     #[serde(default)]
     children: Vec<FilterSpec>,
     #[serde(default)]
@@ -37,11 +78,19 @@ struct FilterSpec {
 pub struct PushdownFilters {
     specs: Vec<FilterSpec>,
     values: Vec<ArrayRef>, // value_ref N → values[N]
+    /// `keys_column` → values, from the InitRequest join-keys batches.
+    join_keys: std::collections::HashMap<String, ArrayRef>,
 }
 
 impl PushdownFilters {
-    /// Parse the `pushdown_filters` IPC blob.
+    /// Parse the `pushdown_filters` IPC blob (no join keys).
     pub fn parse(bytes: &[u8]) -> Result<PushdownFilters> {
+        Self::parse_with_join_keys(bytes, &[])
+    }
+
+    /// Parse the filter blob, resolving `join_keys` filters against the
+    /// supplied side join-keys IPC batches (one column each).
+    pub fn parse_with_join_keys(bytes: &[u8], join_keys: &[Vec<u8>]) -> Result<PushdownFilters> {
         let batch = ipc::read_batch(bytes)?;
         if batch.num_columns() == 0 {
             return Err(RpcError::value_error("filter batch has no columns"));
@@ -60,7 +109,22 @@ impl PushdownFilters {
         let values: Vec<ArrayRef> = (1..batch.num_columns())
             .map(|i| batch.column(i).clone())
             .collect();
-        Ok(PushdownFilters { specs, values })
+        let mut jk = std::collections::HashMap::new();
+        for blob in join_keys {
+            if let Ok(b) = ipc::read_batch(blob) {
+                for (i, f) in b.schema().fields().iter().enumerate() {
+                    jk.insert(f.name().clone(), b.column(i).clone());
+                }
+            }
+        }
+        Ok(PushdownFilters { specs, values, join_keys: jk })
+    }
+
+    /// Resolve the value array for a `join_keys` filter spec.
+    fn join_value(&self, spec: &FilterSpec) -> Option<&ArrayRef> {
+        spec.keys_column
+            .as_ref()
+            .and_then(|c| self.join_keys.get(c))
     }
 
     /// Filter `batch` to the rows that satisfy all top-level filters.
@@ -104,6 +168,137 @@ impl PushdownFilters {
             .ok_or_else(|| RpcError::value_error(format!("value_ref {r} out of range")))
     }
 
+    /// Format the pushed-down filters as a human-readable SQL-like string,
+    /// matching the Python fixtures' `_format_pushed_filters`. Returns
+    /// `"(none)"` when there are no filters.
+    pub fn format_pushed(&self) -> String {
+        if self.specs.is_empty() {
+            return "(none)".to_string();
+        }
+        let parts: Vec<String> = self.specs.iter().map(|s| self.format_one(s, None)).collect();
+        if parts.is_empty() {
+            "(none)".to_string()
+        } else {
+            parts.join(" AND ")
+        }
+    }
+
+    fn format_one(&self, spec: &FilterSpec, col_override: Option<&str>) -> String {
+        let col = col_override.unwrap_or(&spec.column_name);
+        match spec.kind.as_str() {
+            "is_null" => format!("{col} IS NULL"),
+            "is_not_null" => format!("{col} IS NOT NULL"),
+            "constant" => {
+                let sym = op_symbol(spec.op.as_deref().unwrap_or("eq"));
+                let v = self
+                    .value(spec)
+                    .ok()
+                    .map(|a| fmt_scalar(a, 0))
+                    .unwrap_or_default();
+                format!("{col} {sym} {v}")
+            }
+            "in" => match self.value(spec) {
+                Ok(vals) if vals.len() > 20 => format!("{col} IN ({} values)", vals.len()),
+                Ok(vals) => {
+                    let items: Vec<String> = (0..vals.len()).map(|i| fmt_scalar(vals, i)).collect();
+                    format!("{col} IN ({})", items.join(", "))
+                }
+                Err(_) => format!("{col} IN ()"),
+            },
+            "join_keys" => match self.join_value(spec) {
+                Some(vals) if vals.len() > 20 => format!("{col} IN ({} values)", vals.len()),
+                Some(vals) => {
+                    let items: Vec<String> = (0..vals.len()).map(|i| fmt_scalar(vals, i)).collect();
+                    format!("{col} IN ({})", items.join(", "))
+                }
+                None => format!("{col} IN ()"),
+            },
+            "and" => {
+                let parts: Vec<String> =
+                    spec.children.iter().map(|c| self.format_one(c, None)).collect();
+                format!("({})", parts.join(" AND "))
+            }
+            "or" => {
+                let parts: Vec<String> =
+                    spec.children.iter().map(|c| self.format_one(c, None)).collect();
+                format!("({})", parts.join(" OR "))
+            }
+            "struct" => match &spec.child_filter {
+                Some(child) => {
+                    let nested = format!("{}.{}", spec.column_name, child.column_name);
+                    self.format_one(child, Some(&nested))
+                }
+                None => col.to_string(),
+            },
+            other => other.to_string(),
+        }
+    }
+
+    /// Resolve the discrete value set for a column from the pushed-down
+    /// filters (the partition-pruning idiom). Returns `None` when the
+    /// predicate is not enumerable (no filter, bare range, OR with a
+    /// non-discrete branch). Mirrors Python `get_column_values`.
+    pub fn get_column_values(&self, column: &str) -> Option<Vec<i64>> {
+        let mut acc: Option<Vec<i64>> = None;
+        for spec in &self.specs {
+            let vs = self.column_values_of(spec, column)?;
+            // AND across top-level filters: intersect discrete sets.
+            acc = Some(match acc {
+                None => vs,
+                Some(prev) => prev.into_iter().filter(|v| vs.contains(v)).collect(),
+            });
+        }
+        acc
+    }
+
+    fn column_values_of(&self, spec: &FilterSpec, column: &str) -> Option<Vec<i64>> {
+        match spec.kind.as_str() {
+            "in" if spec.column_name == column => {
+                let vals = self.value(spec).ok()?;
+                let casted = arrow_cast::cast(vals, &arrow_schema::DataType::Int64).ok()?;
+                let a = casted.as_primitive::<arrow_array::types::Int64Type>();
+                Some((0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect())
+            }
+            "join_keys" if spec.column_name == column => {
+                let vals = self.join_value(spec)?;
+                let casted = arrow_cast::cast(vals, &arrow_schema::DataType::Int64).ok()?;
+                let a = casted.as_primitive::<arrow_array::types::Int64Type>();
+                Some((0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect())
+            }
+            "constant" if spec.column_name == column && spec.op.as_deref() == Some("eq") => {
+                let vals = self.value(spec).ok()?;
+                let casted = arrow_cast::cast(vals, &arrow_schema::DataType::Int64).ok()?;
+                let a = casted.as_primitive::<arrow_array::types::Int64Type>();
+                a.is_valid(0).then(|| vec![a.value(0)])
+            }
+            "and" => {
+                // Any AND-child that enumerates the column resolves the set.
+                let mut acc: Option<Vec<i64>> = None;
+                for c in &spec.children {
+                    if let Some(vs) = self.column_values_of(c, column) {
+                        acc = Some(match acc {
+                            None => vs,
+                            Some(prev) => prev.into_iter().filter(|v| vs.contains(v)).collect(),
+                        });
+                    }
+                }
+                acc
+            }
+            "or" => {
+                // Union — but only if EVERY branch enumerates the column.
+                let mut out = Vec::new();
+                for c in &spec.children {
+                    let vs = self.column_values_of(c, column)?;
+                    out.extend(vs);
+                }
+                out.sort_unstable();
+                out.dedup();
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     fn eval_spec(&self, spec: &FilterSpec, batch: &RecordBatch) -> Result<BooleanArray> {
         let n = batch.num_rows();
         match spec.kind.as_str() {
@@ -124,6 +319,15 @@ impl PushdownFilters {
                 let col = self.column(spec, batch)?;
                 let vals = self.value(spec)?;
                 in_list(col, vals)
+            }
+            "join_keys" => {
+                let col = self.column(spec, batch)?;
+                match self.join_value(spec) {
+                    // No join-keys batch available — graceful degradation:
+                    // pass every row through and let DuckDB filter client-side.
+                    None => Ok(all_true(n)),
+                    Some(vals) => in_list(col, vals),
+                }
             }
             "and" => {
                 let mut acc = all_true(n);
@@ -183,6 +387,7 @@ fn clone_spec(s: &FilterSpec) -> FilterSpec {
         column_index: s.column_index,
         op: s.op.clone(),
         value_ref: s.value_ref,
+        keys_column: s.keys_column.clone(),
         children: s.children.iter().map(clone_spec).collect(),
         child_filter: s.child_filter.as_ref().map(|c| Box::new(clone_spec(c))),
     }
