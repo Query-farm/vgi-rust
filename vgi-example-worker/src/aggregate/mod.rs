@@ -1,5 +1,7 @@
 //! Aggregate example fixtures.
 
+mod tensor;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,6 +27,8 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(WindowMedianFunction);
     w.register_aggregate(WindowListAggFunction);
     w.register_aggregate(StreamingSumFunction);
+    w.register_aggregate(tensor::NestTensorFunction);
+    w.register_scalar(tensor::UnnestTensorFunction);
 }
 
 /// Build a stable byte key from the partition-key columns at row `i`.
@@ -380,7 +384,7 @@ impl PercentileFunction {
     }
 }
 
-fn agg_meta(desc: &str) -> FunctionMetadata {
+pub(crate) fn agg_meta(desc: &str) -> FunctionMetadata {
     FunctionMetadata {
         description: desc.to_string(),
         order_preservation: None,
