@@ -85,3 +85,32 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
         let _ = t.join();
     }
 }
+
+/// Serve over HTTP: bind a TCP port, announce it with `PORT:<n>`, and serve
+/// the axum router. An optional `authenticate` callback enables bearer auth.
+pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenticate>) {
+    server.notify_transport(TransportKind::Http, TransportCapabilities::none());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let mut builder = vgi_rpc::http::HttpState::builder()
+            .server(server)
+            // Sticky sessions for the versioned HTTP fixtures' cookie routing.
+            .enable_sticky(true);
+        if let Some(auth) = authenticate {
+            builder = builder.authenticate(auth);
+        }
+        let state = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp");
+        let port = listener.local_addr().unwrap().port();
+        println!("PORT:{port}");
+        io::stdout().flush().ok();
+        vgi_rpc::http::serve_with_shutdown(state, listener)
+            .await
+            .expect("axum serve");
+    });
+}

@@ -101,6 +101,11 @@ impl Worker {
         let args: Vec<String> = std::env::args().collect();
         let server = Arc::new(self.build_server());
 
+        if args.iter().any(|a| a == "--http") {
+            crate::transport::serve_http(server, build_authenticate());
+            return;
+        }
+
         if let Some(i) = args.iter().position(|a| a == "--unix") {
             let path = args
                 .get(i + 1)
@@ -118,4 +123,44 @@ impl Worker {
 
         crate::transport::serve_stdio(server);
     }
+}
+
+/// Build the HTTP bearer-auth callback from the environment. Returns `None`
+/// (anonymous-only) unless `VGI_BEARER_TOKENS` (`token=principal,…`) or
+/// `VGI_TEST_BEARER_TOKEN` is set. A bearer token that is *present but invalid*
+/// is rejected (401); a missing token is allowed as anonymous so the same
+/// server can serve the non-auth tests.
+fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
+    let mut tokens: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(pairs) = std::env::var("VGI_BEARER_TOKENS") {
+        for pair in pairs.split(',') {
+            if let Some((tok, principal)) = pair.split_once('=') {
+                tokens.insert(tok.trim().to_string(), principal.trim().to_string());
+            }
+        }
+    }
+    if let Ok(tok) = std::env::var("VGI_TEST_BEARER_TOKEN") {
+        tokens.entry(tok).or_insert_with(|| "test-principal".to_string());
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(move |req: &vgi_rpc::AuthRequest<'_>| {
+        let token = req
+            .header("authorization")
+            .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
+            .map(|t| t.trim());
+        match token {
+            None => Ok(vgi_rpc::AuthContext::anonymous()),
+            Some(tok) => match tokens.get(tok) {
+                Some(principal) => Ok(vgi_rpc::AuthContext {
+                    domain: "bearer".to_string(),
+                    authenticated: true,
+                    principal: principal.clone(),
+                    claims: Default::default(),
+                }),
+                None => Err(vgi_rpc::RpcError::permission_error("bearer token was rejected")),
+            },
+        }
+    }))
 }

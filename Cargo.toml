@@ -11,7 +11,7 @@ authors = ["Query Farm LLC <hello@query.farm>"]
 homepage = "https://query.farm"
 
 [workspace.dependencies]
-vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc", default-features = false, features = ["macros"] }
+vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc", default-features = false, features = ["macros", "http"] }
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 arrow-array = "58"
 arrow-buffer = "58"
