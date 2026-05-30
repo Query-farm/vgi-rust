@@ -22,6 +22,8 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakeSeries::Count);
     w.register_table(MakeSeries::Range);
     w.register_table(MakeSeries::Step);
+    w.register_table(MakeSeriesCsv);
+    w.register_table(MakeSeriesFloat);
     more::register(w);
     filters::register(w);
     batch_index::register(w);
@@ -267,5 +269,73 @@ impl TableFunction for MakeSeries {
             batch_size: 1024,
             schema: schema_value(),
         }))
+    }
+}
+
+/// `make_series(csv)` — parse a comma-separated integer string into rows.
+pub struct MakeSeriesCsv;
+impl TableFunction for MakeSeriesCsv {
+    fn name(&self) -> &str {
+        "make_series"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta("Parse comma-separated integers into rows", &["generator"])
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("values", 0, "varchar", "Comma-separated integers")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: schema_value(), opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let csv = params.arguments.const_str(0).unwrap_or_default();
+        let values: Vec<i64> = csv
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .collect();
+        Ok(Box::new(Countdown { values, offset: 0, batch_size: 1024, schema: schema_value() }))
+    }
+}
+
+/// `make_series(step)` — 10 float values `0.0, step, 2*step, … 9*step`.
+pub struct MakeSeriesFloat;
+fn schema_value_f64() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("value", DataType::Float64, true)]))
+}
+struct FloatSeq {
+    values: Vec<f64>,
+    emitted: bool,
+    schema: SchemaRef,
+}
+impl TableProducer for FloatSeq {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let arr = arrow_array::Float64Array::from(self.values.clone());
+        Ok(Some(
+            RecordBatch::try_new(self.schema.clone(), vec![Arc::new(arr)])
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+}
+impl TableFunction for MakeSeriesFloat {
+    fn name(&self) -> &str {
+        "make_series"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta("Generate 10 float values with given step size", &["generator"])
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("step", 0, "float64", "Step size between values")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: schema_value_f64(), opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let step = params.arguments.const_f64(0).unwrap_or(1.0);
+        let values: Vec<f64> = (0..10).map(|i| i as f64 * step).collect();
+        Ok(Box::new(FloatSeq { values, emitted: false, schema: schema_value_f64() }))
     }
 }
