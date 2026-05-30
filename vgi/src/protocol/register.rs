@@ -119,7 +119,7 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
         srv.register_unary(
             "table_buffering_process",
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_buffering_process(req),
+            move |req, ctx| d.handle_buffering_process(req, ctx),
         );
     }
     {
@@ -127,7 +127,7 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
         srv.register_unary(
             "table_buffering_combine",
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_buffering_combine(req),
+            move |req, ctx| d.handle_buffering_combine(req, ctx),
         );
     }
     {

@@ -417,6 +417,14 @@ impl SumAllColumnsFunction {
         self.process_every_other = true;
         self
     }
+    /// Whether the `logging` flag (persisted at sink init) is set for this run.
+    fn logging_enabled(params: &BufferingParams) -> bool {
+        params
+            .storage
+            .kv_get(&params.execution_id, b"bufflags")
+            .map(|b| b.first() == Some(&1))
+            .unwrap_or(false)
+    }
     /// Sum one (already int64/float64-typed) column to a 1-element array.
     fn sum_column(field_type: &DataType, col: &ArrayRef) -> Result<ArrayRef> {
         let cast = arrow_cast::cast(col, field_type)
@@ -451,7 +459,10 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![table_arg()]
+        vec![
+            table_arg(),
+            ArgSpec::const_arg("logging", -1, "boolean", "Emit per-batch INFO logs"),
+        ]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
         let input = params
@@ -503,6 +514,9 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             }
             return Ok(params.execution_id.clone());
         }
+        if Self::logging_enabled(params) {
+            params.log(format!("Processing batch with {} rows", batch.num_rows()));
+        }
         let out = &params.output_schema;
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(out.fields().len());
         for f in out.fields() {
@@ -518,7 +532,10 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             .append(&params.execution_id, PARTIAL_NS, b"", ipc::write_batch(&partial)?);
         Ok(params.execution_id.clone())
     }
-    fn combine(&self, params: &BufferingParams, _state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    fn combine(&self, params: &BufferingParams, state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        if Self::logging_enabled(params) {
+            params.log(format!("Combining {} state_ids", state_ids.len()));
+        }
         let out = &params.output_schema;
         let mut int_acc: Vec<i64> = vec![0; out.fields().len()];
         let mut flt_acc: Vec<f64> = vec![0.0; out.fields().len()];

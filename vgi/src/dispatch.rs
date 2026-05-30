@@ -399,6 +399,7 @@ impl Dispatcher {
                     arguments: bp.arguments,
                     settings: bp.settings,
                     batch_index: None,
+                    logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
                 let auto_apply = f.metadata().auto_apply_filters;
                 let filters = if auto_apply {
@@ -421,6 +422,13 @@ impl Dispatcher {
             // file-backed store keyed by execution_id for them to read.
             self.store
                 .kv_put(&execution_id, b"outsc", &ipc::write_schema_ref(&output_schema)?);
+            // Persist named flags the process/combine RPCs need (e.g. `logging`),
+            // since those RPCs carry no arguments and may run in another worker.
+            self.store.kv_put(
+                &execution_id,
+                b"bufflags",
+                &[bp.arguments.named_bool("logging").unwrap_or(false) as u8],
+            );
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
@@ -1035,11 +1043,12 @@ impl Dispatcher {
             .unwrap_or(default)
     }
 
-    pub fn handle_buffering_process(&self, req: &Request) -> Result<Option<RecordBatch>> {
+    pub fn handle_buffering_process(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let output_schema = self.buffering_output_schema(&dto.execution_id.0, batch.schema());
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
@@ -1047,18 +1056,30 @@ impl Dispatcher {
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
             batch_index: dto.batch_index,
+            logs: logs.clone(),
         };
         let state_id = f.process(&params, &batch)?;
+        Self::drain_buffering_logs(&logs, ctx);
         Ok(Some(wire::to_result_batch(TableBufferingProcessResponse {
             state_id: Bytes::from(state_id),
         })?))
     }
 
-    pub fn handle_buffering_combine(&self, req: &Request) -> Result<Option<RecordBatch>> {
+    /// Forward queued buffering INFO logs to the call context (→ duckdb_logs()).
+    fn drain_buffering_logs(logs: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, ctx: &CallContext) {
+        if let Ok(mut g) = logs.lock() {
+            for msg in g.drain(..) {
+                ctx.client_log(vgi_rpc::LogLevel::Info, msg);
+            }
+        }
+    }
+
+    pub fn handle_buffering_combine(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
         let output_schema =
             self.buffering_output_schema(&dto.execution_id.0, Arc::new(arrow_schema::Schema::empty()));
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
@@ -1066,9 +1087,11 @@ impl Dispatcher {
             arguments: crate::arguments::Arguments::default(),
             settings: crate::settings::Settings::default(),
             batch_index: None,
+            logs: logs.clone(),
         };
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();
         let finalize_ids = f.combine(&params, &state_ids)?;
+        Self::drain_buffering_logs(&logs, ctx);
         Ok(Some(wire::to_result_batch(TableBufferingCombineResponse {
             finalize_state_ids: finalize_ids.into_iter().map(Bytes::from).collect(),
         })?))

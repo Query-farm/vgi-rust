@@ -227,6 +227,18 @@ pub struct BufferingParams {
     /// DuckDB per-chunk batch index, when the function declares
     /// `requires_input_batch_index` (only set on the process RPC).
     pub batch_index: Option<i64>,
+    /// In-band INFO logs to surface in `duckdb_logs()`; the unary process /
+    /// combine handlers drain this into the call context after returning.
+    pub logs: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl BufferingParams {
+    /// Queue an INFO-level client log line (surfaced under `duckdb_logs()`).
+    pub fn log(&self, message: impl Into<String>) {
+        if let Ok(mut g) = self.logs.lock() {
+            g.push(message.into());
+        }
+    }
 }
 
 /// A table buffering (sink+source) function.
