@@ -32,6 +32,11 @@ fn frow(name: &str, ty: DataType) -> Field {
 fn dtable(name: &str, fields: Vec<Field>, comment: &str) -> CatTable {
     CatTable::new(name, Arc::new(Schema::new(fields)), "sequence", Vec::new(), Some(comment.to_string()), None)
 }
+/// Mark a function-backed table to inline its scan function in `TableInfo`.
+fn inline(mut t: CatTable) -> CatTable {
+    t.inline_scan = true;
+    t
+}
 /// Override a table's backing scan function (a no-arg static scan).
 fn scan(mut t: CatTable, scan_fn: &str) -> CatTable {
     t.scan_function = scan_fn.to_string();
@@ -115,13 +120,13 @@ fn data_tables() -> Vec<CatTable> {
         vec![Field::new("a", Int64, true), Field::new("b", Utf8, true)].into(),
     );
     let mut tables = vec![
-        fn_table("large_sequence", &[("n", Int64)], "sequence",
+        inline(fn_table("large_sequence", &[("n", Int64)], "sequence",
             vec![i64_arg(1_000_000)], Some(1_000_000),
-            "A large sequence of integers from 0 to 1,000,000"),
-        fn_table("ten_thousand_table", &[("n", Int64)], "ten_thousand",
-            vec![], None, "Function-backed table over the no-arg ten_thousand function"),
-        fn_table("cardinality_inlined_table", &[("n", Int64)], "ten_thousand",
-            vec![], Some(10000), "Function-backed table with inlined cardinality (10000 rows)"),
+            "A large sequence of integers from 0 to 1,000,000")),
+        inline(fn_table("ten_thousand_table", &[("n", Int64)], "ten_thousand",
+            vec![], None, "Function-backed table over the no-arg ten_thousand function")),
+        inline(fn_table("cardinality_inlined_table", &[("n", Int64)], "ten_thousand",
+            vec![], Some(10000), "Function-backed table with inlined cardinality (10000 rows)")),
         fn_table("numbers", &[("value", Int64)], "sequence",
             vec![i64_arg(100)], Some(100), "First 100 integers (demonstrates explicit columns)"),
         fn_table("volatile_numbers", &[("value", Int64)], "sequence",

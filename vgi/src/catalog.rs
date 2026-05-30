@@ -369,6 +369,10 @@ pub struct CatTable {
     pub check: Vec<String>,
     pub tags: Vec<(String, String)>,
     pub foreign_keys: Vec<ForeignKey>,
+    /// When true, the scan function is inlined in `TableInfo.scan_function` and
+    /// the C++ extension skips `catalog_table_scan_function_get`. When false
+    /// (default), the scan is resolved lazily via that RPC.
+    pub inline_scan: bool,
 }
 
 /// A foreign-key constraint (referenced table in the same schema by default).
@@ -439,6 +443,7 @@ impl CatTable {
             check: Vec::new(),
             tags: Vec::new(),
             foreign_keys: Vec::new(),
+            inline_scan: false,
         }
     }
 }
@@ -463,15 +468,23 @@ pub fn view_info(schema: &str, v: &CatView) -> crate::protocol::dtos::ViewInfo {
 
 /// Build a `TableInfo` DTO for a function-backed catalog table, inlining the
 /// scan function so DuckDB needn't call `catalog_table_scan_function_get`.
+/// The flat `ScanFunctionResult` batch for a function-backed table (used both
+/// for the inlined `TableInfo.scan_function` and the lazy
+/// `catalog_table_scan_function_get` RPC response).
+pub fn scan_function_result(t: &CatTable) -> Result<crate::protocol::dtos::ScanFunctionResult> {
+    Ok(crate::protocol::dtos::ScanFunctionResult {
+        function_name: t.scan_function.clone(),
+        arguments: Bytes::from(t.scan_arguments.clone()),
+        required_extensions: Vec::new(),
+    })
+}
+
 pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::TableInfo> {
-    use crate::protocol::dtos::{ScanFunctionResult, TableInfo};
-    let scan = if !t.scan_function.is_empty() {
-        let sfr = ScanFunctionResult {
-            function_name: t.scan_function.clone(),
-            arguments: Bytes::from(t.scan_arguments.clone()),
-            required_extensions: Vec::new(),
-        };
-        ipc::write_batch(&crate::wire::to_batch(sfr)?)?
+    use crate::protocol::dtos::TableInfo;
+    // Inline the scan function only for tables that opt in; otherwise the C++
+    // extension resolves it lazily via `catalog_table_scan_function_get`.
+    let scan = if t.inline_scan && !t.scan_function.is_empty() {
+        ipc::write_batch(&crate::wire::to_batch(scan_function_result(t)?)?)?
     } else {
         Vec::new()
     };

@@ -164,6 +164,25 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
             d.handle_table_get(req)
         });
     }
+    {
+        // Legacy scan-function resolution for non-inlined function-backed
+        // tables. The response is a FLAT `ScanFunctionResult` batch (not the
+        // `{result: binary}` envelope), matching the C++ extractor.
+        let d = disp.clone();
+        srv.register_unary(
+            "catalog_table_scan_function_get",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_table_scan_function_get(req),
+        );
+    }
+    {
+        let d = disp.clone();
+        srv.register_unary(
+            "catalog_table_scan_branches_get",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_table_scan_branches_get(req),
+        );
+    }
 
     // --- discovery methods that return empty lists for now ---
     for name in [

@@ -90,6 +90,23 @@ pub struct CatalogAttachRequest {
     pub implementation_version: Option<String>,
 }
 
+/// One physical source backing a (possibly multi-branch) table scan.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct ScanBranch {
+    pub function_name: String,
+    pub arguments: Bytes,
+    pub branch_filter: Option<String>,
+    pub writable: bool,
+}
+
+/// Response for `catalog_table_scan_branches_get`. The `branches` list must be
+/// non-empty (one entry per physical source; single-source tables return one).
+#[derive(Debug, Clone, VgiArrow)]
+pub struct ScanBranchesResult {
+    pub branches: Vec<Bytes>,
+    pub required_extensions: Vec<String>,
+}
+
 /// Secret-type registration entry, IPC-serialized into
 /// `CatalogAttachResult.secret_types`.
 #[derive(Debug, Clone, VgiArrow)]

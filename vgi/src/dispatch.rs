@@ -743,6 +743,46 @@ impl Dispatcher {
         })?))
     }
 
+    /// Lazy scan-function resolution for non-inlined function-backed tables.
+    /// Returns a FLAT `ScanFunctionResult` batch (no `{result}` envelope).
+    pub fn handle_table_scan_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let schema_name = read_string_col(req, "schema_name")?;
+        let table_name = read_string_col(req, "name")?;
+        let t = self
+            .catalog
+            .schema(&schema_name)
+            .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
+            .ok_or_else(|| {
+                RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
+            })?;
+        Ok(Some(wire::to_result_batch(catalog::scan_function_result(t)?)?))
+    }
+
+    /// Multi-branch scan resolution. A single-source table returns one branch
+    /// wrapping its scan function; the list must be non-empty.
+    pub fn handle_table_scan_branches_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        use crate::protocol::dtos::{ScanBranch, ScanBranchesResult};
+        let schema_name = read_string_col(req, "schema_name")?;
+        let table_name = read_string_col(req, "name")?;
+        let t = self
+            .catalog
+            .schema(&schema_name)
+            .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
+            .ok_or_else(|| {
+                RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
+            })?;
+        let branch = ScanBranch {
+            function_name: t.scan_function.clone(),
+            arguments: Bytes::from(t.scan_arguments.clone()),
+            branch_filter: None,
+            writable: false,
+        };
+        Ok(Some(wire::to_result_batch(ScanBranchesResult {
+            branches: vec![Bytes::from(ipc::write_batch(&wire::to_batch(branch)?)?)],
+            required_extensions: Vec::new(),
+        })?))
+    }
+
     pub fn handle_contents_macros(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let name = read_string_col(req, "name")?;
         let want = normalize_function_type(&read_string_col(req, "type").unwrap_or_default());
