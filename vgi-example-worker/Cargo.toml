@@ -1,0 +1,27 @@
+[package]
+name = "vgi-example-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "VGI example worker — integration-test fixture set (Rust port)"
+
+[[bin]]
+name = "vgi-example-worker"
+path = "src/main.rs"
+
+[dependencies]
+vgi = { path = "../vgi" }
+vgi-rpc = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde_json = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-select = { workspace = true }
+ctrlc = "3"

@@ -1,0 +1,26 @@
+[package]
+name = "vgi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+description = "VGI (Vector Gateway Interface) worker SDK — Rust port"
+
+[dependencies]
+vgi-rpc = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-ord = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+ctrlc = "3"
