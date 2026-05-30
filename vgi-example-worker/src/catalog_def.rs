@@ -208,13 +208,16 @@ fn data_tables() -> Vec<CatTable> {
     tables.push(mb("multi_branch_empty",
         "Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test",
         vec![]));
-    tables.push(mb("multi_branch_recon",
-        "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
-        vec![
+    {
+        let mut t = dtable("multi_branch_recon", vec![f("a", Int64), f("b", Int64)],
+            "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test");
+        t.branches = Some(vec![
             native("read_parquet", "/tmp/vgi_recon_a_b.parquet"),
             native("read_parquet", "/tmp/vgi_recon_b_a.parquet"),
             native("read_parquet", "/tmp/vgi_recon_a_only.parquet"),
-        ]));
+        ]);
+        tables.push(t);
+    }
     tables.push(mb("multi_branch_two_writable",
         "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test",
         vec![
