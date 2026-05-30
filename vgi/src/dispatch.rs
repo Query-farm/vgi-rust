@@ -862,7 +862,30 @@ impl Dispatcher {
             } else {
                 None
             });
-        catalog::schema_info(name, comment, &self.attach_bytes())
+        let mut si = catalog::schema_info(name, comment, &self.attach_bytes());
+        // Advertise per-kind object counts so the C++ extension caches
+        // `kind_empty` and skips the bulk discovery RPC for empty kinds.
+        let sch = self.catalog.schema(name);
+        let len = |n: usize| n as i64;
+        let (sf, af, tf) = if name == catalog::MAIN_SCHEMA {
+            (
+                len(self.scalars.len()),
+                len(self.aggregates.len()),
+                len(self.tables.len() + self.tableinouts.len() + self.buffering.len()),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        si.estimated_object_count = Some(vec![
+            ("view".into(), len(sch.map(|s| s.views.len()).unwrap_or(0))),
+            ("macro".into(), len(sch.map(|s| s.macros.len()).unwrap_or(0))),
+            ("table".into(), len(sch.map(|s| s.tables.len()).unwrap_or(0))),
+            ("scalar_function".into(), sf),
+            ("aggregate_function".into(), af),
+            ("table_function".into(), tf),
+            ("index".into(), 0),
+        ]);
+        si
     }
 
     pub fn handle_catalog_schemas(&self, _req: &Request) -> Result<Option<RecordBatch>> {
