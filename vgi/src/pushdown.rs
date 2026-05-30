@@ -103,6 +103,9 @@ impl PushdownFilters {
         if json.is_empty() {
             return Err(RpcError::value_error("filter column 0 is empty"));
         }
+        if std::env::var("VGI_FILTER_DEBUG").is_ok() {
+            eprintln!("[vgi-filter] json={}", json.value(0));
+        }
         let specs: Vec<FilterSpec> = serde_json::from_str(json.value(0))
             .map_err(|e| RpcError::value_error(format!("parsing filter JSON: {e}")))?;
         // value_ref N resolves to column N+1.
