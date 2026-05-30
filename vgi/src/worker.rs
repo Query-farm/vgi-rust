@@ -96,10 +96,14 @@ impl Worker {
             .server_id
             .clone()
             .unwrap_or_else(|| "vgi-rust-worker".to_string());
+        // The `bad_protocol` fixture advertises an incompatible version via
+        // this env override so the C++ ATTACH fails with a clear mismatch.
+        let protocol_version = std::env::var("VGI_PROTOCOL_VERSION_OVERRIDE")
+            .unwrap_or_else(|_| VGI_PROTOCOL_VERSION.to_string());
         let mut srv = RpcServer::builder()
             .server_id(server_id)
             .protocol_name(VGI_PROTOCOL_NAME)
-            .protocol_version(VGI_PROTOCOL_VERSION)
+            .protocol_version(protocol_version)
             .enable_describe(true)
             .build();
         register::register(&mut srv, Arc::new(self.disp));
