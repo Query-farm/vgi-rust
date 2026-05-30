@@ -324,6 +324,8 @@ pub struct CatalogModel {
     pub comment: Option<String>,
     /// Database-level tags (surfaced via `duckdb_databases().tags`).
     pub tags: Vec<(String, String)>,
+    /// Whether the catalog supports time-travel (`AT`) queries.
+    pub supports_time_travel: bool,
 }
 
 #[derive(Clone)]

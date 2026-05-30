@@ -285,6 +285,7 @@ pub fn build() -> CatalogModel {
             ("source".to_string(), "vgi-fixture-worker".to_string()),
             ("version".to_string(), "1".to_string()),
         ],
+        supports_time_travel: true,
         schemas: vec![
             CatSchema {
                 name: "main".to_string(),

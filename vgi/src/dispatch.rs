@@ -637,7 +637,7 @@ impl Dispatcher {
         let result = CatalogAttachResult {
             attach_opaque_data: Bytes::from(self.attach_bytes()),
             supports_transactions: true,
-            supports_time_travel: false,
+            supports_time_travel: self.catalog.supports_time_travel,
             catalog_version_frozen: false,
             catalog_version: 1,
             attach_opaque_data_required: true,
