@@ -29,7 +29,8 @@ fn main() {
     buffering::register(&mut worker);
     aggregate::register(&mut worker);
     register_secrets_and_settings(&mut worker);
-    worker.set_catalog(catalog_def::build());
+    let catalog_name = std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
+    worker.set_catalog(catalog_def::build_by_name(&catalog_name));
     worker.run();
 }
 

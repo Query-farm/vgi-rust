@@ -48,6 +48,74 @@ pub fn serialize_secret_type(spec: &SecretTypeSpec) -> Result<Vec<u8>> {
 /// `{name: string, description: string, type: binary, default_value: binary?}`
 /// where `type` is the IPC schema of a single `value` field of the setting's
 /// type (matches Go `serializeSettingSpec`).
+/// Serialize one `CatalogInfo` discovery record to IPC bytes. The schema
+/// (field order/types) must match `generated.CatalogInfoSchema` exactly; the
+/// `releases` element struct type is emitted even when the list is empty.
+pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
+    use arrow_array::{
+        ArrayRef, BinaryArray, ListArray, RecordBatch, StringArray, StructArray,
+        TimestampMicrosecondArray,
+    };
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::TimeUnit;
+
+    let one_empty_list = |elem_field: Arc<Field>, values: ArrayRef| -> ArrayRef {
+        let offsets = OffsetBuffer::new(vec![0i32, 0].into());
+        Arc::new(ListArray::new(elem_field, offsets, values, None))
+    };
+
+    let name = Arc::new(StringArray::from(vec![model.name.clone()])) as ArrayRef;
+    let impl_ver =
+        Arc::new(StringArray::from(vec![model.implementation_version.clone()])) as ArrayRef;
+    let data_ver = Arc::new(StringArray::from(vec![model.data_version_spec.clone()])) as ArrayRef;
+
+    // attach_option_specs: list<binary>, one empty list.
+    let aos_field = Arc::new(Field::new("item", DataType::Binary, true));
+    let aos = one_empty_list(aos_field, Arc::new(BinaryArray::from(Vec::<&[u8]>::new())));
+
+    // releases: list<struct{version,released_at,summary,notes_url}>, one empty.
+    let rel_fields: arrow_schema::Fields = vec![
+        Field::new("version", DataType::Utf8, false),
+        Field::new(
+            "released_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("summary", DataType::Utf8, false),
+        Field::new("notes_url", DataType::Utf8, true),
+    ]
+    .into();
+    let rel_values = Arc::new(StructArray::new(
+        rel_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ],
+        None,
+    )) as ArrayRef;
+    let rel_field = Arc::new(Field::new("item", DataType::Struct(rel_fields), true));
+    let releases = one_empty_list(rel_field, rel_values);
+
+    let source_url = Arc::new(StringArray::from(vec![Option::<String>::None])) as ArrayRef;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("implementation_version", DataType::Utf8, true),
+        Field::new("data_version_spec", DataType::Utf8, true),
+        Field::new("attach_option_specs", aos.data_type().clone(), false),
+        Field::new("releases", releases.data_type().clone(), false),
+        Field::new("source_url", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![name, impl_ver, data_ver, aos, releases, source_url],
+    )
+    .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    ipc::write_batch(&batch)
+}
+
 pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
     use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
     let type_schema = Arc::new(Schema::new(vec![Field::new("value", spec.data_type.clone(), true)]));
@@ -325,6 +393,8 @@ pub fn schema_info(name: &str, comment: Option<&str>, attach_opaque_data: &[u8])
 /// A declarative catalog: named schemas with views, macros, and tables.
 #[derive(Default, Clone)]
 pub struct CatalogModel {
+    /// Catalog name advertised by `catalog_catalogs` (discovery).
+    pub name: String,
     pub schemas: Vec<CatSchema>,
     /// Database-level comment (surfaced via `duckdb_databases().comment`).
     pub comment: Option<String>,
@@ -332,6 +402,14 @@ pub struct CatalogModel {
     pub tags: Vec<(String, String)>,
     /// Whether the catalog supports time-travel (`AT`) queries.
     pub supports_time_travel: bool,
+    /// Worker software version (singular per worker). `None` = no opinion.
+    pub implementation_version: Option<String>,
+    /// Semver range the catalog serves (e.g. ">=1.0.0,<2.0.0").
+    pub data_version_spec: Option<String>,
+    /// Concrete data versions this worker accepts at ATTACH time.
+    pub supported_data_versions: Vec<String>,
+    /// The data version used when the client omits `data_version_spec`.
+    pub default_data_version: Option<String>,
 }
 
 #[derive(Clone)]

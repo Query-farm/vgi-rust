@@ -653,8 +653,19 @@ impl Dispatcher {
         self.catalog_name.as_bytes().to_vec()
     }
 
+    /// `catalog_catalogs` — discovery: advertise this worker's catalog plus
+    /// its version metadata so clients can inspect before attaching.
+    pub fn handle_catalog_catalogs(&self, _req: &Request) -> Result<Option<RecordBatch>> {
+        let items = vec![Bytes::from(catalog::serialize_catalog_info(&self.catalog)?)];
+        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+    }
+
     pub fn handle_catalog_attach(&self, req: &Request) -> Result<Option<RecordBatch>> {
-        let _dto: CatalogAttachRequest = boxed(req)?;
+        let dto: CatalogAttachRequest = boxed(req)?;
+        // Version negotiation: validate the requested versions against what this
+        // worker serves, then echo the resolved concrete versions back.
+        let (resolved_data_version, resolved_implementation_version) =
+            self.resolve_versions(&dto)?;
         let result = CatalogAttachResult {
             attach_opaque_data: Bytes::from(self.attach_bytes()),
             supports_transactions: true,
@@ -681,10 +692,46 @@ impl Dispatcher {
                 .iter()
                 .flat_map(|s| &s.tables)
                 .any(|t| !t.statistics.is_empty()),
-            resolved_data_version: None,
-            resolved_implementation_version: None,
+            resolved_data_version,
+            resolved_implementation_version,
         };
         Ok(Some(wire::to_result_batch(result)?))
+    }
+
+    /// Validate the ATTACH-time version request against the catalog's declared
+    /// support and return the concrete `(data_version, implementation_version)`.
+    /// Mirrors the Python `versioned` fixture: implementation must match
+    /// exactly; data_version must be one of `supported_data_versions` (or the
+    /// default when omitted). Errors propagate as the ATTACH failure.
+    fn resolve_versions(
+        &self,
+        dto: &CatalogAttachRequest,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let cat = &self.catalog;
+        // Implementation version: exact-match when the worker declares one.
+        let resolved_impl = match (&dto.implementation_version, &cat.implementation_version) {
+            (Some(req), Some(have)) if req != have => {
+                return Err(RpcError::value_error(format!(
+                    "Unsupported implementation_version {req:?}; this worker serves {have:?}"
+                )));
+            }
+            (_, have) => have.clone(),
+        };
+        // Data version: must be a supported concrete version, else the default.
+        let resolved_data = if cat.supported_data_versions.is_empty() {
+            None
+        } else if let Some(req) = &dto.data_version_spec {
+            if !cat.supported_data_versions.contains(req) {
+                return Err(RpcError::value_error(format!(
+                    "Unsupported data_version_spec {req:?}; this worker serves one of {:?}",
+                    cat.supported_data_versions
+                )));
+            }
+            Some(req.clone())
+        } else {
+            cat.default_data_version.clone()
+        };
+        Ok((resolved_data, resolved_impl))
     }
 
     pub fn handle_catalog_version(&self, _req: &Request) -> Result<Option<RecordBatch>> {

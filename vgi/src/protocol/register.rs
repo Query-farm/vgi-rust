@@ -236,9 +236,15 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
         );
     }
 
+    {
+        let d = disp.clone();
+        srv.register_unary("catalog_catalogs", wire::result_binary_schema(), move |req, _ctx| {
+            d.handle_catalog_catalogs(req)
+        });
+    }
+
     // --- discovery methods that return empty lists for now ---
     for name in [
-        "catalog_catalogs",
         "catalog_schema_contents_indexes",
         "catalog_view_get",
         "catalog_macro_get",

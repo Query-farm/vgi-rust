@@ -336,8 +336,52 @@ fn data_tables() -> Vec<CatTable> {
 }
 
 /// Build the `example` catalog model.
+/// The `versioned` catalog fixture — advertises version metadata and validates
+/// `data_version_spec` / `implementation_version` at ATTACH time. Mirrors the
+/// Python `versioned` fixture (impl 1.0.0, data range >=1.0.0,<2.0.0).
+pub fn versioned() -> CatalogModel {
+    CatalogModel {
+        name: "versioned".to_string(),
+        implementation_version: Some("1.0.0".to_string()),
+        data_version_spec: Some(">=1.0.0,<2.0.0".to_string()),
+        supported_data_versions: vec![
+            "1.0.0".to_string(),
+            "1.1.0".to_string(),
+            "1.2.0".to_string(),
+        ],
+        default_data_version: Some("1.2.0".to_string()),
+        comment: Some(
+            "Example catalog demonstrating data_version_spec validation and cookie stickiness"
+                .to_string(),
+        ),
+        tags: Vec::new(),
+        supports_time_travel: false,
+        schemas: vec![CatSchema {
+            name: "main".to_string(),
+            comment: None,
+            views: Vec::new(),
+            macros: Vec::new(),
+            tables: Vec::new(),
+        }],
+    }
+}
+
+/// Select the catalog model by the `VGI_WORKER_CATALOG_NAME` env (default
+/// `example`), mirroring vgi-java's single-binary + wrapper approach.
+pub fn build_by_name(name: &str) -> CatalogModel {
+    match name {
+        "versioned" => versioned(),
+        _ => build(),
+    }
+}
+
 pub fn build() -> CatalogModel {
     CatalogModel {
+        name: "example".to_string(),
+        implementation_version: None,
+        data_version_spec: None,
+        supported_data_versions: Vec::new(),
+        default_data_version: None,
         comment: Some("Example VGI catalog for testing".to_string()),
         tags: vec![
             ("source".to_string(), "vgi-fixture-worker".to_string()),
