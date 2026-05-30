@@ -863,6 +863,12 @@ impl Dispatcher {
                 None
             });
         let mut si = catalog::schema_info(name, comment, &self.attach_bytes());
+        // Version-shaped catalogs vary their object set per attach — the counts
+        // here aren't version-aware, so don't advertise them (avoids wrongly
+        // caching the base schema's empty table set).
+        if !self.catalog.version_schemas.is_empty() {
+            return si;
+        }
         // Advertise per-kind object counts so the C++ extension caches
         // `kind_empty` and skips the bulk discovery RPC for empty kinds.
         let sch = self.catalog.schema(name);
