@@ -28,13 +28,18 @@ pub trait TableProducer: Send {
         &mut self,
         out: &mut vgi_rpc::OutputCollector,
     ) -> Result<Option<arrow_array::RecordBatch>>;
-    /// Serialize the scan position for stateless HTTP continuation (default
-    /// 0 — producers whose whole result fits in one HTTP response need none).
-    fn save_position(&self) -> u64 {
-        0
+    /// Serialize the producer's in-progress scan position for HTTP continuation
+    /// (default empty — producers whose whole result is regenerable from the
+    /// shared work queue alone need none). Work-queue producers that span a
+    /// popped chunk across multiple batches MUST encode their partial-chunk
+    /// cursor here, since the chunk is destructively removed from the queue on
+    /// pop and cannot be re-derived on resume.
+    fn encode_resume(&self) -> Vec<u8> {
+        Vec::new()
     }
-    /// Restore the scan position after rebuilding from an HTTP state token.
-    fn restore_position(&mut self, _pos: u64) {}
+    /// Restore the partial-chunk cursor after rebuilding from an HTTP state
+    /// token. Inverse of [`encode_resume`](Self::encode_resume).
+    fn restore_resume(&mut self, _bytes: &[u8]) {}
     /// Per-batch wire metadata for the batch just returned by `next_batch`
     /// (e.g. `vgi_batch_index` for `supports_batch_index` functions). Default
     /// none. Called once after each `next_batch` that returns `Some`.

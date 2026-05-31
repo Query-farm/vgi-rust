@@ -418,7 +418,7 @@ impl Dispatcher {
                     None
                 };
                 let producer = f.finalize_producer(&bparams, fsid)?;
-                let state = TableProducerState { inner: producer, filters, project_to: None };
+                let state = TableProducerState { inner: producer, filters, project_to: None, resume_blob: None };
                 return Ok(StreamResult::producer(output_schema, Box::new(state))
                     .with_header(header));
             }
@@ -440,6 +440,7 @@ impl Dispatcher {
                 inner: Box::new(EmptyProducer),
                 filters: None,
                 project_to: None,
+                resume_blob: None,
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -463,6 +464,7 @@ impl Dispatcher {
                     inner: Box::new(VecProducer { batches, pos: 0 }),
                     filters: None,
                     project_to: None,
+                    resume_blob: None,
                 };
                 return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
             }
@@ -527,12 +529,26 @@ impl Dispatcher {
             // pre-narrowed the output via projection pushdown.
             let project_to = Some(output_schema.clone());
             let producer = f.producer(&params)?;
+            let resume_blob = if max_workers > 1 {
+                Some(self.exchange_blob(
+                    "table",
+                    bind_call.function_name.clone(),
+                    &output_schema,
+                    None,
+                    &bind_call,
+                    &dto,
+                    &execution_id,
+                    auto_apply,
+                )?)
+            } else {
+                None
+            };
             let header = wire::to_batch(GlobalInitResponse {
                 execution_id: Bytes::from(execution_id),
                 max_workers,
                 opaque_data: None,
             })?;
-            let state = TableProducerState { inner: producer, filters, project_to };
+            let state = TableProducerState { inner: producer, filters, project_to, resume_blob };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
 
@@ -592,6 +608,7 @@ impl Dispatcher {
             init_opaque: dto.bind_opaque_data.clone().map(|b| b.0).unwrap_or_default(),
             pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0).unwrap_or_default(),
             auto_apply,
+            inner_resume: Vec::new(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -644,6 +661,30 @@ impl Dispatcher {
             tablesample_seed: None,
             attach_opaque_data: None,
         };
+        if blob.kind == "table" {
+            let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
+            args.remap_positional(&f.argument_specs());
+            let mut params = make_params(args);
+            params.storage = Some(self.store.clone());
+            let filters = if blob.auto_apply {
+                params
+                    .pushdown_filters
+                    .as_ref()
+                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
+                    .transpose()?
+            } else {
+                None
+            };
+            let project_to = Some(output_schema.clone());
+            let mut producer = f.producer(&params)?;
+            // Restore the partial-chunk cursor so the producer resumes mid-chunk
+            // (the chunk was destructively popped from the queue and lives only
+            // in the token, not the queue).
+            producer.restore_resume(&blob.inner_resume);
+            return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
+                TableProducerState { inner: producer, filters, project_to, resume_blob: Some(bytes.to_vec()) },
+            )));
+        }
         if blob.kind == "table_in_out" {
             let f =
                 self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref())?;
@@ -1651,6 +1692,10 @@ pub struct ExchangeBlob {
     pub init_opaque: Vec<u8>,
     pub pushdown_filters: Vec<u8>, // empty = none
     pub auto_apply: bool,
+    /// Producer-only: the inner producer's partial-chunk cursor
+    /// ([`crate::table_function::TableProducer::encode_resume`]). Empty for
+    /// exchange states and producers between chunks.
+    pub inner_resume: Vec<u8>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -1738,7 +1783,16 @@ struct TableProducerState {
     /// When set, narrow each (post-filter) batch to this projected schema —
     /// the producer emitted the full schema so filters could see all columns.
     project_to: Option<arrow_schema::SchemaRef>,
+    /// HTTP continuation token for resumable (work-queue) producers; `None`
+    /// means drain fully in one response.
+    resume_blob: Option<Vec<u8>>,
 }
+
+/// Per-response batch cap for resumable work-queue producers over HTTP: low
+/// enough that the global init yields early (so the parallel secondary workers
+/// each get a share of the shared queue) yet large enough to keep round-trips
+/// reasonable.
+const HTTP_WORKQUEUE_BATCH_LIMIT: usize = 4;
 
 impl vgi_rpc::ProducerState for TableProducerState {
     fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
@@ -1771,8 +1825,20 @@ impl vgi_rpc::ProducerState for TableProducerState {
             }
         }
     }
+    fn batch_limit(&self) -> Option<usize> {
+        self.resume_blob.as_ref().map(|_| HTTP_WORKQUEUE_BATCH_LIMIT)
+    }
     fn encode_state(&self) -> Result<Vec<u8>> {
-        Ok(Vec::new())
+        match &self.resume_blob {
+            None => Ok(Vec::new()),
+            Some(bytes) => {
+                // Re-encode the (static) bind blob with the producer's CURRENT
+                // partial-chunk cursor so the continuation resumes mid-chunk.
+                let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
+                blob.inner_resume = self.inner.encode_resume();
+                vgi_rpc::stream_codec::bincode_encode(&blob)
+            }
+        }
     }
 }
 

@@ -450,6 +450,9 @@ pub struct TableInfo {
     pub cardinality_max: InlineI64,
     pub column_statistics: Bytes,
     pub bind_result: Bytes,
+    /// Field paths the scan requires to be materialized (struct/list pushdown).
+    /// Empty = no constraint. Added in the C++ protocol's 24-field TableInfo.
+    pub required_field_filter_paths: Vec<String>,
 }
 
 /// `ViewInfo` item.

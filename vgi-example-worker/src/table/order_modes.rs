@@ -83,6 +83,26 @@ impl TableProducer for QueueSeqProducer {
             return Ok(Some(batch));
         }
     }
+    /// Encode the partial-chunk cursor `(idx, end)` so an HTTP continuation can
+    /// resume mid-chunk — the chunk was destructively popped from the queue, so
+    /// its remaining rows live only in `cur`. Empty when between chunks.
+    fn encode_resume(&self) -> Vec<u8> {
+        match self.cur {
+            Some((idx, end)) if idx < end => {
+                let mut v = Vec::with_capacity(16);
+                v.extend_from_slice(&idx.to_le_bytes());
+                v.extend_from_slice(&end.to_le_bytes());
+                v
+            }
+            _ => Vec::new(),
+        }
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if bytes.len() == 16 {
+            let g = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+            self.cur = Some((g(0), g(8)));
+        }
+    }
 }
 
 pub struct QueueSeqFunction {

@@ -626,6 +626,9 @@ pub struct CatTable {
     /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
     /// matching the request's `at_value` (or the highest version when absent).
     pub time_travel: Vec<TimeTravelVersion>,
+    /// Field paths the scan must materialize (surfaced in `TableInfo`). Empty
+    /// = none.
+    pub required_field_filter_paths: Vec<String>,
 }
 
 /// One historical version of a time-travel table.
@@ -785,6 +788,7 @@ impl CatTable {
             branches: None,
             statistics: Vec::new(),
             time_travel: Vec::new(),
+            required_field_filter_paths: Vec::new(),
         }
     }
 }
@@ -855,6 +859,7 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         delete_function: Bytes::from(Vec::new()),
         cardinality_estimate: t.cardinality.into(),
         cardinality_max: t.cardinality.into(),
+        required_field_filter_paths: t.required_field_filter_paths.clone(),
         column_statistics: Bytes::from(Vec::new()),
         bind_result: Bytes::from(Vec::new()),
     })
