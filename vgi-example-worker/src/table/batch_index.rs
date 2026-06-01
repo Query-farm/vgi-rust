@@ -224,6 +224,28 @@ impl TableProducer for QueueProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         Some(HashMap::from([(BATCH_TAG.to_string(), self.partition_id.to_string())]))
     }
+    /// Encode the partial-chunk cursor `(pid, idx, end, start)` for HTTP
+    /// continuation — the chunk was destructively popped, so a mid-chunk yield
+    /// must carry it or those rows are lost. Empty when between chunks.
+    fn encode_resume(&self) -> Vec<u8> {
+        match self.cur {
+            Some((pid, idx, end, start)) if idx < end => {
+                let mut v = Vec::with_capacity(32);
+                for x in [pid, idx, end, start] {
+                    v.extend_from_slice(&x.to_le_bytes());
+                }
+                v
+            }
+            _ => Vec::new(),
+        }
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if bytes.len() == 32 {
+            let g = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+            self.cur = Some((g(0), g(8), g(16), g(24)));
+            self.partition_id = g(0);
+        }
+    }
 }
 
 fn make_producer(params: &ProcessParams, schema: SchemaRef, marked: bool) -> Result<Box<dyn TableProducer>> {
