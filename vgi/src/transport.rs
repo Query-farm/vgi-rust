@@ -70,7 +70,12 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
                         break;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Poll frequently: a parallel scan opens its secondary worker
+                // connections in a burst shortly after the primary's, and a
+                // long poll here would accept them late — letting the primary
+                // drain the shared work queue before they start (collapsing the
+                // scan onto one connection over the launcher transport).
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(_) => break,
         }
