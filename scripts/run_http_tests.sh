@@ -52,7 +52,11 @@ start_worker() {
 : > "$CACHE/worker.log"
 ZSTD_ENV="VGI_HTTP_DISABLE_ZSTD=${VGI_HTTP_DISABLE_ZSTD:-}"
 
-W_EXAMPLE=$(start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" "VGI_BEARER_TOKENS=test-secret-token=test-user")
+# Main example server: NO bearer tokens → anonymous allowed (serves the
+# non-auth suite). The bearer_auth tests run separately against W_BEARER below.
+W_EXAMPLE=$(start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV")
+# Bearer-protected example server (rejects anonymous) for bearer_auth/*.
+W_BEARER=$(start_worker "$CACHE/bearer.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" "VGI_BEARER_TOKENS=test-secret-token=test-principal")
 W_VERSIONED=$(start_worker "$CACHE/versioned.log" "VGI_WORKER_CATALOG_NAME=versioned" "$ZSTD_ENV")
 W_VERSIONED_TABLES=$(start_worker "$CACHE/versioned_tables.log" "VGI_WORKER_CATALOG_NAME=versioned_tables" "$ZSTD_ENV")
 W_ATTACH_OPTIONS=$(start_worker "$CACHE/attach_options.log" "VGI_WORKER_CATALOG_NAME=attach_options" "$ZSTD_ENV")
@@ -66,9 +70,11 @@ if [[ $# -ge 1 ]]; then
     *)      ARGS=("test/sql/integration/$1/*");;
   esac
 else
+  # bearer_auth runs separately (needs the protected server); exclude here.
   ARGS=("test/sql/integration/*"
         "~test/sql/integration/writable/*"
         "~test/sql/integration/simple_writable/*"
+        "~test/sql/integration/bearer_auth/*"
         "~test/sql/integration/table_in_out/echo/nested_type_combinations.test")
 fi
 
@@ -83,6 +89,15 @@ env \
   VGI_WORKER_SUPPORTS_DYNAMIC_CODE=1 \
   "$UNITTEST" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
 RC=$?
+
+# bearer_auth/* against the protected server (only in a full run).
+if [[ $# -eq 0 ]]; then
+  env \
+    VGI_TEST_WORKER="$W_BEARER" \
+    VGI_TEST_BEARER_TOKEN="test-secret-token" \
+    "$UNITTEST" "test/sql/integration/bearer_auth/*" >> "$CACHE/run.log" 2>&1
+  RC=$(( RC | $? ))
+fi
 
 awk '/unexpectedly|FAILED:|Mismatch on/{print}' "$CACHE/run.log" \
   | grep -oE 'test/sql/integration/[A-Za-z0-9_/]+\.test(_slow)?' | sort -u > "$CACHE/failures" 2>/dev/null

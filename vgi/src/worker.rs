@@ -165,7 +165,12 @@ fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
             .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
             .map(|t| t.trim());
         match token {
-            None => Ok(vgi_rpc::AuthContext::anonymous()),
+            // A server with tokens configured is bearer-protected: reject
+            // anonymous (no/blank token) access. A server with NO tokens never
+            // installs this callback, so it allows all (the non-auth tests).
+            None => Err(vgi_rpc::RpcError::permission_error(
+                "bearer token required but not provided",
+            )),
             Some(tok) => match tokens.get(tok) {
                 Some(principal) => Ok(vgi_rpc::AuthContext {
                     domain: "bearer".to_string(),
