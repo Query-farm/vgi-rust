@@ -652,7 +652,11 @@ impl Dispatcher {
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
             join_keys: Vec::new(),
-            storage: None,
+            // The file-backed store is process-global; resumed states (e.g. a
+            // distributed table-in-out's `process` appending partials, or a
+            // work-queue producer) must keep access to it across HTTP
+            // continuations, exactly as the init-time params do.
+            storage: Some(self.store.clone()),
             order_by_column: None,
             order_by_direction: None,
             order_by_null_order: None,
@@ -664,8 +668,7 @@ impl Dispatcher {
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
             args.remap_positional(&f.argument_specs());
-            let mut params = make_params(args);
-            params.storage = Some(self.store.clone());
+            let params = make_params(args);
             let filters = if blob.auto_apply {
                 params
                     .pushdown_filters
