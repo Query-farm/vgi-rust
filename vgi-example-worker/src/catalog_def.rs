@@ -126,6 +126,30 @@ fn fstruct_ab(name: &str) -> Field {
     f(name, DataType::Struct(vec![f("a", DataType::Int64), f("b", DataType::Int64)].into()))
 }
 
+/// `bbox: struct{xmin, ymin, xmax, ymax: float32}` (Overture segment shape).
+fn fbbox() -> Field {
+    f("bbox", DataType::Struct(vec![
+        f("xmin", DataType::Float32), f("ymin", DataType::Float32),
+        f("xmax", DataType::Float32), f("ymax", DataType::Float32),
+    ].into()))
+}
+
+/// A `required_field_filter_paths` table that delegates its scan to a NATIVE
+/// DuckDB function (e.g. `read_parquet`) — `scan_function_get` returns it so the
+/// C++ binds the built-in reader directly.
+fn rff_native(name: &str, fields: Vec<Field>, scan_fn: &str, positional: Vec<ArrayRef>,
+              named: &[(&str, ArrayRef)], paths: &[&str], comment: &str) -> CatTable {
+    let mut t = dtable(name, fields, comment);
+    t.scan_function = scan_fn.to_string();
+    t.scan_arguments = Arguments::serialize_scan_args_named(&positional, named).unwrap_or_default();
+    t.required_field_filter_paths = paths.iter().map(|s| s.to_string()).collect();
+    t
+}
+
+fn str_arg(s: &str) -> ArrayRef {
+    Arc::new(arrow_array::StringArray::from(vec![s]))
+}
+
 /// WKB (little-endian) for `POINT(x y)` — the GEOMETRY internal blob format.
 fn wkb_point(x: f64, y: f64) -> Vec<u8> {
     let mut v = vec![0x01, 0x01, 0x00, 0x00, 0x00];
@@ -212,6 +236,16 @@ fn data_tables() -> Vec<CatTable> {
             &["top", "s.a"], "rff_multi — mixed top-level + struct subfield requirements."),
         rff_table("rff_none", vec![f("a", Int64), f("b", Int64)], "rff_none_scan",
             &[], "rff_none — control table with no required_field_filter_paths (opt-out fast path)."),
+        rff_native("rff_parquet", vec![fbbox(), f("other", Int64)],
+            "read_parquet", vec![str_arg("/tmp/rff_seg.parquet")], &[],
+            &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            "rff_parquet — native read_parquet delegation with bbox.* required filters."),
+        rff_native("rff_hive",
+            vec![f("id", Utf8), fbbox(), f("name", Utf8), f("num", Int64), f("theme", Utf8), f("type", Utf8)],
+            "read_parquet", vec![str_arg("/tmp/rff_hive/*/*/*.parquet")],
+            &[("hive_partitioning", Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef)],
+            &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            "rff_hive — native read_parquet over Hive glob with bbox.* required filters."),
         inline(fn_table("ten_thousand_table", &[("n", Int64)], "ten_thousand",
             vec![], None, "Function-backed table over the no-arg ten_thousand function")),
         inline(fn_table("cardinality_inlined_table", &[("n", Int64)], "ten_thousand",
