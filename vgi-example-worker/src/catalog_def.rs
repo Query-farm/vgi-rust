@@ -112,6 +112,20 @@ fn i64_arg(v: i64) -> ArrayRef {
     Arc::new(Int64Array::from(vec![v]))
 }
 
+/// A `required_field_filter_paths` fixture table backed by a static `rff_*_scan`.
+fn rff_table(name: &str, fields: Vec<Field>, scan_fn: &str, paths: &[&str], comment: &str) -> CatTable {
+    let mut t = dtable(name, fields, comment);
+    t.scan_function = scan_fn.to_string();
+    t.required_field_filter_paths = paths.iter().map(|s| s.to_string()).collect();
+    t.cardinality = Some(3);
+    t
+}
+
+/// `s: struct{a: int64, b: int64}`.
+fn fstruct_ab(name: &str) -> Field {
+    f(name, DataType::Struct(vec![f("a", DataType::Int64), f("b", DataType::Int64)].into()))
+}
+
 /// WKB (little-endian) for `POINT(x y)` — the GEOMETRY internal blob format.
 fn wkb_point(x: f64, y: f64) -> Vec<u8> {
     let mut v = vec![0x01, 0x01, 0x00, 0x00, 0x00];
@@ -184,6 +198,20 @@ fn data_tables() -> Vec<CatTable> {
         // cardinality=None the wire value is NULL, so the C++ still fires the
         // per-bind table_function_cardinality RPC (ten_thousand returns 10000)
         // and emits no cardinality-inlined trace (inlined_cardinality.test).
+        rff_table("rff_simple", vec![f("a", Int64), f("b", Int64)], "rff_simple_scan",
+            &["a"], "rff_simple — requires a filter referencing column 'a'."),
+        rff_table("rff_struct", vec![fstruct_ab("s"), f("other", Int64)], "rff_struct_scan",
+            &["s.a", "s.b"], "rff_struct — requires filters on both struct subfields s.a and s.b."),
+        rff_table("rff_nested",
+            vec![f("wrapper", DataType::Struct(vec![
+                f("mid", DataType::Struct(vec![f("leaf", Int64)].into())),
+            ].into()))],
+            "rff_nested_scan", &["wrapper.mid.leaf"],
+            "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf."),
+        rff_table("rff_multi", vec![fstruct_ab("s"), f("top", Int64)], "rff_multi_scan",
+            &["top", "s.a"], "rff_multi — mixed top-level + struct subfield requirements."),
+        rff_table("rff_none", vec![f("a", Int64), f("b", Int64)], "rff_none_scan",
+            &[], "rff_none — control table with no required_field_filter_paths (opt-out fast path)."),
         inline(fn_table("ten_thousand_table", &[("n", Int64)], "ten_thousand",
             vec![], None, "Function-backed table over the no-arg ten_thousand function")),
         inline(fn_table("cardinality_inlined_table", &[("n", Int64)], "ten_thousand",
