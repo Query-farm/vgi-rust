@@ -17,6 +17,70 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(DynamicFilterEchoFunction);
     w.register_table(SpatialFilterExampleFunction);
     w.register_table(ExpressionFilterTestFunction);
+    w.register_table(FilterEchoTableScan);
+}
+
+/// `filter_echo_table_scan` — no-arg catalog-table scan: 100 rows
+/// `{n, s='row_<n>', pushed_filters}` where `pushed_filters` echoes the
+/// DuckDB-SQL representation of the filters DuckDB pushed into the scan. Backs
+/// `example.data.filter_echo_table` (filter_pushdown_through_view.test). The
+/// framework auto-applies the filters so results stay correct.
+pub struct FilterEchoTableScan;
+impl FilterEchoTableScan {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("pushed_filters", DataType::Utf8, true),
+        ]))
+    }
+}
+impl TableFunction for FilterEchoTableScan {
+    fn name(&self) -> &str {
+        "filter_echo_table_scan"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Catalog table that echoes pushed-down filters".to_string(),
+            categories: vec!["catalog".into(), "filter".into()],
+            projection_pushdown: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, _p: &BindParams) -> Option<TableCardinality> {
+        Some(TableCardinality { estimate: Some(100), max: Some(100) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let pushed = params
+            .pushdown_filters
+            .as_ref()
+            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .map(|f| f.format_pushed())
+            .unwrap_or_else(|| "(none)".to_string());
+        let ns: Int64Array = (0..100).collect();
+        let ss = StringArray::from((0..100).map(|i| format!("row_{i}")).collect::<Vec<_>>());
+        let pf = StringArray::from(vec![pushed; 100]);
+        let batch = RecordBatch::try_new(Self::schema(), vec![Arc::new(ns), Arc::new(ss), Arc::new(pf)])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Box::new(OneBatch { batch: Some(batch) }))
+    }
+}
+
+struct OneBatch {
+    batch: Option<RecordBatch>,
+}
+impl TableProducer for OneBatch {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        Ok(self.batch.take())
+    }
 }
 
 /// Little-endian WKB 2D point: byte_order=1, type=1 (Point), x, y.

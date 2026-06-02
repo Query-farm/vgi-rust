@@ -16,6 +16,90 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(RffScan::nested());
     w.register_table(RffScan::multi());
     w.register_table(RffScan::none());
+    w.register_table(RffRowidScan);
+}
+
+/// `bbox: struct{xmin,ymin,xmax,ymax: float32}`.
+fn bbox_field() -> Field {
+    Field::new(
+        "bbox",
+        DataType::Struct(
+            vec![
+                Field::new("xmin", DataType::Float32, true),
+                Field::new("ymin", DataType::Float32, true),
+                Field::new("xmax", DataType::Float32, true),
+                Field::new("ymax", DataType::Float32, true),
+            ]
+            .into(),
+        ),
+        true,
+    )
+}
+
+/// `rff_rowid_scan` — 10 rows `{row_id[is_row_id], bbox, other}` for the
+/// row_id + bbox.* required-filter test. Honors projection (emits only the
+/// requested columns), since the row_id virtual column requires it.
+pub struct RffRowidScan;
+impl RffRowidScan {
+    fn full_schema() -> SchemaRef {
+        let row_id = Field::new("row_id", DataType::Int64, true)
+            .with_metadata(std::collections::HashMap::from([("is_row_id".to_string(), String::new())]));
+        Arc::new(Schema::new(vec![row_id, bbox_field(), Field::new("other", DataType::Int64, true)]))
+    }
+    fn column(name: &str) -> ArrayRef {
+        use arrow_array::Float32Array;
+        match name {
+            "row_id" => Arc::new(Int64Array::from((0..10).collect::<Vec<_>>())),
+            "other" => Arc::new(Int64Array::from((0..10).map(|i| i * 10).collect::<Vec<_>>())),
+            "bbox" => {
+                let fields: Fields = match bbox_field().data_type() {
+                    DataType::Struct(f) => f.clone(),
+                    _ => unreachable!(),
+                };
+                let xmin: Float32Array = (0..10).map(|i| i as f32).collect();
+                let ymin = Float32Array::from(vec![2.0f32; 10]);
+                let xmax = Float32Array::from(vec![3.0f32; 10]);
+                let ymax = Float32Array::from(vec![4.0f32; 10]);
+                Arc::new(StructArray::new(
+                    fields,
+                    vec![Arc::new(xmin), Arc::new(ymin), Arc::new(xmax), Arc::new(ymax)],
+                    None,
+                ))
+            }
+            _ => Arc::new(Int64Array::from(vec![0i64; 10])),
+        }
+    }
+}
+impl TableFunction for RffRowidScan {
+    fn name(&self) -> &str {
+        "rff_rowid_scan"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "rff_rowid — row_id virtual column + bbox.* required filters".to_string(),
+            categories: vec!["catalog".into()],
+            projection_pushdown: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: Self::full_schema(), opaque_data: Vec::new() })
+    }
+    fn cardinality(&self, _p: &BindParams) -> Option<TableCardinality> {
+        Some(TableCardinality { estimate: Some(10), max: Some(10) })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        // Emit exactly the (possibly projection-narrowed) output schema.
+        let out = params.output_schema.clone();
+        let cols: Vec<ArrayRef> = out.fields().iter().map(|f| Self::column(f.name())).collect();
+        let batch = RecordBatch::try_new(out, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Box::new(OneShot { batch: Some(batch) }))
+    }
 }
 
 fn i64a(v: Vec<i64>) -> ArrayRef {
