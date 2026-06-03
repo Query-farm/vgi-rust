@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Numeric scalar helpers (port of Python `_promote_for_addition` +
 //! `NumericDispatch`).
 //!

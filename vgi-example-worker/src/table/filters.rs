@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Filter-pushdown diagnostic table fixtures (`filter_echo`, `value_prune`).
 
 use std::sync::Arc;

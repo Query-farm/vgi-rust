@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! VGI wire protocol: DTOs, enum payloads, and RPC method registration.
 //!
 //! The C++ DuckDB extension is the client; these types and methods must be

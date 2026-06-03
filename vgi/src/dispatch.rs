@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! The VGI dispatcher: owns the function registries + catalog identity and
 //! implements every RPC handler. Mirrors Go's `Worker` dispatch (handleBind,
 //! handleInit, registerCatalogMethods).

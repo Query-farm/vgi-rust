@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Additional table-producer fixtures.
 
 use std::sync::Arc;

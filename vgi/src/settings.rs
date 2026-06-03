@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! DuckDB session settings passed to functions.
 //!
 //! The `settings` wire blob is an IPC batch with one column per setting (name

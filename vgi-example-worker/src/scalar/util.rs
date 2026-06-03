@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Shared helpers for scalar fixtures.
 
 use std::sync::Arc;

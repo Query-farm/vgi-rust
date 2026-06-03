@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Projection-pushdown reproducer fixtures. Four table functions sharing a
 //! wide 12-column schema (mirrors vgi-kafka's `kafka_consume`). Each declares
 //! `projection_pushdown = true` and emits the full schema; the framework

@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! `attach_options` catalog fixture: 20 ATTACH options of every supported type,
 //! round-tripped through `attach_opaque_data` and echoed by
 //! `echo_attach_options()`. Mirrors `vgi-python/_test_fixtures/attach_options.py`.

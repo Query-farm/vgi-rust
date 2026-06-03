@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Static catalog scan functions: emit a fixed dataset for the constraint /
 //! reference tables (departments, employees, projects, products, colors).
 

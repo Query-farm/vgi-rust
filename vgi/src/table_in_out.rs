@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Table-in-out function model: transform input batches to output batches.
 //!
 //! Driven as an exchange stream: each input batch produces zero or more output

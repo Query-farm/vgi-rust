@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Scan functions backing the `rff_*` catalog tables that exercise
 //! `Table.required_field_filter_paths` (the C++ optimizer enforces the
 //! WHERE-filter requirement; the worker just serves the metadata + rows).

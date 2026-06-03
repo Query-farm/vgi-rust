@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Number/string formatting scalar fixtures (overloaded).
 
 use arrow_array::cast::AsArray;

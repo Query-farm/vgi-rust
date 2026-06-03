@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Table-in-out example fixtures.
 
 use std::sync::Arc;

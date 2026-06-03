@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! VGI (Vector Gateway Interface) worker SDK — Rust port.
 //!
 //! Builds on the `vgi-rpc` crate (wire protocol, RPC server, transports) to

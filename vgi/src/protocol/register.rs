@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Wire every VGI RPC method onto an [`RpcServer`], delegating to a shared
 //! [`Dispatcher`].
 

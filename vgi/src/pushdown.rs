@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Filter pushdown: deserialize the `pushdown_filters` blob, evaluate it
 //! against a batch, and apply it (port of Go `filter_pushdown.go`).
 //!

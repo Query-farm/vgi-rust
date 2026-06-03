@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Partition-column support: mark schema fields as partition columns and
 //! compute the per-batch `vgi_partition_values#b64` metadata (base64 of a
 //! 2-row min/max IPC batch) that the C++ extension reads to plan partitioned

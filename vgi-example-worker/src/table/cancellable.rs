@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! `slow_cancellable(probe_path, sleep_ms := 50, count := 1_000_000)` — a slow
 //! single-worker producer that emits `{n: int64}` one row per tick after a short
 //! sleep. Used by the client-side cancellation smoke (not the integration

@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Arrow IPC stream helpers for the binary-valued wire fields.
 //!
 //! Many VGI wire fields are `binary` columns carrying an IPC-serialized

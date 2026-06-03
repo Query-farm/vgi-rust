@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Function overload resolution (port of Go `overload.go`).
 //!
 //! Given several registered functions sharing a name, pick the one whose

@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Default read-only catalog: auto-generates `SchemaInfo` + `FunctionInfo`
 //! from the worker's registered functions (port of Go's
 //! `DefaultReadOnlyCatalog` + `BuildArgSchema`).

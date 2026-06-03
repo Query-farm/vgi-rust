@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Parameterized time-travel scans: one `versioned_data_scan(version)` /
 //! `versioned_constraints_scan(version)` returning the version-specific schema +
 //! rows (matches the canonical single-function shape). Used via the legacy

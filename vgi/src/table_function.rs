@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Table (producer) function model: generate output batches without input.
 //!
 //! Mirrors Go `initTable` + `TableProducerState`. The function creates a

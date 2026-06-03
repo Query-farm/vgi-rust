@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Parsing of the `arguments` wire blob (port of Go `arguments.go`).
 //!
 //! DuckDB wraps a call's arguments in a single `args` struct column whose

@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! VGI wire DTOs. Field order and types mirror
 //! `vgi-go/vgi/generated/protocol_schemas.go` exactly (the C++ extension
 //! reads several result schemas positionally, so order matters).

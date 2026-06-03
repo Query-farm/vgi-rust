@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Dict-encoded enum string values used across the VGI wire protocol.
 //!
 //! Each is serialized as `dictionary(int16, utf8)` (see `vgi_rpc::DictString`);

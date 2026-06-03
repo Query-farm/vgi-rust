@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! VGI example worker binary — the integration-test fixture set.
 //!
 //! Registers every example function (scalar / table / table-in-out /

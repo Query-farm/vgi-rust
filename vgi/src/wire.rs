@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Flat wire serialization for VGI protocol DTOs.
 //!
 //! The vgi_rpc wire format carries a method's request/response as a

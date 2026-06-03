@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Secret access for functions.
 //!
 //! VGI uses a two-phase bind: the first `bind` returns secret lookup requests

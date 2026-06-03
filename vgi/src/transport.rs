@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Worker transport selection: stdio (default), AF_UNIX (launcher), HTTP.
 //!
 //! Mirrors the Go / conformance worker contract:

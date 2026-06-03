@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! The declarative example catalog (schemas, views, macros, tables).
 
 use std::sync::Arc;

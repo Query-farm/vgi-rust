@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Settings-aware table fixtures: read DuckDB settings (scalar + struct) and
 //! reflect them in the generated rows.
 

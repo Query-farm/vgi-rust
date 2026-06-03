@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! The VGI worker: owns function registries (via [`Dispatcher`]), builds the
 //! RPC server, and drives transport selection from argv.
 

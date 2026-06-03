@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Partition-column table fixtures: queue-driven, one partition per emitted
 //! batch, each tagged with `vgi_partition_values#b64` so DuckDB can plan
 //! partitioned aggregates.

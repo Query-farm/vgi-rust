@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! Queue-driven parallel sequence fixtures: `partitioned_sequence` and the
 //! three `partitioned_*` order-preservation-mode variants. All push (start,
 //! end) work items at `on_init` and emit `n = idx * increment` in 1k batches.

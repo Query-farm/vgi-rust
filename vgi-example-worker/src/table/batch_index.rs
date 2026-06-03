@@ -1,3 +1,5 @@
+// Copyright 2025, 2026 Query Farm LLC - https://query.farm
+
 //! `supports_batch_index` table fixtures: a primary worker pushes per-chunk
 //! work items `(partition_id, start, end)` onto a shared queue at `on_init`;
 //! parallel workers pop items and emit batches tagged with `vgi_batch_index`
