@@ -631,6 +631,11 @@ pub struct CatTable {
     /// Field paths the scan must materialize (surfaced in `TableInfo`). Empty
     /// = none.
     pub required_field_filter_paths: Vec<String>,
+    /// Accept `AT` clauses even without declared `time_travel` versions: the
+    /// backing function reads the AT clause itself (carried on the bind request)
+    /// rather than the catalog resolving it to a version. Mirrors the Python
+    /// `Table(supports_time_travel=True)` on a non-versioned table.
+    pub supports_time_travel: bool,
 }
 
 /// One historical version of a time-travel table.
@@ -662,7 +667,10 @@ impl CatTable {
         if self.time_travel.is_empty() {
             // Multi-branch tables reject AT clauses downstream (C++ emits the
             // "not supported on multi-branch" error) — pass through here.
-            if has_at && self.branches.is_none() {
+            // Function-backed tables that opt into `supports_time_travel` read
+            // the AT clause themselves (carried on the bind request), so the
+            // catalog leaves the schema/scan unchanged (pass-through).
+            if has_at && self.branches.is_none() && !self.supports_time_travel {
                 return Err(vgi_rpc::RpcError::value_error(
                     "this table does not support time travel",
                 ));
@@ -791,6 +799,7 @@ impl CatTable {
             statistics: Vec::new(),
             time_travel: Vec::new(),
             required_field_filter_paths: Vec::new(),
+            supports_time_travel: false,
         }
     }
 }

@@ -312,6 +312,11 @@ pub struct ProcessParams {
     pub tablesample_seed: Option<i64>,
     /// The (plaintext) attach state for this call, when carried by the request.
     pub attach_opaque_data: Option<Vec<u8>>,
+    /// Time-travel `AT (TIMESTAMP|VERSION ...)` clause for this scan, read from
+    /// the per-scan bind request carried on the init request. Both `None`
+    /// without an AT clause. Function-backed tables read these to time-travel.
+    pub at_unit: Option<String>,
+    pub at_value: Option<String>,
 }
 
 /// A scalar VGI function: 1:1 row mapping, single `result` output column.

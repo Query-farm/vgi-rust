@@ -323,7 +323,32 @@ fn data_tables() -> Vec<CatTable> {
             }];
             t
         },
+        // Function-backed time-travel + filter pushdown. Reads AT at init via the
+        // bind request; supports_time_travel lets it accept AT without
+        // catalog-resolved versions (the function resolves the version itself).
+        {
+            let mut t = inline(fn_table("tt_pushdown_fn",
+                &[("id", Int64), ("val", Int64), ("seen_version", Int64), ("pushed_filters", Utf8)],
+                "tt_pushdown_scan", vec![], None,
+                "Function-backed: prunes by filter AND time-travels (AT read at init)."));
+            t.supports_time_travel = true;
+            t
+        },
     ];
+
+    // Columns-based time-travel + filter pushdown: the scan_function_get path
+    // resolves AT → version and passes it as `tt_pushdown_cols_scan(version)`.
+    {
+        let tt_cols = || vec![
+            f("id", Int64), f("val", Int64), f("seen_version", Int64), f("pushed_filters", Utf8),
+        ];
+        tables.push(tt_table("tt_pushdown_cols",
+            "Columns-based: prunes by filter AND time-travels (AT → version arg).",
+            vec![
+                ttv(1, tt_cols(), "tt_pushdown_cols_scan", 2000),
+                ttv(2, tt_cols(), "tt_pushdown_cols_scan", 2021),
+            ]));
+    }
 
     // Multi-branch tables: each declares its physical branches.
     let seq = |count: i64| vgi::catalog::CatBranch {

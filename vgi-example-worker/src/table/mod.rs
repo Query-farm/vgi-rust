@@ -13,6 +13,7 @@ mod versioned_scan;
 mod cancellable;
 mod proj_repro;
 mod rff;
+pub mod tt_pushdown;
 
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     order_modes::register(w);
     static_scan::register(w);
     versioned_scan::register(w);
+    tt_pushdown::register(w);
     rff::register(w);
     settings_fixtures::register(w);
     // The versioned_tables catalog's per-table scan helpers only belong to

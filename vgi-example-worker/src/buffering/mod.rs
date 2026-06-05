@@ -39,6 +39,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_buffering(LargeStateFunction);
     w.register_buffering(BatchIndexBufferInputFunction);
     w.register_buffering(OrderedSourceFunction);
+    w.register_buffering(BufferEmitWideFunction);
 }
 
 fn table_arg() -> ArgSpec {
@@ -205,6 +206,77 @@ impl TableBufferingFunction for BufferInputFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: self.finalize_error.map(|s| s.to_string()),
+        }))
+    }
+}
+
+/// Emits exactly one batch of `rows` rows `{n: 0..rows}` then `None`. Backs
+/// `buffer_emit_wide` — a regression repro for whether the buffering Source
+/// (finalize) path supports an output batch larger than STANDARD_VECTOR_SIZE.
+struct WideProducer {
+    output_schema: arrow_schema::SchemaRef,
+    rows: i64,
+    emitted: bool,
+}
+impl TableProducer for WideProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let col = Arc::new(Int64Array::from((0..self.rows).collect::<Vec<i64>>())) as ArrayRef;
+        Ok(Some(
+            RecordBatch::try_new(self.output_schema.clone(), vec![col])
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+}
+
+/// `buffer_emit_wide(rows, data)` — buffering function whose Source phase
+/// (finalize) emits a SINGLE batch of `rows` rows `{n: 0..rows}`, ignoring its
+/// input. Repro for a Source-path truncation bug where output batches were
+/// capped at STANDARD_VECTOR_SIZE (2048) instead of drained in full.
+pub struct BufferEmitWideFunction;
+
+impl TableBufferingFunction for BufferEmitWideFunction {
+    fn name(&self) -> &str {
+        "buffer_emit_wide"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Emit a single finalize batch of N rows (vector-size repro)".to_string(),
+            categories: vec!["test".into(), "buffer".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("rows", 0, "int64", "Number of rows to emit in one finalize batch"),
+            ArgSpec::column("data", 1, "table", "Input table (content ignored)"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, params: &BufferingParams, _batch: &RecordBatch) -> Result<Vec<u8>> {
+        Ok(params.execution_id.clone())
+    }
+    fn combine(&self, params: &BufferingParams, _state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        Ok(vec![params.execution_id.clone()])
+    }
+    fn finalize_producer(
+        &self,
+        params: &BufferingParams,
+        _finalize_state_id: Vec<u8>,
+    ) -> Result<Box<dyn TableProducer>> {
+        let rows = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        Ok(Box::new(WideProducer {
+            output_schema: params.output_schema.clone(),
+            rows,
+            emitted: false,
         }))
     }
 }

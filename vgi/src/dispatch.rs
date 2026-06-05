@@ -387,6 +387,8 @@ impl Dispatcher {
             tablesample_percentage: dto.tablesample_percentage,
             tablesample_seed: dto.tablesample_seed,
             attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
+            at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
+            at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
         };
 
         // Table buffering: sink (header-only) or finalize source (producer).
@@ -611,6 +613,8 @@ impl Dispatcher {
             pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0).unwrap_or_default(),
             auto_apply,
             inner_resume: Vec::new(),
+            at_unit: bind_call.at_unit.clone().unwrap_or_default(),
+            at_value: bind_call.at_value.clone().unwrap_or_default(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -666,6 +670,8 @@ impl Dispatcher {
             tablesample_percentage: None,
             tablesample_seed: None,
             attach_opaque_data: None,
+            at_unit: Some(blob.at_unit.clone()).filter(|s| !s.is_empty()),
+            at_value: Some(blob.at_value.clone()).filter(|s| !s.is_empty()),
         };
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
@@ -1701,6 +1707,10 @@ pub struct ExchangeBlob {
     /// ([`crate::table_function::TableProducer::encode_resume`]). Empty for
     /// exchange states and producers between chunks.
     pub inner_resume: Vec<u8>,
+    /// Time-travel `AT` clause carried so a resumed function-backed producer
+    /// still sees the version it was scanning (empty = no AT clause).
+    pub at_unit: String,
+    pub at_value: String,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.

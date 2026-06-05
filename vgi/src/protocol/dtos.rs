@@ -80,6 +80,14 @@ pub struct BindRequest {
     pub attach_opaque_data: Option<Bytes>,
     pub transaction_opaque_data: Option<Bytes>,
     pub resolved_secrets_provided: bool,
+    /// Time travel: the `AT (TIMESTAMP|VERSION ...)` clause for this scan,
+    /// threaded through from DuckDB's per-reference bind (both `None` when there
+    /// is no AT clause). For inline-bound (function-backed) tables the actual
+    /// `on_bind` RPC runs once at attach with no AT, so the per-scan AT is
+    /// carried on the bind request embedded in each `InitRequest` and read at
+    /// init. Additive nullable columns — the C++ always emits them.
+    pub at_unit: Option<String>,
+    pub at_value: Option<String>,
 }
 
 /// `BindResponse` — flat result of `bind`.
