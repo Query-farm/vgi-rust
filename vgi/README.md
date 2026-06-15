@@ -3,59 +3,118 @@
 [![crates.io](https://img.shields.io/crates/v/vgi.svg)](https://crates.io/crates/vgi)
 [![docs.rs](https://docs.rs/vgi/badge.svg)](https://docs.rs/vgi)
 
-Rust SDK for writing **VGI** (Vector Gateway Interface) workers — the worker
-side of [Query Farm](https://query.farm)'s DuckDB "Hyperfederation" extension.
-A VGI worker exposes catalogs, functions, and tables to DuckDB over an
-Apache-Arrow-IPC RPC protocol; this crate gives you the typed building blocks
-to implement one in Rust.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rust/main/docs/vgi-logo.png" alt="VGI Logo" width="420">
+</p>
 
-It is a port of the canonical Python `vgi` worker SDK and is **byte-for-byte
-wire-compatible** with it — a Rust worker is a drop-in replacement for a Python
-or Go one behind the same DuckDB `ATTACH ... (TYPE vgi)`.
+<p align="center">
+  <strong>Build native, single-binary DuckDB extensions in Rust — no C++, no linking against DuckDB.</strong>
+</p>
 
-Built on [`vgi-rpc`](https://crates.io/crates/vgi-rpc) (the transport-agnostic
-Arrow-IPC RPC framework). Stock `arrow-rs` 58.x, MSRV 1.86.
+---
 
-## What it provides
+`vgi` is the **Rust SDK for writing VGI (Vector Gateway Interface) workers** —
+the worker side of [Query Farm](https://query.farm)'s DuckDB "Hyperfederation"
+extension. A worker is a separate process that DuckDB talks to over Apache Arrow
+IPC; it exposes scalar / table / aggregate functions and whole catalogs
+(schemas, tables, views) that behave like native DuckDB objects, with no
+compiled C++ extension and no version coupling.
 
-- **Function models** — register scalar, table (producer), table-in-out
-  (exchange), table-buffering (sink → combine → source), and aggregate
-  (update / combine / finalize, incl. window/streaming) functions via typed
-  traits.
-- **Declarative catalogs** — schemas, views, macros, and function-backed
-  tables, plus version-shaped catalogs (time travel / `AT`), constraints,
-  column statistics, and MetaWorker-style secondary catalogs attachable by
-  name.
-- **Wire plumbing handled for you** — bind / init / process dispatch, the
-  result-envelope boxing, projection & filter pushdown, ORDER BY / TABLESAMPLE
-  hints, settings, secrets (two-phase bind), bearer auth, and a cross-process
-  state store for buffering / aggregate work.
-- **Transports** — stdio (default), Unix-socket launcher (`--unix`), and HTTP
-  (`--http`), selected from argv by [`Worker::run`].
+It is **byte-for-byte wire-compatible** with the canonical
+[Python](https://github.com/Query-farm/vgi-python) and Go implementations, so a
+Rust worker drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
+[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, MSRV 1.86.
 
-## Quick start
+## Example
 
 ```rust
-use vgi::Worker;
+use std::sync::Arc;
+
+use arrow_array::{cast::AsArray, ArrayRef, RecordBatch, StringArray};
+use arrow_schema::DataType;
+use vgi::{ArgSpec, FunctionMetadata, ProcessParams, ScalarFunction, Worker};
+use vgi_rpc::{Result, RpcError};
+
+/// `upper_case(s)` — uppercase a string column.
+struct UpperCase;
+
+impl ScalarFunction for UpperCase {
+    fn name(&self) -> &str {
+        "upper_case"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Convert string values to uppercase".into(),
+            return_type: Some(DataType::Utf8),
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "varchar", "String to uppercase")]
+    }
+
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let col = batch.column(0).as_string::<i32>();
+        let upper: StringArray = col.iter().map(|v| v.map(str::to_uppercase)).collect();
+        let out: ArrayRef = Arc::new(upper);
+        RecordBatch::try_new(params.output_schema.clone(), vec![out])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
 
 fn main() {
     let mut worker = Worker::new();
-    // worker.register_scalar(MyScalarFn);
-    // worker.register_table(MyTableFn);
-    // worker.set_catalog(my_catalog());
-    worker.run(); // serves stdio / --unix <path> / --http
+    worker.register_scalar(UpperCase);
+    worker.run(); // serves stdio (default), --unix <path>, or --http
 }
 ```
 
-See the [`vgi-example-worker`](https://github.com/Query-farm/vgi-rust) crate in
-this repository for a complete fixture worker exercising every function kind.
+Then from any DuckDB-compatible engine:
+
+```sql
+INSTALL vgi FROM community; LOAD vgi;      -- first time only
+ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
+SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
+-- ALICE
+-- BOB
+```
+
+## Function types
+
+| Type | Trait | Use case |
+|------|-------|----------|
+| Scalar | `ScalarFunction` | Per-row transforms (1:1) |
+| Table | `TableFunction` | Generate / scan data |
+| Table-In-Out | `TableInOutFunction` | Streaming transforms |
+| Table-Buffering | `TableBufferingFunction` | Aggregate-then-emit (sink → combine → source) |
+| Aggregate | `AggregateFunction` | Grouped / window / streaming aggregates |
+
+Beyond functions, `Worker::set_catalog` exposes full catalogs — schemas,
+function-backed tables, views, and macros — with constraints, column statistics,
+time travel (`AT`), and secondary catalogs attachable by name. Projection &
+filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets, bearer auth,
+and a cross-process state store are handled for you.
+
+## Transports
+
+Selected from argv by [`Worker::run`]: **stdio** (default), **Unix socket**
+(`--unix <path>`, the launcher contract), and **HTTP** (`--http`, Arrow-IPC over
+HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
 ## Status
 
 Verified against the canonical VGI C++ integration suite across all three
-transports — subprocess, launcher (Unix socket), and HTTP (8176 / 7774
-assertions on subprocess / HTTP respectively, 0 failures).
+transports — subprocess, launcher, and HTTP (8176 / 7774 assertions on
+subprocess / HTTP, 0 failures). See the
+[repository](https://github.com/Query-farm/vgi-rust) for a complete fixture
+worker exercising every function kind.
 
 ## License
 
-Query Farm Source-Available License v1.0 — see [LICENSE](../LICENSE).
+Query Farm Source-Available License v1.0 — see [LICENSE](https://github.com/Query-farm/vgi-rust/blob/main/LICENSE).
+Free for use, modification, and redistribution including in production; a
+separate commercial license is required only to offer a *competing* VGI product.
+Each release converts to Apache-2.0 ten years after its publication.
+Copyright © 2025, 2026 Query Farm LLC.
