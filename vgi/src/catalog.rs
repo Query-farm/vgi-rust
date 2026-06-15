@@ -248,7 +248,7 @@ pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
     Schema::new(fields)
 }
 
-/// Public wrapper for [`arg_type_to_arrow`] (used by overload scoring).
+/// Public wrapper for `arg_type_to_arrow` (used by overload scoring).
 pub fn arg_type_to_arrow_pub(t: &str) -> DataType {
     arg_type_to_arrow(t)
 }

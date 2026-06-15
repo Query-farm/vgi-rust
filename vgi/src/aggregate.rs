@@ -92,7 +92,7 @@ pub trait AggregateFunction: Send + Sync {
         ))
     }
 
-    /// Like [`finalize`], but with access to the bind-time arguments (stashed
+    /// Like [`Self::finalize`], but with access to the bind-time arguments (stashed
     /// at `aggregate_bind`, reloaded here). Override for `ConstParam(phase=
     /// "finalize")` aggregates like `vgi_percentile`. The default ignores them.
     fn finalize_with_args(
