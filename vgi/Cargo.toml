@@ -6,7 +6,10 @@ rust-version.workspace = true
 license-file.workspace = true
 authors.workspace = true
 homepage.workspace = true
+repository.workspace = true
 description = "VGI (Vector Gateway Interface) worker SDK — Rust port"
+keywords = ["vgi", "duckdb", "arrow", "rpc", "worker"]
+categories = ["database", "api-bindings"]
 
 [dependencies]
 vgi-rpc = { workspace = true }

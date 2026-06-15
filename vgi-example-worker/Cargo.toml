@@ -7,6 +7,8 @@ license-file.workspace = true
 authors.workspace = true
 homepage.workspace = true
 description = "VGI example worker — integration-test fixture set (Rust port)"
+# Test-fixture binary, not for crates.io (it has a path-only dep on `vgi`).
+publish = false
 
 [[bin]]
 name = "vgi-example-worker"

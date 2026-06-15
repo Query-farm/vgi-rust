@@ -82,6 +82,17 @@ impl Worker {
         self.disp.set_catalog(model);
     }
 
+    /// Add a secondary catalog served alongside the primary (MetaWorker model):
+    /// advertised by `catalog_catalogs` and attachable by its name. `functions`
+    /// names the worker-global functions it owns (scopes its function listing).
+    pub fn register_secondary_catalog(
+        &mut self,
+        model: crate::catalog::CatalogModel,
+        functions: Vec<String>,
+    ) {
+        self.disp.register_secondary_catalog(model, functions);
+    }
+
     /// Register a secret type (surfaced via `catalog_attach`).
     pub fn register_secret_type(&mut self, spec: crate::catalog::SecretTypeSpec) {
         self.disp.register_secret_type(spec);

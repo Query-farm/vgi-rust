@@ -49,6 +49,15 @@ pub struct Dispatcher {
     pub store: Arc<BufferingStore>,
     /// Declarative catalog (views / macros / function-backed tables).
     pub catalog: catalog::CatalogModel,
+    /// Additional catalogs this worker serves (MetaWorker model). Each is
+    /// advertised by `catalog_catalogs` and attachable by its name; an ATTACH
+    /// mints a random per-session scope encoded into `attach_opaque_data`.
+    pub secondary: Vec<catalog::CatalogModel>,
+    /// Function names owned by each secondary catalog (parallel to `secondary`).
+    /// Functions live in the worker-global registries, so these scope which
+    /// names a catalog's `catalog_schema_contents_functions` advertises: a
+    /// secondary shows only its own, and the primary hides every secondary's.
+    secondary_functions: Vec<Vec<String>>,
     /// Secret types registered by the worker (surfaced in `catalog_attach`).
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
@@ -67,6 +76,8 @@ impl Dispatcher {
             aggregates: HashMap::new(),
             store: Arc::new(BufferingStore::new()),
             catalog: catalog::CatalogModel::default(),
+            secondary: Vec::new(),
+            secondary_functions: Vec::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
             exec_counter: AtomicU64::new(1),
@@ -77,21 +88,20 @@ impl Dispatcher {
         self.catalog = model;
     }
 
+    /// Add a secondary catalog (served alongside the primary, MetaWorker-style),
+    /// declaring the worker-global function names it owns (so its function
+    /// listing is scoped and the primary hides them).
+    pub fn register_secondary_catalog(&mut self, model: catalog::CatalogModel, functions: Vec<String>) {
+        self.secondary.push(model);
+        self.secondary_functions.push(functions);
+    }
+
     pub fn register_secret_type(&mut self, spec: catalog::SecretTypeSpec) {
         self.secret_types.push(spec);
     }
 
     pub fn register_setting(&mut self, spec: catalog::SettingSpec) {
         self.settings.push(spec);
-    }
-
-    /// Schema names exposed by the catalog (always includes `main`).
-    fn schema_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.catalog.schemas.iter().map(|s| s.name.clone()).collect();
-        if !names.iter().any(|n| n == catalog::MAIN_SCHEMA) {
-            names.insert(0, catalog::MAIN_SCHEMA.to_string());
-        }
-        names
     }
 
     pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
@@ -409,6 +419,7 @@ impl Dispatcher {
                     output_schema: output_schema.clone(),
                     arguments: bp.arguments,
                     settings: bp.settings,
+                    attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
                     batch_index: None,
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
@@ -440,6 +451,13 @@ impl Dispatcher {
                 b"bufflags",
                 &[bp.arguments.named_bool("logging").unwrap_or(false) as u8],
             );
+            // Replay the call arguments + attach scope to the process/combine
+            // RPCs (they carry neither and may run in another pooled worker).
+            // Stateful buffering functions (e.g. `accumulate`) read these.
+            self.store.kv_put(&execution_id, b"bufargs", &bind_call.arguments.0);
+            if let Some(a) = bind_call.attach_opaque_data.as_ref() {
+                self.store.kv_put(&execution_id, b"bufattach", &a.0);
+            }
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
@@ -738,15 +756,65 @@ impl Dispatcher {
         self.catalog_name.as_bytes().to_vec()
     }
 
+    /// The catalog active for a request, decoded from its `attach_opaque_data`
+    /// (a secondary catalog when the secondary marker is present, else the
+    /// primary). See [`decode_secondary_opaque`].
+    fn active_catalog<'a>(&'a self, req: &Request) -> &'a catalog::CatalogModel {
+        if let Some((name, _)) = read_binary_col(req, "attach_opaque_data")
+            .as_deref()
+            .and_then(decode_secondary_opaque)
+        {
+            if let Some(c) = self.secondary.iter().find(|c| c.name == name) {
+                return c;
+            }
+        }
+        &self.catalog
+    }
+
+    /// Schema names exposed by a specific catalog model (always includes `main`).
+    fn catalog_schema_names(cat: &catalog::CatalogModel) -> Vec<String> {
+        let mut names: Vec<String> = cat.schemas.iter().map(|s| s.name.clone()).collect();
+        if !names.iter().any(|n| n == catalog::MAIN_SCHEMA) {
+            names.insert(0, catalog::MAIN_SCHEMA.to_string());
+        }
+        names
+    }
+
     /// `catalog_catalogs` — discovery: advertise this worker's catalog plus
     /// its version metadata so clients can inspect before attaching.
     pub fn handle_catalog_catalogs(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        let items = vec![Bytes::from(catalog::serialize_catalog_info(&self.catalog)?)];
+        let mut items = vec![Bytes::from(catalog::serialize_catalog_info(&self.catalog)?)];
+        for sec in &self.secondary {
+            items.push(Bytes::from(catalog::serialize_catalog_info(sec)?));
+        }
         Ok(Some(wire::to_result_batch(ItemsResult { items })?))
     }
 
     pub fn handle_catalog_attach(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: CatalogAttachRequest = boxed(req)?;
+        // Secondary (MetaWorker) catalog: attached by its name, with a random
+        // per-session scope id carried back on every request as the storage
+        // scope (so two ATTACH sessions of the same catalog stay isolated).
+        if let Some(sec) = self.secondary.iter().find(|c| c.name == dto.name) {
+            let scope = self.next_execution_id();
+            let result = CatalogAttachResult {
+                attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
+                supports_transactions: true,
+                supports_time_travel: sec.supports_time_travel,
+                catalog_version_frozen: false,
+                catalog_version: 1,
+                attach_opaque_data_required: true,
+                default_schema: catalog::MAIN_SCHEMA.to_string(),
+                settings: Vec::new(),
+                secret_types: Vec::new(),
+                comment: sec.comment.clone(),
+                tags: sec.tags.clone(),
+                supports_column_statistics: false,
+                resolved_data_version: sec.data_version_spec.clone(),
+                resolved_implementation_version: sec.implementation_version.clone(),
+            };
+            return Ok(Some(wire::to_result_batch(result)?));
+        }
         // Version negotiation: validate the requested versions against what this
         // worker serves, then echo the resolved concrete versions back.
         let (resolved_data_version, resolved_implementation_version) =
@@ -899,8 +967,13 @@ impl Dispatcher {
     /// Version-aware schema lookup: selects the object set for the request's
     /// resolved data version (falls back to the base schemas).
     fn schema_for_req<'a>(&'a self, req: &Request, name: &str) -> Option<&'a catalog::CatSchema> {
-        let v = self.req_version(req);
-        self.catalog.schemas_for(v.as_deref()).iter().find(|s| s.name == name)
+        let cat = self.active_catalog(req);
+        if std::ptr::eq(cat, &self.catalog) {
+            let v = self.req_version(req);
+            self.catalog.schemas_for(v.as_deref()).iter().find(|s| s.name == name)
+        } else {
+            cat.schemas.iter().find(|s| s.name == name)
+        }
     }
 
     pub fn handle_catalog_version(&self, _req: &Request) -> Result<Option<RecordBatch>> {
@@ -915,9 +988,8 @@ impl Dispatcher {
         })?))
     }
 
-    fn schema_info_for(&self, name: &str) -> SchemaInfo {
-        let comment = self
-            .catalog
+    fn schema_info_for(&self, cat: &catalog::CatalogModel, name: &str) -> SchemaInfo {
+        let comment = cat
             .schema(name)
             .and_then(|s| s.comment.as_deref())
             .or(if name == catalog::MAIN_SCHEMA {
@@ -925,16 +997,19 @@ impl Dispatcher {
             } else {
                 None
             });
-        let mut si = catalog::schema_info(name, comment, &self.attach_bytes());
-        // Version-shaped catalogs vary their object set per attach — the counts
-        // here aren't version-aware, so don't advertise them (avoids wrongly
-        // caching the base schema's empty table set).
-        if !self.catalog.version_schemas.is_empty() {
+        let is_primary = std::ptr::eq(cat, &self.catalog);
+        let attach = if is_primary { self.attach_bytes() } else { cat.name.as_bytes().to_vec() };
+        let mut si = catalog::schema_info(name, comment, &attach);
+        // Object counts come from the (primary) worker-global function
+        // registries, so only advertise them for the primary, non-version-shaped
+        // catalog. Version-shaped catalogs vary their object set per attach, and
+        // a secondary's functions aren't counted here — let discovery RPCs run.
+        if !is_primary || !self.catalog.version_schemas.is_empty() {
             return si;
         }
         // Advertise per-kind object counts so the C++ extension caches
         // `kind_empty` and skips the bulk discovery RPC for empty kinds.
-        let sch = self.catalog.schema(name);
+        let sch = cat.schema(name);
         let len = |n: usize| n as i64;
         let (sf, af, tf) = if name == catalog::MAIN_SCHEMA {
             (
@@ -957,16 +1032,21 @@ impl Dispatcher {
         si
     }
 
-    pub fn handle_catalog_schemas(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        let infos: Vec<SchemaInfo> = self.schema_names().iter().map(|n| self.schema_info_for(n)).collect();
+    pub fn handle_catalog_schemas(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let cat = self.active_catalog(req);
+        let infos: Vec<SchemaInfo> = Self::catalog_schema_names(cat)
+            .iter()
+            .map(|n| self.schema_info_for(cat, n))
+            .collect();
         let items = catalog::serialize_items(infos)?;
         Ok(Some(wire::to_result_batch(ItemsResult { items })?))
     }
 
     pub fn handle_schema_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let p: CatalogSchemaNameParams = wire::from_batch(&req.batch)?;
-        let items = if self.schema_names().iter().any(|n| n == &p.name) {
-            catalog::serialize_items(vec![self.schema_info_for(&p.name)])?
+        let cat = self.active_catalog(req);
+        let items = if Self::catalog_schema_names(cat).iter().any(|n| n == &p.name) {
+            catalog::serialize_items(vec![self.schema_info_for(cat, &p.name)])?
         } else {
             Vec::new()
         };
@@ -976,8 +1056,7 @@ impl Dispatcher {
     pub fn handle_contents_views(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let name = read_string_col(req, "name")?;
         let infos: Vec<ViewInfo> = self
-            .catalog
-            .schema(&name)
+            .schema_for_req(req, &name)
             .map(|s| s.views.iter().map(|v| catalog::view_info(&name, v)).collect())
             .unwrap_or_default();
         Ok(Some(wire::to_result_batch(ItemsResult {
@@ -1180,8 +1259,7 @@ impl Dispatcher {
         let name = read_string_col(req, "name")?;
         let want = normalize_function_type(&read_string_col(req, "type").unwrap_or_default());
         let infos: Vec<MacroInfo> = self
-            .catalog
-            .schema(&name)
+            .schema_for_req(req, &name)
             .map(|s| {
                 s.macros
                     .iter()
@@ -1209,7 +1287,26 @@ impl Dispatcher {
         let is_proj_repro = read_binary_col(req, "attach_opaque_data")
             .map(|b| b == PROJ_REPRO_APP.as_bytes())
             .unwrap_or(false);
-        let visible = |name: &str| name.starts_with(PROJ_REPRO_PREFIX) == is_proj_repro;
+        // Scope functions to the active catalog: a secondary advertises only the
+        // functions it owns; the primary hides every secondary's functions.
+        let active = self.active_catalog(req);
+        let active_sec_fns: Option<&[String]> = self
+            .secondary
+            .iter()
+            .position(|c| std::ptr::eq(c, active))
+            .and_then(|i| self.secondary_functions.get(i))
+            .map(|v| v.as_slice());
+        let all_sec_fns: std::collections::HashSet<&str> =
+            self.secondary_functions.iter().flatten().map(|s| s.as_str()).collect();
+        let visible = |name: &str| {
+            if name.starts_with(PROJ_REPRO_PREFIX) != is_proj_repro {
+                return false;
+            }
+            match active_sec_fns {
+                Some(fns) => fns.iter().any(|f| f == name),
+                None => !all_sec_fns.contains(name),
+            }
+        };
         let mut infos = Vec::new();
         if schema_name == catalog::MAIN_SCHEMA {
             let want = normalize_function_type(&type_filter);
@@ -1277,6 +1374,23 @@ impl Dispatcher {
             .unwrap_or(default)
     }
 
+    /// Replay the buffering call arguments persisted by the sink init (the
+    /// process/combine RPCs carry none). Remapped onto the function's declared
+    /// positions, matching what `on_bind` saw. Empty when none were persisted.
+    fn buffering_arguments(
+        &self,
+        execution_id: &[u8],
+        f: &dyn TableBufferingFunction,
+    ) -> crate::arguments::Arguments {
+        let mut args = self
+            .store
+            .kv_get(execution_id, b"bufargs")
+            .and_then(|b| crate::arguments::Arguments::parse(&b).ok())
+            .unwrap_or_default();
+        args.remap_positional(&f.argument_specs());
+        args
+    }
+
     pub fn handle_buffering_process(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
@@ -1287,8 +1401,9 @@ impl Dispatcher {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
             output_schema,
-            arguments: crate::arguments::Arguments::default(),
+            arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
+            attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: dto.batch_index,
             logs: logs.clone(),
         };
@@ -1318,8 +1433,9 @@ impl Dispatcher {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
             output_schema,
-            arguments: crate::arguments::Arguments::default(),
+            arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
+            attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: None,
             logs: logs.clone(),
         };
@@ -1913,6 +2029,30 @@ fn split_group_ids(batch: &RecordBatch) -> Result<(Int64Array, Vec<ArrayRef>)> {
         .map(|i| batch.column(i).clone())
         .collect();
     Ok((gids, columns))
+}
+
+/// Marker prefix for a secondary-catalog `attach_opaque_data`:
+/// `\x00sec\x00<name>\x00<scope>`. The leading NUL distinguishes it from a
+/// primary catalog (plaintext name) and a version-shaped one (`<version>\0…`,
+/// whose version is non-empty so its first byte is never NUL).
+const SEC_MARKER: &[u8] = b"\x00sec\x00";
+
+/// Encode a secondary-catalog attach blob from its name + per-session scope id.
+fn encode_secondary_opaque(name: &str, scope: &[u8]) -> Vec<u8> {
+    let mut v = SEC_MARKER.to_vec();
+    v.extend_from_slice(name.as_bytes());
+    v.push(0);
+    v.extend_from_slice(scope);
+    v
+}
+
+/// Decode a secondary-catalog attach blob into `(catalog_name, scope)`, or
+/// `None` when the marker is absent (a primary/version-shaped catalog).
+fn decode_secondary_opaque(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let rest = bytes.strip_prefix(SEC_MARKER)?;
+    let sep = rest.iter().position(|&b| b == 0)?;
+    let name = String::from_utf8(rest[..sep].to_vec()).ok()?;
+    Some((name, rest[sep + 1..].to_vec()))
 }
 
 /// Read a string (or dict-string) column at row 0 by name.

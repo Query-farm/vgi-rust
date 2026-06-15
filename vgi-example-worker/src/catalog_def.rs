@@ -387,7 +387,7 @@ fn data_tables() -> Vec<CatTable> {
         "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
         vec![seq(50), native("read_csv_auto", "/tmp/vgi_nopushdown_branch.csv")]));
     tables.push(mb("multi_branch_empty",
-        "Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test",
+        "Multi-branch: empty branches list — used by multi_branch_empty_branches.test",
         vec![]));
     {
         let mut t = dtable("multi_branch_recon", vec![f("a", Int64), f("b", Int64)],

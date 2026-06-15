@@ -236,6 +236,12 @@ impl Arguments {
         }
     }
 
+    /// The 1-row array of a named argument (non-null), if present. Lets callers
+    /// read types without a dedicated accessor (e.g. INTERVAL month_day_nano).
+    pub fn named(&self, name: &str) -> Option<&ArrayRef> {
+        self.named_nonnull(name)
+    }
+
     /// Read a named const int argument.
     pub fn named_i64(&self, name: &str) -> Option<i64> {
         crate::numeric::array_value_i64(self.named_nonnull(name)?, 0)

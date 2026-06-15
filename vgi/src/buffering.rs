@@ -226,6 +226,11 @@ pub struct BufferingParams {
     pub output_schema: SchemaRef,
     pub arguments: Arguments,
     pub settings: Settings,
+    /// The (plaintext) attach state for this call, when carried by the request.
+    /// Persisted at the sink-init phase and replayed to process/combine, which
+    /// otherwise carry no per-attach context (stateful functions scope storage
+    /// by this).
+    pub attach_opaque_data: Option<Vec<u8>>,
     /// DuckDB per-chunk batch index, when the function declares
     /// `requires_input_batch_index` (only set on the process RPC).
     pub batch_index: Option<i64>,

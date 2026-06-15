@@ -7,6 +7,7 @@
 //! `VGI_WORKER_CATALOG_NAME` (default `example`). Transport is selected from
 //! argv: stdio (default) or `--unix <path>` (launcher).
 
+mod accumulate;
 mod aggregate;
 mod attach_options;
 mod catalog_def;
@@ -43,6 +44,12 @@ fn main() {
     } else {
         catalog_def::build_by_name(&catalog_name)
     };
+    // The `accumulate` fixture catalog is served (MetaWorker-style) alongside
+    // the example catalog — the accumulate tests attach it via the plain worker.
+    if catalog.name == "example" {
+        accumulate::register(&mut worker);
+        worker.register_secondary_catalog(accumulate::catalog(), accumulate::function_names());
+    }
     worker.set_catalog(catalog);
     worker.run();
 }
