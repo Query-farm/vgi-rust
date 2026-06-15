@@ -1,6 +1,6 @@
 # vgi
 
-[![crates.io](https://img.shields.io/crates/v/vgi.svg)](https://crates.io/crates/vgi)
+[![crates.io](https://badgen.net/crates/v/vgi)](https://crates.io/crates/vgi)
 [![docs.rs](https://docs.rs/vgi/badge.svg)](https://docs.rs/vgi)
 
 <p align="center">
