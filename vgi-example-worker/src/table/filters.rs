@@ -55,23 +55,34 @@ impl TableFunction for FilterEchoTableScan {
         vec![]
     }
     fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, _p: &BindParams) -> Option<TableCardinality> {
-        Some(TableCardinality { estimate: Some(100), max: Some(100) })
+        Some(TableCardinality {
+            estimate: Some(100),
+            max: Some(100),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let pushed = params
             .pushdown_filters
             .as_ref()
-            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .and_then(|b| {
+                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+            })
             .map(|f| f.format_pushed())
             .unwrap_or_else(|| "(none)".to_string());
         let ns: Int64Array = (0..100).collect();
         let ss = StringArray::from((0..100).map(|i| format!("row_{i}")).collect::<Vec<_>>());
         let pf = StringArray::from(vec![pushed; 100]);
-        let batch = RecordBatch::try_new(Self::schema(), vec![Arc::new(ns), Arc::new(ss), Arc::new(pf)])
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            Self::schema(),
+            vec![Arc::new(ns), Arc::new(ss), Arc::new(pf)],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Box::new(OneBatch { batch: Some(batch) }))
     }
 }
@@ -101,7 +112,10 @@ impl SpatialFilterExampleFunction {
     fn schema() -> SchemaRef {
         let geom = Field::new("geom", DataType::Binary, true).with_metadata(
             std::collections::HashMap::from([
-                ("ARROW:extension:name".to_string(), "geoarrow.wkb".to_string()),
+                (
+                    "ARROW:extension:name".to_string(),
+                    "geoarrow.wkb".to_string(),
+                ),
                 ("ARROW:extension:metadata".to_string(), "{}".to_string()),
             ]),
         );
@@ -135,15 +149,25 @@ impl TableFunction for SpatialFilterExampleFunction {
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let c = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1024).max(1);
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(1024)
+            .max(1);
         Ok(Box::new(SpatialProducer {
             schema: Self::schema(),
             total: count,
@@ -169,8 +193,14 @@ impl TableProducer for SpatialProducer {
         }
         let size = (self.total - self.index).min(self.batch_size);
         let ns: Vec<i64> = (self.index..self.index + size).collect();
-        let xs: Vec<f64> = ns.iter().map(|&i| (i % self.cols) as f64 / self.cols as f64).collect();
-        let ys: Vec<f64> = ns.iter().map(|&i| (i / self.cols) as f64 / self.cols as f64).collect();
+        let xs: Vec<f64> = ns
+            .iter()
+            .map(|&i| (i % self.cols) as f64 / self.cols as f64)
+            .collect();
+        let ys: Vec<f64> = ns
+            .iter()
+            .map(|&i| (i / self.cols) as f64 / self.cols as f64)
+            .collect();
         let geoms: Vec<Vec<u8>> = xs.iter().zip(&ys).map(|(&x, &y)| wkb_point(x, y)).collect();
         let geom_arr = BinaryArray::from_iter_values(geoms.iter().map(|g| g.as_slice()));
         self.index += size;
@@ -227,16 +257,31 @@ impl TableFunction for ExpressionFilterTestFunction {
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: Self::schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let c = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1024).max(1);
-        Ok(Box::new(ExprFilterProducer { schema: Self::schema(), total: count, batch_size, index: 0 }))
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(1024)
+            .max(1);
+        Ok(Box::new(ExprFilterProducer {
+            schema: Self::schema(),
+            total: count,
+            batch_size,
+            index: 0,
+        }))
     }
 }
 
@@ -265,7 +310,12 @@ impl TableProducer for ExprFilterProducer {
         self.index += size;
         let batch = RecordBatch::try_new(
             self.schema.clone(),
-            vec![Arc::new(Int64Array::from(ids)), Arc::new(names), Arc::new(tags.finish()), Arc::new(scores)],
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(names),
+                Arc::new(tags.finish()),
+                Arc::new(scores),
+            ],
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
@@ -308,16 +358,25 @@ impl TableFunction for DynamicFilterEchoFunction {
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let c = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(2048)
+            .max(1);
         // Init witness from the static filter (if any).
         let witness = params
             .pushdown_filters
             .as_ref()
-            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .and_then(|b| {
+                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+            })
             .map(|f| f.format_repr())
             .unwrap_or_default();
         Ok(Box::new(DynFilterEchoProducer {
@@ -399,7 +458,10 @@ impl TableProducer for DictEchoProducer {
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         let batch = RecordBatch::try_new(
             self.schema.clone(),
-            vec![Arc::new(Int64Array::from(ns)) as ArrayRef, Arc::new(dict) as ArrayRef],
+            vec![
+                Arc::new(Int64Array::from(ns)) as ArrayRef,
+                Arc::new(dict) as ArrayRef,
+            ],
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         self.cursor += size;
@@ -420,11 +482,17 @@ impl TableFunction for DictFilterEchoFunction {
         vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: dict_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: dict_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(DictEchoProducer {
@@ -505,7 +573,8 @@ impl TableFunction for FilterEchoPartitionedFunction {
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: "Multi-worker partitioned sequence that echoes pushed-down filters".to_string(),
+            description: "Multi-worker partitioned sequence that echoes pushed-down filters"
+                .to_string(),
             categories: vec!["generator".into(), "diagnostic".into(), "testing".into()],
             projection_pushdown: true,
             filter_pushdown: true,
@@ -514,20 +583,34 @@ impl TableFunction for FilterEchoPartitionedFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Number of rows to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: fep_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: fep_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn max_workers(&self, _params: &BindParams) -> i64 {
         4
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
-        let store = params.storage.as_ref().ok_or_else(|| RpcError::runtime_error("requires storage"))?;
+        let store = params
+            .storage
+            .as_ref()
+            .ok_or_else(|| RpcError::runtime_error("requires storage"))?;
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let chunk = ((count + 23) / 24).max(1);
         let mut items = Vec::new();
@@ -543,7 +626,10 @@ impl TableFunction for FilterEchoPartitionedFunction {
         Ok(())
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
-        let storage = params.storage.clone().ok_or_else(|| RpcError::runtime_error("requires storage"))?;
+        let storage = params
+            .storage
+            .clone()
+            .ok_or_else(|| RpcError::runtime_error("requires storage"))?;
         Ok(Box::new(FepProducer {
             schema: fep_schema(),
             storage,
@@ -570,9 +656,11 @@ fn meta(desc: &str) -> FunctionMetadata {
 /// The SQL-like string of whatever DuckDB pushed down ("(none)" if nothing).
 fn pushed_filter_str(params: &ProcessParams) -> String {
     match &params.pushdown_filters {
-        Some(bytes) => vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
-            .map(|f| f.format_pushed())
-            .unwrap_or_else(|_| "(none)".to_string()),
+        Some(bytes) => {
+            vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
+                .map(|f| f.format_pushed())
+                .unwrap_or_else(|_| "(none)".to_string())
+        }
         None => "(none)".to_string(),
     }
 }
@@ -653,7 +741,11 @@ impl TableFunction for FilterEchoFunction {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(2048)
+            .max(1);
         Ok(Box::new(FilterEchoProducer {
             schema: filter_echo_schema(),
             remaining: count,
@@ -729,17 +821,27 @@ impl TableFunction for ValuePruneFunction {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1) as usize;
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(2048)
+            .max(1) as usize;
         let discrete = params
             .pushdown_filters
             .as_ref()
-            .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok())
+            .and_then(|b| {
+                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+            })
             .and_then(|f| f.get_column_values("n"));
         let (values, resolved) = match discrete {
             Some(mut vs) => {
                 vs.sort_unstable();
                 vs.dedup();
-                let resolved = vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+                let resolved = vs
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let emit: Vec<i64> = vs.into_iter().filter(|&v| v >= 0 && v < count).collect();
                 (emit, resolved)
             }
@@ -836,7 +938,10 @@ impl TableFunction for NamedParamsEchoFunction {
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
@@ -845,7 +950,10 @@ impl TableFunction for NamedParamsEchoFunction {
             remaining: count,
             cursor: 0,
             batch_size: 2048,
-            greeting: params.arguments.named_str("greeting").unwrap_or_else(|| "hello".to_string()),
+            greeting: params
+                .arguments
+                .named_str("greeting")
+                .unwrap_or_else(|| "hello".to_string()),
             multiplier: params.arguments.named_i64("multiplier").unwrap_or(1),
             scale: params.arguments.named_f64("scale").unwrap_or(1.0),
             enabled: params.arguments.named_bool("enabled").unwrap_or(true),

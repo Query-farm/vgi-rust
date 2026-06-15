@@ -87,7 +87,9 @@ impl ScalarFunction for DoubleFunction {
         vec![ArgSpec::any_column("value", 0, "Numeric value to double").with_bound(MULTIPLIABLE)]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse::result(promote_for_addition(&first_input_type(params))))
+        Ok(BindResponse::result(promote_for_addition(
+            &first_input_type(params),
+        )))
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         double_first(params, batch)
@@ -162,7 +164,9 @@ impl ScalarFunction for SumValuesFunction {
             .with_bound(ADDABLE)]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse::result(promote_for_addition(&first_input_type(params))))
+        Ok(BindResponse::result(promote_for_addition(
+            &first_input_type(params),
+        )))
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.num_columns() == 0 {
@@ -177,7 +181,8 @@ impl ScalarFunction for SumValuesFunction {
             acc = arrow_arith::numeric::add(&acc, &c)
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         }
-        let acc = arrow_cast::cast(&acc, &ty).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let acc =
+            arrow_cast::cast(&acc, &ty).map_err(|e| RpcError::runtime_error(e.to_string()))?;
         result(params, acc)
     }
 }
@@ -253,7 +258,12 @@ impl ScalarFunction for UpperCaseFunction {
         meta_ret("Converts string values to uppercase", DataType::Utf8)
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::column("value", 0, "varchar", "String value to uppercase")]
+        vec![ArgSpec::column(
+            "value",
+            0,
+            "varchar",
+            "String value to uppercase",
+        )]
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let s = batch.column(0).as_string::<i32>();
@@ -304,7 +314,9 @@ impl ScalarFunction for BinaryPacketFunction {
                     .unwrap_or_default();
                 let version = sa
                     .column_by_name("version")
-                    .and_then(|c| vgi::numeric::array_value_i64(&arrow_array::make_array(c.to_data()), 0))
+                    .and_then(|c| {
+                        vgi::numeric::array_value_i64(&arrow_array::make_array(c.to_data()), 0)
+                    })
                     .unwrap_or(0);
                 (label, version)
             }
@@ -344,10 +356,17 @@ impl ScalarFunction for NullHandlingFunction {
         m
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::column("value", 0, "int64", "Integer value to process")]
+        vec![ArgSpec::column(
+            "value",
+            0,
+            "int64",
+            "Integer value to process",
+        )]
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
-        let a = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
+        let a = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
         let out: Int64Array = (0..a.len())
             .map(|i| Some(if a.is_null(i) { -5000 } else { a.value(i) }))
             .collect();
@@ -403,7 +422,10 @@ impl ScalarFunction for HashSeedFunction {
         "hash_seed"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta_ret("Generate deterministic integers from a constant seed", DataType::Int64)
+        meta_ret(
+            "Generate deterministic integers from a constant seed",
+            DataType::Int64,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::const_arg("seed", 0, "int64", "Seed value")]
@@ -462,8 +484,12 @@ impl ScalarFunction for RandomIntFunction {
         ]
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
-        let lo = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
-        let hi = batch.column(1).as_primitive::<arrow_array::types::Int64Type>();
+        let lo = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let hi = batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Int64Type>();
         let mut rng = Rng::new(volatile_seed());
         let out: Int64Array = (0..lo.len())
             .map(|i| {
@@ -518,7 +544,10 @@ impl ScalarFunction for TypeInfo {
         "type_info"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta_ret(&format!("Return type name for {} input", self.0), DataType::Utf8)
+        meta_ret(
+            &format!("Return type name for {} input", self.0),
+            DataType::Utf8,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::column_typed("v", 0, self.1.clone(), "Input value")]
@@ -539,7 +568,10 @@ impl ScalarFunction for PairType {
         "pair_type"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta_ret(&format!("Return type pair name for {}", self.0), DataType::Utf8)
+        meta_ret(
+            &format!("Return type pair name for {}", self.0),
+            DataType::Utf8,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
@@ -605,14 +637,24 @@ impl ScalarFunction for MultiplyBySettingFunction {
         "multiply_by_setting"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta_ret("Multiply the input value by a setting value", DataType::Int64)
+        meta_ret(
+            "Multiply the input value by a setting value",
+            DataType::Int64,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::column("value", 0, "int64", "Integer value to multiply")]
+        vec![ArgSpec::column(
+            "value",
+            0,
+            "int64",
+            "Integer value to multiply",
+        )]
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let mult = params.settings.get_i64("multiplier").unwrap_or(1);
-        let a = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
+        let a = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
         let out: Int64Array = (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i) * mult))
             .collect();

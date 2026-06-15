@@ -3,17 +3,17 @@
 //! Table (producer) example fixtures.
 
 mod batch_index;
-mod order_modes;
-mod settings_fixtures;
-mod static_scan;
-mod partition;
+mod cancellable;
 mod filters;
 mod more;
-mod versioned_scan;
-mod cancellable;
+mod order_modes;
+mod partition;
 mod proj_repro;
 mod rff;
+mod settings_fixtures;
+mod static_scan;
 pub mod tt_pushdown;
+mod versioned_scan;
 
 use std::sync::Arc;
 
@@ -62,7 +62,11 @@ fn schema_n() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]))
 }
 fn schema_value() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        true,
+    )]))
 }
 
 /// Validate `sequence`/`make_series` args: count must be non-NULL; batch_size
@@ -73,7 +77,11 @@ fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
     let count_null = a
         .positional
         .first()
-        .map(|o| o.as_ref().map(|c| c.is_empty() || c.is_null(0)).unwrap_or(true))
+        .map(|o| {
+            o.as_ref()
+                .map(|c| c.is_empty() || c.is_null(0))
+                .unwrap_or(true)
+        })
         .unwrap_or(true);
     if count_null {
         return Err(RpcError::value_error("sequence: count cannot be NULL"));
@@ -81,7 +89,9 @@ fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
     for name in ["batch_size", "increment"] {
         if let Some(arr) = a.named.get(name) {
             if arr.is_null(0) {
-                return Err(RpcError::value_error(format!("sequence: {name} cannot be NULL")));
+                return Err(RpcError::value_error(format!(
+                    "sequence: {name} cannot be NULL"
+                )));
             }
         }
     }
@@ -170,7 +180,11 @@ impl TableFunction for SequenceFunction {
     fn statistics(&self, params: &BindParams) -> Option<Vec<vgi::statistics::CatColStat>> {
         let count = params.arguments.const_i64(0)?.max(0);
         let increment = params.arguments.named_i64("increment").unwrap_or(1);
-        let max = if count == 0 { 0 } else { (count - 1) * increment };
+        let max = if count == 0 {
+            0
+        } else {
+            (count - 1) * increment
+        };
         Some(vec![vgi::statistics::CatColStat {
             column_name: "n".to_string(),
             min: vgi::statistics::StatValue::Int64(0.min(max)),
@@ -186,7 +200,11 @@ impl TableFunction for SequenceFunction {
         validate_sequence_args(&params.arguments)?;
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let increment = params.arguments.named_i64("increment").unwrap_or(1);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(1000).max(1) as usize;
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(1000)
+            .max(1) as usize;
         let values: Vec<i64> = (0..count).map(|i| i * increment).collect();
         Ok(Box::new(Countdown {
             values,
@@ -227,16 +245,26 @@ impl TableFunction for ProfilingDemoFunction {
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let increment = params.arguments.named_i64("increment").unwrap_or(1);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1) as usize;
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(2048)
+            .max(1) as usize;
         let values: Vec<i64> = (0..count).map(|i| i * increment).collect();
         Ok(Box::new(ProfilingProducer {
             values,
@@ -315,8 +343,9 @@ impl TableProducer for ProfilingProducer {
 const SCRAMBLE: i64 = 2654435761;
 
 fn late_mat_schema() -> SchemaRef {
-    let rid = Field::new("row_id", DataType::Int64, true)
-        .with_metadata(std::collections::HashMap::from([("is_row_id".to_string(), String::new())]));
+    let rid = Field::new("row_id", DataType::Int64, true).with_metadata(
+        std::collections::HashMap::from([("is_row_id".to_string(), String::new())]),
+    );
     Arc::new(Schema::new(vec![
         rid,
         Field::new("ord", DataType::Int64, true),
@@ -327,15 +356,17 @@ fn late_mat_schema() -> SchemaRef {
 
 /// Summarize the pushed rowid filter as the `pushed` witness string.
 fn rowid_witness(params: &ProcessParams) -> String {
-    let pf = params
-        .pushdown_filters
-        .as_ref()
-        .and_then(|b| vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok());
+    let pf = params.pushdown_filters.as_ref().and_then(|b| {
+        vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+    });
     match pf {
         Some(pf) => {
             let (n, lo, hi) = pf.column_summary("row_id");
             let rng = if lo.is_some() || hi.is_some() {
-                let s = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "None".to_string());
+                let s = |v: Option<i64>| {
+                    v.map(|x| x.to_string())
+                        .unwrap_or_else(|| "None".to_string())
+                };
                 format!("{}..{}", s(lo), s(hi))
             } else {
                 "none".to_string()
@@ -363,22 +394,46 @@ impl TableFunction for LateMaterializationFunction {
         vec![
             ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
             ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
-            ArgSpec::const_arg("dup_row_id", -1, "boolean", "Emit a non-unique row_id (index // 2)"),
-            ArgSpec::const_arg("null_ord_stride", -1, "int64", "Emit NULL ord every Nth row"),
+            ArgSpec::const_arg(
+                "dup_row_id",
+                -1,
+                "boolean",
+                "Emit a non-unique row_id (index // 2)",
+            ),
+            ArgSpec::const_arg(
+                "null_ord_stride",
+                -1,
+                "int64",
+                "Emit NULL ord every Nth row",
+            ),
         ]
     }
     fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: late_mat_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: late_mat_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let c = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let batch_size = params.arguments.named_i64("batch_size").unwrap_or(2048).max(1);
+        let batch_size = params
+            .arguments
+            .named_i64("batch_size")
+            .unwrap_or(2048)
+            .max(1);
         let dup = params.arguments.named_bool("dup_row_id").unwrap_or(false);
-        let stride = params.arguments.named_i64("null_ord_stride").unwrap_or(0).max(0);
+        let stride = params
+            .arguments
+            .named_i64("null_ord_stride")
+            .unwrap_or(0)
+            .max(0);
         Ok(Box::new(LateMatProducer {
             schema: late_mat_schema(),
             count,
@@ -408,7 +463,10 @@ impl TableProducer for LateMatProducer {
         }
         let end = (self.offset + self.batch_size).min(self.count);
         let rows: Vec<i64> = (self.offset..end).collect();
-        let row_id: Int64Array = rows.iter().map(|&i| if self.dup { i / 2 } else { i }).collect();
+        let row_id: Int64Array = rows
+            .iter()
+            .map(|&i| if self.dup { i / 2 } else { i })
+            .collect();
         let ord: Int64Array = rows
             .iter()
             .map(|&i| {
@@ -419,12 +477,21 @@ impl TableProducer for LateMatProducer {
                 }
             })
             .collect();
-        let payload = StringArray::from(rows.iter().map(|&i| format!("payload_{i}")).collect::<Vec<_>>());
+        let payload = StringArray::from(
+            rows.iter()
+                .map(|&i| format!("payload_{i}"))
+                .collect::<Vec<_>>(),
+        );
         let pushed = StringArray::from(vec![self.witness.clone(); rows.len()]);
         self.offset = end;
         let batch = RecordBatch::try_new(
             self.schema.clone(),
-            vec![Arc::new(row_id), Arc::new(ord), Arc::new(payload), Arc::new(pushed)],
+            vec![
+                Arc::new(row_id),
+                Arc::new(ord),
+                Arc::new(payload),
+                Arc::new(pushed),
+            ],
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
@@ -476,7 +543,10 @@ impl TableFunction for TxCachedValueFunction {
         })
     }
     fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {
-        Some(TableCardinality { estimate: Some(1), max: Some(1) })
+        Some(TableCardinality {
+            estimate: Some(1),
+            max: Some(1),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let v = params
@@ -485,7 +555,12 @@ impl TableFunction for TxCachedValueFunction {
             .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
             .unwrap_or(0);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        Ok(Box::new(Countdown { values: vec![v], offset: 0, batch_size: 1, schema }))
+        Ok(Box::new(Countdown {
+            values: vec![v],
+            offset: 0,
+            batch_size: 1,
+            schema,
+        }))
     }
 }
 
@@ -534,16 +609,31 @@ impl TableFunction for NestedSequenceFunction {
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: nested_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: nested_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let history_size = params.arguments.named_i64("history_size").unwrap_or(20).max(1);
-        Ok(Box::new(NestedSeqProducer { schema: nested_schema(), count, history_size, done: false }))
+        let history_size = params
+            .arguments
+            .named_i64("history_size")
+            .unwrap_or(20)
+            .max(1);
+        Ok(Box::new(NestedSeqProducer {
+            schema: nested_schema(),
+            count,
+            history_size,
+            done: false,
+        }))
     }
 }
 
@@ -563,7 +653,11 @@ impl TableProducer for NestedSeqProducer {
         self.done = true;
         let n: Int64Array = (0..self.count).collect();
         let index: Int64Array = (0..self.count).collect();
-        let label = StringArray::from((0..self.count).map(|i| format!("row_{i}")).collect::<Vec<_>>());
+        let label = StringArray::from(
+            (0..self.count)
+                .map(|i| format!("row_{i}"))
+                .collect::<Vec<_>>(),
+        );
         let DataType::Struct(meta_fields) = self.schema.field(1).data_type().clone() else {
             unreachable!()
         };
@@ -705,10 +799,18 @@ impl TableFunction for MakeSeriesCsv {
         gen_meta("Parse comma-separated integers into rows", &["generator"])
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("values", 0, "varchar", "Comma-separated integers")]
+        vec![ArgSpec::const_arg(
+            "values",
+            0,
+            "varchar",
+            "Comma-separated integers",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_value(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_value(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let csv = params.arguments.const_str(0).unwrap_or_default();
@@ -716,14 +818,23 @@ impl TableFunction for MakeSeriesCsv {
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
             .collect();
-        Ok(Box::new(Countdown { values, offset: 0, batch_size: 1024, schema: schema_value() }))
+        Ok(Box::new(Countdown {
+            values,
+            offset: 0,
+            batch_size: 1024,
+            schema: schema_value(),
+        }))
     }
 }
 
 /// `make_series(step)` — 10 float values `0.0, step, 2*step, … 9*step`.
 pub struct MakeSeriesFloat;
 fn schema_value_f64() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("value", DataType::Float64, true)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Float64,
+        true,
+    )]))
 }
 struct FloatSeq {
     values: Vec<f64>,
@@ -748,17 +859,32 @@ impl TableFunction for MakeSeriesFloat {
         "make_series"
     }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Generate 10 float values with given step size", &["generator"])
+        gen_meta(
+            "Generate 10 float values with given step size",
+            &["generator"],
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("step", 0, "float64", "Step size between values")]
+        vec![ArgSpec::const_arg(
+            "step",
+            0,
+            "float64",
+            "Step size between values",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_value_f64(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_value_f64(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let step = params.arguments.const_f64(0).unwrap_or(1.0);
         let values: Vec<f64> = (0..10).map(|i| i as f64 * step).collect();
-        Ok(Box::new(FloatSeq { values, emitted: false, schema: schema_value_f64() }))
+        Ok(Box::new(FloatSeq {
+            values,
+            emitted: false,
+            schema: schema_value_f64(),
+        }))
     }
 }

@@ -5,7 +5,10 @@
 use std::sync::Arc;
 
 use arrow_array::types::UInt32Type;
-use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, PrimitiveArray, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, Float64Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+    UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableFunction, TableProducer};
@@ -44,10 +47,18 @@ impl TableFunction for GeneratorExceptionFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("fail_after", 0, "int64", "Batches before failure")]
+        vec![ArgSpec::const_arg(
+            "fail_after",
+            0,
+            "int64",
+            "Batches before failure",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(GenExc {
@@ -93,10 +104,18 @@ impl TableFunction for LoggingGeneratorFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Number of values to generate")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Number of values to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(LogGen {
@@ -161,9 +180,7 @@ impl ConstantColumnsFunction {
                     .arg_field(i)
                     .map(|f| f.metadata().clone())
                     .unwrap_or_default();
-                fields.push(
-                    Field::new(name, a.data_type().clone(), true).with_metadata(meta),
-                );
+                fields.push(Field::new(name, a.data_type().clone(), true).with_metadata(meta));
             }
         }
         Arc::new(Schema::new(fields))
@@ -254,10 +271,18 @@ impl TableFunction for ProjectedDataFunction {
         "projected_data"
     }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Generates data with 4 columns, supporting projection pushdown", true)
+        gen_meta(
+            "Generates data with 4 columns, supporting projection pushdown",
+            true,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Number of rows to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         Ok(BindResponse {
@@ -308,14 +333,18 @@ impl TableProducer for ProjectedData {
                 match f.name().as_str() {
                     "id" => Arc::new(Int64Array::from_iter_values(start..start + n)),
                     "name" => Arc::new(StringArray::from(
-                        (start..start + n).map(|i| format!("item_{i}")).collect::<Vec<_>>(),
+                        (start..start + n)
+                            .map(|i| format!("item_{i}"))
+                            .collect::<Vec<_>>(),
                     )),
                     "value" => Arc::new(Float64Array::from_iter_values(
                         (start..start + n).map(|i| i as f64 * 1.5),
                     )),
-                    "extra" => Arc::new(PrimitiveArray::<arrow_array::types::Int64Type>::from_iter_values(
-                        (start..start + n).map(|i| i * i),
-                    )),
+                    "extra" => Arc::new(
+                        PrimitiveArray::<arrow_array::types::Int64Type>::from_iter_values(
+                            (start..start + n).map(|i| i * i),
+                        ),
+                    ),
                     _ => Arc::new(Int64Array::from_iter_values(start..start + n)),
                 }
             })
@@ -349,7 +378,9 @@ fn diag_schema(extra: &[(&str, DataType)]) -> SchemaRef {
 
 pub struct OrderEchoFunction;
 impl TableFunction for OrderEchoFunction {
-    fn name(&self) -> &str { "order_echo" }
+    fn name(&self) -> &str {
+        "order_echo"
+    }
     fn metadata(&self) -> FunctionMetadata {
         let mut m = gen_meta("Echoes ORDER BY + LIMIT pushdown hints in output", false);
         m.projection_pushdown = true;
@@ -377,7 +408,10 @@ impl TableFunction for OrderEchoFunction {
     }
     fn cardinality(&self, p: &BindParams) -> Option<vgi::table_function::TableCardinality> {
         let c = p.arguments.const_i64(0)?;
-        Some(vgi::table_function::TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(vgi::table_function::TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(DiagEcho {
@@ -387,8 +421,12 @@ impl TableFunction for OrderEchoFunction {
             schema: p.output_schema.clone(),
             strs: vec![
                 p.order_by_column.clone().unwrap_or_else(|| "(none)".into()),
-                p.order_by_direction.clone().unwrap_or_else(|| "(none)".into()),
-                p.order_by_null_order.clone().unwrap_or_else(|| "(none)".into()),
+                p.order_by_direction
+                    .clone()
+                    .unwrap_or_else(|| "(none)".into()),
+                p.order_by_null_order
+                    .clone()
+                    .unwrap_or_else(|| "(none)".into()),
             ],
             ints: vec![p.order_by_limit.unwrap_or(-1)],
             floats: vec![],
@@ -398,7 +436,9 @@ impl TableFunction for OrderEchoFunction {
 
 pub struct SampleEchoFunction;
 impl TableFunction for SampleEchoFunction {
-    fn name(&self) -> &str { "sample_echo" }
+    fn name(&self) -> &str {
+        "sample_echo"
+    }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
             sampling_pushdown: true,
@@ -422,7 +462,10 @@ impl TableFunction for SampleEchoFunction {
     }
     fn cardinality(&self, p: &BindParams) -> Option<vgi::table_function::TableCardinality> {
         let c = p.arguments.const_i64(0)?;
-        Some(vgi::table_function::TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(vgi::table_function::TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(DiagEcho {
@@ -442,9 +485,9 @@ struct DiagEcho {
     current: i64,
     batch_size: i64,
     schema: SchemaRef,
-    strs: Vec<String>,   // order_column/direction/null_order OR none (sample)
-    ints: Vec<i64>,      // order_limit OR sample_seed
-    floats: Vec<f64>,    // sample_percentage OR none
+    strs: Vec<String>, // order_column/direction/null_order OR none (sample)
+    ints: Vec<i64>,    // order_limit OR sample_seed
+    floats: Vec<f64>,  // sample_percentage OR none
 }
 impl TableProducer for DiagEcho {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
@@ -463,13 +506,17 @@ impl TableProducer for DiagEcho {
                 match f.name().as_str() {
                     "n" => Arc::new(Int64Array::from_iter_values(start..start + n)),
                     "s" => Arc::new(StringArray::from(
-                        (start..start + n).map(|i| format!("row_{i}")).collect::<Vec<_>>(),
+                        (start..start + n)
+                            .map(|i| format!("row_{i}"))
+                            .collect::<Vec<_>>(),
                     )),
                     "order_column" => rep_str(&self.strs[0], n),
                     "order_direction" => rep_str(&self.strs[1], n),
                     "order_null_order" => rep_str(&self.strs[2], n),
                     "order_limit" => Arc::new(Int64Array::from(vec![self.ints[0]; n as usize])),
-                    "sample_percentage" => Arc::new(Float64Array::from(vec![self.floats[0]; n as usize])),
+                    "sample_percentage" => {
+                        Arc::new(Float64Array::from(vec![self.floats[0]; n as usize]))
+                    }
                     "sample_seed" => Arc::new(Int64Array::from(vec![self.ints[0]; n as usize])),
                     _ => Arc::new(Int64Array::from(vec![0i64; n as usize])),
                 }
@@ -493,9 +540,14 @@ fn rep_str(s: &str, n: i64) -> ArrayRef {
 
 pub struct DoubleSequenceFunction;
 impl TableFunction for DoubleSequenceFunction {
-    fn name(&self) -> &str { "double_sequence" }
+    fn name(&self) -> &str {
+        "double_sequence"
+    }
     fn metadata(&self) -> FunctionMetadata {
-        gen_meta("Generates a sequence of floating-point numbers from 0 to n-1", false)
+        gen_meta(
+            "Generates a sequence of floating-point numbers from 0 to n-1",
+            false,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
@@ -512,12 +564,19 @@ impl TableFunction for DoubleSequenceFunction {
     }
     fn cardinality(&self, p: &BindParams) -> Option<vgi::table_function::TableCardinality> {
         let c = p.arguments.const_i64(0)?;
-        Some(vgi::table_function::TableCardinality { estimate: Some(c), max: Some(c) })
+        Some(vgi::table_function::TableCardinality {
+            estimate: Some(c),
+            max: Some(c),
+        })
     }
     fn statistics(&self, p: &BindParams) -> Option<Vec<vgi::statistics::CatColStat>> {
         let count = p.arguments.const_i64(0)?.max(0);
         let inc = p.arguments.named_f64("increment").unwrap_or(1.0);
-        let max = if count == 0 { 0.0 } else { (count - 1) as f64 * inc };
+        let max = if count == 0 {
+            0.0
+        } else {
+            (count - 1) as f64 * inc
+        };
         Some(vec![vgi::statistics::CatColStat {
             column_name: "n".to_string(),
             min: vgi::statistics::StatValue::Float64(0.0_f64.min(max)),
@@ -534,22 +593,35 @@ impl TableFunction for DoubleSequenceFunction {
         let inc = p.arguments.named_f64("increment").unwrap_or(1.0);
         let bs = p.arguments.named_i64("batch_size").unwrap_or(1000).max(1);
         Ok(Box::new(DoubleSeq {
-            count, inc, bs, current: 0,
+            count,
+            inc,
+            bs,
+            current: 0,
             schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, true)])),
         }))
     }
 }
-struct DoubleSeq { count: i64, inc: f64, bs: i64, current: i64, schema: SchemaRef }
+struct DoubleSeq {
+    count: i64,
+    inc: f64,
+    bs: i64,
+    current: i64,
+    schema: SchemaRef,
+}
 impl TableProducer for DoubleSeq {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         if self.current >= self.count {
             return Ok(None);
         }
         let n = (self.count - self.current).min(self.bs);
-        let arr = Float64Array::from_iter_values((self.current..self.current + n).map(|i| i as f64 * self.inc));
+        let arr = Float64Array::from_iter_values(
+            (self.current..self.current + n).map(|i| i as f64 * self.inc),
+        );
         self.current += n;
-        Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![Arc::new(arr)])
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+        Ok(Some(
+            RecordBatch::try_new(self.schema.clone(), vec![Arc::new(arr)])
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
     }
 }
 
@@ -557,9 +629,15 @@ impl TableProducer for DoubleSeq {
 // make_pairs overloads -> {a, b}
 // ---------------------------------------------------------------------------
 
-pub enum MakePairs { Int, Str, IntStr }
+pub enum MakePairs {
+    Int,
+    Str,
+    IntStr,
+}
 impl TableFunction for MakePairs {
-    fn name(&self) -> &str { "make_pairs" }
+    fn name(&self) -> &str {
+        "make_pairs"
+    }
     fn metadata(&self) -> FunctionMetadata {
         let desc = match self {
             MakePairs::Int => "Generate integer pairs (i, i*2)",
@@ -599,7 +677,10 @@ impl TableFunction for MakePairs {
                 Field::new("b", DataType::Utf8, true),
             ]),
         };
-        Ok(BindResponse { output_schema: Arc::new(s), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Arc::new(s),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let schema = p.output_schema.clone();
@@ -609,30 +690,45 @@ impl TableFunction for MakePairs {
                 let stop = p.arguments.const_i64(1).unwrap_or(0);
                 let vals: Vec<i64> = (start..stop).collect();
                 let bvals: Vec<i64> = vals.iter().map(|v| v * 2).collect();
-                (Arc::new(Int64Array::from(vals)), Arc::new(Int64Array::from(bvals)))
+                (
+                    Arc::new(Int64Array::from(vals)),
+                    Arc::new(Int64Array::from(bvals)),
+                )
             }
             MakePairs::Str => {
                 let prefix = p.arguments.const_str(0).unwrap_or_default();
                 let suffix = p.arguments.const_str(1).unwrap_or_default();
                 let a: Vec<String> = (0..5).map(|i| format!("{prefix}{i}")).collect();
                 let b: Vec<String> = (0..5).map(|i| format!("{suffix}{i}")).collect();
-                (Arc::new(StringArray::from(a)), Arc::new(StringArray::from(b)))
+                (
+                    Arc::new(StringArray::from(a)),
+                    Arc::new(StringArray::from(b)),
+                )
             }
             MakePairs::IntStr => {
                 let start = p.arguments.const_i64(0).unwrap_or(0);
                 let label = p.arguments.const_str(1).unwrap_or_default();
                 let a: Vec<i64> = (0..5).map(|i| start + i).collect();
                 let b: Vec<String> = (0..5).map(|i| format!("{label}{i}")).collect();
-                (Arc::new(Int64Array::from(a)), Arc::new(StringArray::from(b)))
+                (
+                    Arc::new(Int64Array::from(a)),
+                    Arc::new(StringArray::from(b)),
+                )
             }
         };
-        Ok(Box::new(OneShot { batch: Some(RecordBatch::try_new(schema, vec![a, b])
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?) }))
+        Ok(Box::new(OneShot {
+            batch: Some(
+                RecordBatch::try_new(schema, vec![a, b])
+                    .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+            ),
+        }))
     }
 }
 
 /// Emits a single pre-built batch then finishes.
-struct OneShot { batch: Option<RecordBatch> }
+struct OneShot {
+    batch: Option<RecordBatch>,
+}
 impl TableProducer for OneShot {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         Ok(self.batch.take())
@@ -643,31 +739,49 @@ impl TableProducer for OneShot {
 // repeat_value(count, values...) -> {v0, v1, ...} N rows
 // ---------------------------------------------------------------------------
 
-pub enum RepeatValue { Int, Str }
+pub enum RepeatValue {
+    Int,
+    Str,
+}
 impl TableFunction for RepeatValue {
-    fn name(&self) -> &str { "repeat_value" }
-    fn metadata(&self) -> FunctionMetadata { gen_meta("Repeat values for N rows", false) }
+    fn name(&self) -> &str {
+        "repeat_value"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta("Repeat values for N rows", false)
+    }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        let vty = match self { RepeatValue::Int => "int64", RepeatValue::Str => "varchar" };
+        let vty = match self {
+            RepeatValue::Int => "int64",
+            RepeatValue::Str => "varchar",
+        };
         vec![
             ArgSpec::const_arg("count", 0, "int64", "Number of rows"),
             ArgSpec::const_arg("values", 1, vty, "Values to repeat").varargs(),
         ]
     }
     fn on_bind(&self, p: &BindParams) -> Result<BindResponse> {
-        let ty = match self { RepeatValue::Int => DataType::Int64, RepeatValue::Str => DataType::Utf8 };
+        let ty = match self {
+            RepeatValue::Int => DataType::Int64,
+            RepeatValue::Str => DataType::Utf8,
+        };
         let fields: Vec<Field> = (1..p.arguments.num_positional())
             .map(|i| Field::new(format!("v{}", i - 1), ty.clone(), true))
             .collect();
-        Ok(BindResponse { output_schema: Arc::new(Schema::new(fields)), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(fields)),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = p.arguments.const_i64(0).unwrap_or(0).max(0) as usize;
         let indices = UInt32Array::from(vec![0u32; count]);
         let cols: Vec<ArrayRef> = (1..p.arguments.num_positional())
             .filter_map(|i| p.arguments.arg(i).cloned())
-            .map(|v| arrow_select::take::take(&v, &indices, None)
-                .map_err(|e| RpcError::runtime_error(e.to_string())))
+            .map(|v| {
+                arrow_select::take::take(&v, &indices, None)
+                    .map_err(|e| RpcError::runtime_error(e.to_string()))
+            })
             .collect::<Result<_>>()?;
         let batch = RecordBatch::try_new(p.output_schema.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;

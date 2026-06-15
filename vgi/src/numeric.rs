@@ -153,12 +153,14 @@ pub fn double_first(params: &ProcessParams, batch: &RecordBatch) -> Result<Recor
         // precision must surface the canonical "does not fit in precision N".
         let wide = DataType::Decimal256(76, s);
         let c = cast(batch.column(0), &wide)?;
-        let summed = arrow_arith::numeric::add(&c, &c)
-            .map_err(|_| precision_error(p))?;
+        let summed = arrow_arith::numeric::add(&c, &c).map_err(|_| precision_error(p))?;
         let narrowed = arrow_cast::cast_with_options(
             &summed,
             &ty,
-            &arrow_cast::CastOptions { safe: false, ..Default::default() },
+            &arrow_cast::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
         )
         .map_err(|_| precision_error(p))?;
         return result_batch(params, narrowed);

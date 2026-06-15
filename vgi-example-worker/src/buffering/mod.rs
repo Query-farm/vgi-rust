@@ -63,7 +63,9 @@ impl TableProducer for LogDrain {
         if let Some(msg) = self.error.take() {
             return Err(RpcError::value_error(msg));
         }
-        let rows = self.storage.scan(&self.execution_id, self.ns, b"", self.after_id, 1);
+        let rows = self
+            .storage
+            .scan(&self.execution_id, self.ns, b"", self.after_id, 1);
         let Some((id, value)) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -251,7 +253,12 @@ impl TableBufferingFunction for BufferEmitWideFunction {
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
-            ArgSpec::const_arg("rows", 0, "int64", "Number of rows to emit in one finalize batch"),
+            ArgSpec::const_arg(
+                "rows",
+                0,
+                "int64",
+                "Number of rows to emit in one finalize batch",
+            ),
             ArgSpec::column("data", 1, "table", "Input table (content ignored)"),
         ]
     }
@@ -469,7 +476,9 @@ impl TableBufferingFunction for OrderedSourceFunction {
         Ok(params.execution_id.clone())
     }
     fn combine(&self, _params: &BufferingParams, _state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-        Ok((0..ORDERED_SOURCE_N).map(|i| i.to_be_bytes().to_vec()).collect())
+        Ok((0..ORDERED_SOURCE_N)
+            .map(|i| i.to_be_bytes().to_vec())
+            .collect())
     }
     fn finalize_producer(
         &self,
@@ -531,12 +540,18 @@ impl SumAllColumnsFunction {
         match field_type {
             DataType::Int64 => {
                 let a = cast.as_primitive::<Int64Type>();
-                let s: i64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                let s: i64 = (0..a.len())
+                    .filter(|&i| a.is_valid(i))
+                    .map(|i| a.value(i))
+                    .sum();
                 Ok(Arc::new(Int64Array::from(vec![s])) as ArrayRef)
             }
             DataType::Float64 => {
                 let a = cast.as_primitive::<Float64Type>();
-                let s: f64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                let s: f64 = (0..a.len())
+                    .filter(|&i| a.is_valid(i))
+                    .map(|i| a.value(i))
+                    .sum();
                 Ok(Arc::new(Float64Array::from(vec![s])) as ArrayRef)
             }
             other => Err(RpcError::runtime_error(format!(
@@ -606,7 +621,9 @@ impl TableBufferingFunction for SumAllColumnsFunction {
     }
     fn process(&self, params: &BufferingParams, batch: &RecordBatch) -> Result<Vec<u8>> {
         if self.process_every_other {
-            params.storage.append(&params.execution_id, b"count", b"", Vec::new());
+            params
+                .storage
+                .append(&params.execution_id, b"count", b"", Vec::new());
             let count = params
                 .storage
                 .scan(&params.execution_id, b"count", b"", -1, usize::MAX)
@@ -631,9 +648,12 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         }
         let partial = RecordBatch::try_new(out.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        params
-            .storage
-            .append(&params.execution_id, PARTIAL_NS, b"", ipc::write_batch(&partial)?);
+        params.storage.append(
+            &params.execution_id,
+            PARTIAL_NS,
+            b"",
+            ipc::write_batch(&partial)?,
+        );
         Ok(params.execution_id.clone())
     }
     fn combine(&self, params: &BufferingParams, state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
@@ -643,7 +663,11 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         let out = &params.output_schema;
         let mut int_acc: Vec<i64> = vec![0; out.fields().len()];
         let mut flt_acc: Vec<f64> = vec![0.0; out.fields().len()];
-        for (_id, blob) in params.storage.scan(&params.execution_id, PARTIAL_NS, b"", -1, usize::MAX) {
+        for (_id, blob) in
+            params
+                .storage
+                .scan(&params.execution_id, PARTIAL_NS, b"", -1, usize::MAX)
+        {
             let pb = ipc::read_batch(&blob)?;
             for (i, f) in out.fields().iter().enumerate() {
                 let c = pb.column(i);

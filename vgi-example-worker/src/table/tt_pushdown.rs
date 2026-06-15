@@ -63,7 +63,9 @@ pub fn resolve_tt_version(at_unit: Option<&str>, at_value: Option<&str>) -> Resu
             if v == 1 || v == 2 {
                 Ok(v)
             } else {
-                Err(RpcError::value_error(format!("Unknown version {v}; valid: [1, 2]")))
+                Err(RpcError::value_error(format!(
+                    "Unknown version {v}; valid: [1, 2]"
+                )))
             }
         }
         "TIMESTAMP" => {
@@ -73,16 +75,20 @@ pub fn resolve_tt_version(at_unit: Option<&str>, at_value: Option<&str>) -> Resu
                 .ok_or_else(|| RpcError::value_error("invalid AT TIMESTAMP value"))?;
             Ok(if year <= 2020 { 1 } else { 2 })
         }
-        other => Err(RpcError::value_error(format!("Unsupported at_unit: {other:?}"))),
+        other => Err(RpcError::value_error(format!(
+            "Unsupported at_unit: {other:?}"
+        ))),
     }
 }
 
 /// The SQL-like string of whatever DuckDB pushed down ("(none)" if nothing).
 fn pushed_filter_str(params: &ProcessParams) -> String {
     match &params.pushdown_filters {
-        Some(bytes) => vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
-            .map(|f| f.format_pushed())
-            .unwrap_or_else(|_| "(none)".to_string()),
+        Some(bytes) => {
+            vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
+                .map(|f| f.format_pushed())
+                .unwrap_or_else(|_| "(none)".to_string())
+        }
         None => "(none)".to_string(),
     }
 }
@@ -141,7 +147,10 @@ impl TableFunction for TimeTravelPushdownFunction {
         vec![]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: tt_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: tt_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let version = resolve_tt_version(params.at_unit.as_deref(), params.at_value.as_deref())?;
@@ -161,15 +170,26 @@ impl TableFunction for TtPushdownColsScanFunction {
         meta("Columns-based time-travel + filter-pushdown scan (version via arg).")
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("version", 0, "int64", "Resolved data version")]
+        vec![ArgSpec::const_arg(
+            "version",
+            0,
+            "int64",
+            "Resolved data version",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: tt_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: tt_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let v = params.arguments.const_i64(0).unwrap_or(CURRENT_VERSION);
         let n = version_ids(v).len() as i64;
-        Some(TableCardinality { estimate: Some(n), max: Some(n) })
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let version = params.arguments.const_i64(0).unwrap_or(CURRENT_VERSION);

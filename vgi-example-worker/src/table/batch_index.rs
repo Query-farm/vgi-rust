@@ -19,9 +19,18 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionedBatchIndexFunction);
     w.register_table(PartitionedBatchIndexMarkedFunction);
-    w.register_table(BrokenBatchIndexFunction { name: "broken_missing_batch_index_tag", mode: BrokenMode::Missing });
-    w.register_table(BrokenBatchIndexFunction { name: "broken_non_monotone_batch_index", mode: BrokenMode::NonMonotone });
-    w.register_table(BrokenBatchIndexFunction { name: "broken_batch_index_overflow", mode: BrokenMode::Overflow });
+    w.register_table(BrokenBatchIndexFunction {
+        name: "broken_missing_batch_index_tag",
+        mode: BrokenMode::Missing,
+    });
+    w.register_table(BrokenBatchIndexFunction {
+        name: "broken_non_monotone_batch_index",
+        mode: BrokenMode::NonMonotone,
+    });
+    w.register_table(BrokenBatchIndexFunction {
+        name: "broken_batch_index_overflow",
+        mode: BrokenMode::Overflow,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -44,8 +53,11 @@ struct BrokenProducer {
 impl TableProducer for BrokenProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         let mk = |vals: Vec<i64>, schema: &SchemaRef| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals)) as ArrayRef])
-                .map_err(|e| RpcError::runtime_error(e.to_string()))
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vals)) as ArrayRef],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
         };
         match (self.mode, self.step) {
             (BrokenMode::NonMonotone, 0) => {
@@ -71,9 +83,10 @@ impl TableProducer for BrokenProducer {
                 BATCH_TAG.to_string(),
                 if self.step <= 1 { "10" } else { "3" }.to_string(),
             )])),
-            BrokenMode::Overflow => {
-                Some(HashMap::from([(BATCH_TAG.to_string(), (1i64 << 60).to_string())]))
-            }
+            BrokenMode::Overflow => Some(HashMap::from([(
+                BATCH_TAG.to_string(),
+                (1i64 << 60).to_string(),
+            )])),
         }
     }
 }
@@ -101,11 +114,17 @@ impl TableFunction for BrokenBatchIndexFunction {
         vec![ArgSpec::const_arg("count", 0, "int64", "Rows to generate")]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         Ok(Box::new(BrokenProducer {
@@ -193,7 +212,10 @@ impl QueueProducer {
             )
         } else {
             let ns: Vec<i64> = (idx..end).collect();
-            RecordBatch::try_new(self.schema.clone(), vec![Arc::new(Int64Array::from(ns)) as ArrayRef])
+            RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(ns)) as ArrayRef],
+            )
         }
         .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
@@ -224,7 +246,10 @@ impl TableProducer for QueueProducer {
         }
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
-        Some(HashMap::from([(BATCH_TAG.to_string(), self.partition_id.to_string())]))
+        Some(HashMap::from([(
+            BATCH_TAG.to_string(),
+            self.partition_id.to_string(),
+        )]))
     }
     /// Encode the partial-chunk cursor `(pid, idx, end, start)` for HTTP
     /// continuation — the chunk was destructively popped, so a mid-chunk yield
@@ -250,12 +275,20 @@ impl TableProducer for QueueProducer {
     }
 }
 
-fn make_producer(params: &ProcessParams, schema: SchemaRef, marked: bool) -> Result<Box<dyn TableProducer>> {
+fn make_producer(
+    params: &ProcessParams,
+    schema: SchemaRef,
+    marked: bool,
+) -> Result<Box<dyn TableProducer>> {
     let storage = params
         .storage
         .clone()
         .ok_or_else(|| RpcError::runtime_error("batch_index requires storage"))?;
-    let tag = format!("{}_{}", std::process::id(), CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     Ok(Box::new(QueueProducer {
         schema,
         storage,
@@ -281,20 +314,34 @@ impl TableFunction for PartitionedBatchIndexFunction {
         "partitioned_batch_index"
     }
     fn metadata(&self) -> FunctionMetadata {
-        batch_index_meta("Multi-worker partitioned sequence with per-batch batch_index tagging", true)
+        batch_index_meta(
+            "Multi-worker partitioned sequence with per-batch batch_index tagging",
+            true,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Total integers to generate")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Total integers to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn max_workers(&self, _params: &BindParams) -> i64 {
         4
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
@@ -323,7 +370,10 @@ impl TableFunction for PartitionedBatchIndexMarkedFunction {
     }
     fn metadata(&self) -> FunctionMetadata {
         // projection_pushdown OFF so the partition_id column survives.
-        batch_index_meta("Two-column batch_index demo: rows are (partition_id, seq)", false)
+        batch_index_meta(
+            "Two-column batch_index demo: rows are (partition_id, seq)",
+            false,
+        )
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
@@ -332,18 +382,28 @@ impl TableFunction for PartitionedBatchIndexMarkedFunction {
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: marked_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: marked_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn max_workers(&self, _params: &BindParams) -> i64 {
         4
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let chunk_size = params.arguments.named_i64("chunk_size").unwrap_or(1000).max(1);
+        let chunk_size = params
+            .arguments
+            .named_i64("chunk_size")
+            .unwrap_or(1000)
+            .max(1);
         push_work(params, count, chunk_size)
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {

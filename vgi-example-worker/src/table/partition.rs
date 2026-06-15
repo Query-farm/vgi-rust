@@ -23,10 +23,22 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::RegionYear);
     w.register_table(PartitionFunction::Override);
     w.register_table(PartitionFunction::Disjoint);
-    w.register_table(BrokenPartitionFunction { name: "broken_missing_partition_values", mode: BrokenPart::MissingMeta });
-    w.register_table(BrokenPartitionFunction { name: "broken_partition_min_neq_max", mode: BrokenPart::MinNeqMax });
-    w.register_table(BrokenPartitionFunction { name: "broken_partition_values_no_annotation", mode: BrokenPart::NoAnnotation });
-    w.register_table(BrokenPartitionFunction { name: "broken_partition_column_absent_from_batch", mode: BrokenPart::AbsentColumn });
+    w.register_table(BrokenPartitionFunction {
+        name: "broken_missing_partition_values",
+        mode: BrokenPart::MissingMeta,
+    });
+    w.register_table(BrokenPartitionFunction {
+        name: "broken_partition_min_neq_max",
+        mode: BrokenPart::MinNeqMax,
+    });
+    w.register_table(BrokenPartitionFunction {
+        name: "broken_partition_values_no_annotation",
+        mode: BrokenPart::NoAnnotation,
+    });
+    w.register_table(BrokenPartitionFunction {
+        name: "broken_partition_column_absent_from_batch",
+        mode: BrokenPart::AbsentColumn,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -35,10 +47,10 @@ pub fn register(w: &mut vgi::Worker) {
 
 #[derive(Clone, Copy)]
 enum BrokenPart {
-    MissingMeta,   // partition field but no vgi_partition_values metadata
-    MinNeqMax,     // SINGLE_VALUE with two distinct values in the chunk
-    NoAnnotation,  // partition_kind set but no partition_field in schema
-    AbsentColumn,  // partition field declared but absent from emitted batch
+    MissingMeta,  // partition field but no vgi_partition_values metadata
+    MinNeqMax,    // SINGLE_VALUE with two distinct values in the chunk
+    NoAnnotation, // partition_kind set but no partition_field in schema
+    AbsentColumn, // partition field declared but absent from emitted batch
 }
 
 struct BrokenPartProducer {
@@ -86,7 +98,11 @@ impl TableProducer for BrokenPartProducer {
                 // Emit a batch missing the annotated `country` column; the
                 // partition-values computation raises the typed error.
                 let absent = RecordBatch::try_new(
-                    Arc::new(Schema::new(vec![Field::new("sales", DataType::Int64, true)])),
+                    Arc::new(Schema::new(vec![Field::new(
+                        "sales",
+                        DataType::Int64,
+                        true,
+                    )])),
                     vec![Arc::new(Int64Array::from((0..5i64).collect::<Vec<_>>())) as ArrayRef],
                 )
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?;
@@ -123,7 +139,12 @@ impl TableFunction for BrokenPartitionFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Rows to attempt to emit")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Rows to attempt to emit",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         // NoAnnotation: same columns but WITHOUT the partition marker.
@@ -137,7 +158,10 @@ impl TableFunction for BrokenPartitionFunction {
                 Field::new("sales", DataType::Int64, true),
             ])),
         };
-        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema,
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, _params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         // Use the function's full natural schema (with the partition marker)
@@ -206,7 +230,11 @@ impl PartitionFunction {
     }
     fn rows(&self, params: &ProcessParams) -> i64 {
         match self {
-            PartitionFunction::Disjoint => params.arguments.named_i64("rows_per_partition").unwrap_or(10).max(1),
+            PartitionFunction::Disjoint => params
+                .arguments
+                .named_i64("rows_per_partition")
+                .unwrap_or(10)
+                .max(1),
             _ => params.arguments.const_i64(0).unwrap_or(1).max(1),
         }
     }
@@ -218,7 +246,9 @@ impl PartitionFunction {
                 let base = idx * 1_000_000;
                 vec![
                     Arc::new(StringArray::from(vec![c; n])),
-                    Arc::new(Int64Array::from((0..rows).map(|i| base + i).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| base + i).collect::<Vec<_>>(),
+                    )),
                 ]
             }
             PartitionFunction::RegionYear => {
@@ -227,25 +257,34 @@ impl PartitionFunction {
                 vec![
                     Arc::new(StringArray::from(vec![region; n])),
                     Arc::new(Int64Array::from(vec![year; n])),
-                    Arc::new(Float64Array::from((0..rows).map(|i| base + i as f64).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        (0..rows).map(|i| base + i as f64).collect::<Vec<_>>(),
+                    )),
                 ]
             }
             PartitionFunction::Override => {
                 let c = CATEGORIES[idx as usize];
                 vec![
                     Arc::new(StringArray::from(vec![c; n])),
-                    Arc::new(Int64Array::from((0..rows).map(|i| (idx + 1) * 100 + i).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| (idx + 1) * 100 + i).collect::<Vec<_>>(),
+                    )),
                 ]
             }
             PartitionFunction::Disjoint => {
                 let base = idx * 1000;
                 vec![
-                    Arc::new(Int64Array::from((0..rows).map(|i| base + i).collect::<Vec<_>>())),
-                    Arc::new(Int64Array::from((0..rows).map(|i| idx * 10 + i).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| base + i).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| idx * 10 + i).collect::<Vec<_>>(),
+                    )),
                 ]
             }
         };
-        RecordBatch::try_new(schema.clone(), cols).map_err(|e| RpcError::runtime_error(e.to_string()))
+        RecordBatch::try_new(schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
 }
 
@@ -286,7 +325,9 @@ impl TableFunction for PartitionFunction {
     }
     fn metadata(&self) -> FunctionMetadata {
         let kind = match self {
-            PartitionFunction::Disjoint => vgi::protocol::enums::partition_kind::DISJOINT_PARTITIONS,
+            PartitionFunction::Disjoint => {
+                vgi::protocol::enums::partition_kind::DISJOINT_PARTITIONS
+            }
             _ => vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS,
         };
         FunctionMetadata {
@@ -306,7 +347,10 @@ impl TableFunction for PartitionFunction {
         }
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: self.schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: self.schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn max_workers(&self, _params: &BindParams) -> i64 {
         4
@@ -319,8 +363,9 @@ impl TableFunction for PartitionFunction {
             .storage
             .as_ref()
             .ok_or_else(|| RpcError::runtime_error("partition fixture requires storage"))?;
-        let items: Vec<Vec<u8>> =
-            (0..self.num_partitions(params)).map(|i| i.to_le_bytes().to_vec()).collect();
+        let items: Vec<Vec<u8>> = (0..self.num_partitions(params))
+            .map(|i| i.to_le_bytes().to_vec())
+            .collect();
         store.queue_push(&params.execution_id, &items);
         Ok(())
     }
@@ -329,7 +374,11 @@ impl TableFunction for PartitionFunction {
             .storage
             .clone()
             .ok_or_else(|| RpcError::runtime_error("partition fixture requires storage"))?;
-        let tag = format!("{}_{}", std::process::id(), CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tag = format!(
+            "{}_{}",
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         Ok(Box::new(PartitionProducer {
             kind: *self,
             schema: self.schema(),

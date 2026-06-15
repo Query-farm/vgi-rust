@@ -69,7 +69,9 @@ fn lat_lon(arr: &dyn Array) -> Result<(Vec<Option<f64>>, Vec<Option<f64>>)> {
             }
             Ok((lat, lon))
         }
-        other => Err(RpcError::runtime_error(format!("unsupported point type {other:?}"))),
+        other => Err(RpcError::runtime_error(format!(
+            "unsupported point type {other:?}"
+        ))),
     }
 }
 
@@ -109,7 +111,10 @@ impl ScalarFunction for GeoDistance {
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: format!("Euclidean distance between two {} points", shape_phrase(self.0)),
+            description: format!(
+                "Euclidean distance between two {} points",
+                shape_phrase(self.0)
+            ),
             return_type: Some(DataType::Float64),
             ..Default::default()
         }

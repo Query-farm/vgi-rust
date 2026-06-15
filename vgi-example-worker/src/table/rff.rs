@@ -44,15 +44,22 @@ fn bbox_field() -> Field {
 pub struct RffRowidScan;
 impl RffRowidScan {
     fn full_schema() -> SchemaRef {
-        let row_id = Field::new("row_id", DataType::Int64, true)
-            .with_metadata(std::collections::HashMap::from([("is_row_id".to_string(), String::new())]));
-        Arc::new(Schema::new(vec![row_id, bbox_field(), Field::new("other", DataType::Int64, true)]))
+        let row_id = Field::new("row_id", DataType::Int64, true).with_metadata(
+            std::collections::HashMap::from([("is_row_id".to_string(), String::new())]),
+        );
+        Arc::new(Schema::new(vec![
+            row_id,
+            bbox_field(),
+            Field::new("other", DataType::Int64, true),
+        ]))
     }
     fn column(name: &str) -> ArrayRef {
         use arrow_array::Float32Array;
         match name {
             "row_id" => Arc::new(Int64Array::from((0..10).collect::<Vec<_>>())),
-            "other" => Arc::new(Int64Array::from((0..10).map(|i| i * 10).collect::<Vec<_>>())),
+            "other" => Arc::new(Int64Array::from(
+                (0..10).map(|i| i * 10).collect::<Vec<_>>(),
+            )),
             "bbox" => {
                 let fields: Fields = match bbox_field().data_type() {
                     DataType::Struct(f) => f.clone(),
@@ -64,7 +71,12 @@ impl RffRowidScan {
                 let ymax = Float32Array::from(vec![4.0f32; 10]);
                 Arc::new(StructArray::new(
                     fields,
-                    vec![Arc::new(xmin), Arc::new(ymin), Arc::new(xmax), Arc::new(ymax)],
+                    vec![
+                        Arc::new(xmin),
+                        Arc::new(ymin),
+                        Arc::new(xmax),
+                        Arc::new(ymax),
+                    ],
                     None,
                 ))
             }
@@ -90,16 +102,27 @@ impl TableFunction for RffRowidScan {
         vec![]
     }
     fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: Self::full_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::full_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, _p: &BindParams) -> Option<TableCardinality> {
-        Some(TableCardinality { estimate: Some(10), max: Some(10) })
+        Some(TableCardinality {
+            estimate: Some(10),
+            max: Some(10),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         // Emit exactly the (possibly projection-narrowed) output schema.
         let out = params.output_schema.clone();
-        let cols: Vec<ArrayRef> = out.fields().iter().map(|f| Self::column(f.name())).collect();
-        let batch = RecordBatch::try_new(out, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let cols: Vec<ArrayRef> = out
+            .fields()
+            .iter()
+            .map(|f| Self::column(f.name()))
+            .collect();
+        let batch =
+            RecordBatch::try_new(out, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Box::new(OneShot { batch: Some(batch) }))
     }
 }
@@ -116,7 +139,10 @@ fn struct_ab(a: Vec<i64>, b: Vec<i64>) -> (Field, ArrayRef) {
     ]
     .into();
     let arr = StructArray::new(fields.clone(), vec![i64a(a), i64a(b)], None);
-    (Field::new("s", DataType::Struct(fields), true), Arc::new(arr))
+    (
+        Field::new("s", DataType::Struct(fields), true),
+        Arc::new(arr),
+    )
 }
 
 pub struct RffScan {
@@ -132,17 +158,28 @@ impl RffScan {
             Field::new("a", DataType::Int64, true),
             Field::new("b", DataType::Int64, true),
         ]));
-        RffScan { name, description, schema, columns: vec![i64a(vec![1, 2, 3]), i64a(vec![10, 20, 30])] }
+        RffScan {
+            name,
+            description,
+            schema,
+            columns: vec![i64a(vec![1, 2, 3]), i64a(vec![10, 20, 30])],
+        }
     }
     fn simple() -> Self {
         Self::flat("rff_simple_scan", "rff_simple — flat columns (a, b)")
     }
     fn none() -> Self {
-        Self::flat("rff_none_scan", "rff_none — control table with no required_field_filter_paths")
+        Self::flat(
+            "rff_none_scan",
+            "rff_none — control table with no required_field_filter_paths",
+        )
     }
     fn struct_() -> Self {
         let (sf, sa) = struct_ab(vec![1, 2, 3], vec![10, 20, 30]);
-        let schema = Arc::new(Schema::new(vec![sf, Field::new("other", DataType::Int64, true)]));
+        let schema = Arc::new(Schema::new(vec![
+            sf,
+            Field::new("other", DataType::Int64, true),
+        ]));
         RffScan {
             name: "rff_struct_scan",
             description: "rff_struct — STRUCT(s.a, s.b) + other",
@@ -170,7 +207,10 @@ impl RffScan {
     }
     fn multi() -> Self {
         let (sf, sa) = struct_ab(vec![1, 2], vec![10, 20]);
-        let schema = Arc::new(Schema::new(vec![sf, Field::new("top", DataType::Int64, true)]));
+        let schema = Arc::new(Schema::new(vec![
+            sf,
+            Field::new("top", DataType::Int64, true),
+        ]));
         RffScan {
             name: "rff_multi_scan",
             description: "rff_multi — top-level + struct subfield required paths",
@@ -204,11 +244,17 @@ impl TableFunction for RffScan {
         vec![]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: self.schema.clone(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: self.schema.clone(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {
         let n = self.columns.first().map(|c| c.len() as i64).unwrap_or(0);
-        Some(TableCardinality { estimate: Some(n), max: Some(n) })
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
     }
     fn producer(&self, _params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let batch = RecordBatch::try_new(self.schema.clone(), self.columns.clone())

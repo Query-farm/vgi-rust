@@ -42,9 +42,14 @@ fn score_candidate(
     args: &Arguments,
     input_schema: Option<&SchemaRef>,
 ) -> Option<i64> {
-    let const_specs: Vec<&ArgSpec> = specs.iter().filter(|s| s.position >= 0 && s.is_const).collect();
-    let nonconst_specs: Vec<&ArgSpec> =
-        specs.iter().filter(|s| s.position >= 0 && !s.is_const).collect();
+    let const_specs: Vec<&ArgSpec> = specs
+        .iter()
+        .filter(|s| s.position >= 0 && s.is_const)
+        .collect();
+    let nonconst_specs: Vec<&ArgSpec> = specs
+        .iter()
+        .filter(|s| s.position >= 0 && !s.is_const)
+        .collect();
     let varargs_spec = specs.iter().find(|s| s.is_varargs);
     let has_varargs = varargs_spec.is_some();
 
@@ -75,7 +80,9 @@ fn score_candidate(
         if num_pos != num_const {
             return None;
         }
-        if input_schema.is_some() && !nonconst_specs.is_empty() && input_fields != nonconst_specs.len()
+        if input_schema.is_some()
+            && !nonconst_specs.is_empty()
+            && input_fields != nonconst_specs.len()
         {
             return None;
         }
@@ -164,11 +171,17 @@ fn score_type(actual: &DataType, spec: &ArgSpec) -> Option<i64> {
 
 fn is_integer(t: &DataType) -> bool {
     use DataType::*;
-    matches!(t, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+    matches!(
+        t,
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+    )
 }
 fn is_float_or_decimal(t: &DataType) -> bool {
     use DataType::*;
-    matches!(t, Float16 | Float32 | Float64 | Decimal128(_, _) | Decimal256(_, _))
+    matches!(
+        t,
+        Float16 | Float32 | Float64 | Decimal128(_, _) | Decimal256(_, _)
+    )
 }
 fn is_string(t: &DataType) -> bool {
     matches!(t, DataType::Utf8 | DataType::LargeUtf8)

@@ -10,7 +10,7 @@ use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableProducer, TableFunction};
+use vgi::table_function::{TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -76,7 +76,11 @@ impl TableFunction for SecretDemoFunction {
         vec![]
     }
     fn secret_lookups(&self, _params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
-        vec![vgi::secrets::SecretLookup { secret_type: "vgi_example".into(), scope: None, name: None }]
+        vec![vgi::secrets::SecretLookup {
+            secret_type: "vgi_example".into(),
+            scope: None,
+            name: None,
+        }]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         Ok(BindResponse {
@@ -148,11 +152,20 @@ impl TableFunction for ScopedSecretDemoFunction {
         meta("Demo: resolves scoped secret based on argument")
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("path", 0, "varchar", "Scope path for secret lookup")]
+        vec![ArgSpec::const_arg(
+            "path",
+            0,
+            "varchar",
+            "Scope path for secret lookup",
+        )]
     }
     fn secret_lookups(&self, params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
         let scope = params.arguments.const_str(0);
-        vec![vgi::secrets::SecretLookup { secret_type: "vgi_example".into(), scope, name: None }]
+        vec![vgi::secrets::SecretLookup {
+            secret_type: "vgi_example".into(),
+            scope,
+            name: None,
+        }]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         Ok(BindResponse {
@@ -168,7 +181,9 @@ impl TableFunction for ScopedSecretDemoFunction {
         let scope = params.arguments.const_str(0).unwrap_or_default();
         let secret = params.secrets.by_name.get("vgi_example");
         let found = secret.map(|m| !m.is_empty()).unwrap_or(false);
-        let mut keys: Vec<String> = secret.map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        let mut keys: Vec<String> = secret
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
         keys.sort();
         Ok(Box::new(ScopedRow {
             schema: params.output_schema.clone(),
@@ -194,7 +209,10 @@ fn meta(desc: &str) -> FunctionMetadata {
 // ---------------------------------------------------------------------------
 
 fn verbose(params: &BindParams) -> bool {
-    params.settings.get_bool("vgi_verbose_mode").unwrap_or(false)
+    params
+        .settings
+        .get_bool("vgi_verbose_mode")
+        .unwrap_or(false)
 }
 fn settings_aware_schema(verbose: bool) -> SchemaRef {
     let mut fields = vec![
@@ -224,7 +242,10 @@ impl TableProducer for SettingsAwareProducer {
         self.emitted = true;
         let ids: Vec<i64> = (0..self.count).collect();
         let greetings: Vec<&str> = vec![self.greeting.as_str(); self.count as usize];
-        let values: Vec<f64> = ids.iter().map(|i| *i as f64 * 2.5 * self.multiplier as f64).collect();
+        let values: Vec<f64> = ids
+            .iter()
+            .map(|i| *i as f64 * 2.5 * self.multiplier as f64)
+            .collect();
         let mut cols: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(ids.clone())),
             Arc::new(StringArray::from(greetings)),
@@ -253,14 +274,23 @@ impl TableFunction for SettingsAwareFunction {
         vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: settings_aware_schema(verbose(params)), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: settings_aware_schema(verbose(params)),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
-        let v = params.settings.get_bool("vgi_verbose_mode").unwrap_or(false);
+        let v = params
+            .settings
+            .get_bool("vgi_verbose_mode")
+            .unwrap_or(false);
         Ok(Box::new(SettingsAwareProducer {
             schema: settings_aware_schema(v),
             count: params.arguments.const_i64(0).unwrap_or(0).max(0),
-            greeting: params.settings.get_str("greeting").unwrap_or_else(|| "Hello".to_string()),
+            greeting: params
+                .settings
+                .get_str("greeting")
+                .unwrap_or_else(|| "Hello".to_string()),
             multiplier: params.settings.get_i64("multiplier").unwrap_or(1),
             verbose: v,
             emitted: false,
@@ -286,12 +316,18 @@ fn read_config(params: &ProcessParams) -> (i64, i64, String) {
     let mut label = "item".to_string();
     if let Some(arr) = params.settings.get("config") {
         if let Some(sa) = arr.as_any().downcast_ref::<arrow_array::StructArray>() {
-            if let Some(c) = sa.column_by_name("start").map(|c| arrow_cast::cast(c, &DataType::Int64)) {
+            if let Some(c) = sa
+                .column_by_name("start")
+                .map(|c| arrow_cast::cast(c, &DataType::Int64))
+            {
                 if let Ok(c) = c {
                     start = c.as_primitive::<Int64Type>().value(0);
                 }
             }
-            if let Some(Ok(c)) = sa.column_by_name("step").map(|c| arrow_cast::cast(c, &DataType::Int64)) {
+            if let Some(Ok(c)) = sa
+                .column_by_name("step")
+                .map(|c| arrow_cast::cast(c, &DataType::Int64))
+            {
                 step = c.as_primitive::<Int64Type>().value(0);
             }
             if let Some(c) = sa.column_by_name("label") {
@@ -318,12 +354,19 @@ impl TableProducer for StructSettingsProducer {
             return Ok(None);
         }
         self.emitted = true;
-        let ns: Vec<i64> = (0..self.count).map(|i| self.start + i * self.step).collect();
-        let labels: Vec<String> = (0..self.count).map(|i| format!("{}_{i}", self.label)).collect();
+        let ns: Vec<i64> = (0..self.count)
+            .map(|i| self.start + i * self.step)
+            .collect();
+        let labels: Vec<String> = (0..self.count)
+            .map(|i| format!("{}_{i}", self.label))
+            .collect();
         Ok(Some(
             RecordBatch::try_new(
                 self.schema.clone(),
-                vec![Arc::new(Int64Array::from(ns)) as ArrayRef, Arc::new(StringArray::from(labels)) as ArrayRef],
+                vec![
+                    Arc::new(Int64Array::from(ns)) as ArrayRef,
+                    Arc::new(StringArray::from(labels)) as ArrayRef,
+                ],
             )
             .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         ))
@@ -342,7 +385,10 @@ impl TableFunction for StructSettingsFunction {
         vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows")]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: struct_settings_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: struct_settings_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let (start, step, label) = read_config(params);

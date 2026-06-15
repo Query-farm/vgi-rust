@@ -24,15 +24,13 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         let d = disp.clone();
         let dd = disp.clone();
         let empty = Arc::new(arrow_schema::Schema::empty());
-        let info = vgi_rpc::MethodInfo::stream(
-            "init",
-            MethodType::Dynamic,
-            empty,
-            move |req, ctx| d.handle_init(req, ctx),
-        )
-        // HTTP continuations rebuild the (stateless) exchange handler from an
-        // AEAD state token; without a decoder the server 500s on /init/exchange.
-        .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
+        let info =
+            vgi_rpc::MethodInfo::stream("init", MethodType::Dynamic, empty, move |req, ctx| {
+                d.handle_init(req, ctx)
+            })
+            // HTTP continuations rebuild the (stateless) exchange handler from an
+            // AEAD state token; without a decoder the server 500s on /init/exchange.
+            .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
         srv.register(info);
     }
 
@@ -64,55 +62,99 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     // --- aggregates ---
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_bind", wire::result_binary_schema(), move |req, ctx| {
-            d.handle_aggregate_bind(req, ctx)
-        });
+        srv.register_unary(
+            "aggregate_bind",
+            wire::result_binary_schema(),
+            move |req, ctx| d.handle_aggregate_bind(req, ctx),
+        );
     }
     {
         let d = disp.clone();
-srv.register_unary("aggregate_update", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_update(req));
+        srv.register_unary(
+            "aggregate_update",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_update(req),
+        );
     }
     {
         let d = disp.clone();
-srv.register_unary("aggregate_combine", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_combine(req));
+        srv.register_unary(
+            "aggregate_combine",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_combine(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_finalize", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_aggregate_finalize(req)
-        });
+        srv.register_unary(
+            "aggregate_finalize",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_finalize(req),
+        );
     }
     {
         let d = disp.clone();
-srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_destructor(req));
+        srv.register_unary(
+            "aggregate_destructor",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_destructor(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_window_init", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_init(req));
+        srv.register_unary(
+            "aggregate_window_init",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_window_init(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_window", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window(req));
+        srv.register_unary(
+            "aggregate_window",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_window(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_window_batch", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_batch(req));
+        srv.register_unary(
+            "aggregate_window_batch",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_window_batch(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_window_destructor", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_window_destructor(req));
+        srv.register_unary(
+            "aggregate_window_destructor",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_window_destructor(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_streaming_open", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_open(req));
+        srv.register_unary(
+            "aggregate_streaming_open",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_streaming_open(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_streaming_chunk", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_chunk(req));
+        srv.register_unary(
+            "aggregate_streaming_chunk",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_streaming_chunk(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("aggregate_streaming_close", wire::result_binary_schema(), move |req, _ctx| d.handle_aggregate_streaming_close(req));
+        srv.register_unary(
+            "aggregate_streaming_close",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_aggregate_streaming_close(req),
+        );
     }
 
     // --- table buffering ---
@@ -207,27 +249,35 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
 
     {
         let d = disp.clone();
-        srv.register_unary("catalog_schema_contents_views", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_contents_views(req)
-        });
+        srv.register_unary(
+            "catalog_schema_contents_views",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_contents_views(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("catalog_schema_contents_macros", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_contents_macros(req)
-        });
+        srv.register_unary(
+            "catalog_schema_contents_macros",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_contents_macros(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("catalog_schema_contents_tables", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_contents_tables(req)
-        });
+        srv.register_unary(
+            "catalog_schema_contents_tables",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_contents_tables(req),
+        );
     }
     {
         let d = disp.clone();
-        srv.register_unary("catalog_table_get", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_table_get(req)
-        });
+        srv.register_unary(
+            "catalog_table_get",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_table_get(req),
+        );
     }
     {
         // Legacy scan-function resolution for non-inlined function-backed
@@ -283,9 +333,11 @@ srv.register_unary("aggregate_destructor", wire::result_binary_schema(), move |r
 
     {
         let d = disp.clone();
-        srv.register_unary("catalog_catalogs", wire::result_binary_schema(), move |req, _ctx| {
-            d.handle_catalog_catalogs(req)
-        });
+        srv.register_unary(
+            "catalog_catalogs",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_catalog_catalogs(req),
+        );
     }
 
     // --- discovery methods that return empty lists for now ---

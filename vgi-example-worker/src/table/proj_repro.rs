@@ -17,10 +17,22 @@ use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
-    w.register_table(ProjRepro { name: "proj_repro_strict", chunk: 0 });
-    w.register_table(ProjRepro { name: "proj_repro_full_schema", chunk: 0 });
-    w.register_table(ProjRepro { name: "proj_repro_chunked", chunk: 1 });
-    w.register_table(ProjRepro { name: "proj_repro_multi_worker", chunk: 0 });
+    w.register_table(ProjRepro {
+        name: "proj_repro_strict",
+        chunk: 0,
+    });
+    w.register_table(ProjRepro {
+        name: "proj_repro_full_schema",
+        chunk: 0,
+    });
+    w.register_table(ProjRepro {
+        name: "proj_repro_chunked",
+        chunk: 1,
+    });
+    w.register_table(ProjRepro {
+        name: "proj_repro_multi_worker",
+        chunk: 0,
+    });
 }
 
 fn header_struct_fields() -> Fields {
@@ -87,7 +99,10 @@ fn build_wide_batch(schema: &SchemaRef, start: i64, size: i64) -> Result<RecordB
     // headers: one empty struct-list per row.
     let struct_builder = StructBuilder::new(
         header_struct_fields(),
-        vec![Box::new(StringBuilder::new()), Box::new(BinaryBuilder::new())],
+        vec![
+            Box::new(StringBuilder::new()),
+            Box::new(BinaryBuilder::new()),
+        ],
     );
     let mut header_builder = ListBuilder::new(struct_builder);
     for _ in 0..size {
@@ -131,19 +146,35 @@ impl TableFunction for ProjRepro {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("n", 0, "int64", "Number of rows to generate")]
+        vec![ArgSpec::const_arg(
+            "n",
+            0,
+            "int64",
+            "Number of rows to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: wide_schema(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: wide_schema(),
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let n = params.arguments.const_i64(0)?;
-        Some(TableCardinality { estimate: Some(n), max: Some(n) })
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let n = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let chunk = if self.chunk > 0 { self.chunk } else { n.max(1) };
-        Ok(Box::new(WideProducer { schema: wide_schema(), n, pos: 0, chunk }))
+        Ok(Box::new(WideProducer {
+            schema: wide_schema(),
+            n,
+            pos: 0,
+            chunk,
+        }))
     }
 }
 

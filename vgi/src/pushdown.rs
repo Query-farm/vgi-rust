@@ -137,7 +137,11 @@ impl PushdownFilters {
                 }
             }
         }
-        Ok(PushdownFilters { specs, values, join_keys: jk })
+        Ok(PushdownFilters {
+            specs,
+            values,
+            join_keys: jk,
+        })
     }
 
     /// Resolve the value array for a `join_keys` filter spec.
@@ -157,7 +161,12 @@ impl PushdownFilters {
         let val_i64 = |a: &ArrayRef| -> Option<i64> {
             arrow_cast::cast(a, &arrow_schema::DataType::Int64)
                 .ok()
-                .map(|c| c.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0))
+                .map(|c| {
+                    c.as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap()
+                        .value(0)
+                })
         };
         let mut stack: Vec<&FilterSpec> = self.specs.iter().collect();
         while let Some(spec) = stack.pop() {
@@ -172,11 +181,18 @@ impl PushdownFilters {
                     in_count += self.join_value(spec).map(|a| a.len()).unwrap_or(0);
                 }
                 "constant" if spec.column_name == column => {
-                    let v = spec.value_ref.and_then(|r| self.values.get(r)).and_then(val_i64);
+                    let v = spec
+                        .value_ref
+                        .and_then(|r| self.values.get(r))
+                        .and_then(val_i64);
                     if let Some(v) = v {
                         match spec.op.as_deref().unwrap_or("eq") {
-                            "gt" | "ge" | "gteq" | ">" | ">=" => lo = Some(lo.map_or(v, |l| l.min(v))),
-                            "lt" | "le" | "lteq" | "<" | "<=" => hi = Some(hi.map_or(v, |h| h.max(v))),
+                            "gt" | "ge" | "gteq" | ">" | ">=" => {
+                                lo = Some(lo.map_or(v, |l| l.min(v)))
+                            }
+                            "lt" | "le" | "lteq" | "<" | "<=" => {
+                                hi = Some(hi.map_or(v, |h| h.max(v)))
+                            }
                             _ => {
                                 lo = Some(v);
                                 hi = Some(v);
@@ -216,10 +232,9 @@ impl PushdownFilters {
             return Ok(batch.column(c.0));
         }
         let idx = spec.column_index as usize;
-        batch
-            .columns()
-            .get(idx)
-            .ok_or_else(|| RpcError::value_error(format!("filter column {} not found", spec.column_name)))
+        batch.columns().get(idx).ok_or_else(|| {
+            RpcError::value_error(format!("filter column {} not found", spec.column_name))
+        })
     }
 
     fn value(&self, spec: &FilterSpec) -> Result<&ArrayRef> {
@@ -238,7 +253,11 @@ impl PushdownFilters {
         if self.specs.is_empty() {
             return "(none)".to_string();
         }
-        let parts: Vec<String> = self.specs.iter().map(|s| self.format_one(s, None)).collect();
+        let parts: Vec<String> = self
+            .specs
+            .iter()
+            .map(|s| self.format_one(s, None))
+            .collect();
         if parts.is_empty() {
             "(none)".to_string()
         } else {
@@ -264,7 +283,11 @@ impl PushdownFilters {
             "is_not_null" => format!("IsNotNullFilter({col} IS NOT NULL)"),
             "constant" => {
                 let sym = op_symbol(spec.op.as_deref().unwrap_or("eq"));
-                let v = self.value(spec).ok().map(|a| fmt_scalar(a, 0)).unwrap_or_default();
+                let v = self
+                    .value(spec)
+                    .ok()
+                    .map(|a| fmt_scalar(a, 0))
+                    .unwrap_or_default();
                 format!("ConstantFilter({col} {sym} {v})")
             }
             "in" => match self.value(spec) {
@@ -282,11 +305,19 @@ impl PushdownFilters {
                 None => format!("InFilter({col} IN [])"),
             },
             "and" => {
-                let parts: Vec<String> = spec.children.iter().map(|c| self.repr_one(c, None)).collect();
+                let parts: Vec<String> = spec
+                    .children
+                    .iter()
+                    .map(|c| self.repr_one(c, None))
+                    .collect();
                 format!("AndFilter({})", parts.join(" AND "))
             }
             "or" => {
-                let parts: Vec<String> = spec.children.iter().map(|c| self.repr_one(c, None)).collect();
+                let parts: Vec<String> = spec
+                    .children
+                    .iter()
+                    .map(|c| self.repr_one(c, None))
+                    .collect();
                 format!("OrFilter({})", parts.join(" OR "))
             }
             "struct" => match &spec.child_filter {
@@ -331,13 +362,19 @@ impl PushdownFilters {
                 None => format!("{col} IN ()"),
             },
             "and" => {
-                let parts: Vec<String> =
-                    spec.children.iter().map(|c| self.format_one(c, None)).collect();
+                let parts: Vec<String> = spec
+                    .children
+                    .iter()
+                    .map(|c| self.format_one(c, None))
+                    .collect();
                 format!("({})", parts.join(" AND "))
             }
             "or" => {
-                let parts: Vec<String> =
-                    spec.children.iter().map(|c| self.format_one(c, None)).collect();
+                let parts: Vec<String> = spec
+                    .children
+                    .iter()
+                    .map(|c| self.format_one(c, None))
+                    .collect();
                 format!("({})", parts.join(" OR "))
             }
             "struct" => match &spec.child_filter {
@@ -374,13 +411,23 @@ impl PushdownFilters {
                 let vals = self.value(spec).ok()?;
                 let casted = arrow_cast::cast(vals, &arrow_schema::DataType::Int64).ok()?;
                 let a = casted.as_primitive::<arrow_array::types::Int64Type>();
-                Some((0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect())
+                Some(
+                    (0..a.len())
+                        .filter(|&i| a.is_valid(i))
+                        .map(|i| a.value(i))
+                        .collect(),
+                )
             }
             "join_keys" if spec.column_name == column => {
                 let vals = self.join_value(spec)?;
                 let casted = arrow_cast::cast(vals, &arrow_schema::DataType::Int64).ok()?;
                 let a = casted.as_primitive::<arrow_array::types::Int64Type>();
-                Some((0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect())
+                Some(
+                    (0..a.len())
+                        .filter(|&i| a.is_valid(i))
+                        .map(|i| a.value(i))
+                        .collect(),
+                )
             }
             "constant" if spec.column_name == column && spec.op.as_deref() == Some("eq") => {
                 let vals = self.value(spec).ok()?;
@@ -495,7 +542,9 @@ impl PushdownFilters {
                 child2.column_index = 0;
                 self.eval_spec(&child2, &sub)
             }
-            other => Err(RpcError::value_error(format!("unsupported filter type {other}"))),
+            other => Err(RpcError::value_error(format!(
+                "unsupported filter type {other}"
+            ))),
         }
     }
 }
@@ -567,7 +616,10 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
             _ => return None,
         })
     };
-    let clean: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
+    let clean: Vec<u8> = s
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
+        .collect();
     let mut out = Vec::with_capacity(clean.len() * 3 / 4);
     for chunk in clean.chunks(4) {
         if chunk.len() < 2 {

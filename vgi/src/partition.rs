@@ -21,33 +21,44 @@ pub const PARTITION_VALUES_META: &str = "vgi_partition_values#b64";
 
 /// Build a field marked as a VGI partition column.
 pub fn partition_field(name: &str, ty: DataType) -> Field {
-    Field::new(name, ty, true)
-        .with_metadata(HashMap::from([(PARTITION_COLUMN_KEY.to_string(), "true".to_string())]))
+    Field::new(name, ty, true).with_metadata(HashMap::from([(
+        PARTITION_COLUMN_KEY.to_string(),
+        "true".to_string(),
+    )]))
 }
 
 fn is_partition_field(f: &Field) -> bool {
-    f.metadata().get(PARTITION_COLUMN_KEY).map(|v| v == "true").unwrap_or(false)
+    f.metadata()
+        .get(PARTITION_COLUMN_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 /// Compute the `vgi_partition_values#b64` metadata value for a batch, or
 /// `None` if the (full) schema declares no partition columns or the batch is
 /// empty. The value is base64(IPC of a 2-row batch holding [min, max] for each
 /// partition column).
-pub fn partition_values_b64(full_schema: &SchemaRef, batch: &RecordBatch) -> Result<Option<String>> {
-    let part_fields: Vec<&Arc<Field>> =
-        full_schema.fields().iter().filter(|f| is_partition_field(f)).collect();
+pub fn partition_values_b64(
+    full_schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<Option<String>> {
+    let part_fields: Vec<&Arc<Field>> = full_schema
+        .fields()
+        .iter()
+        .filter(|f| is_partition_field(f))
+        .collect();
     if part_fields.is_empty() || batch.num_rows() == 0 {
         return Ok(None);
     }
     let mut fields = Vec::with_capacity(part_fields.len());
     let mut cols = Vec::with_capacity(part_fields.len());
     for pf in &part_fields {
-        let col = batch
-            .column_by_name(pf.name())
-            .ok_or_else(|| RpcError::value_error(format!(
+        let col = batch.column_by_name(pf.name()).ok_or_else(|| {
+            RpcError::value_error(format!(
                 "partition column {:?} is partition-annotated but absent from emitted batch",
                 pf.name()
-            )))?;
+            ))
+        })?;
         // min = first index, max = last index after an ascending sort.
         let order = arrow_ord::sort::sort_to_indices(col, None, None)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
@@ -84,8 +95,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

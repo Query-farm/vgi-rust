@@ -36,7 +36,12 @@ impl TableInOutFunction for SlowCancellableInOutFunction {
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
-            ArgSpec::const_arg("probe_path", 0, "varchar", "Path to append to when on_cancel fires"),
+            ArgSpec::const_arg(
+                "probe_path",
+                0,
+                "varchar",
+                "Path to append to when on_cancel fires",
+            ),
             table_arg("data", 1),
             ArgSpec::const_arg("sleep_ms", -1, "int64", "Sleep per batch (ms)"),
         ]
@@ -80,20 +85,30 @@ impl SumAllColumnsSimpleDistributed {
             .collect();
         Arc::new(Schema::new(fields))
     }
-    fn sum_one(field_type: &arrow_schema::DataType, col: &arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef> {
+    fn sum_one(
+        field_type: &arrow_schema::DataType,
+        col: &arrow_array::ArrayRef,
+    ) -> Result<arrow_array::ArrayRef> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::{Float64Type, Int64Type};
         use arrow_array::{Float64Array, Int64Array};
-        let cast = arrow_cast::cast(col, field_type).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let cast = arrow_cast::cast(col, field_type)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         match field_type {
             arrow_schema::DataType::Int64 => {
                 let a = cast.as_primitive::<Int64Type>();
-                let s: i64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                let s: i64 = (0..a.len())
+                    .filter(|&i| a.is_valid(i))
+                    .map(|i| a.value(i))
+                    .sum();
                 Ok(Arc::new(Int64Array::from(vec![s])))
             }
             _ => {
                 let a = cast.as_primitive::<Float64Type>();
-                let s: f64 = (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).sum();
+                let s: f64 = (0..a.len())
+                    .filter(|&i| a.is_valid(i))
+                    .map(|i| a.value(i))
+                    .sum();
                 Ok(Arc::new(Float64Array::from(vec![s])))
             }
         }
@@ -115,11 +130,13 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
         vec![table_arg("data", 0)]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        let input = params
-            .input_schema
-            .clone()
-            .ok_or_else(|| RpcError::value_error("sum_all_columns_simple_distributed requires input"))?;
-        Ok(BindResponse { output_schema: Self::output_schema(&input), opaque_data: Vec::new() })
+        let input = params.input_schema.clone().ok_or_else(|| {
+            RpcError::value_error("sum_all_columns_simple_distributed requires input")
+        })?;
+        Ok(BindResponse {
+            output_schema: Self::output_schema(&input),
+            opaque_data: Vec::new(),
+        })
     }
     fn has_finish(&self) -> bool {
         true
@@ -136,7 +153,12 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
         let partial = RecordBatch::try_new(out.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         if let Some(store) = &params.storage {
-            store.append(&params.execution_id, DIST_NS, b"", vgi::ipc::write_batch(&partial)?);
+            store.append(
+                &params.execution_id,
+                DIST_NS,
+                b"",
+                vgi::ipc::write_batch(&partial)?,
+            );
         }
         // Emit nothing during processing (one empty batch satisfies the exchange).
         Ok(vec![RecordBatch::new_empty(out.clone())])
@@ -155,7 +177,9 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
                 let pb = vgi::ipc::read_batch(&blob)?;
                 for (i, f) in out.fields().iter().enumerate() {
                     match f.data_type() {
-                        DataType::Int64 => int_acc[i] += pb.column(i).as_primitive::<Int64Type>().value(0),
+                        DataType::Int64 => {
+                            int_acc[i] += pb.column(i).as_primitive::<Int64Type>().value(0)
+                        }
                         _ => flt_acc[i] += pb.column(i).as_primitive::<Float64Type>().value(0),
                     }
                 }
@@ -170,8 +194,8 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
                 _ => Arc::new(Float64Array::from(vec![flt_acc[i]])) as ArrayRef,
             })
             .collect();
-        let batch =
-            RecordBatch::try_new(out.clone(), cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let batch = RecordBatch::try_new(out.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![batch])
     }
 }
@@ -315,4 +339,3 @@ impl TableInOutFunction for RepeatInputsFunction {
         Ok(vec![out])
     }
 }
-

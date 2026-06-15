@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
 };
-use arrow_array::{ArrayRef, Int8Array, RecordBatch, UnionArray};
+use arrow_array::{ArrayRef, RecordBatch, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, UnionFields};
 use vgi_rpc::{Result, RpcError};
@@ -61,13 +61,19 @@ pub struct CatColStat {
 /// Build a sparse-union (min or max) array over the stats. The union has one
 /// child per distinct value type; each child has length `n` with the value at
 /// rows of its type and null elsewhere.
-fn build_union(stats: &[CatColStat], min: bool, order: &[StatValue]) -> Result<(UnionFields, ArrayRef)> {
-    let n = stats.len();
+fn build_union(
+    stats: &[CatColStat],
+    min: bool,
+    order: &[StatValue],
+) -> Result<(UnionFields, ArrayRef)> {
     let type_ids: Vec<i8> = stats
         .iter()
         .map(|s| {
             let v = if min { &s.min } else { &s.max };
-            order.iter().position(|o| o.type_key() == v.type_key()).unwrap_or(0) as i8
+            order
+                .iter()
+                .position(|o| o.type_key() == v.type_key())
+                .unwrap_or(0) as i8
         })
         .collect();
 
@@ -118,7 +124,10 @@ fn build_union(stats: &[CatColStat], min: bool, order: &[StatValue]) -> Result<(
             }
         };
         children.push(child);
-        fields.push((code as i8, Arc::new(Field::new(format!("{code}"), dt, true))));
+        fields.push((
+            code as i8,
+            Arc::new(Field::new(format!("{code}"), dt, true)),
+        ));
     }
     let union_fields: UnionFields = fields.into_iter().collect();
     let union = UnionArray::try_new(
@@ -196,7 +205,7 @@ pub fn serialize_column_statistics(stats: &[CatColStat]) -> Result<Vec<u8>> {
         Arc::new(uni_b.finish()),
         Arc::new(maxlen_b.finish()),
     ];
-    let batch = RecordBatch::try_new(schema, cols)
-        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+    let batch =
+        RecordBatch::try_new(schema, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)
 }

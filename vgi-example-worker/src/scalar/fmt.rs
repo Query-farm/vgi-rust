@@ -33,13 +33,21 @@ fn value_col(batch: &RecordBatch) -> Vec<Option<f64>> {
         Err(_) => return vec![None; batch.num_rows()],
     };
     let a = casted.as_primitive::<Float64Type>();
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 /// `format_number` overloads: default / (precision) / (precision, prefix).
-pub enum FormatNumber { Default, Precision, Full }
+pub enum FormatNumber {
+    Default,
+    Precision,
+    Full,
+}
 impl ScalarFunction for FormatNumber {
-    fn name(&self) -> &str { "format_number" }
+    fn name(&self) -> &str {
+        "format_number"
+    }
     fn metadata(&self) -> FunctionMetadata {
         meta(match self {
             FormatNumber::Default => "Format number with default precision (0 decimals)",
@@ -67,12 +75,16 @@ impl ScalarFunction for FormatNumber {
             FormatNumber::Default => vals.iter().map(|v| v.map(|v| format!("{v:.0}"))).collect(),
             FormatNumber::Precision => {
                 let p = params.arguments.const_i64(0).unwrap_or(0).max(0) as usize;
-                vals.iter().map(|v| v.map(|v| format!("{v:.p$}", p = p))).collect()
+                vals.iter()
+                    .map(|v| v.map(|v| format!("{v:.p$}", p = p)))
+                    .collect()
             }
             FormatNumber::Full => {
                 let p = params.arguments.const_i64(0).unwrap_or(0).max(0) as usize;
                 let prefix = params.arguments.const_str(1).unwrap_or_default();
-                vals.iter().map(|v| v.map(|v| format!("{prefix}{v:.p$}", p = p))).collect()
+                vals.iter()
+                    .map(|v| v.map(|v| format!("{prefix}{v:.p$}", p = p)))
+                    .collect()
             }
         };
         result(params, arc(out))
@@ -80,10 +92,17 @@ impl ScalarFunction for FormatNumber {
 }
 
 /// `smart_format` overloads: (width:int) right-align / (prefix:str) prepend.
-pub enum SmartFormat { Width, Prefix }
+pub enum SmartFormat {
+    Width,
+    Prefix,
+}
 impl ScalarFunction for SmartFormat {
-    fn name(&self) -> &str { "smart_format" }
-    fn metadata(&self) -> FunctionMetadata { meta("Smart-format a value") }
+    fn name(&self) -> &str {
+        "smart_format"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Smart-format a value")
+    }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         match self {
             SmartFormat::Width => vec![
@@ -101,11 +120,15 @@ impl ScalarFunction for SmartFormat {
         let out: StringArray = match self {
             SmartFormat::Width => {
                 let w = params.arguments.const_i64(0).unwrap_or(0).max(0) as usize;
-                vals.iter().map(|v| v.map(|v| format!("{:>w$}", py_float(v), w = w))).collect()
+                vals.iter()
+                    .map(|v| v.map(|v| format!("{:>w$}", py_float(v), w = w)))
+                    .collect()
             }
             SmartFormat::Prefix => {
                 let prefix = params.arguments.const_str(0).unwrap_or_default();
-                vals.iter().map(|v| v.map(|v| format!("{prefix}{}", py_float(v)))).collect()
+                vals.iter()
+                    .map(|v| v.map(|v| format!("{prefix}{}", py_float(v))))
+                    .collect()
             }
         };
         result(params, arc(out))

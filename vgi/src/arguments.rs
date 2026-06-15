@@ -112,7 +112,11 @@ impl Arguments {
             .enumerate()
             .map(|(i, a)| {
                 (
-                    Arc::new(Field::new(format!("positional_{i}"), a.data_type().clone(), true)),
+                    Arc::new(Field::new(
+                        format!("positional_{i}"),
+                        a.data_type().clone(),
+                        true,
+                    )),
                     a.clone(),
                 )
             })
@@ -263,7 +267,9 @@ impl Arguments {
 
     /// Read a named const bool argument.
     pub fn named_bool(&self, name: &str) -> Option<bool> {
-        self.named_nonnull(name)?.as_boolean_opt().map(|b| b.value(0))
+        self.named_nonnull(name)?
+            .as_boolean_opt()
+            .map(|b| b.value(0))
     }
 
     /// Expand compacted const-only positional args to their declared positions

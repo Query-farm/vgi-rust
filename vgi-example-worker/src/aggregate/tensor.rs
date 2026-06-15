@@ -175,8 +175,7 @@ impl AggregateFunction for NestTensorFunction {
         }
         let tb = vgi::ipc::read_batch(&t)?;
         let sb = vgi::ipc::read_batch(&s)?;
-        let merged =
-            arrow_select::concat::concat_batches(&tb.schema(), [&tb, &sb]).map_err(cvt)?;
+        let merged = arrow_select::concat::concat_batches(&tb.schema(), [&tb, &sb]).map_err(cvt)?;
         vgi::ipc::write_batch(&merged)
     }
 
@@ -194,8 +193,7 @@ impl AggregateFunction for NestTensorFunction {
         let DataType::Struct(axes_out_fields) = result_fields[1].data_type().clone() else {
             return Err(nest_err("axes output is not a struct"));
         };
-        let axis_names: Vec<String> =
-            axes_out_fields.iter().map(|f| f.name().clone()).collect();
+        let axis_names: Vec<String> = axes_out_fields.iter().map(|f| f.name().clone()).collect();
         let n_axes = axis_names.len();
 
         // Per-group leaf value arrays + shapes; per-axis per-group coord arrays.
@@ -251,8 +249,11 @@ impl AggregateFunction for NestTensorFunction {
                         }
                         let mut distinct: Vec<Vec<u8>> = first_row.keys().cloned().collect();
                         distinct.sort(); // byte-lexicographic == value order
-                        let idx_map: HashMap<Vec<u8>, usize> =
-                            distinct.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
+                        let idx_map: HashMap<Vec<u8>, usize> = distinct
+                            .iter()
+                            .enumerate()
+                            .map(|(i, k)| (k.clone(), i))
+                            .collect();
                         shape.push(distinct.len());
                         let rep: Vec<u32> = distinct.iter().map(|k| first_row[k]).collect();
                         let coord_arr =
@@ -289,12 +290,9 @@ impl AggregateFunction for NestTensorFunction {
                         }
                         take_idx[flat] = Some(r as u32);
                     }
-                    let leaf = arrow_select::take::take(
-                        value_col,
-                        &UInt32Array::from(take_idx),
-                        None,
-                    )
-                    .map_err(cvt)?;
+                    let leaf =
+                        arrow_select::take::take(value_col, &UInt32Array::from(take_idx), None)
+                            .map_err(cvt)?;
                     leaf_arrays.push(leaf);
                     shapes.push(shape);
                 }
@@ -354,11 +352,19 @@ fn unwrap_list(mut t: DataType, depth: usize) -> DataType {
 
 fn unnest_output_type(struct_type: &DataType) -> Result<DataType> {
     let DataType::Struct(fields) = struct_type else {
-        return Err(nest_err(format!("argument must be a struct, got {struct_type}")));
+        return Err(nest_err(format!(
+            "argument must be a struct, got {struct_type}"
+        )));
     };
     let missing = || nest_err("struct must have 'tensor' and 'axes' fields");
-    let tensor_f = fields.iter().find(|f| f.name() == "tensor").ok_or_else(missing)?;
-    let axes_f = fields.iter().find(|f| f.name() == "axes").ok_or_else(missing)?;
+    let tensor_f = fields
+        .iter()
+        .find(|f| f.name() == "tensor")
+        .ok_or_else(missing)?;
+    let axes_f = fields
+        .iter()
+        .find(|f| f.name() == "axes")
+        .ok_or_else(missing)?;
     let DataType::Struct(axis_fields) = axes_f.data_type() else {
         return Err(nest_err("'axes' field must be a struct"));
     };
@@ -406,7 +412,12 @@ impl vgi::table_in_out::TableInOutFunction for UnnestTensorRowsFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::column("data", 0, "table", "Input table: one column of nest_tensor structs")]
+        vec![ArgSpec::column(
+            "data",
+            0,
+            "table",
+            "Input table: one column of nest_tensor structs",
+        )]
     }
     fn on_bind(&self, params: &vgi::function::BindParams) -> Result<BindResponse> {
         let input = params
@@ -452,7 +463,12 @@ impl vgi::table_in_out::TableInOutFunction for UnnestTensorRowsFunction {
         let n_axes = axes.num_columns();
         let mut leaf: ArrayRef = tensor_list.clone();
         for _ in 0..n_axes {
-            leaf = leaf.as_any().downcast_ref::<ListArray>().unwrap().values().clone();
+            leaf = leaf
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .values()
+                .clone();
         }
         let axis_lists: Vec<&ListArray> = (0..n_axes)
             .map(|a| axes.column(a).as_any().downcast_ref::<ListArray>().unwrap())
@@ -466,10 +482,13 @@ impl vgi::table_in_out::TableInOutFunction for UnnestTensorRowsFunction {
             if struct_arr.is_null(i) {
                 continue;
             }
-            let shape: Vec<usize> =
-                (0..n_axes).map(|a| axis_lists[a].value_length(i) as usize).collect();
+            let shape: Vec<usize> = (0..n_axes)
+                .map(|a| axis_lists[a].value_length(i) as usize)
+                .collect();
             let total: usize = shape.iter().product();
-            let axis_off: Vec<i32> = (0..n_axes).map(|a| axis_lists[a].value_offsets()[i]).collect();
+            let axis_off: Vec<i32> = (0..n_axes)
+                .map(|a| axis_lists[a].value_offsets()[i])
+                .collect();
             for k in 0..total {
                 value_take.push(Some(leaf_start + k as u32));
                 let mut rem = k;
@@ -491,9 +510,12 @@ impl vgi::table_in_out::TableInOutFunction for UnnestTensorRowsFunction {
         };
         let mut axis_cols: Vec<(Arc<Field>, ArrayRef)> = Vec::with_capacity(n_axes);
         for a in 0..n_axes {
-            let arr =
-                arrow_select::take::take(&axis_values[a], &UInt32Array::from(axis_take[a].clone()), None)
-                    .map_err(cvt)?;
+            let arr = arrow_select::take::take(
+                &axis_values[a],
+                &UInt32Array::from(axis_take[a].clone()),
+                None,
+            )
+            .map_err(cvt)?;
             axis_cols.push((out_axis_fields[a].clone(), arr));
         }
         let axes_struct = StructArray::from(axis_cols);
@@ -514,7 +536,12 @@ impl vgi::function::ScalarFunction for UnnestTensorFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::column("t", 0, "any", "Struct produced by nest_tensor")]
+        vec![ArgSpec::column(
+            "t",
+            0,
+            "any",
+            "Struct produced by nest_tensor",
+        )]
     }
     fn on_bind(&self, params: &vgi::function::BindParams) -> Result<BindResponse> {
         let input = params
@@ -577,9 +604,13 @@ impl vgi::function::ScalarFunction for UnnestTensorFunction {
                 continue;
             }
             valid.push(true);
-            let shape: Vec<usize> = (0..n_axes).map(|a| axis_lists[a].value_length(i) as usize).collect();
+            let shape: Vec<usize> = (0..n_axes)
+                .map(|a| axis_lists[a].value_length(i) as usize)
+                .collect();
             let total: usize = shape.iter().product();
-            let axis_off: Vec<i32> = (0..n_axes).map(|a| axis_lists[a].value_offsets()[i]).collect();
+            let axis_off: Vec<i32> = (0..n_axes)
+                .map(|a| axis_lists[a].value_offsets()[i])
+                .collect();
             for k in 0..total {
                 value_take.push(Some(leaf_start + k as u32));
                 // Decode row-major k into per-axis indices.
@@ -598,8 +629,8 @@ impl vgi::function::ScalarFunction for UnnestTensorFunction {
             out_offsets.push(acc);
         }
 
-        let value_arr = arrow_select::take::take(&leaf, &UInt32Array::from(value_take), None)
-            .map_err(cvt)?;
+        let value_arr =
+            arrow_select::take::take(&leaf, &UInt32Array::from(value_take), None).map_err(cvt)?;
         let DataType::List(row_field) = params.output_schema.field(0).data_type().clone() else {
             return Err(nest_err("output is not a list"));
         };
@@ -611,8 +642,12 @@ impl vgi::function::ScalarFunction for UnnestTensorFunction {
         };
         let mut axis_cols: Vec<(Arc<Field>, ArrayRef)> = Vec::with_capacity(n_axes);
         for a in 0..n_axes {
-            let arr = arrow_select::take::take(&axis_values[a], &UInt32Array::from(axis_take[a].clone()), None)
-                .map_err(cvt)?;
+            let arr = arrow_select::take::take(
+                &axis_values[a],
+                &UInt32Array::from(axis_take[a].clone()),
+                None,
+            )
+            .map_err(cvt)?;
             axis_cols.push((out_axis_fields[a].clone(), arr));
         }
         let axes_struct = StructArray::from(axis_cols);

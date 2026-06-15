@@ -71,7 +71,11 @@ pub fn read_struct<T: VgiArrow>(arr: &dyn Array, idx: usize) -> Result<T> {
 /// IPC-serialized flat DTO batch (Go `serializeResult`); the flat DTO schema
 /// is the schema of those inner bytes, not of the response batch itself.
 pub fn result_binary_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("result", DataType::Binary, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "result",
+        DataType::Binary,
+        false,
+    )]))
 }
 
 /// Serialize a response DTO into the wire `{result: binary}` envelope.

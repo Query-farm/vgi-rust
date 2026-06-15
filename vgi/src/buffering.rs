@@ -105,7 +105,14 @@ impl BufferingStore {
     }
 
     /// Scan log entries with `id > after_id`, up to `limit`, ordered by id.
-    pub fn scan(&self, exec: &[u8], ns: &[u8], key: &[u8], after_id: i64, limit: usize) -> Vec<(i64, Vec<u8>)> {
+    pub fn scan(
+        &self,
+        exec: &[u8],
+        ns: &[u8],
+        key: &[u8],
+        after_id: i64,
+        limit: usize,
+    ) -> Vec<(i64, Vec<u8>)> {
         let dir = self.log_dir(exec, ns, key);
         let mut ids: Vec<i64> = std::fs::read_dir(&dir)
             .into_iter()
@@ -180,7 +187,11 @@ impl BufferingStore {
         let mut id = self.max_id(&dir) + 1;
         for item in items {
             let path = dir.join(format!("{id:020}.bin"));
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 let _ = f.write_all(item);
             }
             id += 1;

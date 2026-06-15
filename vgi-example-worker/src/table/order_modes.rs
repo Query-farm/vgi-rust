@@ -79,8 +79,11 @@ impl TableProducer for QueueSeqProducer {
             }
             let bend = (idx + BATCH_SIZE).min(end);
             let vals: Vec<i64> = (idx..bend).map(|i| i * self.increment).collect();
-            let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(Int64Array::from(vals)) as ArrayRef])
-                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+            let batch = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vals)) as ArrayRef],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
             self.cur = Some((bend, end));
             return Ok(Some(batch));
         }
@@ -127,23 +130,43 @@ impl TableFunction for QueueSeqFunction {
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        let mut v = vec![ArgSpec::const_arg("count", 0, "int64", "Total integers to generate")];
+        let mut v = vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Total integers to generate",
+        )];
         if self.has_increment {
-            v.push(ArgSpec::const_arg("increment", -1, "int64", "Step between values"));
+            v.push(ArgSpec::const_arg(
+                "increment",
+                -1,
+                "int64",
+                "Step between values",
+            ));
         }
         v
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn max_workers(&self, _params: &BindParams) -> i64 {
         4
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let count = params.arguments.const_i64(0)?;
-        let inc = if self.has_increment { params.arguments.named_i64("increment").unwrap_or(1) } else { 1 };
+        let inc = if self.has_increment {
+            params.arguments.named_i64("increment").unwrap_or(1)
+        } else {
+            1
+        };
         let _ = inc;
-        Some(TableCardinality { estimate: Some(count), max: Some(count) })
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
     }
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
         let store = params
@@ -177,7 +200,11 @@ impl TableFunction for QueueSeqFunction {
         } else {
             1
         };
-        let tag = format!("{}_{}", std::process::id(), CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tag = format!(
+            "{}_{}",
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         Ok(Box::new(QueueSeqProducer {
             schema: schema_n(),
             storage,

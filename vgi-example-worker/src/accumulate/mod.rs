@@ -80,7 +80,9 @@ fn input_fields_match(pinned: &Schema, incoming: &Schema) -> bool {
 
 fn validate_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
-        return Err(RpcError::value_error("collection name must be a non-empty string"));
+        return Err(RpcError::value_error(
+            "collection name must be a non-empty string",
+        ));
     }
     if name.len() > MAX_NAME_BYTES {
         return Err(RpcError::value_error(format!(
@@ -159,8 +161,11 @@ impl AccumulateStore {
 
     fn put_schema(&self, scope: &[u8], name: &str, schema: &SchemaRef) -> Result<()> {
         let _ = std::fs::create_dir_all(self.coll_dir(scope, name));
-        std::fs::write(self.schema_path(scope, name), ipc::write_schema_ref(schema)?)
-            .map_err(|e| RpcError::runtime_error(e.to_string()))
+        std::fs::write(
+            self.schema_path(scope, name),
+            ipc::write_schema_ref(schema)?,
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
 
     /// Segment files sorted oldest-first, as `(ts_micros, path)`.
@@ -185,7 +190,11 @@ impl AccumulateStore {
         let _ = std::fs::create_dir_all(&dir);
         // A monotonic seq within the (possibly shared) timestamp keeps the
         // filename unique and preserves insertion order.
-        let seq = std::fs::read_dir(&dir).into_iter().flatten().flatten().count();
+        let seq = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .count();
         let path = dir.join(format!("{ts:020}_{seq:010}.bin"));
         std::fs::write(&path, ipc::write_batch(batch)?)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
@@ -195,7 +204,8 @@ impl AccumulateStore {
         self.segments(scope, name)
             .into_iter()
             .map(|(_, path)| {
-                let bytes = std::fs::read(&path).map_err(|e| RpcError::runtime_error(e.to_string()))?;
+                let bytes =
+                    std::fs::read(&path).map_err(|e| RpcError::runtime_error(e.to_string()))?;
                 ipc::read_batch(&bytes)
             })
             .collect()
@@ -262,7 +272,8 @@ fn stamp(input: &RecordBatch, output_schema: &SchemaRef, ts: i64) -> Result<Reco
     let mut cols: Vec<ArrayRef> = input.columns().to_vec();
     let n = input.num_rows();
     cols.push(Arc::new(TimestampMicrosecondArray::from(vec![ts; n])) as ArrayRef);
-    RecordBatch::try_new(output_schema.clone(), cols).map_err(|e| RpcError::runtime_error(e.to_string()))
+    RecordBatch::try_new(output_schema.clone(), cols)
+        .map_err(|e| RpcError::runtime_error(e.to_string()))
 }
 
 /// Read a named INTERVAL (month_day_nano) argument as microseconds; months are
@@ -292,7 +303,10 @@ impl TableProducer for BatchListProducer {
         }
         let batch = self.batches[self.pos].clone();
         self.pos += 1;
-        Ok(Some(vgi::table_in_out::project_batch(&batch, &self.output_schema)?))
+        Ok(Some(vgi::table_in_out::project_batch(
+            &batch,
+            &self.output_schema,
+        )?))
     }
 }
 
@@ -306,19 +320,28 @@ struct OutDrain {
 
 impl TableProducer for OutDrain {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
-        let rows = self.storage.scan(&self.execution_id, NS_OUT, b"", self.after_id, 1);
+        let rows = self
+            .storage
+            .scan(&self.execution_id, NS_OUT, b"", self.after_id, 1);
         let Some((id, value)) = rows.into_iter().next() else {
             return Ok(None);
         };
         self.after_id = id;
         let batch = ipc::read_batch(&value)?;
-        Ok(Some(vgi::table_in_out::project_batch(&batch, &self.output_schema)?))
+        Ok(Some(vgi::table_in_out::project_batch(
+            &batch,
+            &self.output_schema,
+        )?))
     }
 }
 
 /// Re-chunk `table` (a list of batches) into `≤ OUT_BATCH_ROWS` slices staged
 /// into the execution-scoped output log for the source phase to drain.
-fn stage_batches(storage: &vgi::buffering::BufferingStore, exec: &[u8], batches: &[RecordBatch]) -> Result<()> {
+fn stage_batches(
+    storage: &vgi::buffering::BufferingStore,
+    exec: &[u8],
+    batches: &[RecordBatch],
+) -> Result<()> {
     for batch in batches {
         let mut off = 0;
         while off < batch.num_rows() {
@@ -344,8 +367,9 @@ impl TableBufferingFunction for AccumulateFunction {
 
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: "Append rows to a named collection; return all/new/no rows with a _timestamp column"
-                .to_string(),
+            description:
+                "Append rows to a named collection; return all/new/no rows with a _timestamp column"
+                    .to_string(),
             categories: vec!["stateful".to_string(), "utility".to_string()],
             ..Default::default()
         }
@@ -353,8 +377,18 @@ impl TableBufferingFunction for AccumulateFunction {
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
-            ArgSpec::const_arg("name", 0, "varchar", "Name of the collection to accumulate into"),
-            ArgSpec::column("data", 1, "table", "Rows to accumulate (any table expression)"),
+            ArgSpec::const_arg(
+                "name",
+                0,
+                "varchar",
+                "Name of the collection to accumulate into",
+            ),
+            ArgSpec::column(
+                "data",
+                1,
+                "table",
+                "Rows to accumulate (any table expression)",
+            ),
             ArgSpec::const_typed(
                 "ttl",
                 -1,
@@ -367,7 +401,12 @@ impl TableBufferingFunction for AccumulateFunction {
                 "int64",
                 "Maximum rows retained per name; oldest dropped first (0 = unlimited)",
             ),
-            ArgSpec::const_arg("result", -1, "varchar", "What to return: 'all' (default), 'new', or 'none'"),
+            ArgSpec::const_arg(
+                "result",
+                -1,
+                "varchar",
+                "What to return: 'all' (default), 'new', or 'none'",
+            ),
         ]
     }
 
@@ -420,7 +459,9 @@ impl TableBufferingFunction for AccumulateFunction {
         let store = AccumulateStore::new();
 
         // Reassemble this call's input from the execution-scoped staging log.
-        let staged = params.storage.scan(&params.execution_id, NS_IN, b"", -1, usize::MAX);
+        let staged = params
+            .storage
+            .scan(&params.execution_id, NS_IN, b"", -1, usize::MAX);
         let mut input_batches = Vec::with_capacity(staged.len());
         for (_, value) in staged {
             input_batches.push(ipc::read_batch(&value)?);
@@ -448,7 +489,12 @@ impl TableBufferingFunction for AccumulateFunction {
         }
 
         // Stage the requested result for the source phase.
-        match params.arguments.named_str("result").as_deref().unwrap_or("all") {
+        match params
+            .arguments
+            .named_str("result")
+            .as_deref()
+            .unwrap_or("all")
+        {
             "none" => {}
             "new" => stage_batches(&params.storage, &params.execution_id, &[new_table])?,
             _ => {
@@ -493,7 +539,12 @@ impl TableFunction for AccumulateReadFunction {
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("name", 0, "varchar", "Name of the collection to read")]
+        vec![ArgSpec::const_arg(
+            "name",
+            0,
+            "varchar",
+            "Name of the collection to read",
+        )]
     }
 
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
@@ -501,9 +552,9 @@ impl TableFunction for AccumulateReadFunction {
         validate_name(&name)?;
         let store = AccumulateStore::new();
         let scope = scope_of(&params.attach_opaque_data);
-        let schema = store
-            .get_schema(&scope, &name)
-            .ok_or_else(|| RpcError::value_error(format!("no accumulation named '{name}' in this session")))?;
+        let schema = store.get_schema(&scope, &name).ok_or_else(|| {
+            RpcError::value_error(format!("no accumulation named '{name}' in this session"))
+        })?;
         Ok(BindResponse {
             output_schema: schema,
             opaque_data: Vec::new(),
@@ -543,14 +594,20 @@ impl TableFunction for AccumulateClearFunction {
 
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: "Remove an accumulated collection by name; returns rows cleared".to_string(),
+            description: "Remove an accumulated collection by name; returns rows cleared"
+                .to_string(),
             categories: vec!["stateful".to_string(), "utility".to_string()],
             ..Default::default()
         }
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("name", 0, "varchar", "Name of the collection to clear")]
+        vec![ArgSpec::const_arg(
+            "name",
+            0,
+            "varchar",
+            "Name of the collection to clear",
+        )]
     }
 
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
@@ -611,7 +668,8 @@ pub fn catalog() -> CatalogModel {
         implementation_version: Some(IMPLEMENTATION_VERSION.to_string()),
         data_version_spec: Some(DATA_VERSION.to_string()),
         comment: Some(
-            "Row accumulation keyed by name, persisted via FunctionStorage and scoped per ATTACH".to_string(),
+            "Row accumulation keyed by name, persisted via FunctionStorage and scoped per ATTACH"
+                .to_string(),
         ),
         supports_time_travel: false,
         schemas: vec![CatSchema {

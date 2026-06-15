@@ -36,18 +36,34 @@ impl TableFunction for SlowCancellableFunction {
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
-            ArgSpec::const_arg("probe_path", 0, "varchar", "Path to append to when on_cancel fires"),
+            ArgSpec::const_arg(
+                "probe_path",
+                0,
+                "varchar",
+                "Path to append to when on_cancel fires",
+            ),
             ArgSpec::const_arg("sleep_ms", -1, "int64", "Sleep per batch (ms)"),
             ArgSpec::const_arg("count", -1, "int64", "Total rows to produce"),
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        Ok(BindResponse { output_schema: schema_n(), opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
-        let count = params.arguments.named_i64("count").unwrap_or(1_000_000).max(0);
+        let count = params
+            .arguments
+            .named_i64("count")
+            .unwrap_or(1_000_000)
+            .max(0);
         let sleep_ms = params.arguments.named_i64("sleep_ms").unwrap_or(50).max(0) as u64;
-        Ok(Box::new(SlowProducer { remaining: count, sleep_ms, next: 0 }))
+        Ok(Box::new(SlowProducer {
+            remaining: count,
+            sleep_ms,
+            next: 0,
+        }))
     }
 }
 
@@ -64,8 +80,11 @@ impl TableProducer for SlowProducer {
         if self.sleep_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
         }
-        let batch = RecordBatch::try_new(schema_n(), vec![Arc::new(Int64Array::from(vec![self.next]))])
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            schema_n(),
+            vec![Arc::new(Int64Array::from(vec![self.next]))],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         self.next += 1;
         self.remaining -= 1;
         Ok(Some(batch))

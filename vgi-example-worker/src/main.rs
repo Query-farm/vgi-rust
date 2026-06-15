@@ -10,8 +10,8 @@
 mod accumulate;
 mod aggregate;
 mod attach_options;
-mod catalog_def;
 mod buffering;
+mod catalog_def;
 mod scalar;
 mod table;
 mod table_in_out;
@@ -20,13 +20,12 @@ use vgi::Worker;
 
 fn main() {
     // Logs go to stderr — stdout is the Arrow-IPC channel.
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().filter_or("VGI_LOG", "info"),
-    )
-    .format_timestamp_millis()
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().filter_or("VGI_LOG", "info"))
+        .format_timestamp_millis()
+        .try_init();
 
-    let catalog_name = std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
+    let catalog_name =
+        std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
 
     let mut worker = Worker::new();
     scalar::register(&mut worker);

@@ -46,7 +46,6 @@ impl VgiArrow for InlineI64 {
         "int".into()
     }
     fn read(arr: &dyn arrow_array::Array, idx: usize) -> Result<Self> {
-        use arrow_array::Array;
         if arr.is_null(idx) {
             return Ok(InlineI64(None));
         }

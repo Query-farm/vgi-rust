@@ -69,7 +69,9 @@ pub trait AggregateFunction: Send + Sync {
         _frames: &[Vec<(i64, i64)>],
         _filter_mask: Option<&[bool]>,
     ) -> Result<arrow_array::ArrayRef> {
-        Err(RpcError::runtime_error("window() not supported by this aggregate"))
+        Err(RpcError::runtime_error(
+            "window() not supported by this aggregate",
+        ))
     }
 
     /// Process one chunk of a streaming-partitioned session. The chunk's
@@ -85,7 +87,9 @@ pub trait AggregateFunction: Send + Sync {
         _order_key_count: usize,
         _states: &mut HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<ArrayRef> {
-        Err(RpcError::runtime_error("streaming_chunk() not supported by this aggregate"))
+        Err(RpcError::runtime_error(
+            "streaming_chunk() not supported by this aggregate",
+        ))
     }
 
     /// Like [`finalize`], but with access to the bind-time arguments (stashed

@@ -167,32 +167,41 @@ fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
         }
     }
     if let Ok(tok) = std::env::var("VGI_TEST_BEARER_TOKEN") {
-        tokens.entry(tok).or_insert_with(|| "test-principal".to_string());
+        tokens
+            .entry(tok)
+            .or_insert_with(|| "test-principal".to_string());
     }
     if tokens.is_empty() {
         return None;
     }
-    Some(std::sync::Arc::new(move |req: &vgi_rpc::AuthRequest<'_>| {
-        let token = req
-            .header("authorization")
-            .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
-            .map(|t| t.trim());
-        match token {
-            // A server with tokens configured is bearer-protected: reject
-            // anonymous (no/blank token) access. A server with NO tokens never
-            // installs this callback, so it allows all (the non-auth tests).
-            None => Err(vgi_rpc::RpcError::permission_error(
-                "bearer token required but not provided",
-            )),
-            Some(tok) => match tokens.get(tok) {
-                Some(principal) => Ok(vgi_rpc::AuthContext {
-                    domain: "bearer".to_string(),
-                    authenticated: true,
-                    principal: principal.clone(),
-                    claims: Default::default(),
-                }),
-                None => Err(vgi_rpc::RpcError::permission_error("bearer token was rejected")),
-            },
-        }
-    }))
+    Some(std::sync::Arc::new(
+        move |req: &vgi_rpc::AuthRequest<'_>| {
+            let token = req
+                .header("authorization")
+                .and_then(|h| {
+                    h.strip_prefix("Bearer ")
+                        .or_else(|| h.strip_prefix("bearer "))
+                })
+                .map(|t| t.trim());
+            match token {
+                // A server with tokens configured is bearer-protected: reject
+                // anonymous (no/blank token) access. A server with NO tokens never
+                // installs this callback, so it allows all (the non-auth tests).
+                None => Err(vgi_rpc::RpcError::permission_error(
+                    "bearer token required but not provided",
+                )),
+                Some(tok) => match tokens.get(tok) {
+                    Some(principal) => Ok(vgi_rpc::AuthContext {
+                        domain: "bearer".to_string(),
+                        authenticated: true,
+                        principal: principal.clone(),
+                        claims: Default::default(),
+                    }),
+                    None => Err(vgi_rpc::RpcError::permission_error(
+                        "bearer token was rejected",
+                    )),
+                },
+            }
+        },
+    ))
 }

@@ -67,16 +67,20 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     };
 
     let name = Arc::new(StringArray::from(vec![model.name.clone()])) as ArrayRef;
-    let impl_ver =
-        Arc::new(StringArray::from(vec![model.implementation_version.clone()])) as ArrayRef;
+    let impl_ver = Arc::new(StringArray::from(vec![model
+        .implementation_version
+        .clone()])) as ArrayRef;
     let data_ver = Arc::new(StringArray::from(vec![model.data_version_spec.clone()])) as ArrayRef;
 
     // attach_option_specs: list<binary>, one list of the serialized specs.
     let aos_field = Arc::new(Field::new("item", DataType::Binary, true));
-    let specs: Vec<&[u8]> = model.attach_option_specs.iter().map(|v| v.as_slice()).collect();
+    let specs: Vec<&[u8]> = model
+        .attach_option_specs
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
     let aos_values = Arc::new(BinaryArray::from(specs)) as ArrayRef;
-    let aos_offsets =
-        OffsetBuffer::new(vec![0i32, model.attach_option_specs.len() as i32].into());
+    let aos_offsets = OffsetBuffer::new(vec![0i32, model.attach_option_specs.len() as i32].into());
     let aos = Arc::new(ListArray::new(aos_field, aos_offsets, aos_values, None)) as ArrayRef;
 
     // releases: list<struct{version,released_at,summary,notes_url}>, one empty.
@@ -132,7 +136,11 @@ pub fn serialize_attach_option_spec(
     default: Option<&arrow_array::ArrayRef>,
 ) -> Result<Vec<u8>> {
     use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
-    let type_schema = Arc::new(Schema::new(vec![Field::new("value", arrow_type.clone(), true)]));
+    let type_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        arrow_type.clone(),
+        true,
+    )]));
     let type_bytes = ipc::write_schema_ref(&type_schema)?;
     let default_bytes: Option<Vec<u8>> = match default {
         Some(arr) => {
@@ -154,14 +162,18 @@ pub fn serialize_attach_option_spec(
         Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])),
         Arc::new(BinaryArray::from(vec![default_bytes.as_deref()])),
     ];
-    let batch =
-        RecordBatch::try_new(schema, cols).map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    let batch = RecordBatch::try_new(schema, cols)
+        .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)
 }
 
 pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
     use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
-    let type_schema = Arc::new(Schema::new(vec![Field::new("value", spec.data_type.clone(), true)]));
+    let type_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        spec.data_type.clone(),
+        true,
+    )]));
     let type_bytes = ipc::write_schema_ref(&type_schema)?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -175,8 +187,8 @@ pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
         Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])),
         Arc::new(BinaryArray::from(vec![None as Option<&[u8]>])),
     ];
-    let batch =
-        RecordBatch::try_new(schema, cols).map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
+    let batch = RecordBatch::try_new(schema, cols)
+        .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)
 }
 
@@ -345,7 +357,9 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
         None => {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
-            Schema::new(vec![Field::new("result", DataType::Null, false).with_metadata(m)])
+            Schema::new(vec![
+                Field::new("result", DataType::Null, false).with_metadata(m)
+            ])
         }
     };
     fi.output_schema = Bytes::from(ipc::write_schema(&out_schema)?);
@@ -395,7 +409,9 @@ pub fn buffering_function_info(
 /// Build the `FunctionInfo` for an aggregate function. Aggregates must
 /// advertise a 1-field output schema at discovery time, so resolve it via
 /// `on_bind` with empty params (a fixed-return aggregate ignores them).
-pub fn aggregate_function_info(f: &dyn crate::aggregate::AggregateFunction) -> Result<FunctionInfo> {
+pub fn aggregate_function_info(
+    f: &dyn crate::aggregate::AggregateFunction,
+) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::AGGREGATE);
     apply_metadata(&mut fi, &meta);
@@ -416,9 +432,12 @@ pub fn aggregate_function_info(f: &dyn crate::aggregate::AggregateFunction) -> R
         (None, Err(_)) => {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
-            Arc::new(Schema::new(vec![
-                Field::new("result", DataType::Null, false).with_metadata(m),
-            ]))
+            Arc::new(Schema::new(vec![Field::new(
+                "result",
+                DataType::Null,
+                false,
+            )
+            .with_metadata(m)]))
         }
     };
     fi.output_schema = Bytes::from(ipc::write_schema_ref(&out)?);
@@ -427,7 +446,11 @@ pub fn aggregate_function_info(f: &dyn crate::aggregate::AggregateFunction) -> R
 
 /// The default `SchemaInfo` for the `main` schema.
 pub fn main_schema_info(attach_opaque_data: &[u8]) -> SchemaInfo {
-    schema_info(MAIN_SCHEMA, Some("Default schema containing all registered functions"), attach_opaque_data)
+    schema_info(
+        MAIN_SCHEMA,
+        Some("Default schema containing all registered functions"),
+        attach_opaque_data,
+    )
 }
 
 /// Build a `SchemaInfo` for an arbitrary schema.
@@ -518,11 +541,16 @@ pub fn resolve_version_npm(
         None | Some("") => return Ok(default.to_string()),
         Some(s) => s,
     };
-    let mut sorted: Vec<((u32, u32, u32), &String)> =
-        supported.iter().filter_map(|v| parse_semver(v).map(|t| (t, v))).collect();
+    let mut sorted: Vec<((u32, u32, u32), &String)> = supported
+        .iter()
+        .filter_map(|v| parse_semver(v).map(|t| (t, v)))
+        .collect();
     sorted.sort();
-    let unsupported =
-        || vgi_rpc::RpcError::value_error(format!("Unsupported {label} {spec:?}; this worker serves {supported:?}"));
+    let unsupported = || {
+        vgi_rpc::RpcError::value_error(format!(
+            "Unsupported {label} {spec:?}; this worker serves {supported:?}"
+        ))
+    };
 
     // Exact X.Y.Z
     if parse_semver(spec).is_some() {
@@ -540,7 +568,7 @@ pub fn resolve_version_npm(
         return sorted
             .iter()
             .filter(|(t, _)| t.0 == major)
-            .last()
+            .next_back()
             .map(|(_, v)| v.to_string())
             .ok_or_else(unsupported);
     }
@@ -558,10 +586,8 @@ pub fn resolve_version_npm(
         if let Some(base) = parse_semver(spec.trim_start_matches(['^', '~'])) {
             return sorted
                 .iter()
-                .filter(|(t, _)| {
-                    t.0 == base.0 && *t >= base && (prefix == '^' || t.1 == base.1)
-                })
-                .last()
+                .filter(|(t, _)| t.0 == base.0 && *t >= base && (prefix == '^' || t.1 == base.1))
+                .next_back()
                 .map(|(_, v)| v.to_string())
                 .ok_or_else(unsupported);
         }
@@ -688,7 +714,9 @@ impl CatTable {
                     .iter()
                     .find(|t| t.version == want)
                     .map(Some)
-                    .ok_or_else(|| vgi_rpc::RpcError::value_error(format!("Unknown version: {want}")))
+                    .ok_or_else(|| {
+                        vgi_rpc::RpcError::value_error(format!("Unknown version: {want}"))
+                    })
             }
             Some("TIMESTAMP") => {
                 let year: i32 = at_value
@@ -712,7 +740,9 @@ impl CatTable {
                         ))
                     })
             }
-            Some(other) => Err(vgi_rpc::RpcError::value_error(format!("Unsupported at_unit: {other:?}"))),
+            Some(other) => Err(vgi_rpc::RpcError::value_error(format!(
+                "Unsupported at_unit: {other:?}"
+            ))),
         }
     }
 }
@@ -883,9 +913,15 @@ pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInf
         tags: Vec::new(),
         name: m.name.clone(),
         schema_name: schema.to_string(),
-        macro_type: DictString(if m.table_macro { "table".into() } else { "scalar".into() }),
+        macro_type: DictString(if m.table_macro {
+            "table".into()
+        } else {
+            "scalar".into()
+        }),
         parameters: m.parameters.clone(),
-        parameter_default_values: Bytes::from(build_macro_defaults(&m.defaults).unwrap_or_default()),
+        parameter_default_values: Bytes::from(
+            build_macro_defaults(&m.defaults).unwrap_or_default(),
+        ),
         definition: m.definition.clone(),
     }
 }
@@ -896,8 +932,14 @@ fn build_macro_defaults(defaults: &[(String, i64)]) -> Result<Vec<u8>> {
     if defaults.is_empty() {
         return Ok(Vec::new());
     }
-    let fields: Vec<Field> = defaults.iter().map(|(n, _)| Field::new(n, DataType::Int64, false)).collect();
-    let cols: Vec<ArrayRef> = defaults.iter().map(|(_, v)| Arc::new(Int64Array::from(vec![*v])) as ArrayRef).collect();
+    let fields: Vec<Field> = defaults
+        .iter()
+        .map(|(n, _)| Field::new(n, DataType::Int64, false))
+        .collect();
+    let cols: Vec<ArrayRef> = defaults
+        .iter()
+        .map(|(_, v)| Arc::new(Int64Array::from(vec![*v])) as ArrayRef)
+        .collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
         .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)

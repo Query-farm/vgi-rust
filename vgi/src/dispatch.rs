@@ -91,7 +91,11 @@ impl Dispatcher {
     /// Add a secondary catalog (served alongside the primary, MetaWorker-style),
     /// declaring the worker-global function names it owns (so its function
     /// listing is scoped and the primary hides them).
-    pub fn register_secondary_catalog(&mut self, model: catalog::CatalogModel, functions: Vec<String>) {
+    pub fn register_secondary_catalog(
+        &mut self,
+        model: catalog::CatalogModel,
+        functions: Vec<String>,
+    ) {
         self.secondary.push(model);
         self.secondary_functions.push(functions);
     }
@@ -120,7 +124,10 @@ impl Dispatcher {
     }
 
     pub fn register_scalar(&mut self, f: Arc<dyn ScalarFunction>) {
-        self.scalars.entry(f.name().to_string()).or_default().push(f);
+        self.scalars
+            .entry(f.name().to_string())
+            .or_default()
+            .push(f);
     }
 
     pub fn register_table(&mut self, f: Arc<dyn TableFunction>) {
@@ -264,7 +271,11 @@ impl Dispatcher {
 
         // Table-in-out.
         if self.tableinouts.contains_key(&dto.function_name) {
-            let f = self.resolve_table_in_out(&dto.function_name, &params.arguments, params.input_schema.as_ref())?;
+            let f = self.resolve_table_in_out(
+                &dto.function_name,
+                &params.arguments,
+                params.input_schema.as_ref(),
+            )?;
             params.arguments.remap_positional(&f.argument_specs());
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
@@ -282,7 +293,11 @@ impl Dispatcher {
             || (!self.scalars.contains_key(&dto.function_name)
                 && self.tables.contains_key(&dto.function_name))
         {
-            let f = self.resolve_table(&dto.function_name, &params.arguments, params.input_schema.as_ref())?;
+            let f = self.resolve_table(
+                &dto.function_name,
+                &params.arguments,
+                params.input_schema.as_ref(),
+            )?;
             params.arguments.remap_positional(&f.argument_specs());
             // Two-phase secret bind: first pass requests the secret types; the
             // C++ resolves them and re-binds with `resolved_secrets_provided`.
@@ -292,7 +307,10 @@ impl Dispatcher {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
                         opaque_data: Bytes::from(Vec::new()),
-                        lookup_secret_types: lookups.iter().map(|l| l.secret_type.clone()).collect(),
+                        lookup_secret_types: lookups
+                            .iter()
+                            .map(|l| l.secret_type.clone())
+                            .collect(),
                         lookup_scopes: lookups
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
@@ -316,7 +334,11 @@ impl Dispatcher {
             return Ok(Some(wire::to_result_batch(resp)?));
         }
 
-        let f = self.resolve_scalar(&dto.function_name, &params.arguments, params.input_schema.as_ref())?;
+        let f = self.resolve_scalar(
+            &dto.function_name,
+            &params.arguments,
+            params.input_schema.as_ref(),
+        )?;
         params.arguments.remap_positional(&f.argument_specs());
 
         // Two-phase secret resolution.
@@ -373,33 +395,38 @@ impl Dispatcher {
             .unwrap_or_else(|| self.next_execution_id());
         let ft = normalize_function_type(&bind_call.function_type.0).unwrap_or_default();
 
-        let build_params = |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
-            output_schema: output_schema.clone(),
-            input_schema: input_schema.clone(),
-            execution_id: execution_id.clone(),
-            init_opaque_data: dto.bind_opaque_data.clone().map(|b| b.into()).unwrap_or_default(),
-            arguments: args,
-            settings,
-            secrets,
-            auth_principal: auth,
-            projection_ids: dto.projection_ids.clone(),
-            pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0),
-            join_keys: dto
-                .join_keys
-                .clone()
-                .map(|v| v.into_iter().map(|b| b.0).collect())
-                .unwrap_or_default(),
-            storage: Some(self.store.clone()),
-            order_by_column: dto.order_by_column_name.clone(),
-            order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
-            order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
-            order_by_limit: dto.order_by_limit,
-            tablesample_percentage: dto.tablesample_percentage,
-            tablesample_seed: dto.tablesample_seed,
-            attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
-            at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
-            at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
-        };
+        let build_params =
+            |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
+                output_schema: output_schema.clone(),
+                input_schema: input_schema.clone(),
+                execution_id: execution_id.clone(),
+                init_opaque_data: dto
+                    .bind_opaque_data
+                    .clone()
+                    .map(|b| b.into())
+                    .unwrap_or_default(),
+                arguments: args,
+                settings,
+                secrets,
+                auth_principal: auth,
+                projection_ids: dto.projection_ids.clone(),
+                pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0),
+                join_keys: dto
+                    .join_keys
+                    .clone()
+                    .map(|v| v.into_iter().map(|b| b.0).collect())
+                    .unwrap_or_default(),
+                storage: Some(self.store.clone()),
+                order_by_column: dto.order_by_column_name.clone(),
+                order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
+                order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
+                order_by_limit: dto.order_by_limit,
+                tablesample_percentage: dto.tablesample_percentage,
+                tablesample_seed: dto.tablesample_seed,
+                attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
+                at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
+                at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
+            };
 
         // Table buffering: sink (header-only) or finalize source (producer).
         if self.buffering.contains_key(&bind_call.function_name) {
@@ -412,7 +439,11 @@ impl Dispatcher {
                 opaque_data: None,
             })?;
             if phase == crate::protocol::enums::phase::TABLE_BUFFERING_FINALIZE {
-                let fsid = dto.finalize_state_id.clone().map(|b| b.0).unwrap_or_default();
+                let fsid = dto
+                    .finalize_state_id
+                    .clone()
+                    .map(|b| b.0)
+                    .unwrap_or_default();
                 let bparams = BufferingParams {
                     execution_id,
                     storage: self.store.clone(),
@@ -433,17 +464,26 @@ impl Dispatcher {
                     None
                 };
                 let producer = f.finalize_producer(&bparams, fsid)?;
-                let state = TableProducerState { inner: producer, filters, project_to: None, resume_blob: None };
-                return Ok(StreamResult::producer(output_schema, Box::new(state))
-                    .with_header(header));
+                let state = TableProducerState {
+                    inner: producer,
+                    filters,
+                    project_to: None,
+                    resume_blob: None,
+                };
+                return Ok(
+                    StreamResult::producer(output_schema, Box::new(state)).with_header(header)
+                );
             }
             // Sink phase: emit nothing; data arrives via process RPCs.
             // The process/combine RPCs carry no schema and may run in a
             // different pooled worker, so persist the bound output schema
             // (which may differ from the input, e.g. sum_all_columns) to the
             // file-backed store keyed by execution_id for them to read.
-            self.store
-                .kv_put(&execution_id, b"outsc", &ipc::write_schema_ref(&output_schema)?);
+            self.store.kv_put(
+                &execution_id,
+                b"outsc",
+                &ipc::write_schema_ref(&output_schema)?,
+            );
             // Persist named flags the process/combine RPCs need (e.g. `logging`),
             // since those RPCs carry no arguments and may run in another worker.
             self.store.kv_put(
@@ -454,7 +494,8 @@ impl Dispatcher {
             // Replay the call arguments + attach scope to the process/combine
             // RPCs (they carry neither and may run in another pooled worker).
             // Stateful buffering functions (e.g. `accumulate`) read these.
-            self.store.kv_put(&execution_id, b"bufargs", &bind_call.arguments.0);
+            self.store
+                .kv_put(&execution_id, b"bufargs", &bind_call.arguments.0);
             if let Some(a) = bind_call.attach_opaque_data.as_ref() {
                 self.store.kv_put(&execution_id, b"bufattach", &a.0);
             }
@@ -469,7 +510,11 @@ impl Dispatcher {
 
         // Table-in-out (exchange) path.
         if self.tableinouts.contains_key(&bind_call.function_name) {
-            let f = self.resolve_table_in_out(&bind_call.function_name, &bp.arguments, input_schema.as_ref())?;
+            let f = self.resolve_table_in_out(
+                &bind_call.function_name,
+                &bp.arguments,
+                input_schema.as_ref(),
+            )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let auto_apply = f.metadata().auto_apply_filters;
             let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
@@ -488,13 +533,17 @@ impl Dispatcher {
                     project_to: None,
                     resume_blob: None,
                 };
-                return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
+                return Ok(
+                    StreamResult::producer(output_schema, Box::new(state)).with_header(header)
+                );
             }
             let filters = if auto_apply {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
+                    .map(|b| {
+                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
+                    })
                     .transpose()?
             } else {
                 None
@@ -515,9 +564,16 @@ impl Dispatcher {
                 auto_apply,
             )?;
             let in_schema = input_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-            let state = TableInOutExchangeState { func: f, params, filters, blob };
-            return Ok(StreamResult::exchange(output_schema, in_schema, Box::new(state))
-                .with_header(header));
+            let state = TableInOutExchangeState {
+                func: f,
+                params,
+                filters,
+                blob,
+            };
+            return Ok(
+                StreamResult::exchange(output_schema, in_schema, Box::new(state))
+                    .with_header(header),
+            );
         }
 
         // Table (producer) path.
@@ -525,7 +581,11 @@ impl Dispatcher {
             || (!self.scalars.contains_key(&bind_call.function_name)
                 && self.tables.contains_key(&bind_call.function_name))
         {
-            let f = self.resolve_table(&bind_call.function_name, &bp.arguments, input_schema.as_ref())?;
+            let f = self.resolve_table(
+                &bind_call.function_name,
+                &bp.arguments,
+                input_schema.as_ref(),
+            )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let max_workers = f.max_workers(&bp);
             let auto_apply = f.metadata().auto_apply_filters;
@@ -539,7 +599,9 @@ impl Dispatcher {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
+                    .map(|b| {
+                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
+                    })
                     .transpose()?
             } else {
                 None
@@ -570,12 +632,21 @@ impl Dispatcher {
                 max_workers,
                 opaque_data: None,
             })?;
-            let state = TableProducerState { inner: producer, filters, project_to, resume_blob };
+            let state = TableProducerState {
+                inner: producer,
+                filters,
+                project_to,
+                resume_blob,
+            };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
 
         // Scalar (exchange) path.
-        let f = self.resolve_scalar(&bind_call.function_name, &bp.arguments, input_schema.as_ref())?;
+        let f = self.resolve_scalar(
+            &bind_call.function_name,
+            &bp.arguments,
+            input_schema.as_ref(),
+        )?;
         bp.arguments.remap_positional(&f.argument_specs());
         let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
 
@@ -595,7 +666,11 @@ impl Dispatcher {
             &execution_id,
             false,
         )?;
-        let state = ScalarExchangeState { func: f, params, blob };
+        let state = ScalarExchangeState {
+            func: f,
+            params,
+            blob,
+        };
         let in_schema = input_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
         Ok(StreamResult::exchange(output_schema, in_schema, Box::new(state)).with_header(header))
     }
@@ -627,8 +702,16 @@ impl Dispatcher {
             settings: bind_call.settings.clone().map(|b| b.0).unwrap_or_default(),
             secrets: bind_call.secrets.clone().map(|b| b.0).unwrap_or_default(),
             execution_id: execution_id.to_vec(),
-            init_opaque: dto.bind_opaque_data.clone().map(|b| b.0).unwrap_or_default(),
-            pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0).unwrap_or_default(),
+            init_opaque: dto
+                .bind_opaque_data
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
+            pushdown_filters: dto
+                .pushdown_filters
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
             auto_apply,
             inner_resume: Vec::new(),
             at_unit: bind_call.at_unit.clone().unwrap_or_default(),
@@ -699,7 +782,9 @@ impl Dispatcher {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
+                    .map(|b| {
+                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
+                    })
                     .transpose()?
             } else {
                 None
@@ -711,19 +796,25 @@ impl Dispatcher {
             // in the token, not the queue).
             producer.restore_resume(&blob.inner_resume);
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
-                TableProducerState { inner: producer, filters, project_to, resume_blob: Some(bytes.to_vec()) },
+                TableProducerState {
+                    inner: producer,
+                    filters,
+                    project_to,
+                    resume_blob: Some(bytes.to_vec()),
+                },
             )));
         }
         if blob.kind == "table_in_out" {
-            let f =
-                self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref())?;
+            let f = self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref())?;
             args.remap_positional(&f.argument_specs());
             let params = make_params(args);
             let filters = if blob.auto_apply {
                 params
                     .pushdown_filters
                     .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys))
+                    .map(|b| {
+                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
+                    })
                     .transpose()?
             } else {
                 None
@@ -822,46 +913,59 @@ impl Dispatcher {
         // Version-shaped catalogs encode the resolved data version into the
         // attach_opaque_data (`<version>\0<id>`) so per-request catalog handlers
         // can select the right object set without server-side session state.
-        let attach_opaque_data = if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
-            // Merge the user-supplied options over the declared defaults and
-            // encode the one-row result as `<16-byte id>\0<ipc batch>`.
-            let default_batch = ipc::read_batch(default_bytes)?;
-            let options = dto.options.as_ref().map(|b| ipc::read_batch(&b.0)).transpose()?;
-            let cols: Vec<arrow_array::ArrayRef> = default_batch
-                .schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, f)| -> Result<arrow_array::ArrayRef> {
-                    match options.as_ref().and_then(|o| o.column_by_name(f.name())) {
-                        // Cast to the declared type to normalize nested field
-                        // names (DuckDB's list/struct field names differ).
-                        Some(c) => arrow_cast::cast(c, f.data_type())
-                            .map_err(|e| RpcError::runtime_error(e.to_string())),
-                        None => Ok(default_batch.column(i).clone()),
-                    }
-                })
-                .collect::<Result<_>>()?;
-            let merged = RecordBatch::try_new(default_batch.schema(), cols)
-                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-            let id = self.attach_bytes();
-            let mut v: Vec<u8> = id.iter().copied().chain(std::iter::repeat(0)).take(16).collect();
-            v.push(0);
-            v.extend_from_slice(&ipc::write_batch(&merged)?);
-            v
-        } else if !self.catalog.version_schemas.is_empty() {
-            let mut v = resolved_data_version.clone().unwrap_or_default().into_bytes();
-            v.push(0);
-            v.extend_from_slice(&self.attach_bytes());
-            v
-        } else if dto.name == PROJ_REPRO_APP {
-            // The `projection_repro` reproducer is a distinct "app" served by the
-            // same binary, selected by ATTACH name. Echo it back so function
-            // advertisement (which is otherwise global) can scope to it.
-            PROJ_REPRO_APP.as_bytes().to_vec()
-        } else {
-            self.attach_bytes()
-        };
+        let attach_opaque_data =
+            if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
+                // Merge the user-supplied options over the declared defaults and
+                // encode the one-row result as `<16-byte id>\0<ipc batch>`.
+                let default_batch = ipc::read_batch(default_bytes)?;
+                let options = dto
+                    .options
+                    .as_ref()
+                    .map(|b| ipc::read_batch(&b.0))
+                    .transpose()?;
+                let cols: Vec<arrow_array::ArrayRef> = default_batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| -> Result<arrow_array::ArrayRef> {
+                        match options.as_ref().and_then(|o| o.column_by_name(f.name())) {
+                            // Cast to the declared type to normalize nested field
+                            // names (DuckDB's list/struct field names differ).
+                            Some(c) => arrow_cast::cast(c, f.data_type())
+                                .map_err(|e| RpcError::runtime_error(e.to_string())),
+                            None => Ok(default_batch.column(i).clone()),
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                let merged = RecordBatch::try_new(default_batch.schema(), cols)
+                    .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+                let id = self.attach_bytes();
+                let mut v: Vec<u8> = id
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(0))
+                    .take(16)
+                    .collect();
+                v.push(0);
+                v.extend_from_slice(&ipc::write_batch(&merged)?);
+                v
+            } else if !self.catalog.version_schemas.is_empty() {
+                let mut v = resolved_data_version
+                    .clone()
+                    .unwrap_or_default()
+                    .into_bytes();
+                v.push(0);
+                v.extend_from_slice(&self.attach_bytes());
+                v
+            } else if dto.name == PROJ_REPRO_APP {
+                // The `projection_repro` reproducer is a distinct "app" served by the
+                // same binary, selected by ATTACH name. Echo it back so function
+                // advertisement (which is otherwise global) can scope to it.
+                PROJ_REPRO_APP.as_bytes().to_vec()
+            } else {
+                self.attach_bytes()
+            };
         let result = CatalogAttachResult {
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
@@ -906,25 +1010,24 @@ impl Dispatcher {
         let cat = &self.catalog;
         // Implementation version: npm-resolved against the supported set when
         // opted in, else exact-match against the single declared version.
-        let resolved_impl = if cat.npm_version_resolution
-            && !cat.supported_implementation_versions.is_empty()
-        {
-            Some(catalog::resolve_version_npm(
-                dto.implementation_version.as_deref(),
-                &cat.supported_implementation_versions,
-                cat.implementation_version.as_deref().unwrap_or(""),
-                "implementation_version",
-            )?)
-        } else {
-            match (&dto.implementation_version, &cat.implementation_version) {
-                (Some(req), Some(have)) if req != have => {
-                    return Err(RpcError::value_error(format!(
+        let resolved_impl =
+            if cat.npm_version_resolution && !cat.supported_implementation_versions.is_empty() {
+                Some(catalog::resolve_version_npm(
+                    dto.implementation_version.as_deref(),
+                    &cat.supported_implementation_versions,
+                    cat.implementation_version.as_deref().unwrap_or(""),
+                    "implementation_version",
+                )?)
+            } else {
+                match (&dto.implementation_version, &cat.implementation_version) {
+                    (Some(req), Some(have)) if req != have => {
+                        return Err(RpcError::value_error(format!(
                         "Unsupported implementation_version {req:?}; this worker serves {have:?}"
                     )));
+                    }
+                    (_, have) => have.clone(),
                 }
-                (_, have) => have.clone(),
-            }
-        };
+            };
         // Data version: npm-style resolution when opted in, else exact-match.
         let resolved_data = if cat.supported_data_versions.is_empty() {
             None
@@ -970,35 +1073,45 @@ impl Dispatcher {
         let cat = self.active_catalog(req);
         if std::ptr::eq(cat, &self.catalog) {
             let v = self.req_version(req);
-            self.catalog.schemas_for(v.as_deref()).iter().find(|s| s.name == name)
+            self.catalog
+                .schemas_for(v.as_deref())
+                .iter()
+                .find(|s| s.name == name)
         } else {
             cat.schemas.iter().find(|s| s.name == name)
         }
     }
 
     pub fn handle_catalog_version(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        Ok(Some(wire::to_result_batch(CatalogVersionResult { version: 1 })?))
+        Ok(Some(wire::to_result_batch(CatalogVersionResult {
+            version: 1,
+        })?))
     }
 
     pub fn handle_transaction_begin(&self, _req: &Request) -> Result<Option<RecordBatch>> {
         // A fresh id per BEGIN so transaction-scoped caches (tx_cached_value)
         // don't leak across transactions; in autocommit DuckDB passes None.
-        Ok(Some(wire::to_result_batch(CatalogTransactionBeginResult {
-            transaction_opaque_data: Some(Bytes::from(self.next_execution_id())),
-        })?))
+        Ok(Some(wire::to_result_batch(
+            CatalogTransactionBeginResult {
+                transaction_opaque_data: Some(Bytes::from(self.next_execution_id())),
+            },
+        )?))
     }
 
     fn schema_info_for(&self, cat: &catalog::CatalogModel, name: &str) -> SchemaInfo {
-        let comment = cat
-            .schema(name)
-            .and_then(|s| s.comment.as_deref())
-            .or(if name == catalog::MAIN_SCHEMA {
+        let comment = cat.schema(name).and_then(|s| s.comment.as_deref()).or(
+            if name == catalog::MAIN_SCHEMA {
                 Some("Default schema containing all registered functions")
             } else {
                 None
-            });
+            },
+        );
         let is_primary = std::ptr::eq(cat, &self.catalog);
-        let attach = if is_primary { self.attach_bytes() } else { cat.name.as_bytes().to_vec() };
+        let attach = if is_primary {
+            self.attach_bytes()
+        } else {
+            cat.name.as_bytes().to_vec()
+        };
         let mut si = catalog::schema_info(name, comment, &attach);
         // Object counts come from the (primary) worker-global function
         // registries, so only advertise them for the primary, non-version-shaped
@@ -1022,8 +1135,14 @@ impl Dispatcher {
         };
         si.estimated_object_count = Some(vec![
             ("view".into(), len(sch.map(|s| s.views.len()).unwrap_or(0))),
-            ("macro".into(), len(sch.map(|s| s.macros.len()).unwrap_or(0))),
-            ("table".into(), len(sch.map(|s| s.tables.len()).unwrap_or(0))),
+            (
+                "macro".into(),
+                len(sch.map(|s| s.macros.len()).unwrap_or(0)),
+            ),
+            (
+                "table".into(),
+                len(sch.map(|s| s.tables.len()).unwrap_or(0)),
+            ),
             ("scalar_function".into(), sf),
             ("aggregate_function".into(), af),
             ("table_function".into(), tf),
@@ -1057,7 +1176,12 @@ impl Dispatcher {
         let name = read_string_col(req, "name")?;
         let infos: Vec<ViewInfo> = self
             .schema_for_req(req, &name)
-            .map(|s| s.views.iter().map(|v| catalog::view_info(&name, v)).collect())
+            .map(|s| {
+                s.views
+                    .iter()
+                    .map(|v| catalog::view_info(&name, v))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(Some(wire::to_result_batch(ItemsResult {
             items: catalog::serialize_items(infos)?,
@@ -1113,7 +1237,9 @@ impl Dispatcher {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
         let t = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
-        Ok(Some(wire::to_result_batch(catalog::scan_function_result(&t)?)?))
+        Ok(Some(wire::to_result_batch(catalog::scan_function_result(
+            &t,
+        )?)?))
     }
 
     /// Return the table view for a requested time-travel `AT` clause (the
@@ -1145,7 +1271,11 @@ impl Dispatcher {
     }
 
     /// Per-call cardinality for a function-backed table scan.
-    pub fn handle_table_function_cardinality(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+    pub fn handle_table_function_cardinality(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
         let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
         let bp = self.bind_params(&bind_call, ctx)?;
@@ -1162,7 +1292,10 @@ impl Dispatcher {
     }
 
     /// Post-execution profiling info (EXPLAIN ANALYZE Extra Info).
-    pub fn handle_table_function_dynamic_to_string(&self, req: &Request) -> Result<Option<RecordBatch>> {
+    pub fn handle_table_function_dynamic_to_string(
+        &self,
+        req: &Request,
+    ) -> Result<Option<RecordBatch>> {
         use crate::protocol::dtos::{DynamicToStringRequest, DynamicToStringResponse};
         let dto: DynamicToStringRequest = boxed(req)?;
         let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
@@ -1173,11 +1306,18 @@ impl Dispatcher {
             .map(|f| f.dynamic_to_string(&dto.global_execution_id.0, &self.store))
             .unwrap_or_default();
         let (keys, values): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
-        Ok(Some(wire::to_result_batch(DynamicToStringResponse { keys, values })?))
+        Ok(Some(wire::to_result_batch(DynamicToStringResponse {
+            keys,
+            values,
+        })?))
     }
 
     /// Per-call statistics for a function-backed table scan (e.g. `sequence`).
-    pub fn handle_table_function_statistics(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+    pub fn handle_table_function_statistics(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
         let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
         let bp = self.bind_params(&bind_call, ctx)?;
@@ -1296,8 +1436,12 @@ impl Dispatcher {
             .position(|c| std::ptr::eq(c, active))
             .and_then(|i| self.secondary_functions.get(i))
             .map(|v| v.as_slice());
-        let all_sec_fns: std::collections::HashSet<&str> =
-            self.secondary_functions.iter().flatten().map(|s| s.as_str()).collect();
+        let all_sec_fns: std::collections::HashSet<&str> = self
+            .secondary_functions
+            .iter()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
         let visible = |name: &str| {
             if name.starts_with(PROJ_REPRO_PREFIX) != is_proj_repro {
                 return false;
@@ -1320,7 +1464,8 @@ impl Dispatcher {
                 }
             }
             // Table-buffering functions also surface under a TABLE request.
-            if matches!(want.as_deref(), Some("table") | Some("table_buffering")) || want.is_none() {
+            if matches!(want.as_deref(), Some("table") | Some("table_buffering")) || want.is_none()
+            {
                 let mut names: Vec<&String> = self.tables.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
@@ -1328,7 +1473,8 @@ impl Dispatcher {
                         infos.push(catalog::table_function_info(f.as_ref())?);
                     }
                 }
-                let mut tio: Vec<&String> = self.tableinouts.keys().filter(|n| visible(n)).collect();
+                let mut tio: Vec<&String> =
+                    self.tableinouts.keys().filter(|n| visible(n)).collect();
                 tio.sort();
                 for name in tio {
                     for f in &self.tableinouts[name] {
@@ -1391,7 +1537,11 @@ impl Dispatcher {
         args
     }
 
-    pub fn handle_buffering_process(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+    pub fn handle_buffering_process(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
@@ -1409,13 +1559,18 @@ impl Dispatcher {
         };
         let state_id = f.process(&params, &batch)?;
         Self::drain_buffering_logs(&logs, ctx);
-        Ok(Some(wire::to_result_batch(TableBufferingProcessResponse {
-            state_id: Bytes::from(state_id),
-        })?))
+        Ok(Some(wire::to_result_batch(
+            TableBufferingProcessResponse {
+                state_id: Bytes::from(state_id),
+            },
+        )?))
     }
 
     /// Forward queued buffering INFO logs to the call context (→ duckdb_logs()).
-    fn drain_buffering_logs(logs: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, ctx: &CallContext) {
+    fn drain_buffering_logs(
+        logs: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ctx: &CallContext,
+    ) {
         if let Ok(mut g) = logs.lock() {
             for msg in g.drain(..) {
                 ctx.client_log(vgi_rpc::LogLevel::Info, msg);
@@ -1423,11 +1578,15 @@ impl Dispatcher {
         }
     }
 
-    pub fn handle_buffering_combine(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+    pub fn handle_buffering_combine(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
-        let output_schema =
-            self.buffering_output_schema(&dto.execution_id.0, Arc::new(arrow_schema::Schema::empty()));
+        let output_schema = self
+            .buffering_output_schema(&dto.execution_id.0, Arc::new(arrow_schema::Schema::empty()));
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
@@ -1442,9 +1601,11 @@ impl Dispatcher {
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();
         let finalize_ids = f.combine(&params, &state_ids)?;
         Self::drain_buffering_logs(&logs, ctx);
-        Ok(Some(wire::to_result_batch(TableBufferingCombineResponse {
-            finalize_state_ids: finalize_ids.into_iter().map(Bytes::from).collect(),
-        })?))
+        Ok(Some(wire::to_result_batch(
+            TableBufferingCombineResponse {
+                finalize_state_ids: finalize_ids.into_iter().map(Bytes::from).collect(),
+            },
+        )?))
     }
 
     pub fn handle_buffering_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -1459,7 +1620,11 @@ impl Dispatcher {
         gid.to_le_bytes().to_vec()
     }
 
-    pub fn handle_aggregate_bind(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
+    pub fn handle_aggregate_bind(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
         let dto: AggregateBindRequest = boxed(req)?;
         let mut args = crate::arguments::Arguments::parse(&dto.arguments.0)?;
         let input_schema = opt_schema(&dto.input_schema)?;
@@ -1476,7 +1641,8 @@ impl Dispatcher {
         // Stash the raw bind-time arguments so `finalize` can rebuild const
         // params (e.g. `vgi_percentile`'s percentile) — update/finalize RPCs
         // don't resend arguments and may run in a different pooled worker.
-        self.store.kv_put(&execution_id, b"aggargs", &dto.arguments.0);
+        self.store
+            .kv_put(&execution_id, b"aggargs", &dto.arguments.0);
         Ok(Some(wire::to_result_batch(AggregateBindResponse {
             output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
             execution_id: Bytes::from(execution_id),
@@ -1497,9 +1663,9 @@ impl Dispatcher {
         let mut states: HashMap<i64, Vec<u8>> = HashMap::new();
         for i in 0..gids.len() {
             let gid = gids.value(i);
-            if !states.contains_key(&gid) {
+            if let std::collections::hash_map::Entry::Vacant(e) = states.entry(gid) {
                 if let Some(s) = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(gid)) {
-                    states.insert(gid, s);
+                    e.insert(s);
                 }
             }
         }
@@ -1558,7 +1724,10 @@ impl Dispatcher {
             .ok_or_else(|| RpcError::type_error("finalize: group_ids not int64"))?
             .clone();
         let states: Vec<Option<Vec<u8>>> = (0..gids.len())
-            .map(|i| self.store.kv_get(&dto.execution_id.0, &Self::agg_key(gids.value(i))))
+            .map(|i| {
+                self.store
+                    .kv_get(&dto.execution_id.0, &Self::agg_key(gids.value(i)))
+            })
             .collect();
         // Reload the bind-time arguments stashed at aggregate_bind, remapped
         // to the function's declared positions, for ConstParam finalize.
@@ -1591,10 +1760,22 @@ impl Dispatcher {
         // Cache the partition (input columns + output schema + filter mask) so
         // the window / window_batch calls — possibly in another pooled worker —
         // can evaluate frames against it.
-        self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "p"), &dto.partition_batch.0);
-        self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "o"), &dto.output_schema.0);
+        self.store.kv_put(
+            &dto.execution_id.0,
+            &Self::win_key(dto.partition_id, "p"),
+            &dto.partition_batch.0,
+        );
+        self.store.kv_put(
+            &dto.execution_id.0,
+            &Self::win_key(dto.partition_id, "o"),
+            &dto.output_schema.0,
+        );
         if let Some(m) = &dto.filter_mask {
-            self.store.kv_put(&dto.execution_id.0, &Self::win_key(dto.partition_id, "m"), &m.0);
+            self.store.kv_put(
+                &dto.execution_id.0,
+                &Self::win_key(dto.partition_id, "m"),
+                &m.0,
+            );
         }
         Ok(Some(wire::empty_result_batch()?))
     }
@@ -1608,9 +1789,11 @@ impl Dispatcher {
         let pb = self
             .store
             .kv_get(exec, &Self::win_key(partition_id, "p"))
-            .ok_or_else(|| RpcError::runtime_error(format!(
-                "aggregate_window: unknown partition_id={partition_id}"
-            )))?;
+            .ok_or_else(|| {
+                RpcError::runtime_error(format!(
+                    "aggregate_window: unknown partition_id={partition_id}"
+                ))
+            })?;
         let os = self
             .store
             .kv_get(exec, &Self::win_key(partition_id, "o"))
@@ -1626,7 +1809,12 @@ impl Dispatcher {
             .filter(|b| !b.is_empty())
             .map(|bytes| {
                 (0..n)
-                    .map(|i| bytes.get(i / 8).map(|byte| byte & (1 << (i % 8)) != 0).unwrap_or(true))
+                    .map(|i| {
+                        bytes
+                            .get(i / 8)
+                            .map(|byte| byte & (1 << (i % 8)) != 0)
+                            .unwrap_or(true)
+                    })
                     .collect::<Vec<bool>>()
             });
         Ok((partition, output_schema, mask))
@@ -1681,7 +1869,8 @@ impl Dispatcher {
     pub fn handle_aggregate_window_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateWindowDestructorRequest = boxed(req)?;
         for sfx in ["p", "o", "m"] {
-            self.store.kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, sfx));
+            self.store
+                .kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, sfx));
         }
         Ok(Some(wire::empty_result_batch()?))
     }
@@ -1714,7 +1903,9 @@ impl Dispatcher {
         let count = u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize;
         off += 8;
         for _ in 0..count {
-            if off + 8 > b.len() { break; }
+            if off + 8 > b.len() {
+                break;
+            }
             let kl = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize;
             off += 8;
             let k = rd(b, &mut off, kl);
@@ -1730,12 +1921,23 @@ impl Dispatcher {
         let dto: AggregateStreamingOpenRequest = boxed(req)?;
         self.resolve_aggregate(&dto.function_name)?;
         let execution_id = self.next_execution_id();
-        self.store.kv_put(&execution_id, b"strm_pkc", &dto.partition_key_count.to_le_bytes());
-        self.store.kv_put(&execution_id, b"strm_okc", &dto.order_key_count.to_le_bytes());
-        self.store.kv_put(&execution_id, b"strm_sos", &dto.output_schema.0);
-        Ok(Some(wire::to_result_batch(AggregateStreamingOpenResponse {
-            execution_id: Bytes::from(execution_id),
-        })?))
+        self.store.kv_put(
+            &execution_id,
+            b"strm_pkc",
+            &dto.partition_key_count.to_le_bytes(),
+        );
+        self.store.kv_put(
+            &execution_id,
+            b"strm_okc",
+            &dto.order_key_count.to_le_bytes(),
+        );
+        self.store
+            .kv_put(&execution_id, b"strm_sos", &dto.output_schema.0);
+        Ok(Some(wire::to_result_batch(
+            AggregateStreamingOpenResponse {
+                execution_id: Bytes::from(execution_id),
+            },
+        )?))
     }
 
     pub fn handle_aggregate_streaming_chunk(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -1762,8 +1964,11 @@ impl Dispatcher {
             .map(|b| Self::de_state_map(&b))
             .unwrap_or_default();
         let col = f.streaming_chunk(&chunk, pkc, okc, &mut states)?;
-        self.store
-            .kv_put(&dto.execution_id.0, b"strm_state", &Self::ser_state_map(&states));
+        self.store.kv_put(
+            &dto.execution_id.0,
+            b"strm_state",
+            &Self::ser_state_map(&states),
+        );
         let schema = output_schema.unwrap_or_else(|| {
             Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "result",
@@ -1773,14 +1978,21 @@ impl Dispatcher {
         });
         let batch = RecordBatch::try_new(schema, vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        Ok(Some(wire::to_result_batch(AggregateStreamingChunkResponse {
-            result_batch: Bytes::from(ipc::write_batch(&batch)?),
-        })?))
+        Ok(Some(wire::to_result_batch(
+            AggregateStreamingChunkResponse {
+                result_batch: Bytes::from(ipc::write_batch(&batch)?),
+            },
+        )?))
     }
 
     pub fn handle_aggregate_streaming_close(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateStreamingCloseRequest = boxed(req)?;
-        for k in [b"strm_pkc".as_slice(), b"strm_okc", b"strm_sos", b"strm_state"] {
+        for k in [
+            b"strm_pkc".as_slice(),
+            b"strm_okc",
+            b"strm_sos",
+            b"strm_state",
+        ] {
             self.store.kv_del(&dto.execution_id.0, k);
         }
         Ok(Some(wire::empty_result_batch()?))
@@ -1788,7 +2000,9 @@ impl Dispatcher {
 
     /// Empty `ItemsResult` for the contents/get methods not yet implemented.
     pub fn handle_empty_items(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        Ok(Some(wire::to_result_batch(ItemsResult { items: Vec::new() })?))
+        Ok(Some(wire::to_result_batch(ItemsResult {
+            items: Vec::new(),
+        })?))
     }
 
     /// Void result (commit / rollback / detach / drop).
@@ -1957,7 +2171,9 @@ impl vgi_rpc::ProducerState for TableProducerState {
         }
     }
     fn batch_limit(&self) -> Option<usize> {
-        self.resume_blob.as_ref().map(|_| HTTP_WORKQUEUE_BATCH_LIMIT)
+        self.resume_blob
+            .as_ref()
+            .map(|_| HTTP_WORKQUEUE_BATCH_LIMIT)
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         match &self.resume_blob {
@@ -1994,21 +2210,15 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
         eprintln!(
             "[vgi-wire] {} inner schema: {:?}",
             req.method,
-            batch.schema().fields().iter().map(|f| format!("{}:{}", f.name(), f.data_type())).collect::<Vec<_>>()
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
         );
     }
     wire::from_batch::<T>(&batch)
-}
-
-/// A 0-column, 0-row batch for methods whose result is an empty struct.
-fn empty_batch() -> RecordBatch {
-    use arrow_array::RecordBatchOptions;
-    RecordBatch::try_new_with_options(
-        Arc::new(arrow_schema::Schema::empty()),
-        vec![],
-        &RecordBatchOptions::new().with_row_count(Some(0)),
-    )
-    .expect("empty batch")
 }
 
 /// Split an aggregate UPDATE batch into the group-id column and the remaining

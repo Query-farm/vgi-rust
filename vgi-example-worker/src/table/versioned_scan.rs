@@ -39,7 +39,10 @@ impl VersionedDataScan {
     fn build(version: i64) -> (SchemaRef, Vec<ArrayRef>) {
         use DataType::{Boolean, Float64, Int64, Utf8};
         match version {
-            1 => (Arc::new(Schema::new(vec![fld("id", Int64)])), vec![i(vec![1, 2, 3])]),
+            1 => (
+                Arc::new(Schema::new(vec![fld("id", Int64)])),
+                vec![i(vec![1, 2, 3])],
+            ),
             2 => (
                 Arc::new(Schema::new(vec![
                     fld("id", Int64),
@@ -66,24 +69,44 @@ impl TableFunction for VersionedDataScan {
         "versioned_data_scan"
     }
     fn metadata(&self) -> FunctionMetadata {
-        FunctionMetadata { description: "Versioned data scan (time travel)".to_string(), ..Default::default() }
+        FunctionMetadata {
+            description: "Versioned data scan (time travel)".to_string(),
+            ..Default::default()
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("version", 0, "int64", "Data version to return")]
+        vec![ArgSpec::const_arg(
+            "version",
+            0,
+            "int64",
+            "Data version to return",
+        )]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
-        Ok(BindResponse { output_schema: Self::build(v).0, opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::build(v).0,
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
-        let n = Self::build(v).1.first().map(|a| a.len() as i64).unwrap_or(0);
-        Some(TableCardinality { estimate: Some(n), max: Some(n) })
+        let n = Self::build(v)
+            .1
+            .first()
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
         let (schema, cols) = Self::build(v);
-        Ok(Box::new(OneShot { batch: Some(RecordBatch::try_new(schema, cols).map_err(cvt)?) }))
+        Ok(Box::new(OneShot {
+            batch: Some(RecordBatch::try_new(schema, cols).map_err(cvt)?),
+        }))
     }
 }
 
@@ -97,8 +120,16 @@ impl VersionedConstraintsScan {
                 vec![i(vec![1, 2]), s(vec!["Alice", "Bob"])],
             ),
             2 => (
-                Arc::new(Schema::new(vec![fld("id", Int64), fld("name", Utf8), fld("email", Utf8)])),
-                vec![i(vec![1, 2, 3]), s(vec!["Alice", "Bob", "Carol"]), s(vec!["a@co", "b@co", "c@co"])],
+                Arc::new(Schema::new(vec![
+                    fld("id", Int64),
+                    fld("name", Utf8),
+                    fld("email", Utf8),
+                ])),
+                vec![
+                    i(vec![1, 2, 3]),
+                    s(vec!["Alice", "Bob", "Carol"]),
+                    s(vec!["a@co", "b@co", "c@co"]),
+                ],
             ),
             _ => (
                 Arc::new(Schema::new(vec![
@@ -122,24 +153,44 @@ impl TableFunction for VersionedConstraintsScan {
         "versioned_constraints_scan"
     }
     fn metadata(&self) -> FunctionMetadata {
-        FunctionMetadata { description: "Versioned constraints scan (time travel)".to_string(), ..Default::default() }
+        FunctionMetadata {
+            description: "Versioned constraints scan (time travel)".to_string(),
+            ..Default::default()
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("version", 0, "int64", "Data version to return")]
+        vec![ArgSpec::const_arg(
+            "version",
+            0,
+            "int64",
+            "Data version to return",
+        )]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
-        Ok(BindResponse { output_schema: Self::build(v).0, opaque_data: Vec::new() })
+        Ok(BindResponse {
+            output_schema: Self::build(v).0,
+            opaque_data: Vec::new(),
+        })
     }
     fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
-        let n = Self::build(v).1.first().map(|a| a.len() as i64).unwrap_or(0);
-        Some(TableCardinality { estimate: Some(n), max: Some(n) })
+        let n = Self::build(v)
+            .1
+            .first()
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let v = params.arguments.const_i64(0).unwrap_or(3);
         let (schema, cols) = Self::build(v);
-        Ok(Box::new(OneShot { batch: Some(RecordBatch::try_new(schema, cols).map_err(cvt)?) }))
+        Ok(Box::new(OneShot {
+            batch: Some(RecordBatch::try_new(schema, cols).map_err(cvt)?),
+        }))
     }
 }
 

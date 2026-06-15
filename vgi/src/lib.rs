@@ -21,15 +21,17 @@ pub mod numeric;
 pub mod overload;
 pub mod partition;
 pub mod protocol;
-pub mod statistics;
 pub mod pushdown;
 pub mod secrets;
 pub mod settings;
+pub mod statistics;
 pub mod table_function;
 pub mod table_in_out;
 pub mod transport;
 pub mod wire;
 pub mod worker;
 
-pub use function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction};
+pub use function::{
+    ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction,
+};
 pub use worker::Worker;
