@@ -9,7 +9,6 @@
 //! - `--http`: print `PORT:<n>\n`, serve axum (added with the `http` feature).
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use vgi_rpc::{RpcServer, TransportCapabilities, TransportKind};
@@ -29,8 +28,13 @@ pub fn serve_stdio(server: Arc<RpcServer>) {
 /// inbound connection on a worker thread. `idle_timeout` (seconds, 0 =
 /// never) self-shuts the worker after that long without a new connection,
 /// matching the launcher protocol.
+///
+/// Unix-only: the launcher transport relies on AF_UNIX sockets. On other
+/// platforms the worker falls back to stdio/HTTP (see [`crate::Worker::run`]).
+#[cfg(unix)]
 pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     server.notify_transport(TransportKind::Unix, TransportCapabilities::none());
     let _ = std::fs::remove_file(path);

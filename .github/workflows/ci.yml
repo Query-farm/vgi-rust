@@ -42,3 +42,19 @@ jobs:
         run: cargo doc -p vgi --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Windows has no AF_UNIX launcher transport: the `vgi` crate must still
+  # compile (stdio + http transports stay available). Guards against the
+  # `serve_unix` AF_UNIX path regressing the cross-platform build.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (vgi)
+        run: cargo build -p vgi --all-features

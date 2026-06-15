@@ -134,18 +134,27 @@ impl Worker {
         }
 
         if let Some(i) = args.iter().position(|a| a == "--unix") {
-            let path = args
-                .get(i + 1)
-                .expect("--unix requires a socket path")
-                .clone();
-            let idle = args
-                .iter()
-                .position(|a| a == "--idle-timeout")
-                .and_then(|j| args.get(j + 1))
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(300.0);
-            crate::transport::serve_unix(server, &path, idle);
-            return;
+            #[cfg(unix)]
+            {
+                let path = args
+                    .get(i + 1)
+                    .expect("--unix requires a socket path")
+                    .clone();
+                let idle = args
+                    .iter()
+                    .position(|a| a == "--idle-timeout")
+                    .and_then(|j| args.get(j + 1))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(300.0);
+                crate::transport::serve_unix(server, &path, idle);
+                return;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = i;
+                eprintln!("the --unix launcher transport is only supported on Unix platforms");
+                std::process::exit(1);
+            }
         }
 
         crate::transport::serve_stdio(server);
