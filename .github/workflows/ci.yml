@@ -1,0 +1,44 @@
+name: CI
+
+# fmt / clippy / build / doc on the workspace. The full VGI integration suite
+# (test/sql/integration/*) is NOT run here — it drives the C++ DuckDB `vgi`
+# extension's `unittest` binary against the worker, which isn't available on a
+# stock runner. Run it locally with `scripts/run_tests.sh`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # The published `vgi` crate is gated clippy-clean under `-D warnings`.
+      # The `vgi-example-worker` fixture binary (publish = false) is not.
+      - name: cargo clippy (vgi)
+        run: cargo clippy -p vgi --all-targets --all-features -- -D warnings
+
+      - name: cargo build
+        run: cargo build --workspace --all-features
+
+      - name: cargo doc (vgi)
+        run: cargo doc -p vgi --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings

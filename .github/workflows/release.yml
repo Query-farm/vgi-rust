@@ -1,0 +1,77 @@
+name: Release
+
+# Publish the `vgi` crate to crates.io when a `v*` tag is pushed, using
+# crates.io Trusted Publishing (OIDC) — no long-lived CARGO_REGISTRY_TOKEN
+# secret required. `vgi-example-worker` is `publish = false` (a test fixture).
+#
+# Setup checklist (one-time):
+#   1. Register `vgi` on crates.io as a Trusted Publisher bound to this repo
+#      (Query-farm/vgi-rust), this workflow file (release.yml), and the
+#      `crates-io` environment below. For a brand-new crate name, configure the
+#      trusted publisher before the first release (or do the very first publish
+#      with a token, then switch to OIDC).
+#   2. Create a GitHub Environment named `crates-io` (Settings → Environments)
+#      with required reviewers, so a release requires a human approval click.
+#
+# Release flow:
+#   1. Bump the workspace version in the root `Cargo.toml`.
+#   2. Update README / docs as needed.
+#   3. `git tag v0.1.0 && git push origin v0.1.0`.
+#   4. Approve the workflow run in the `crates-io` environment.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, run `cargo publish --dry-run` instead of publishing."
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Sanity gate — fmt, clippy, build
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy -p vgi --all-targets --all-features -- -D warnings
+          cargo build --workspace --all-features
+
+      - name: Authenticate to crates.io via OIDC
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish vgi
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run -p vgi
+          else
+            cargo publish -p vgi
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Summarise
+        if: success()
+        run: |
+          echo "Published vgi from tag ${GITHUB_REF_NAME} at commit ${GITHUB_SHA}"
+          echo "  - https://crates.io/crates/vgi"
