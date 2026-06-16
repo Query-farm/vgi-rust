@@ -8,7 +8,8 @@ mod util;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow_schema::DataType;
 use util::*;
@@ -37,7 +38,9 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(RandomBytesFunction);
     w.register_scalar(BinaryPacketFunction);
     w.register_scalar(MultiplyBySettingFunction);
+    w.register_scalar(ScaleBySettingFunction);
     w.register_scalar(ReturnSecretValueFunction);
+    w.register_scalar(SecretFieldFunction);
     w.register_scalar(WhoAmIFunction);
     // type_info overloads
     w.register_scalar(TypeInfo("int32", DataType::Int32));
@@ -676,6 +679,36 @@ impl ScalarFunction for MultiplyBySettingFunction {
     }
 }
 
+/// `scale_by_setting(value)` — value * the float setting `scale_factor`.
+///
+/// Reads a `DOUBLE` session setting via `Settings::get_f64` (the float-typed
+/// settings accessor), distinct from `multiply_by_setting`'s integer `get_i64`.
+pub struct ScaleBySettingFunction;
+impl ScalarFunction for ScaleBySettingFunction {
+    fn name(&self) -> &str {
+        "scale_by_setting"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret(
+            "Scale the input value by the float setting `scale_factor`",
+            DataType::Float64,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "float64", "Value to scale")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let scale = params.settings.get_f64("scale_factor").unwrap_or(1.0);
+        let v = arrow_cast::cast(batch.column(0), &DataType::Float64)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let a = v.as_primitive::<arrow_array::types::Float64Type>();
+        let out: Float64Array = (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i) * scale))
+            .collect();
+        result(params, arc(out))
+    }
+}
+
 /// `return_secret_value()` — JSON of the resolved `vgi_example` secret.
 pub struct ReturnSecretValueFunction;
 impl ScalarFunction for ReturnSecretValueFunction {
@@ -706,6 +739,43 @@ impl ScalarFunction for ReturnSecretValueFunction {
         let json = serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string());
         let n = output_len(batch);
         let out: StringArray = (0..n).map(|_| Some(json.clone())).collect();
+        result(params, arc(out))
+    }
+}
+
+/// `secret_field()` — exercise the `Secrets::named_field` / `Secrets::field`
+/// accessors over the resolved `vgi_example` secret.
+///
+/// `named_field` looks up a field on a specific secret; `field` returns the
+/// first secret of any name carrying that field. Both render the underlying
+/// (numeric) value to a string via the secret value renderer.
+pub struct SecretFieldFunction;
+impl ScalarFunction for SecretFieldFunction {
+    fn name(&self) -> &str {
+        "secret_field"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret("Look up secret fields by name", DataType::Utf8)
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![]
+    }
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<SecretLookup> {
+        vec![SecretLookup {
+            secret_type: "vgi_example".to_string(),
+            scope: None,
+            name: None,
+        }]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let port = params
+            .secrets
+            .named_field("vgi_example", "port")
+            .unwrap_or_default();
+        let name = params.secrets.field("secret_string").unwrap_or_default();
+        let s = format!("port={port};name={name}");
+        let n = output_len(batch);
+        let out: StringArray = (0..n).map(|_| Some(s.clone())).collect();
         result(params, arc(out))
     }
 }

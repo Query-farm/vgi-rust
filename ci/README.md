@@ -51,16 +51,29 @@ Dropped at staging (covered by the locally-built `unittest` in the `vgi` repo):
 
 The `coverage` job (Linux only) measures **what the integration suite actually
 exercises in the worker** — untested code is a gap in the suite. It builds the
-worker with `-Cinstrument-coverage` + the `coverage` feature, runs the launcher
-lane, merges the per-worker `.profraw` files, and reports `vgi`-SDK coverage
+worker with `-Cinstrument-coverage` + the `coverage` feature, runs the suite,
+merges the per-worker `.profraw` files, and reports `vgi`-SDK coverage
 (`ci/coverage-report.sh`); the `lcov` + text report upload as the
 `worker-coverage` artifact, and a digest lands in the job summary.
 
-The launcher / http workers are killed at teardown without a clean exit, so the
-LLVM `atexit` profile writer never runs. The `coverage` feature
-(`vgi-example-worker/src/coverage.rs`) works around this: a background thread
-periodically calls the profiling runtime's `__llvm_profile_write_file`, so each
-worker's latest counters are on disk whenever it dies.
+**Two lanes, merged — for accuracy.** The job runs *both* the stdio (subprocess)
+and launch lanes and merges their profiles, because either lane alone is
+misleading:
+
+- The pooled launcher / long-lived http workers are killed at teardown without a
+  clean exit, so the LLVM `atexit` profile writer never runs. The `coverage`
+  feature (`vgi-example-worker/src/coverage.rs`) flushes periodically via a
+  background thread, but counters for code that runs *once, early* — notably
+  bind-time work like overload resolution — can still be lost. On the launch
+  lane alone, `overload.rs` read **~8%** when the suite in fact covers **~95%**.
+- The stdio lane spawns a fresh worker per query that exits cleanly, so its
+  `atexit`-written counters are reliable — but it never exercises the
+  pooled-worker / launcher code paths.
+
+Running both and merging gives reliable bind-time numbers *and* covers the
+launcher/pool paths. `ci/coverage-report.sh` validates each `.profraw` before
+merging (a worker killed mid-write can leave a truncated file, and one corrupt
+input would otherwise abort the whole merge).
 
 ## Version pinning
 

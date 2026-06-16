@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
@@ -20,6 +23,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(SpatialFilterExampleFunction);
     w.register_table(ExpressionFilterTestFunction);
     w.register_table(FilterEchoTableScan);
+    w.register_table(FilteredColumnsEchoFunction);
 }
 
 /// `filter_echo_table_scan` — no-arg catalog-table scan: 100 rows
@@ -853,6 +857,132 @@ impl TableFunction for ValuePruneFunction {
             resolved,
             cursor: 0,
             batch_size,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// filtered_columns_echo(count) -> {n, tag, filtered_cols, has_n, has_tag, tag_values}
+//   Echoes the column-introspection accessors on the pushed-down filter set:
+//   `filtered_columns()`, `has_filter_for_column()`, and the typed (string-
+//   capable) `get_column_values_array()`.
+// ---------------------------------------------------------------------------
+
+fn fce_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("tag", DataType::Utf8, true),
+        Field::new("filtered_cols", DataType::Utf8, true),
+        Field::new("has_n", DataType::Boolean, true),
+        Field::new("has_tag", DataType::Boolean, true),
+        Field::new("tag_values", DataType::Utf8, true),
+    ]))
+}
+
+/// Render a discrete value array (any type) as a sorted, comma-joined string.
+fn render_values(arr: &ArrayRef) -> String {
+    let Ok(casted) = arrow_cast::cast(arr, &DataType::Utf8) else {
+        return "(?)".to_string();
+    };
+    let a = casted.as_string::<i32>();
+    let mut vs: Vec<String> = (0..a.len())
+        .filter(|&i| a.is_valid(i))
+        .map(|i| a.value(i).to_string())
+        .collect();
+    vs.sort();
+    vs.join(",")
+}
+
+struct FceProducer {
+    schema: SchemaRef,
+    remaining: i64,
+    cursor: i64,
+    filtered_cols: String,
+    has_n: bool,
+    has_tag: bool,
+    tag_values: String,
+}
+impl TableProducer for FceProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.remaining <= 0 {
+            return Ok(None);
+        }
+        let size = self.remaining.min(1024);
+        let n_rows = size as usize;
+        let ns: Vec<i64> = (self.cursor..self.cursor + size).collect();
+        let tags: Vec<String> = ns.iter().map(|i| format!("t{i}")).collect();
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ns)) as ArrayRef,
+                Arc::new(StringArray::from(tags)) as ArrayRef,
+                Arc::new(StringArray::from(vec![self.filtered_cols.as_str(); n_rows])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![self.has_n; n_rows])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![self.has_tag; n_rows])) as ArrayRef,
+                Arc::new(StringArray::from(vec![self.tag_values.as_str(); n_rows])) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor += size;
+        self.remaining -= size;
+        Ok(Some(batch))
+    }
+}
+
+pub struct FilteredColumnsEchoFunction;
+impl TableFunction for FilteredColumnsEchoFunction {
+    fn name(&self) -> &str {
+        "filtered_columns_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Echoes filtered_columns / has_filter_for_column / get_column_values_array")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: fce_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        let pf = params.pushdown_filters.as_ref().and_then(|b| {
+            vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+        });
+        let (filtered_cols, has_n, has_tag, tag_values) = match pf {
+            Some(f) => {
+                let mut cols: Vec<String> = f.filtered_columns().into_iter().collect();
+                cols.sort();
+                let tag_values = f
+                    .get_column_values_array("tag")
+                    .map(|a| render_values(&a))
+                    .unwrap_or_else(|| "(none)".to_string());
+                (
+                    cols.join(","),
+                    f.has_filter_for_column("n"),
+                    f.has_filter_for_column("tag"),
+                    tag_values,
+                )
+            }
+            None => (String::new(), false, false, "(none)".to_string()),
+        };
+        Ok(Box::new(FceProducer {
+            schema: fce_schema(),
+            remaining: count,
+            cursor: 0,
+            filtered_cols,
+            has_n,
+            has_tag,
+            tag_values,
         }))
     }
 }

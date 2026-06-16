@@ -405,6 +405,53 @@ impl PushdownFilters {
         acc
     }
 
+    /// The set of column names referenced by the top-level filters (and their
+    /// AND/OR/struct children). Mirrors Python `{f.column_name for f in pf}` and
+    /// the Go `FilteredColumns()`. Lets a worker discover which columns a query
+    /// constrains (e.g. to enforce a required-column rule).
+    pub fn filtered_columns(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for spec in &self.specs {
+            collect_columns(spec, &mut out);
+        }
+        out
+    }
+
+    /// Whether any pushed-down filter references `column`. Mirrors Python
+    /// `column in pf` and the Go `HasFilterForColumn`.
+    pub fn has_filter_for_column(&self, column: &str) -> bool {
+        self.specs.iter().any(|s| spec_mentions(s, column))
+    }
+
+    /// Resolve the discrete `=`/`IN` value set for `column` as a *typed* Arrow
+    /// array (not coerced to i64), so string columns like `path` are usable.
+    /// Mirrors Python `PushdownFilters.get_column_values` (which returns the
+    /// Arrow array) and the Go `GetColumnValues`. Returns `None` when the
+    /// predicate is not a simple enumerable equality/IN on `column`.
+    pub fn get_column_values_array(&self, column: &str) -> Option<ArrayRef> {
+        for spec in &self.specs {
+            if let Some(a) = self.column_values_array_of(spec, column) {
+                return Some(a);
+            }
+        }
+        None
+    }
+
+    fn column_values_array_of(&self, spec: &FilterSpec, column: &str) -> Option<ArrayRef> {
+        match spec.kind.as_str() {
+            "in" if spec.column_name == column => self.value(spec).ok().cloned(),
+            "join_keys" if spec.column_name == column => self.join_value(spec).cloned(),
+            "constant" if spec.column_name == column && spec.op.as_deref() == Some("eq") => {
+                self.value(spec).ok().map(|v| v.slice(0, 1))
+            }
+            "and" => spec
+                .children
+                .iter()
+                .find_map(|c| self.column_values_array_of(c, column)),
+            _ => None,
+        }
+    }
+
     fn column_values_of(&self, spec: &FilterSpec, column: &str) -> Option<Vec<i64>> {
         match spec.kind.as_str() {
             "in" if spec.column_name == column => {
@@ -547,6 +594,33 @@ impl PushdownFilters {
             ))),
         }
     }
+}
+
+/// Collect every column name referenced by a filter spec tree.
+fn collect_columns(spec: &FilterSpec, out: &mut std::collections::HashSet<String>) {
+    if !spec.column_name.is_empty() {
+        out.insert(spec.column_name.clone());
+    }
+    for c in &spec.children {
+        collect_columns(c, out);
+    }
+    if let Some(child) = &spec.child_filter {
+        collect_columns(child, out);
+    }
+}
+
+/// Whether a filter spec tree references `column`.
+fn spec_mentions(spec: &FilterSpec, column: &str) -> bool {
+    if spec.column_name == column {
+        return true;
+    }
+    if spec.children.iter().any(|c| spec_mentions(c, column)) {
+        return true;
+    }
+    spec.child_filter
+        .as_ref()
+        .map(|c| spec_mentions(c, column))
+        .unwrap_or(false)
 }
 
 fn clone_spec(s: &FilterSpec) -> FilterSpec {

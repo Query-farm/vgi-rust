@@ -95,6 +95,7 @@ fn register_secrets_and_settings(worker: &mut Worker) {
         ("greeting", DataType::Utf8),
         ("multiplier", DataType::Int64),
         ("threshold", DataType::Int64),
+        ("scale_factor", DataType::Float64),
         ("config", config_struct),
     ] {
         worker.register_setting(SettingSpec {

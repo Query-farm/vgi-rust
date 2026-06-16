@@ -18,8 +18,19 @@ TBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/b
 IGNORE='(/\.cargo/|/rustc/|/library/(std|core|alloc)/|vgi-rpc|arrow|tokio)'
 
 mkdir -p "$OUT"
-find "$COVDIR" -name '*.profraw' -size +0c > "$COVDIR/list.txt"
-echo "Merging $(wc -l < "$COVDIR/list.txt" | tr -d ' ') profraw files ..."
+# A worker killed mid-write (or the coverage flush thread racing the atexit
+# writer) can leave a truncated .profraw, and one corrupt input aborts the whole
+# merge — so validate each file first and merge only the readable ones.
+: > "$COVDIR/list.txt"
+bad=0
+while IFS= read -r f; do
+  if "$TBIN/llvm-profdata" show "$f" >/dev/null 2>&1; then
+    printf '%s\n' "$f" >> "$COVDIR/list.txt"
+  else
+    bad=$((bad + 1))
+  fi
+done < <(find "$COVDIR" -name '*.profraw' -size +0c)
+echo "Merging $(wc -l < "$COVDIR/list.txt" | tr -d ' ') profraw files ($bad skipped as corrupt) ..."
 "$TBIN/llvm-profdata" merge -sparse -f "$COVDIR/list.txt" -o "$COVDIR/merged.profdata"
 
 "$TBIN/llvm-cov" export "$BIN" -instr-profile="$COVDIR/merged.profdata" \

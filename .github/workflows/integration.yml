@@ -95,12 +95,19 @@ jobs:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           TRANSPORT: ${{ matrix.transport }}
 
-  # Measure what the VGI integration suite exercises in the worker. Linux only,
-  # over the launcher lane (pooled workers = less time spawning, and it covers
-  # the launcher/pool code paths too). The instrumented worker flushes coverage
-  # periodically (the `coverage` feature) so the pool teardown doesn't lose it.
+  # Measure what the VGI integration suite exercises in the worker. Linux only.
+  #
+  # Runs BOTH the subprocess (stdio) and launcher lanes and merges their
+  # profiles. This matters for accuracy: a launcher/http worker is killed at
+  # teardown without a clean exit, so counters for code that runs once early
+  # (notably bind-time work like overload resolution) can be lost even with the
+  # periodic flush — the launcher lane alone under-reports them badly (it read
+  # overload.rs at ~8% when the suite actually covers ~95%). The stdio lane
+  # spawns a fresh worker per query that exits cleanly (LLVM `atexit` writer), so
+  # its counters are reliable; the launch lane adds the pooled-worker / launcher
+  # code paths stdio never exercises. Together they give a trustworthy picture.
   coverage:
-    name: coverage (worker / Linux launcher)
+    name: coverage (worker / Linux stdio+launch)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -139,6 +146,15 @@ jobs:
           chmod +x "$ut"
           echo "HAYBARN_UNITTEST=$(cd "$(dirname "$ut")" && pwd)/$(basename "$ut")" >> "$GITHUB_ENV"
 
+      - name: Run integration suite (stdio) with coverage
+        shell: bash
+        run: ci/run-integration.sh
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-upstream
+          VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
+          TRANSPORT: stdio
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/stdio-%p-%m.profraw
+
       - name: Run integration suite (launcher) with coverage
         shell: bash
         run: ci/run-integration.sh
@@ -146,7 +162,7 @@ jobs:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
           TRANSPORT: launch
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/worker-%p.profraw
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/launch-%p-%m.profraw
 
       - name: Merge + report coverage
         if: always()
