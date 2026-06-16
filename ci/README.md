@@ -27,14 +27,15 @@ from a pinned `Query-farm/vgi` checkout.
 |----|:------------------:|:----------------:|:----:|
 | Linux  | — (covered by launch) | ✅ | ✅ |
 | macOS  | — (covered by launch) | ✅ | ✅ |
-| Windows | ✅ | — (no AF_UNIX) | ✅ |
+| Windows | — (slow; AF_UNIX is Unix-only) | — | ✅ |
 
 The launcher lane runs the whole suite over the AF_UNIX worker pool, so it
-covers the subprocess (stdio) path too — stdio runs as a dedicated lane only on
-**Windows**, which has no AF_UNIX launcher. Windows also cannot exec a shell
-catalog-wrapper as a subprocess `LOCATION`, so it exercises the main `example`
-catalog only (the secondary-catalog tests self-skip via `require-env`) and drops
-the fixtures that read parquet/csv from POSIX `/tmp` paths.
+covers the subprocess (stdio) path too. **Windows** runs the http lane only: the
+worker's AF_UNIX launcher transport is Unix-only, and the bare stdio lane is slow
+(a fresh worker process per query). Over http, Windows exercises the main
+`example` catalog only (the secondary-catalog tests self-skip via `require-env`,
+since the runner can't exec a shell catalog-wrapper as a Windows `LOCATION`) and
+drops the fixtures that read parquet/csv from POSIX `/tmp` paths.
 
 ## Out of scope / known prebuilt-binary differences
 

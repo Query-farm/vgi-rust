@@ -47,9 +47,9 @@ jobs:
           - { os: ubuntu-latest,  transport: http,   asset: haybarn_unittest-linux-amd64.zip }
           - { os: macos-latest,   transport: launch, asset: haybarn_unittest-osx-arm64.zip }
           - { os: macos-latest,   transport: http,   asset: haybarn_unittest-osx-arm64.zip }
-          # Windows — no AF_UNIX launcher, so the subprocess (stdio) lane is its
-          # only non-http transport.
-          - { os: windows-latest, transport: stdio,  asset: haybarn_unittest-windows-amd64.zip }
+          # Windows — the worker's AF_UNIX launcher transport is Unix-only, and
+          # the subprocess (stdio) lane is slow (per-query process spawn), so
+          # Windows runs the http lane only.
           - { os: windows-latest, transport: http,   asset: haybarn_unittest-windows-amd64.zip }
     steps:
       - name: Checkout vgi-rust
