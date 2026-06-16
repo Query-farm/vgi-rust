@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Copyright 2025, 2026 Query Farm LLC - https://query.farm
+# Route the single vgi-example-worker into a named catalog (the integration
+# suite expects a dedicated worker per catalog). Execs $VGI_WORKER_BIN.
+export VGI_WORKER_CATALOG_NAME=versioned
+exec "${VGI_WORKER_BIN:?VGI_WORKER_BIN must point at vgi-example-worker}" "$@"

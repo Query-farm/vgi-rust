@@ -1,0 +1,96 @@
+# Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#
+# Runs the canonical Query-farm/vgi integration sqllogictest suite against the
+# Rust example worker across three transports (subprocess / launcher / http) and
+# three platforms (Linux / macOS / Windows). Rather than building the C++ vgi
+# extension from source, it drives a prebuilt standalone `haybarn-unittest` and
+# installs the signed vgi extension from the Haybarn community channel. The
+# .test files come from a pinned Query-farm/vgi checkout. See ci/README.md.
+name: Integration suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Query-farm/vgi commit whose test/sql/integration suite we run. Pinned for
+  # reproducibility; bump deliberately and re-validate against the then-current
+  # community extension (see ci/README.md).
+  VGI_REF: 3e4b68da081cae8215018221092e2408f100766a
+  # The Haybarn release providing the prebuilt haybarn-unittest binary. Must be
+  # ABI-compatible with the community-published vgi extension.
+  HAYBARN_RELEASE: haybarn-v1.5.3-rc7
+
+jobs:
+  integration:
+    name: ${{ matrix.os }} / ${{ matrix.transport }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux — all three transports.
+          - { os: ubuntu-latest,  transport: stdio,  asset: haybarn_unittest-linux-amd64.zip }
+          - { os: ubuntu-latest,  transport: launch, asset: haybarn_unittest-linux-amd64.zip }
+          - { os: ubuntu-latest,  transport: http,   asset: haybarn_unittest-linux-amd64.zip }
+          # macOS (Apple Silicon) — all three transports.
+          - { os: macos-latest,   transport: stdio,  asset: haybarn_unittest-osx-arm64.zip }
+          - { os: macos-latest,   transport: launch, asset: haybarn_unittest-osx-arm64.zip }
+          - { os: macos-latest,   transport: http,   asset: haybarn_unittest-osx-arm64.zip }
+          # Windows — no AF_UNIX launcher transport.
+          - { os: windows-latest, transport: stdio,  asset: haybarn_unittest-windows-amd64.zip }
+          - { os: windows-latest, transport: http,   asset: haybarn_unittest-windows-amd64.zip }
+    steps:
+      - name: Checkout vgi-rust
+        uses: actions/checkout@v5
+
+      - name: Checkout pinned vgi test suite
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: ${{ env.VGI_REF }}
+          path: vgi-upstream
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build example worker
+        run: cargo build --release -p vgi-example-worker
+
+      - name: Download + extract haybarn-unittest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$HAYBARN_RELEASE" --repo Query-farm-haybarn/haybarn \
+            --pattern '${{ matrix.asset }}' --output hb.zip --clobber
+          python3 -c "import zipfile; zipfile.ZipFile('hb.zip').extractall('hb')"
+          ut="$(find hb -type f -name 'haybarn-unittest' -o -type f -name 'haybarn-unittest.exe' | head -1)"
+          chmod +x "$ut" 2>/dev/null || true
+          echo "HAYBARN_UNITTEST=$(cd "$(dirname "$ut")" && pwd)/$(basename "$ut")" >> "$GITHUB_ENV"
+
+      - name: Resolve worker binary path
+        shell: bash
+        run: |
+          exe=""; [ "$RUNNER_OS" = "Windows" ] && exe=".exe"
+          echo "VGI_WORKER_BIN=$(pwd)/target/release/vgi-example-worker${exe}" >> "$GITHUB_ENV"
+
+      - name: Run integration suite (${{ matrix.transport }})
+        shell: bash
+        run: ci/run-integration.sh
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-upstream
+          TRANSPORT: ${{ matrix.transport }}
