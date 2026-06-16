@@ -37,18 +37,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
-      fail-fast: false
+      # One failure cancels the rest of the matrix.
+      fail-fast: true
       matrix:
         include:
-          # Linux — all three transports.
-          - { os: ubuntu-latest,  transport: stdio,  asset: haybarn_unittest-linux-amd64.zip }
+          # Linux / macOS — the launcher lane covers the subprocess (stdio) path,
+          # so only launch + http run here.
           - { os: ubuntu-latest,  transport: launch, asset: haybarn_unittest-linux-amd64.zip }
           - { os: ubuntu-latest,  transport: http,   asset: haybarn_unittest-linux-amd64.zip }
-          # macOS (Apple Silicon) — all three transports.
-          - { os: macos-latest,   transport: stdio,  asset: haybarn_unittest-osx-arm64.zip }
           - { os: macos-latest,   transport: launch, asset: haybarn_unittest-osx-arm64.zip }
           - { os: macos-latest,   transport: http,   asset: haybarn_unittest-osx-arm64.zip }
-          # Windows — no AF_UNIX launcher transport.
+          # Windows — no AF_UNIX launcher, so the subprocess (stdio) lane is its
+          # only non-http transport.
           - { os: windows-latest, transport: stdio,  asset: haybarn_unittest-windows-amd64.zip }
           - { os: windows-latest, transport: http,   asset: haybarn_unittest-windows-amd64.zip }
     steps:
