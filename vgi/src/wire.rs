@@ -7,8 +7,8 @@
 //! (a *flat* schema). `vgi_rpc`'s [`VgiArrow`] derive instead models a
 //! struct as a nested `Struct<fields>` column. This module bridges the
 //! two: it flattens the derived `StructArray` into the top-level
-//! columns the C++ extension expects, byte-compatible with the Python /
-//! Go / Java workers.
+//! columns the C++ extension expects, byte-compatible with the Python and
+//! Java workers.
 //!
 //! Define every DTO with `#[derive(VgiArrow)]` and round-trip it with
 //! [`to_batch`] / [`from_batch`]; obtain its flat schema with
@@ -68,7 +68,7 @@ pub fn read_struct<T: VgiArrow>(arr: &dyn Array, idx: usize) -> Result<T> {
 /// The schema of every unary *response*: a single `result: binary` column.
 ///
 /// The canonical wire wraps unary results as one `result` column holding the
-/// IPC-serialized flat DTO batch (Go `serializeResult`); the flat DTO schema
+/// IPC-serialized flat DTO batch; the flat DTO schema
 /// is the schema of those inner bytes, not of the response batch itself.
 pub fn result_binary_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(

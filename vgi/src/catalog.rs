@@ -1,8 +1,7 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! Default read-only catalog: auto-generates `SchemaInfo` + `FunctionInfo`
-//! from the worker's registered functions (port of Go's
-//! `DefaultReadOnlyCatalog` + `BuildArgSchema`).
+//! from the worker's registered functions.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,7 +48,7 @@ pub fn serialize_secret_type(spec: &SecretTypeSpec) -> Result<Vec<u8>> {
 /// Serialize a [`SettingSpec`] to its IPC `settings` entry. The batch schema is
 /// `{name: string, description: string, type: binary, default_value: binary?}`
 /// where `type` is the IPC schema of a single `value` field of the setting's
-/// type (matches Go `serializeSettingSpec`).
+/// type.
 /// Serialize one `CatalogInfo` discovery record to IPC bytes. The schema
 /// (field order/types) must match `generated.CatalogInfoSchema` exactly; the
 /// `releases` element struct type is emitted even when the list is empty.
@@ -193,7 +192,7 @@ pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
 }
 
 /// Build the wire arg schema (`FunctionInfo.arguments`) from arg specs,
-/// attaching `vgi_*` field-metadata markers exactly as Go's `BuildArgSchema`.
+/// attaching `vgi_*` field-metadata markers.
 pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
     if specs.is_empty() {
         return Schema::empty();
@@ -965,7 +964,7 @@ pub fn serialize_items<T: vgi_rpc::VgiArrow>(items: Vec<T>) -> Result<Vec<Bytes>
 /// values. `arrow`'s safe `RecordBatch`/`StructArray` constructors reject a
 /// non-nullable field with nulls, so these columns are built nullable and the
 /// declared wire schema is tightened only at IPC-write time — matching the
-/// vgi-go / vgi-python convention (NULL in a non-nullable column = "not inlined").
+/// canonical convention (NULL in a non-nullable column = "not inlined").
 fn tighten_inline_schema(schema: &Schema) -> Schema {
     const TIGHTEN: [&str; 2] = ["cardinality_estimate", "cardinality_max"];
     let fields: Vec<Field> = schema

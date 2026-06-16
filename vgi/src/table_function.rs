@@ -2,7 +2,7 @@
 
 //! Table (producer) function model: generate output batches without input.
 //!
-//! Mirrors Go `initTable` + `TableProducerState`. The function creates a
+//! The function creates a
 //! per-execution [`TableProducer`] whose `produce` is called repeatedly; it
 //! emits one batch per tick and calls `out.finish()` when exhausted.
 

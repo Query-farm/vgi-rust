@@ -16,7 +16,7 @@
 //! version coupling to a specific DuckDB build.
 //!
 //! Workers built with this crate are byte-for-byte wire-compatible with the
-//! canonical Python and Go implementations, so a Rust worker drops in behind the
+//! canonical Python implementation, so a Rust worker drops in behind the
 //! same `ATTACH … (TYPE vgi)`. It is built on the
 //! [`vgi-rpc`](https://docs.rs/vgi-rpc) crate (wire protocol, RPC server,
 //! transports), uses stock `arrow-rs` 58.x, and has an MSRV of 1.86.
@@ -83,10 +83,6 @@
 //! ```
 //!
 //! [Haybarn]: https://github.com/Query-farm-haybarn/haybarn
-//!
-//! See the [Getting Started guide][gs] for the full walkthrough.
-//!
-//! [gs]: https://github.com/Query-farm/vgi-rust/blob/main/docs/getting-started.md
 //!
 //! # The function model
 //!

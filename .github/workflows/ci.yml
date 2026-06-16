@@ -61,3 +61,23 @@ jobs:
 
       - name: cargo build (vgi)
         run: cargo build -p vgi --all-features
+
+  # Build AND run every ```rust worker example in the docs end-to-end: each is
+  # compiled against the local `vgi`, attached in Haybarn (Query Farm's DuckDB
+  # distribution, which provides the `vgi` extension), and its `upper_case`
+  # function is exercised. Guarantees the copy-paste examples never drift.
+  doc-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.86)
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install uv (for haybarn-cli)
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build and run the doc examples
+        run: bash scripts/check_doc_examples.sh

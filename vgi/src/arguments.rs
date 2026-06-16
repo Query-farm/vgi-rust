@@ -1,6 +1,6 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Parsing of the `arguments` wire blob (port of Go `arguments.go`).
+//! Parsing of the `arguments` wire blob.
 //!
 //! DuckDB wraps a call's arguments in a single `args` struct column whose
 //! fields are `positional_0`, `positional_1`, … and `named_<name>`. Const
@@ -134,13 +134,13 @@ impl Arguments {
 
     /// Serialize positional scan arguments in the catalog `ScanFunctionResult`
     /// format: a flat IPC batch with columns `arg_0`, `arg_1`, … (NOT the
-    /// `args` struct used for direct calls). Matches Go `serializeScanArgs`.
+    /// `args` struct used for direct calls).
     pub fn serialize_scan_args(values: &[ArrayRef]) -> Result<Vec<u8>> {
         Self::serialize_scan_args_named(values, &[])
     }
 
     /// Serialize positional (`arg_<i>`) plus named (bare-name) scan arguments
-    /// into the flat `ScanFunctionResult.arguments` batch (Go `serializeScanArgs`).
+    /// into the flat `ScanFunctionResult.arguments` batch.
     pub fn serialize_scan_args_named(
         positional: &[ArrayRef],
         named: &[(&str, ArrayRef)],
@@ -273,7 +273,7 @@ impl Arguments {
     }
 
     /// Expand compacted const-only positional args to their declared positions
-    /// (port of Go `RemapPositionalArgs`). DuckDB sends only the const values,
+    /// DuckDB sends only the const values,
     /// indexed in send order; this maps them back onto the declared positions.
     pub fn remap_positional(&mut self, specs: &[crate::function::ArgSpec]) {
         if self.positional.is_empty() || specs.is_empty() {

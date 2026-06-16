@@ -4,9 +4,8 @@
 //!
 //! Many VGI wire fields are `binary` columns carrying an IPC-serialized
 //! Arrow object — either a full record batch (schema + 1 row + EOS) or a
-//! bare schema (schema message + EOS). These mirror the Go helpers
-//! `SerializeSchema` / per-type `ipc.NewWriter(...)` so the bytes are
-//! byte-compatible with Python / Go / the C++ extension.
+//! bare schema (schema message + EOS). The bytes are byte-compatible with the
+//! canonical Python worker and the C++ extension.
 
 use std::io::Cursor;
 use std::sync::Arc;

@@ -4,7 +4,7 @@
 //!
 //! The C++ DuckDB extension is the client; these types and methods must be
 //! byte-compatible with the canonical Python `vgi/protocol.py`. Field names,
-//! Arrow types, and nullability mirror the Go port (`vgi-go/vgi/generated/`).
+//! Arrow types, and nullability all follow that canonical wire schema.
 
 pub mod dtos;
 pub mod enums;

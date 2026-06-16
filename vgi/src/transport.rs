@@ -2,7 +2,7 @@
 
 //! Worker transport selection: stdio (default), AF_UNIX (launcher), HTTP.
 //!
-//! Mirrors the Go / conformance worker contract:
+//! Mirrors the conformance worker contract:
 //! - stdio: serve a single sequential Arrow-IPC stream over stdin/stdout.
 //! - `--unix <path>`: bind the socket, print `UNIX:<path>\n`, serve each
 //!   connection on its own thread until SIGTERM/SIGINT.

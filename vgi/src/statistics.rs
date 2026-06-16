@@ -1,8 +1,8 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! Column-statistics serialization: the sparse-union IPC batch DuckDB's VGI
-//! extension reads to seed the optimizer. Mirrors Go `column_statistics.go` /
-//! Python `serialize_column_statistics`.
+//! extension reads to seed the optimizer. Mirrors the canonical Python
+//! `serialize_column_statistics`.
 
 use std::sync::Arc;
 

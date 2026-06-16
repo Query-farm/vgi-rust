@@ -21,13 +21,9 @@ for you when a query needs it — you never run a server by hand.
 
 `vgi` is the Rust SDK for building those workers. It is byte-for-byte
 wire-compatible with the canonical
-[Python](https://github.com/Query-farm/vgi-python) and Go SDKs, so a Rust worker
+[Python](https://github.com/Query-farm/vgi-python) SDK, so a Rust worker
 drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 [`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, **MSRV 1.86**.
-
-> New to VGI? The repo has a step-by-step
-> [Getting Started guide](https://github.com/Query-farm/vgi-rust/blob/main/docs/getting-started.md)
-> that takes you from `cargo new` to calling your function from SQL.
 
 ## Why a worker instead of a C++ extension?
 
@@ -136,6 +132,33 @@ SELECT main.upper_case('hello');   -- HELLO
 That's it — a native-speed SQL function, shipped as one static binary, with no
 extension to compile.
 
+## Iterating
+
+Change your Rust, rebuild, and re-attach. DuckDB pools the worker process per
+attachment, so the reliable way to pick up a new build is to re-`ATTACH` (or start
+a fresh session):
+
+```sh
+cargo build --release
+```
+
+```sql
+DETACH demo;
+ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
+```
+
+## Troubleshooting
+
+- **`ATTACH` can't find the worker** — `LOCATION` is resolved relative to DuckDB's
+  working directory, not your project. Use an absolute path.
+- **`Catalog Error: ... upper_case does not exist`** — qualify with the attach
+  alias (`demo.main.upper_case`) or run `USE demo;` first.
+- **A runtime error in your function** — anything you return as `RpcError` (or any
+  panic) surfaces in DuckDB's error message; return descriptive errors from
+  `process` to make debugging easy.
+- **Type mismatch at the call site** — `argument_specs` is validated at bind time,
+  so a wrong-typed column fails fast with a clear message before any rows flow.
+
 ## Function types
 
 Register any mix of these via the typed traits in [`vgi`](https://docs.rs/vgi):
@@ -181,7 +204,6 @@ as native catalogs.
 
 ## Where to go next
 
-- **[Getting Started](https://github.com/Query-farm/vgi-rust/blob/main/docs/getting-started.md)** — the full first-worker walkthrough.
 - **[API docs (docs.rs)](https://docs.rs/vgi)** — every trait and type.
 - **[Example worker](https://github.com/Query-farm/vgi-rust/tree/main/vgi-example-worker)** — a fixture worker exercising every function kind and full catalogs.
 

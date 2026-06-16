@@ -1,8 +1,8 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! VGI wire DTOs. Field order and types mirror
-//! `vgi-go/vgi/generated/protocol_schemas.go` exactly (the C++ extension
-//! reads several result schemas positionally, so order matters).
+//! VGI wire DTOs. Field order and types follow the canonical wire schema
+//! exactly (the C++ extension reads several result schemas positionally, so
+//! order matters).
 //!
 //! Serialize/deserialize the flat ones with [`crate::wire`]; the catalog
 //! item structs (`SchemaInfo`, `FunctionInfo`, …) are IPC-serialized into
@@ -21,7 +21,7 @@ pub type IntMap = Vec<(String, i64)>;
 /// (the C++ extension's result-schema check requires `int64 not null`) yet may
 /// carry a NULL value. The extension reads it via `row[...].as<int64_t>()`,
 /// which yields `nullopt` for NULL — its signal for "not inlined, fire the RPC".
-/// Matches the vgi-go / vgi-python convention (null in a non-nullable column).
+/// Matches the canonical convention (null in a non-nullable column).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InlineI64(pub Option<i64>);
 
@@ -496,8 +496,7 @@ pub struct ScanFunctionResult {
     pub required_extensions: Vec<String>,
 }
 
-/// `FunctionInfo` item — describes a function to DuckDB. Field order matches
-/// `FunctionInfoSchema` in the generated Go schemas.
+/// `FunctionInfo` item — describes a function to DuckDB.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct FunctionInfo {
     pub comment: Option<String>,

@@ -1,6 +1,6 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Aggregate function model (UPDATE / COMBINE / FINALIZE).
+//! Aggregate function model (update / combine / finalize).
 //!
 //! DuckDB drives aggregates with per-group state. The worker keeps state in
 //! the cross-process [`crate::buffering::BufferingStore`] (KV mode), keyed by

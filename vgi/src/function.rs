@@ -2,8 +2,7 @@
 
 //! Core function model shared by all VGI function kinds.
 //!
-//! Mirrors the Go `function.go` / `bind.go` / `scalar.go` surface and the
-//! canonical Python base classes.
+//! Mirrors the canonical Python base classes.
 
 use std::sync::Arc;
 

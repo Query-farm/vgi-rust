@@ -22,12 +22,9 @@ for you when a query needs it — you never run a server by hand.
 
 This repo is the **Rust** worker SDK ([`vgi`](https://crates.io/crates/vgi)). It is
 byte-for-byte wire-compatible with the canonical
-[Python](https://github.com/Query-farm/vgi-python) and Go SDKs, so a Rust worker
+[Python](https://github.com/Query-farm/vgi-python) SDK, so a Rust worker
 drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 [`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, **MSRV 1.86**.
-
-> **New here? Start with the [Getting Started guide](docs/getting-started.md)** —
-> it takes you from `cargo new` to calling your function from SQL.
 
 ## Why a worker instead of a C++ extension?
 
@@ -122,8 +119,19 @@ SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
 > **`LOCATION` gotcha:** the path is resolved relative to DuckDB's working
 > directory, not your project. If the worker isn't found, use an absolute path.
 
-The [Getting Started guide](docs/getting-started.md) walks through this in full,
-including iteration and troubleshooting.
+### Iterating
+
+Change your Rust, rebuild, and re-attach — DuckDB pools the worker per attachment,
+so `DETACH demo; ATTACH 'demo' (...)` (or a fresh session) picks up a new build.
+
+### Troubleshooting
+
+- **`ATTACH` can't find the worker** — `LOCATION` is relative to DuckDB's working
+  directory; use an absolute path.
+- **`Catalog Error: ... does not exist`** — qualify with the attach alias
+  (`demo.main.upper_case`) or run `USE demo;`.
+- **Runtime / type errors** — errors returned from `process` (and bind-time
+  `argument_specs` type checks) surface directly in DuckDB's error message.
 
 ## Function types
 

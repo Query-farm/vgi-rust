@@ -3,7 +3,7 @@
 //! Partition-column support: mark schema fields as partition columns and
 //! compute the per-batch `vgi_partition_values#b64` metadata (base64 of a
 //! 2-row min/max IPC batch) that the C++ extension reads to plan partitioned
-//! aggregates. Mirrors Go `batch_emit.go` / Python `partition_field`.
+//! aggregates. Mirrors the canonical Python `partition_field`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

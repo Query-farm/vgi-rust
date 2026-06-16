@@ -1,7 +1,7 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! Filter pushdown: deserialize the `pushdown_filters` blob, evaluate it
-//! against a batch, and apply it (port of Go `filter_pushdown.go`).
+//! against a batch, and apply it.
 //!
 //! Wire format: an IPC batch whose column 0 is a JSON array of filter specs
 //! (field metadata `vgi_filter_version`), and columns 1.. carry the constant

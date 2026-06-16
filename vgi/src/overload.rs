@@ -1,6 +1,6 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Function overload resolution (port of Go `overload.go`).
+//! Function overload resolution.
 //!
 //! Given several registered functions sharing a name, pick the one whose
 //! argument specs best match the call: count compatibility first, then a type

@@ -1,8 +1,8 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! The VGI dispatcher: owns the function registries + catalog identity and
-//! implements every RPC handler. Mirrors Go's `Worker` dispatch (handleBind,
-//! handleInit, registerCatalogMethods).
+//! implements every RPC handler (bind, init, and the catalog discovery
+//! methods).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
