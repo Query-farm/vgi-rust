@@ -37,7 +37,6 @@ drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 | Must be rebuilt for each DuckDB version | Version independent |
 | Complex build / signing / release cycle | `cargo build`, ship the binary |
 | Runs in-process | Process isolation |
-| Single-threaded | Parallel workers |
 
 **Reach for it when you want to:** call REST APIs from SQL, run ML inference,
 expose an external database / API / filesystem as a queryable catalog, or ship
@@ -103,14 +102,16 @@ fn main() {
 }
 ```
 
-**3. Build it** (`cargo build --release`), **then call it from DuckDB** — stock
-[`duckdb`](https://duckdb.org/docs/installation/) works. From your project directory:
+**3. Build it** (`cargo build --release`), **then call it from a DuckDB engine
+that has the `vgi` extension.** The `vgi` extension currently ships with Query
+Farm's [Haybarn](https://github.com/Query-farm-haybarn/haybarn) DuckDB
+distribution, which starts with no install via `uvx haybarn-cli`. From your
+project directory:
 
 ```sql
-INSTALL vgi FROM community; LOAD vgi;   -- first time only
-
--- DuckDB LAUNCHES the worker. LOCATION is the command it runs; the alias
--- 'demo' is what you qualify functions with in SQL.
+-- Haybarn ships the `vgi` extension. DuckDB LAUNCHES the worker for you;
+-- LOCATION is the command it runs, and the alias 'demo' is what you
+-- qualify functions with in SQL.
 ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
 
 SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
@@ -228,20 +229,5 @@ cargo fmt --all
 
 ## License
 
+Query Farm Source-Available License v1.0 — see [LICENSE](LICENSE).
 Copyright © 2025, 2026 Query Farm LLC.
-
-Licensed under the **Query Farm Source-Available License, Version 1.0** — see
-[LICENSE](LICENSE) for the binding terms. In summary (the LICENSE text governs):
-
-- ✅ **Use, copy, modify, and redistribute** the code freely, **including in
-  production and for commercial purposes** — your own internal use, and building
-  products and services on top of VGI.
-- 🚫 Not permitted **without a separate commercial license**: offering a
-  *competing* VGI-equivalent product or service to third parties (hosted,
-  embedded, or as-a-service), or operating a commercial marketplace for such
-  services.
-- ⏳ Each released version converts to the **Apache License, Version 2.0**, ten
-  years after its public release.
-
-For a commercial license or any licensing questions, contact
-[hello@query.farm](mailto:hello@query.farm).

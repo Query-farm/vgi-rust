@@ -37,7 +37,6 @@ drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 | Must be rebuilt for each DuckDB version | Version independent |
 | Complex build / signing / release cycle | `cargo build`, ship the binary |
 | Runs in-process | Process isolation |
-| Single-threaded | Parallel workers |
 
 **Reach for it when you want to:** call REST APIs from SQL, run ML inference,
 expose an external database / API / filesystem as a queryable catalog, or ship
@@ -110,16 +109,15 @@ fn main() {
 cargo build --release
 ```
 
-**4. Call it from DuckDB.** You need a DuckDB-compatible engine — stock
-[`duckdb`](https://duckdb.org/docs/installation/) works. Start a session **from
-your project directory** and:
+**4. Call it from a DuckDB engine that has the `vgi` extension.** The `vgi`
+extension currently ships with Query Farm's
+[Haybarn](https://github.com/Query-farm-haybarn/haybarn) DuckDB distribution,
+which starts with no install via `uvx haybarn-cli`. From your project directory:
 
 ```sql
-INSTALL vgi FROM community;   -- first time only: pulls the `vgi` extension
-LOAD vgi;
-
--- DuckDB LAUNCHES the worker for you. LOCATION is the command it runs;
--- the alias 'demo' is what you qualify functions with in SQL.
+-- Haybarn ships the `vgi` extension. DuckDB LAUNCHES the worker for you;
+-- LOCATION is the command it runs, and the alias 'demo' is what you
+-- qualify functions with in SQL.
 ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
 
 SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
@@ -187,16 +185,7 @@ as native catalogs.
 - **[API docs (docs.rs)](https://docs.rs/vgi)** — every trait and type.
 - **[Example worker](https://github.com/Query-farm/vgi-rust/tree/main/vgi-example-worker)** — a fixture worker exercising every function kind and full catalogs.
 
-## Status
-
-Verified against the canonical VGI C++ integration suite across all three
-transports — subprocess, launcher, and HTTP (8176 / 7774 assertions on
-subprocess / HTTP, 0 failures).
-
 ## License
 
 Query Farm Source-Available License v1.0 — see [LICENSE](https://github.com/Query-farm/vgi-rust/blob/main/LICENSE).
-Free for use, modification, and redistribution including in production; a separate
-commercial license is required only to offer a *competing* VGI product. Each
-release converts to Apache-2.0 ten years after its publication.
 Copyright © 2025, 2026 Query Farm LLC.

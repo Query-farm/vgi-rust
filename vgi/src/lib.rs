@@ -71,15 +71,18 @@
 //! }
 //! ```
 //!
-//! Build it (`cargo build --release`), then from any DuckDB-compatible engine:
+//! Build it (`cargo build --release`), then call it from a DuckDB engine that
+//! has the `vgi` extension — Query Farm's [Haybarn] distribution ships it and
+//! starts with `uvx haybarn-cli`:
 //!
 //! ```sql
-//! INSTALL vgi FROM community; LOAD vgi;      -- first time only
 //! ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
 //! SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
 //! -- ALICE
 //! -- BOB
 //! ```
+//!
+//! [Haybarn]: https://github.com/Query-farm-haybarn/haybarn
 //!
 //! See the [Getting Started guide][gs] for the full walkthrough.
 //!

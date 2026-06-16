@@ -10,10 +10,10 @@ needs it. By the end you'll have an `upper_case(...)` function callable from SQL
 ## Prerequisites
 
 - **Rust 1.86 or newer** (`rustc --version`).
-- **A DuckDB-compatible SQL engine.** Stock [DuckDB](https://duckdb.org/docs/installation/)
-  is fine — install the CLI and confirm `duckdb --version` works. (Query Farm's
-  [Haybarn](https://github.com/Query-farm-haybarn/haybarn) distribution also works
-  and ships the `vgi` extension pre-signed.)
+- **A DuckDB engine with the `vgi` extension.** The `vgi` extension currently
+  ships with Query Farm's [Haybarn](https://github.com/Query-farm-haybarn/haybarn)
+  DuckDB distribution, which runs with no install via `uvx haybarn-cli` (install
+  [`uv`](https://docs.astral.sh/uv/) first).
 
 ## 1. Create a project
 
@@ -107,20 +107,17 @@ Your worker binary is now at `target/release/my-worker`.
 
 ## 5. Call it from DuckDB
 
-Start a DuckDB session **from your project directory** (so the relative path in
-`LOCATION` resolves):
+Start a Haybarn session **from your project directory** (so the relative path in
+`LOCATION` resolves). Haybarn ships the `vgi` extension, so there's nothing to
+install:
 
 ```sh
-duckdb
+uvx haybarn-cli
 ```
 
-Then, in the DuckDB prompt:
+Then, in the SQL prompt:
 
 ```sql
--- First time only: pull and load the `vgi` extension. This persists.
-INSTALL vgi FROM community;
-LOAD vgi;
-
 -- DuckDB launches your worker. LOCATION is the command it runs.
 -- 'demo' is the alias you'll qualify functions with in SQL.
 ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
