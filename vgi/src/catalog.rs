@@ -316,6 +316,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.stability = meta.stability.as_deref().map(enums::dict);
     fi.null_handling = meta.null_handling.as_deref().map(enums::dict);
     fi.categories = meta.categories.clone();
+    fi.examples = meta.examples.clone();
     if meta.projection_pushdown {
         fi.projection_pushdown = Some(true);
     }
@@ -989,4 +990,56 @@ pub fn dict(s: &str) -> DictString {
 /// Build an `Arc<Schema>` from a `Schema` (convenience).
 pub fn arc(schema: Schema) -> Arc<Schema> {
     Arc::new(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::function::{ArgSpec, FunctionExample, ProcessParams};
+    use arrow_array::RecordBatch;
+
+    /// A minimal scalar whose `metadata()` advertises SQL examples.
+    struct ExampleScalar;
+
+    impl ScalarFunction for ExampleScalar {
+        fn name(&self) -> &str {
+            "example_scalar"
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata {
+                description: "demonstrates examples".to_string(),
+                examples: vec![
+                    FunctionExample {
+                        sql: "SELECT example_scalar(1)".to_string(),
+                        description: "basic usage".to_string(),
+                        expected_output: Some("1".to_string()),
+                    },
+                    FunctionExample {
+                        sql: "SELECT example_scalar(x) FROM t".to_string(),
+                        description: "column usage".to_string(),
+                        expected_output: None,
+                    },
+                ],
+                return_type: Some(DataType::Int64),
+                ..Default::default()
+            }
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("x", 0, "int64", "input")]
+        }
+        fn process(&self, _params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+            Ok(batch.clone())
+        }
+    }
+
+    #[test]
+    fn scalar_function_info_carries_examples() {
+        let fi = scalar_function_info(&ExampleScalar).expect("build FunctionInfo");
+        assert_eq!(fi.examples.len(), 2);
+        assert_eq!(fi.examples[0].sql, "SELECT example_scalar(1)");
+        assert_eq!(fi.examples[0].description, "basic usage");
+        assert_eq!(fi.examples[0].expected_output.as_deref(), Some("1"));
+        assert_eq!(fi.examples[1].sql, "SELECT example_scalar(x) FROM t");
+        assert_eq!(fi.examples[1].expected_output, None);
+    }
 }

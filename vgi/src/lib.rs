@@ -140,6 +140,7 @@ pub mod wire;
 pub mod worker;
 
 pub use function::{
-    ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction,
+    ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
+    ScalarFunction,
 };
 pub use worker::Worker;

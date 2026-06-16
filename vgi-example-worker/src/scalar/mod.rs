@@ -13,8 +13,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use util::*;
 use vgi::function::{
-    ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction, ADDABLE,
-    MULTIPLIABLE,
+    ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
+    ScalarFunction, ADDABLE, MULTIPLIABLE,
 };
 use vgi::numeric::{add_two, common_type_for_addition, double_first, promote_for_addition};
 use vgi::secrets::SecretLookup;
@@ -81,7 +81,21 @@ impl ScalarFunction for DoubleFunction {
         "double"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta("Doubles numeric values")
+        FunctionMetadata {
+            examples: vec![
+                FunctionExample {
+                    sql: "SELECT double(21)".to_string(),
+                    description: "Double an integer literal".to_string(),
+                    expected_output: Some("42".to_string()),
+                },
+                FunctionExample {
+                    sql: "SELECT double(value) FROM numbers".to_string(),
+                    description: "Double every value in a column".to_string(),
+                    expected_output: None,
+                },
+            ],
+            ..meta("Doubles numeric values")
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::any_column("value", 0, "Numeric value to double").with_bound(MULTIPLIABLE)]

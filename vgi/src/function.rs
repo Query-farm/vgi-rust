@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, SchemaRef};
 use vgi_rpc::Result;
 
+pub use crate::protocol::dtos::FunctionExample;
 use crate::protocol::enums;
 
 /// A named type-bound predicate for ANY-typed arguments. Checked at bind:
@@ -187,6 +188,8 @@ pub struct FunctionMetadata {
     pub stability: Option<String>,
     pub null_handling: Option<String>,
     pub categories: Vec<String>,
+    /// SQL usage examples surfaced in `FunctionInfo` for discovery.
+    pub examples: Vec<FunctionExample>,
     /// Fixed scalar return type, when not computed dynamically at bind.
     pub return_type: Option<DataType>,
     pub projection_pushdown: bool,
@@ -217,6 +220,7 @@ impl Default for FunctionMetadata {
             stability: Some(enums::stability::CONSISTENT.to_string()),
             null_handling: None,
             categories: Vec::new(),
+            examples: Vec::new(),
             return_type: None,
             projection_pushdown: false,
             filter_pushdown: false,
