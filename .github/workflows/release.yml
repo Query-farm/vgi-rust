@@ -50,11 +50,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Sanity gate — fmt, clippy, build
+      - name: Sanity gate — fmt, clippy, build, doctests
         run: |
           cargo fmt --all -- --check
           cargo clippy -p vgi --all-targets --all-features -- -D warnings
           cargo build --workspace --all-features
+          cargo test --doc -p vgi --all-features
 
       - name: Authenticate to crates.io via OIDC
         id: auth

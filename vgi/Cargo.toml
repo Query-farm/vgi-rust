@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["vgi", "duckdb", "arrow", "rpc", "worker"]
 categories = ["database", "api-bindings"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 vgi-rpc = { workspace = true }
 arrow = { workspace = true }

@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <strong>Apache Arrow-based protocol for extending DuckDB using any language.</strong><br/>
-  <strong>This is the Rust SDK — build native, single-binary VGI workers with zero DuckDB linking.</strong>
+  <strong>Add your own functions and tables to DuckDB — written in Rust, shipped as one binary.<br/>
+  No C++ extension to compile, no linking against DuckDB, no version coupling.</strong>
 </p>
 
 <p align="center">
@@ -15,21 +15,37 @@
 
 ---
 
-A **VGI worker** is a separate process that DuckDB talks to over Apache Arrow
-IPC. It can expose scalar / table / aggregate functions and whole catalogs
-(schemas, tables, views) that behave exactly like native DuckDB objects — no C++
-extension to compile, no linking against DuckDB, no version coupling.
+A **VGI worker** is a small Rust program that DuckDB talks to over Apache Arrow IPC.
+It can expose scalar / table / aggregate functions and whole catalogs (schemas,
+tables, views) that behave like native DuckDB objects. DuckDB launches your worker
+for you when a query needs it — you never run a server by hand.
 
-This crate, [`vgi`](https://crates.io/crates/vgi), is the **Rust** worker SDK. It
-is byte-for-byte wire-compatible with the canonical
-[Python](https://github.com/Query-farm/vgi-python) and Go implementations, so a
-Rust worker is a drop-in replacement behind the same `ATTACH ... (TYPE vgi)`.
-Built on [`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x,
-MSRV 1.86.
+This repo is the **Rust** worker SDK ([`vgi`](https://crates.io/crates/vgi)). It is
+byte-for-byte wire-compatible with the canonical
+[Python](https://github.com/Query-farm/vgi-python) and Go SDKs, so a Rust worker
+drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
+[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, **MSRV 1.86**.
 
-## See It in Action
+> **New here? Start with the [Getting Started guide](docs/getting-started.md)** —
+> it takes you from `cargo new` to calling your function from SQL.
 
-A worker is a small Rust binary. Add the dependency:
+## Why a worker instead of a C++ extension?
+
+| Traditional DuckDB extension | VGI worker |
+|------------------------------|------------|
+| Written in C/C++, compiled and linked against DuckDB | Written in Rust, one standalone binary |
+| Must be rebuilt for each DuckDB version | Version independent |
+| Complex build / signing / release cycle | `cargo build`, ship the binary |
+| Runs in-process | Process isolation |
+| Single-threaded | Parallel workers |
+
+**Reach for it when you want to:** call REST APIs from SQL, run ML inference,
+expose an external database / API / filesystem as a queryable catalog, or ship
+domain-specific functions to your team as a single binary.
+
+## Your first worker
+
+**1. Create a project and add the dependencies:**
 
 ```toml
 # Cargo.toml
@@ -40,7 +56,7 @@ arrow-array = "58"
 arrow-schema = "58"
 ```
 
-Define a function and serve it:
+**2. Write a function and serve it:**
 
 ```rust
 // src/main.rs
@@ -87,14 +103,14 @@ fn main() {
 }
 ```
 
-Build it, then call it from any DuckDB-compatible engine:
+**3. Build it** (`cargo build --release`), **then call it from DuckDB** — stock
+[`duckdb`](https://duckdb.org/docs/installation/) works. From your project directory:
 
 ```sql
--- First time only (stock DuckDB):
-INSTALL vgi FROM community;
-LOAD vgi;
+INSTALL vgi FROM community; LOAD vgi;   -- first time only
 
--- LOCATION is the command DuckDB runs to launch the worker.
+-- DuckDB LAUNCHES the worker. LOCATION is the command it runs; the alias
+-- 'demo' is what you qualify functions with in SQL.
 ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
 
 SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
@@ -102,40 +118,13 @@ SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
 -- BOB
 ```
 
-That's it — a native-speed function, shipped as one static binary, callable from
-SQL with no extension build.
+> **`LOCATION` gotcha:** the path is resolved relative to DuckDB's working
+> directory, not your project. If the worker isn't found, use an absolute path.
 
----
-
-## Why VGI?
-
-VGI extends DuckDB with functions and catalogs that run in a **separate
-process**, communicating via Apache Arrow IPC:
-
-| Traditional extension | VGI worker |
-|-----------------------|------------|
-| C/C++ compilation required | Write it in Rust (or Python / Go / …) |
-| Tied to a DuckDB version | Version independent |
-| Complex build / release cycle | Ship one executable |
-| Runs in-process | Process isolation |
-| Single-threaded | Parallel workers |
-
-### Why the Rust SDK specifically?
-
-- **One static binary** — no interpreter, no runtime, trivial to ship and run.
-- **Native performance** with zero-copy Arrow throughout.
-- **Strong typing** — function arguments, schemas, and catalogs are checked at
-  compile time *and* validated at SQL bind time.
-
-**Use cases:** call REST APIs from SQL, run ML inference, expose external data
-sources as queryable catalogs, build high-throughput ETL transforms, or ship
-domain-specific functions to your team as a single binary.
-
----
+The [Getting Started guide](docs/getting-started.md) walks through this in full,
+including iteration and troubleshooting.
 
 ## Function types
-
-Register any mix of these via the typed traits in [`vgi`](https://docs.rs/vgi):
 
 | Type | Trait | SQL pattern | Use case |
 |------|-------|-------------|----------|
@@ -145,18 +134,16 @@ Register any mix of these via the typed traits in [`vgi`](https://docs.rs/vgi):
 | **Table-Buffering** | `TableBufferingFunction` | `SELECT * FROM f((SELECT …))` | Aggregate-then-emit (sink → combine → source) |
 | **Aggregate** | `AggregateFunction` | `SELECT f(col) … GROUP BY …` | Grouped / window / streaming aggregates |
 
-Each trait is small: a `name`, `metadata`, `argument_specs`, an `on_bind` to
-resolve the output schema, and a `process` (or the buffering / aggregate
-lifecycle methods). Projection & filter pushdown, ORDER BY / TABLESAMPLE hints,
-settings, secrets (two-phase bind), and a cross-process state store are handled
-for you.
+Each trait is small: `name`, `metadata`, `argument_specs`, an `on_bind` to resolve
+the output schema, and `process` (or the buffering / aggregate lifecycle methods).
+Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets,
+bearer auth, and a cross-process state store are handled for you.
 
 ## Beyond functions: full catalogs
 
-A worker can expose a complete database catalog — schemas, function-backed
-**tables**, **views**, and **macros** — via `Worker::set_catalog`, including
-constraints, column statistics, time travel (`AT`), and MetaWorker-style
-secondary catalogs attachable by name:
+`Worker::set_catalog` exposes a complete catalog — schemas, function-backed
+**tables**, **views**, and **macros** — with constraints, column statistics, time
+travel (`AT`), and secondary catalogs attachable by name:
 
 ```sql
 ATTACH 'external_db' (TYPE vgi, LOCATION './my-catalog-worker');
@@ -166,55 +153,51 @@ SELECT * FROM external_db.analytics.daily_view;  -- a view
 SELECT external_db.main.transform(col) FROM t;   -- a function
 ```
 
-This lets a worker act as a bridge — databases, APIs, file systems — presented
-to DuckDB as native catalogs.
-
 ## Transports
 
-A worker selects its transport from argv via `Worker::run`:
-
-- **stdio** (default) — DuckDB spawns the worker per query.
-- **Unix socket** (`--unix <path>`) — the launcher contract; one long-lived worker.
-- **HTTP** (`--http`) — Arrow-IPC over HTTP with AEAD-sealed stateless stream
-  tokens, optional bearer auth, and zstd compression.
+`Worker::run` picks the transport from argv: **stdio** (default), **Unix socket**
+(`--unix <path>`, the launcher contract), or **HTTP** (`--http`, Arrow-IPC over
+HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
 ## Protocol overview
 
 VGI uses [`vgi-rpc`](https://crates.io/crates/vgi-rpc), an Apache-Arrow-IPC RPC
-framework, for all client ↔ worker communication:
+framework, for all DuckDB ↔ worker communication. You don't write to this
+directly — the traits handle it — but here's what happens per query:
 
 ```
 DuckDB (client)                      VGI worker
-  │                                      │
-  │──── bind(request) ─────────────────▶ │  function name, args, input schema
-  │◀─── BindResponse ───────────────────  │  output schema, opaque data
-  │                                      │
-  │──── init(request) ─────────────────▶ │  start the processing stream
-  │◀─── stream header ──────────────────  │  execution_id, max_workers
-  │                                      │
-  │──── process / exchange(batch) ─────▶ │
-  │◀─── output batch ───────────────────  │  your process(batch)
-  │            …                         │
-  │──── [stream close] ────────────────▶ │
-  └──────────────────────────────────────┘
+  │──── bind(request) ─────────────▶ │  function name, args, input schema
+  │◀─── BindResponse ───────────────  │  output schema (your on_bind)
+  │──── init(request) ─────────────▶ │  start the processing stream
+  │◀─── stream header ──────────────  │  execution_id, max_workers
+  │──── process(batch) ────────────▶ │
+  │◀─── output batch ───────────────  │  your process(batch)
+  │──── [stream close] ────────────▶ │
 ```
-
----
 
 ## Workspace layout
 
 | crate | published | summary |
 |-------|:---------:|---------|
 | [`vgi/`](vgi/) | ✅ [crates.io](https://crates.io/crates/vgi) · [docs.rs](https://docs.rs/vgi) | The worker SDK: function models, declarative catalogs, wire dispatch, transports. |
-| `vgi-example-worker/` | — | A fixture worker registering every function kind; drives the integration suite. `publish = false`. |
+| `vgi-example-worker/` | — | A fixture worker registering every function kind and full catalogs; drives the integration suite. `publish = false`. |
 
-## Testing
+Read `vgi-example-worker/src/` for a working example of every trait — scalar,
+table, table-in-out, buffering, aggregate, and catalog-backed tables/views.
 
-`cargo fmt` / `clippy` / `build` / `doc` run in CI. The full behavioral suite is
-the canonical **VGI C++ integration suite** (`test/sql/integration/*` in the
-`vgi` extension repo), which drives DuckDB's `unittest` binary against the
-worker. It passes across all three transports (8176 assertions on subprocess,
-7774 on HTTP, 0 failures). Run it locally:
+## Testing your own worker
+
+The fastest check is to call your function from a DuckDB session (see "Your first
+worker"). For automated tests, drive the worker from Rust with `vgi-rpc`'s client,
+or shell out to a DuckDB session from your test harness.
+
+## Running the SDK's integration suite (contributors)
+
+The full behavioral suite is the canonical **VGI C++ integration suite**
+(`test/sql/integration/*` in the `vgi` extension repo), which drives DuckDB's
+`unittest` binary against the example worker. It passes across all three transports
+(8176 assertions on subprocess, 7774 on HTTP, 0 failures):
 
 ```sh
 cargo build --release
@@ -222,6 +205,8 @@ scripts/run_tests.sh            # subprocess transport, full in-scope suite
 LAUNCH=1 scripts/run_tests.sh   # launcher (Unix socket) transport
 scripts/run_http_tests.sh       # HTTP transport
 ```
+
+`cargo fmt` / `clippy` / `build` / `doc` run in CI.
 
 ## Development
 
@@ -237,10 +222,9 @@ vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
 ```sh
 cargo build --workspace
 cargo clippy -p vgi --all-targets --all-features -- -D warnings
+cargo test --doc -p vgi
 cargo fmt --all
 ```
-
----
 
 ## License
 

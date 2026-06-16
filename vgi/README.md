@@ -8,26 +8,59 @@
 </p>
 
 <p align="center">
-  <strong>Build native, single-binary DuckDB extensions in Rust — no C++, no linking against DuckDB.</strong>
+  <strong>Add your own functions and tables to DuckDB — written in Rust, shipped as one binary.<br/>
+  No C++ extension to compile, no linking against DuckDB, no version coupling.</strong>
 </p>
 
 ---
 
-`vgi` is the **Rust SDK for writing VGI (Vector Gateway Interface) workers** —
-the worker side of [Query Farm](https://query.farm)'s DuckDB "Hyperfederation"
-extension. A worker is a separate process that DuckDB talks to over Apache Arrow
-IPC; it exposes scalar / table / aggregate functions and whole catalogs
-(schemas, tables, views) that behave like native DuckDB objects, with no
-compiled C++ extension and no version coupling.
+A **VGI worker** is a small Rust program that DuckDB talks to over Apache Arrow IPC.
+It can expose scalar / table / aggregate functions and whole catalogs (schemas,
+tables, views) that behave like native DuckDB objects. DuckDB launches your worker
+for you when a query needs it — you never run a server by hand.
 
-It is **byte-for-byte wire-compatible** with the canonical
-[Python](https://github.com/Query-farm/vgi-python) and Go implementations, so a
-Rust worker drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
-[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, MSRV 1.86.
+`vgi` is the Rust SDK for building those workers. It is byte-for-byte
+wire-compatible with the canonical
+[Python](https://github.com/Query-farm/vgi-python) and Go SDKs, so a Rust worker
+drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
+[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, **MSRV 1.86**.
 
-## Example
+> New to VGI? The repo has a step-by-step
+> [Getting Started guide](https://github.com/Query-farm/vgi-rust/blob/main/docs/getting-started.md)
+> that takes you from `cargo new` to calling your function from SQL.
+
+## Why a worker instead of a C++ extension?
+
+| Traditional DuckDB extension | VGI worker |
+|------------------------------|------------|
+| Written in C/C++, compiled and linked against DuckDB | Written in Rust, one standalone binary |
+| Must be rebuilt for each DuckDB version | Version independent |
+| Complex build / signing / release cycle | `cargo build`, ship the binary |
+| Runs in-process | Process isolation |
+| Single-threaded | Parallel workers |
+
+**Reach for it when you want to:** call REST APIs from SQL, run ML inference,
+expose an external database / API / filesystem as a queryable catalog, or ship
+domain-specific functions to your team as a single binary.
+
+## Your first worker
+
+**1. Create a project and add the dependencies** (these are exactly what the
+example below needs):
+
+```toml
+# Cargo.toml
+[dependencies]
+vgi = "0.1"
+vgi-rpc = "0.2"
+arrow-array = "58"
+arrow-schema = "58"
+```
+
+**2. Write a function and serve it:**
 
 ```rust
+// src/main.rs
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, ArrayRef, RecordBatch, StringArray};
@@ -71,50 +104,99 @@ fn main() {
 }
 ```
 
-Then from any DuckDB-compatible engine:
+**3. Build it:**
+
+```sh
+cargo build --release
+```
+
+**4. Call it from DuckDB.** You need a DuckDB-compatible engine — stock
+[`duckdb`](https://duckdb.org/docs/installation/) works. Start a session **from
+your project directory** and:
 
 ```sql
-INSTALL vgi FROM community; LOAD vgi;      -- first time only
+INSTALL vgi FROM community;   -- first time only: pulls the `vgi` extension
+LOAD vgi;
+
+-- DuckDB LAUNCHES the worker for you. LOCATION is the command it runs;
+-- the alias 'demo' is what you qualify functions with in SQL.
 ATTACH 'demo' (TYPE vgi, LOCATION './target/release/my-worker');
+
 SELECT demo.main.upper_case(name) FROM (VALUES ('alice'), ('bob')) t(name);
 -- ALICE
 -- BOB
+
+-- Or drop the prefix:
+USE demo;
+SELECT main.upper_case('hello');   -- HELLO
 ```
+
+> **`LOCATION` gotcha:** the path is resolved relative to the DuckDB process's
+> working directory, not your project. If the worker isn't found, use an absolute
+> path (e.g. `LOCATION '/abs/path/to/target/release/my-worker'`).
+
+That's it — a native-speed SQL function, shipped as one static binary, with no
+extension to compile.
 
 ## Function types
 
-| Type | Trait | Use case |
-|------|-------|----------|
-| Scalar | `ScalarFunction` | Per-row transforms (1:1) |
-| Table | `TableFunction` | Generate / scan data |
-| Table-In-Out | `TableInOutFunction` | Streaming transforms |
-| Table-Buffering | `TableBufferingFunction` | Aggregate-then-emit (sink → combine → source) |
-| Aggregate | `AggregateFunction` | Grouped / window / streaming aggregates |
+Register any mix of these via the typed traits in [`vgi`](https://docs.rs/vgi):
 
-Beyond functions, `Worker::set_catalog` exposes full catalogs — schemas,
-function-backed tables, views, and macros — with constraints, column statistics,
-time travel (`AT`), and secondary catalogs attachable by name. Projection &
-filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets, bearer auth,
-and a cross-process state store are handled for you.
+| Type | Trait | SQL pattern | Use case |
+|------|-------|-------------|----------|
+| **Scalar** | `ScalarFunction` | `SELECT f(col) FROM t` | Per-row transforms (1:1) |
+| **Table** | `TableFunction` | `SELECT * FROM f(args)` | Generate / scan data |
+| **Table-In-Out** | `TableInOutFunction` | `SELECT * FROM f((SELECT …))` | Streaming transforms |
+| **Table-Buffering** | `TableBufferingFunction` | `SELECT * FROM f((SELECT …))` | Aggregate-then-emit (sink → combine → source) |
+| **Aggregate** | `AggregateFunction` | `SELECT f(col) … GROUP BY …` | Grouped / window / streaming aggregates |
+
+Each trait is small: `name`, `metadata`, `argument_specs`, an `on_bind` to resolve
+the output schema, and `process` (or the buffering / aggregate lifecycle methods).
+Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets
+(two-phase bind), bearer auth, and a cross-process state store are handled for you.
+
+## Beyond functions: full catalogs
+
+`Worker::set_catalog` exposes a complete catalog — schemas, function-backed
+**tables**, **views**, and **macros** — with constraints, column statistics, time
+travel (`AT`), and secondary catalogs attachable by name:
+
+```sql
+ATTACH 'external_db' (TYPE vgi, LOCATION './my-catalog-worker');
+
+SELECT * FROM external_db.main.users;            -- a function-backed table
+SELECT * FROM external_db.analytics.daily_view;  -- a view
+SELECT external_db.main.transform(col) FROM t;   -- a function
+```
+
+A worker can act as a bridge — databases, APIs, filesystems — presented to DuckDB
+as native catalogs.
 
 ## Transports
 
-Selected from argv by [`Worker::run`]: **stdio** (default), **Unix socket**
-(`--unix <path>`, the launcher contract), and **HTTP** (`--http`, Arrow-IPC over
-HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
+`Worker::run` picks the transport from argv:
+
+- **stdio** (default) — DuckDB spawns the worker per query. Nothing to configure.
+- **Unix socket** (`--unix <path>`) — one long-lived worker (the launcher contract).
+- **HTTP** (`--http`) — Arrow-IPC over HTTP with AEAD-sealed stateless stream
+  tokens and optional bearer auth.
+
+## Where to go next
+
+- **[Getting Started](https://github.com/Query-farm/vgi-rust/blob/main/docs/getting-started.md)** — the full first-worker walkthrough.
+- **[API docs (docs.rs)](https://docs.rs/vgi)** — every trait and type.
+- **[Example worker](https://github.com/Query-farm/vgi-rust/tree/main/vgi-example-worker)** — a fixture worker exercising every function kind and full catalogs.
 
 ## Status
 
 Verified against the canonical VGI C++ integration suite across all three
 transports — subprocess, launcher, and HTTP (8176 / 7774 assertions on
-subprocess / HTTP, 0 failures). See the
-[repository](https://github.com/Query-farm/vgi-rust) for a complete fixture
-worker exercising every function kind.
+subprocess / HTTP, 0 failures).
 
 ## License
 
 Query Farm Source-Available License v1.0 — see [LICENSE](https://github.com/Query-farm/vgi-rust/blob/main/LICENSE).
-Free for use, modification, and redistribution including in production; a
-separate commercial license is required only to offer a *competing* VGI product.
-Each release converts to Apache-2.0 ten years after its publication.
+Free for use, modification, and redistribution including in production; a separate
+commercial license is required only to offer a *competing* VGI product. Each
+release converts to Apache-2.0 ten years after its publication.
 Copyright © 2025, 2026 Query Farm LLC.

@@ -38,6 +38,9 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --all-features
 
+      - name: cargo test --doc (vgi)
+        run: cargo test --doc -p vgi --all-features
+
       - name: cargo doc (vgi)
         run: cargo doc -p vgi --no-deps --all-features
         env:

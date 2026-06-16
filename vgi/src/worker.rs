@@ -16,7 +16,35 @@ pub const VGI_PROTOCOL_VERSION: &str = "1.0.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 
-/// A VGI worker. Register functions, then `run()` to serve.
+/// A VGI worker: the process DuckDB launches and talks to.
+///
+/// Build one with [`Worker::new`], register one or more functions
+/// ([`register_scalar`](Self::register_scalar),
+/// [`register_table`](Self::register_table),
+/// [`register_aggregate`](Self::register_aggregate), …) and/or a catalog
+/// ([`set_catalog`](Self::set_catalog)), then call [`run`](Self::run) to serve.
+/// `run` does not return — it serves until DuckDB disconnects.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vgi::Worker;
+/// # use vgi::{ArgSpec, FunctionMetadata, ProcessParams, ScalarFunction};
+/// # use vgi_rpc::Result;
+/// # struct UpperCase;
+/// # impl ScalarFunction for UpperCase {
+/// #     fn name(&self) -> &str { "upper_case" }
+/// #     fn metadata(&self) -> FunctionMetadata { Default::default() }
+/// #     fn argument_specs(&self) -> Vec<ArgSpec> { vec![] }
+/// #     fn process(&self, _p: &ProcessParams, b: &arrow_array::RecordBatch)
+/// #         -> Result<arrow_array::RecordBatch> { Ok(b.clone()) }
+/// # }
+/// fn main() {
+///     let mut worker = Worker::new();
+///     worker.register_scalar(UpperCase);
+///     worker.run(); // never returns
+/// }
+/// ```
 pub struct Worker {
     disp: Dispatcher,
     server_id: Option<String>,
@@ -29,8 +57,12 @@ impl Default for Worker {
 }
 
 impl Worker {
-    /// New worker serving the catalog named by `VGI_WORKER_CATALOG_NAME`
-    /// (default `example`).
+    /// Create a worker.
+    ///
+    /// The catalog name DuckDB sees in `ATTACH 'name' (TYPE vgi, …)` defaults to
+    /// `example` and can be overridden with the `VGI_WORKER_CATALOG_NAME`
+    /// environment variable. (In SQL you qualify functions by the *alias* you
+    /// give `ATTACH`, not by this internal name.)
     pub fn new() -> Self {
         let catalog_name =
             std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".to_string());
@@ -123,7 +155,17 @@ impl Worker {
         srv
     }
 
-    /// Parse argv and serve over the selected transport.
+    /// Parse `argv` and serve over the selected transport, blocking until the
+    /// connection closes.
+    ///
+    /// DuckDB launches the worker with the right flags; you normally just call
+    /// `run()` from `main`. The transport is chosen from `argv`:
+    ///
+    /// - *(none)* — **stdio** (the default).
+    /// - `--unix <path>` — **Unix-socket** launcher transport
+    ///   (`--idle-timeout <secs>` optional; Unix only).
+    /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Bearer auth is
+    ///   enabled by setting `VGI_BEARER_TOKENS` (`token=principal,…`).
     pub fn run(self) {
         let args: Vec<String> = std::env::args().collect();
         let server = Arc::new(self.build_server());

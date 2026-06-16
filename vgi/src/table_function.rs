@@ -26,6 +26,9 @@ pub struct TableCardinality {
 /// for `client_log` — do NOT emit through it (the adapter emits the returned
 /// batch).
 pub trait TableProducer: Send {
+    /// Produce the next output batch, or `None` when the scan is exhausted.
+    /// Called repeatedly until it returns `None`. `out` is for `client_log`
+    /// only — return the batch, do not emit through `out`.
     fn next_batch(
         &mut self,
         out: &mut vgi_rpc::OutputCollector,
@@ -54,10 +57,81 @@ pub trait TableProducer: Send {
     fn on_dynamic_filters(&mut self, _filters: Option<&crate::pushdown::PushdownFilters>) {}
 }
 
-/// A table (producer) VGI function.
+/// A table (producer) VGI function: generates rows with no row input.
+///
+/// A table function is a *factory*: at bind time it resolves an output schema
+/// ([`on_bind`](Self::on_bind)), and for each execution it builds a
+/// [`TableProducer`] ([`producer`](Self::producer)) that yields output batches
+/// until exhausted. Implement [`name`](Self::name), [`metadata`](Self::metadata),
+/// [`argument_specs`](Self::argument_specs), [`on_bind`](Self::on_bind), and
+/// [`producer`](Self::producer); everything else (cardinality, statistics,
+/// parallelism, secrets) has a default. Projection and pushed-down filters are
+/// applied to each emitted batch by the framework, so producers don't handle
+/// them. Register with [`Worker::register_table`](crate::Worker::register_table).
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+/// use arrow_schema::{DataType, Field, Schema, SchemaRef};
+/// use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
+/// use vgi::table_function::{TableFunction, TableProducer};
+/// use vgi_rpc::{OutputCollector, Result, RpcError};
+///
+/// /// `count_to(n)` — emit a single `value` column 0..n.
+/// struct CountTo;
+///
+/// struct CountProducer {
+///     schema: SchemaRef,
+///     n: i64,
+///     done: bool,
+/// }
+///
+/// impl TableProducer for CountProducer {
+///     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+///         if self.done {
+///             return Ok(None);
+///         }
+///         self.done = true;
+///         let col: ArrayRef = Arc::new((0..self.n).collect::<Int64Array>());
+///         let batch = RecordBatch::try_new(self.schema.clone(), vec![col])
+///             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+///         Ok(Some(batch))
+///     }
+/// }
+///
+/// impl TableFunction for CountTo {
+///     fn name(&self) -> &str {
+///         "count_to"
+///     }
+///     fn metadata(&self) -> FunctionMetadata {
+///         FunctionMetadata::default()
+///     }
+///     fn argument_specs(&self) -> Vec<ArgSpec> {
+///         vec![ArgSpec::const_arg("n", 0, "int64", "Upper bound (exclusive)")]
+///     }
+///     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+///         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]));
+///         Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+///     }
+///     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+///         Ok(Box::new(CountProducer {
+///             schema: params.output_schema.clone(),
+///             n: params.arguments.const_i64(0).unwrap_or(0),
+///             done: false,
+///         }))
+///     }
+/// }
+/// ```
 pub trait TableFunction: Send + Sync {
+    /// The SQL name this table function is exposed as (e.g. `"count_to"`).
     fn name(&self) -> &str;
+    /// Optimizer- and discovery-facing properties. Start from
+    /// [`FunctionMetadata::default`].
     fn metadata(&self) -> FunctionMetadata;
+    /// The argument list, built with the [`ArgSpec`] constructors.
     fn argument_specs(&self) -> Vec<ArgSpec>;
     /// Resolve the output schema from bind-time arguments.
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse>;

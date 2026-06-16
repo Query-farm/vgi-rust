@@ -319,10 +319,70 @@ pub struct ProcessParams {
     pub at_value: Option<String>,
 }
 
-/// A scalar VGI function: 1:1 row mapping, single `result` output column.
+/// A scalar VGI function: one output row per input row.
+///
+/// A scalar function receives a [`RecordBatch`](arrow_array::RecordBatch) of its
+/// argument columns and returns a single-column batch (the column is named
+/// `result`) with the same number of rows. Implement [`name`](Self::name),
+/// [`metadata`](Self::metadata), [`argument_specs`](Self::argument_specs), and
+/// [`process`](Self::process); [`on_bind`](Self::on_bind) has a sensible default
+/// and is only overridden when the return type is computed from the argument
+/// types. Register the function with
+/// [`Worker::register_scalar`](crate::Worker::register_scalar).
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_array::{cast::AsArray, ArrayRef, RecordBatch, StringArray};
+/// use arrow_schema::DataType;
+/// use vgi::{ArgSpec, FunctionMetadata, ProcessParams, ScalarFunction};
+/// use vgi_rpc::{Result, RpcError};
+///
+/// struct UpperCase;
+///
+/// impl ScalarFunction for UpperCase {
+///     fn name(&self) -> &str {
+///         "upper_case"
+///     }
+///
+///     fn metadata(&self) -> FunctionMetadata {
+///         FunctionMetadata {
+///             description: "Uppercase a string".into(),
+///             return_type: Some(DataType::Utf8),
+///             ..Default::default()
+///         }
+///     }
+///
+///     fn argument_specs(&self) -> Vec<ArgSpec> {
+///         vec![ArgSpec::column("value", 0, "varchar", "String to uppercase")]
+///     }
+///
+///     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+///         let col = batch.column(0).as_string::<i32>();
+///         let out: ArrayRef = Arc::new(
+///             col.iter().map(|v| v.map(str::to_uppercase)).collect::<StringArray>(),
+///         );
+///         RecordBatch::try_new(params.output_schema.clone(), vec![out])
+///             .map_err(|e| RpcError::runtime_error(e.to_string()))
+///     }
+/// }
+/// ```
 pub trait ScalarFunction: Send + Sync {
+    /// The SQL name this function is exposed as (e.g. `"upper_case"`). Multiple
+    /// impls may share a name to form a typed overload set.
     fn name(&self) -> &str;
+
+    /// Optimizer- and discovery-facing properties: description, return type,
+    /// stability, null handling, and pushdown opt-ins. Start from
+    /// [`FunctionMetadata::default`] and set only what you need.
     fn metadata(&self) -> FunctionMetadata;
+
+    /// The argument list, built with the [`ArgSpec`] constructors
+    /// ([`column`](ArgSpec::column), [`const_arg`](ArgSpec::const_arg), …).
+    /// Positions are 0-based and match the columns read in
+    /// [`process`](Self::process).
     fn argument_specs(&self) -> Vec<ArgSpec>;
     /// Secret lookups to request at bind (two-phase secret resolution). When
     /// non-empty and secrets are not yet resolved, `bind` returns these and the
@@ -332,6 +392,8 @@ pub trait ScalarFunction: Send + Sync {
     }
     /// Resolve the output schema. Default: a `result` column whose type is the
     /// metadata `return_type` if fixed, else the first input field's type.
+    /// Override to compute the return type from the argument types, returning
+    /// [`BindResponse::result`] with the chosen type.
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
         if let Some(ty) = self.metadata().return_type {
             return Ok(BindResponse::result(ty));
@@ -343,8 +405,13 @@ pub trait ScalarFunction: Send + Sync {
             .unwrap_or(DataType::Int64);
         Ok(BindResponse::result(ty))
     }
-    /// Transform one input batch into a single-column output batch with the
+    /// Transform one input batch into a single-column `result` batch with the
     /// same row count.
+    ///
+    /// Build the output against [`ProcessParams::output_schema`] (the schema
+    /// chosen at bind). Const arguments are available via
+    /// [`ProcessParams::arguments`]; column arguments arrive as the columns of
+    /// `batch`, in [`argument_specs`](Self::argument_specs) order.
     fn process(
         &self,
         params: &ProcessParams,
