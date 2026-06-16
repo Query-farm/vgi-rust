@@ -12,6 +12,8 @@ mod aggregate;
 mod attach_options;
 mod buffering;
 mod catalog_def;
+#[cfg(feature = "coverage")]
+mod coverage;
 mod scalar;
 mod table;
 mod table_in_out;
@@ -19,6 +21,11 @@ mod table_in_out;
 use vgi::Worker;
 
 fn main() {
+    // Coverage build only: start periodic .profraw snapshots so a worker the
+    // harness kills abruptly still records what it exercised.
+    #[cfg(feature = "coverage")]
+    coverage::start();
+
     // Logs go to stderr — stdout is the Arrow-IPC channel.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().filter_or("VGI_LOG", "info"))
         .format_timestamp_millis()

@@ -14,6 +14,13 @@ publish = false
 name = "vgi-example-worker"
 path = "src/main.rs"
 
+[features]
+# Periodically flush LLVM coverage counters so a worker the integration suite
+# kills abruptly (the pooled launcher / long-lived http workers) still leaves a
+# .profraw. Calls the profiling runtime's own writer via FFI, so it must be
+# built with `-Cinstrument-coverage` (which links that runtime).
+coverage = []
+
 [dependencies]
 vgi = { path = "../vgi" }
 vgi-rpc = { workspace = true }

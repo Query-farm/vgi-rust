@@ -94,3 +94,68 @@ jobs:
         env:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           TRANSPORT: ${{ matrix.transport }}
+
+  # Measure what the VGI integration suite exercises in the worker. Linux only,
+  # over the launcher lane (pooled workers = less time spawning, and it covers
+  # the launcher/pool code paths too). The instrumented worker flushes coverage
+  # periodically (the `coverage` feature) so the pool teardown doesn't lose it.
+  coverage:
+    name: coverage (worker / Linux launcher)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout pinned vgi test suite
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: ${{ env.VGI_REF }}
+          path: vgi-upstream
+
+      - name: Install Rust toolchain (MSRV 1.86) + llvm-tools
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Build instrumented worker
+        run: cargo build --release -p vgi-example-worker --features coverage
+        env:
+          RUSTFLAGS: -Cinstrument-coverage
+
+      - name: Download + extract haybarn-unittest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$HAYBARN_RELEASE" --repo Query-farm-haybarn/haybarn \
+            --pattern 'haybarn_unittest-linux-amd64.zip' --output hb.zip --clobber
+          python3 -c "import zipfile; zipfile.ZipFile('hb.zip').extractall('hb')"
+          ut="$(find hb -type f -name 'haybarn-unittest' | head -1)"
+          chmod +x "$ut"
+          echo "HAYBARN_UNITTEST=$(cd "$(dirname "$ut")" && pwd)/$(basename "$ut")" >> "$GITHUB_ENV"
+
+      - name: Run integration suite (launcher) with coverage
+        shell: bash
+        run: ci/run-integration.sh
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-upstream
+          VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
+          TRANSPORT: launch
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/worker-%p.profraw
+
+      - name: Merge + report coverage
+        if: always()
+        shell: bash
+        run: ci/coverage-report.sh "${{ github.workspace }}/target/release/vgi-example-worker" "${{ github.workspace }}/covdata" "${{ github.workspace }}/coverage"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-coverage
+          path: coverage/

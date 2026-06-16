@@ -47,6 +47,21 @@ Dropped at staging (covered by the locally-built `unittest` in the `vgi` repo):
   predicate's WKT differently under the prebuilt DuckDB/spatial build.
 - http lane only: `projection_pushdown_repro.test`, `dynamic_filter.test`.
 
+## Worker coverage
+
+The `coverage` job (Linux only) measures **what the integration suite actually
+exercises in the worker** — untested code is a gap in the suite. It builds the
+worker with `-Cinstrument-coverage` + the `coverage` feature, runs the launcher
+lane, merges the per-worker `.profraw` files, and reports `vgi`-SDK coverage
+(`ci/coverage-report.sh`); the `lcov` + text report upload as the
+`worker-coverage` artifact, and a digest lands in the job summary.
+
+The launcher / http workers are killed at teardown without a clean exit, so the
+LLVM `atexit` profile writer never runs. The `coverage` feature
+(`vgi-example-worker/src/coverage.rs`) works around this: a background thread
+periodically calls the profiling runtime's `__llvm_profile_write_file`, so each
+worker's latest counters are on disk whenever it dies.
+
 ## Version pinning
 
 `integration.yml` pins `VGI_REF` (the `Query-farm/vgi` commit whose suite runs)
