@@ -1943,29 +1943,38 @@ impl Dispatcher {
         out
     }
 
+    /// Decode the length-prefixed state map written by [`Self::ser_state_map`].
+    ///
+    /// Defensive against truncation/corruption: this blob lives in the
+    /// cross-process file store (`$TMPDIR/...`), so a partial write, a disk
+    /// fault, or a stale file could hand us a malformed buffer. Every read is
+    /// bounds-checked; on any short/garbage length we stop and return what
+    /// parsed cleanly rather than panicking (which on stdio would otherwise be
+    /// converted to an opaque "handler panicked" RPC error).
     fn de_state_map(b: &[u8]) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
         let mut m = std::collections::HashMap::new();
-        let rd = |b: &[u8], off: &mut usize, n: usize| -> Vec<u8> {
-            let s = b[*off..*off + n].to_vec();
-            *off += n;
-            s
+        // Read `n` bytes at `*off`, advancing it; None if the slice is short.
+        let rd = |b: &[u8], off: &mut usize, n: usize| -> Option<Vec<u8>> {
+            let end = off.checked_add(n)?;
+            let s = b.get(*off..end)?.to_vec();
+            *off = end;
+            Some(s)
         };
-        if b.len() < 8 {
-            return m;
-        }
+        // Read an 8-byte little-endian length at `*off`, advancing it.
+        let rd_len = |b: &[u8], off: &mut usize| -> Option<usize> {
+            let raw = rd(b, off, 8)?;
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            Some(u64::from_le_bytes(arr) as usize)
+        };
         let mut off = 0usize;
-        let count = u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize;
-        off += 8;
+        let Some(count) = rd_len(b, &mut off) else {
+            return m;
+        };
         for _ in 0..count {
-            if off + 8 > b.len() {
-                break;
-            }
-            let kl = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize;
-            off += 8;
-            let k = rd(b, &mut off, kl);
-            let vl = u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize;
-            off += 8;
-            let v = rd(b, &mut off, vl);
+            let Some(kl) = rd_len(b, &mut off) else { break };
+            let Some(k) = rd(b, &mut off, kl) else { break };
+            let Some(vl) = rd_len(b, &mut off) else { break };
+            let Some(v) = rd(b, &mut off, vl) else { break };
             m.insert(k, v);
         }
         m
@@ -2001,13 +2010,13 @@ impl Dispatcher {
         let pkc = self
             .store
             .kv_get(&dto.execution_id.0, b"strm_pkc")
-            .map(|b| i64::from_le_bytes(b[..8].try_into().unwrap()) as usize)
-            .unwrap_or(0);
+            .and_then(|b| read_le_i64(&b))
+            .unwrap_or(0) as usize;
         let okc = self
             .store
             .kv_get(&dto.execution_id.0, b"strm_okc")
-            .map(|b| i64::from_le_bytes(b[..8].try_into().unwrap()) as usize)
-            .unwrap_or(0);
+            .and_then(|b| read_le_i64(&b))
+            .unwrap_or(0) as usize;
         let output_schema = self
             .store
             .kv_get(&dto.execution_id.0, b"strm_sos")
@@ -2248,6 +2257,14 @@ impl vgi_rpc::ProducerState for TableProducerState {
 // ---------------------------------------------------------------------------
 
 /// Read a "boxed" DTO from the `request` binary column (IPC stream).
+/// Read a little-endian `i64` from the first 8 bytes of a store value, or
+/// `None` if the buffer is shorter. Store blobs come off disk and could be
+/// truncated/corrupt, so slicing `b[..8]` directly would risk a panic.
+fn read_le_i64(b: &[u8]) -> Option<i64> {
+    let arr: [u8; 8] = b.get(..8)?.try_into().ok()?;
+    Some(i64::from_le_bytes(arr))
+}
+
 fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
     let col = req
         .column("request")
@@ -2467,5 +2484,70 @@ mod buffering_schema_tests {
         assert!(d
             .buffering_output_schema(&exec, &FixedOutput, None)
             .is_err());
+    }
+}
+
+// Defensive-decoding tests: the streaming state blob and the small int store
+// values live in the on-disk cross-process store, so a truncated write or a
+// corrupt file must degrade to a default — never panic (which on stdio becomes
+// an opaque "handler panicked" error, and over HTTP a bare 500).
+#[cfg(test)]
+mod malformed_input_tests {
+    use super::*;
+
+    #[test]
+    fn de_state_map_roundtrips() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(b"k1".to_vec(), b"value-one".to_vec());
+        m.insert(b"".to_vec(), b"".to_vec());
+        m.insert(vec![0xff, 0x00, 0xfe], vec![1, 2, 3, 4]);
+        let enc = Dispatcher::ser_state_map(&m);
+        assert_eq!(Dispatcher::de_state_map(&enc), m);
+    }
+
+    #[test]
+    fn de_state_map_tolerates_truncation_at_every_offset() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(b"alpha".to_vec(), b"beta".to_vec());
+        m.insert(b"gamma".to_vec(), b"delta".to_vec());
+        let enc = Dispatcher::ser_state_map(&m);
+        // Cutting the buffer at any length must not panic; it returns whatever
+        // prefix decoded cleanly (a subset of the original entries).
+        for n in 0..=enc.len() {
+            let got = Dispatcher::de_state_map(&enc[..n]);
+            for (k, v) in &got {
+                assert_eq!(m.get(k), Some(v), "decoded a key/value that was never encoded");
+            }
+        }
+    }
+
+    #[test]
+    fn de_state_map_rejects_garbage_lengths() {
+        // count = 1, then a key length of u64::MAX with no payload.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&1u64.to_le_bytes());
+        bad.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Dispatcher::de_state_map(&bad).is_empty());
+
+        // Random short buffers of every small length must not panic.
+        for len in 0..20usize {
+            let buf: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let _ = Dispatcher::de_state_map(&buf);
+        }
+    }
+
+    #[test]
+    fn read_le_i64_is_bounds_safe() {
+        assert_eq!(read_le_i64(&7i64.to_le_bytes()), Some(7));
+        assert_eq!(read_le_i64(&(-1i64).to_le_bytes()), Some(-1));
+        // A value longer than 8 bytes reads the first 8.
+        let mut long = 42i64.to_le_bytes().to_vec();
+        long.extend_from_slice(b"trailing");
+        assert_eq!(read_le_i64(&long), Some(42));
+        // Anything shorter than 8 bytes is None, not a panic.
+        for n in 0..8usize {
+            assert_eq!(read_le_i64(&vec![0u8; n]), None);
+        }
+        assert_eq!(read_le_i64(&[]), None);
     }
 }

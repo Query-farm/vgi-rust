@@ -253,14 +253,10 @@ impl PushdownFilters {
         let mut lo: Option<i64> = None;
         let mut hi: Option<i64> = None;
         let val_i64 = |a: &ArrayRef| -> Option<i64> {
-            arrow_cast::cast(a, &arrow_schema::DataType::Int64)
-                .ok()
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<arrow_array::Int64Array>()
-                        .unwrap()
-                        .value(0)
-                })
+            let c = arrow_cast::cast(a, &arrow_schema::DataType::Int64).ok()?;
+            let arr = c.as_any().downcast_ref::<arrow_array::Int64Array>()?;
+            // A malformed/empty filter constant must not index row 0.
+            (!arr.is_empty() && arr.is_valid(0)).then(|| arr.value(0))
         };
         let mut stack: Vec<&FilterSpec> = self.specs.iter().collect();
         while let Some(spec) = stack.pop() {
