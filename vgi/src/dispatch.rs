@@ -487,12 +487,19 @@ impl Dispatcher {
             // The process/combine RPCs carry no schema and may run in a
             // different pooled worker, so persist the bound output schema
             // (which may differ from the input, e.g. sum_all_columns) to the
-            // file-backed store keyed by execution_id for them to read.
+            // file-backed store keyed by execution_id for them to read. Also
+            // persist the input schema so they can re-derive the output schema
+            // via on_bind should the stored copy be unreadable (see
+            // buffering_output_schema).
             self.store.kv_put(
                 &execution_id,
                 b"outsc",
                 &ipc::write_schema_ref(&output_schema)?,
             );
+            if let Some(insc) = input_schema.as_ref() {
+                self.store
+                    .kv_put(&execution_id, b"insc", &ipc::write_schema_ref(insc)?);
+            }
             // Persist named flags the process/combine RPCs need (e.g. `logging`),
             // since those RPCs carry no arguments and may run in another worker.
             self.store.kv_put(
@@ -1518,15 +1525,53 @@ impl Dispatcher {
     /// sink init to the file-backed store (process/combine carry no schema and
     /// may run in a different pooled worker). Falls back to `default` when no
     /// schema was persisted (e.g. echo-style functions where it is unused).
+    /// Resolve the bound output schema for a buffering process/combine RPC.
+    ///
+    /// Persisted at sink-init under `outsc`, but a process/combine RPC may land
+    /// on a different pooled worker that never wrote it (launcher transport).
+    /// On a store miss, recompute it deterministically by re-running the
+    /// function's `on_bind` with the same arguments and input schema sink-init
+    /// saw — the process batch's schema, or the persisted `insc` for combine.
+    ///
+    /// This never silently substitutes a possibly-wrong schema: the previous
+    /// behaviour fell back to the raw input schema, which is correct only when a
+    /// function's output type matches its input and silently breaks otherwise
+    /// (e.g. sum_all_columns, whose DECIMAL inputs map to FLOAT64 output —
+    /// `sum_column` then rejected the unexpected DECIMAL type). If no input
+    /// schema is available to rebind from, fail loudly rather than guess.
     fn buffering_output_schema(
         &self,
         execution_id: &[u8],
-        default: arrow_schema::SchemaRef,
-    ) -> arrow_schema::SchemaRef {
-        self.store
+        f: &dyn TableBufferingFunction,
+        input_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Result<arrow_schema::SchemaRef> {
+        if let Some(s) = self
+            .store
             .kv_get(execution_id, b"outsc")
             .and_then(|b| ipc::read_schema(&b).ok())
-            .unwrap_or(default)
+        {
+            return Ok(s);
+        }
+        let input_schema = input_schema.or_else(|| {
+            self.store
+                .kv_get(execution_id, b"insc")
+                .and_then(|b| ipc::read_schema(&b).ok())
+        });
+        let Some(input_schema) = input_schema else {
+            return Err(RpcError::runtime_error(
+                "table-buffering: bound output schema unavailable (sink-init state \
+                 not found on this worker and no input schema to rebind from)"
+                    .to_string(),
+            ));
+        };
+        let bind = f.on_bind(&BindParams {
+            input_schema: Some(input_schema),
+            arguments: self.buffering_arguments(execution_id, f),
+            attach_opaque_data: self.store.kv_get(execution_id, b"bufattach"),
+            storage: Some(self.store.clone()),
+            ..Default::default()
+        })?;
+        Ok(bind.output_schema)
     }
 
     /// Replay the buffering call arguments persisted by the sink init (the
@@ -1554,7 +1599,8 @@ impl Dispatcher {
         let dto: TableBufferingProcessRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
-        let output_schema = self.buffering_output_schema(&dto.execution_id.0, batch.schema());
+        let output_schema =
+            self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), Some(batch.schema()))?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
@@ -1594,8 +1640,7 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
         let f = self.resolve_buffering(&dto.function_name)?;
-        let output_schema = self
-            .buffering_output_schema(&dto.execution_id.0, Arc::new(arrow_schema::Schema::empty()));
+        let output_schema = self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), None)?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
@@ -2340,4 +2385,87 @@ fn normalize_function_type(t: &str) -> Option<String> {
     let lower = t.to_lowercase();
     let short = lower.strip_suffix("_function").unwrap_or(&lower);
     Some(short.to_string())
+}
+
+#[cfg(test)]
+mod buffering_schema_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    // A buffering function whose on_bind maps ANY input to a fixed FLOAT64 `s`
+    // column — output type deliberately differs from input, the case the old
+    // raw-input-schema fallback silently got wrong (sum_all_columns over DECIMAL).
+    struct FixedOutput;
+    impl crate::buffering::TableBufferingFunction for FixedOutput {
+        fn name(&self) -> &str {
+            "fixed_output"
+        }
+        fn metadata(&self) -> crate::function::FunctionMetadata {
+            Default::default()
+        }
+        fn argument_specs(&self) -> Vec<crate::function::ArgSpec> {
+            vec![]
+        }
+        fn on_bind(&self, _p: &BindParams) -> Result<crate::function::BindResponse> {
+            Ok(crate::function::BindResponse {
+                output_schema: Arc::new(Schema::new(vec![Field::new(
+                    "s",
+                    DataType::Float64,
+                    true,
+                )])),
+                opaque_data: Vec::new(),
+            })
+        }
+        fn process(
+            &self,
+            _p: &crate::buffering::BufferingParams,
+            _b: &arrow_array::RecordBatch,
+        ) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn combine(
+            &self,
+            _p: &crate::buffering::BufferingParams,
+            _s: &[Vec<u8>],
+        ) -> Result<Vec<Vec<u8>>> {
+            unimplemented!()
+        }
+        fn finalize_producer(
+            &self,
+            _p: &crate::buffering::BufferingParams,
+            _f: Vec<u8>,
+        ) -> Result<Box<dyn crate::table_function::TableProducer>> {
+            unimplemented!()
+        }
+    }
+
+    // On a store miss the output schema must be recomputed via on_bind from the
+    // input schema (FLOAT64 `s`), NOT fall back to the raw DECIMAL input.
+    #[test]
+    fn output_schema_recomputed_on_store_miss() {
+        let d = Dispatcher::new("test");
+        let exec = format!("test-recompute-{}", std::process::id()).into_bytes();
+        d.store.clear(&exec); // ensure no `outsc`/`insc` from a prior run
+        let decimal_input = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let out = d
+            .buffering_output_schema(&exec, &FixedOutput, Some(decimal_input))
+            .expect("recompute via on_bind");
+        assert_eq!(out.fields().len(), 1);
+        assert_eq!(out.field(0).data_type(), &DataType::Float64);
+    }
+
+    // No stored schema and no input to rebind from → fail loudly, never guess.
+    #[test]
+    fn output_schema_errors_without_any_input() {
+        let d = Dispatcher::new("test");
+        let exec = format!("test-error-{}", std::process::id()).into_bytes();
+        d.store.clear(&exec);
+        assert!(d
+            .buffering_output_schema(&exec, &FixedOutput, None)
+            .is_err());
+    }
 }
