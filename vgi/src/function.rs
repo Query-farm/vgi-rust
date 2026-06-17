@@ -260,7 +260,7 @@ pub struct BindParams {
     /// Sealed transaction state.
     pub transaction_opaque_data: Option<Vec<u8>>,
     /// Cross-process kv/work store (for transaction-scoped caching, etc.).
-    pub storage: Option<std::sync::Arc<crate::buffering::BufferingStore>>,
+    pub storage: Option<crate::storage::SharedStorage>,
 }
 
 /// Result of `on_bind`.
@@ -304,7 +304,7 @@ pub struct ProcessParams {
     /// Side join-keys IPC batches referenced by `join_keys` filters.
     pub join_keys: Vec<Vec<u8>>,
     /// Cross-process work-queue / kv store (for parallel-scan producers).
-    pub storage: Option<std::sync::Arc<crate::buffering::BufferingStore>>,
+    pub storage: Option<crate::storage::SharedStorage>,
     /// ORDER BY pushdown hints.
     pub order_by_column: Option<String>,
     pub order_by_direction: Option<String>,

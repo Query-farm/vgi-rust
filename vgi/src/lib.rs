@@ -133,6 +133,7 @@ pub mod pushdown;
 pub mod secrets;
 pub mod settings;
 pub mod statistics;
+pub mod storage;
 pub mod table_function;
 pub mod table_in_out;
 pub mod transport;

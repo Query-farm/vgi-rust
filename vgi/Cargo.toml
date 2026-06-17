@@ -15,6 +15,14 @@ categories = ["database", "api-bindings"]
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+default = ["sqlite"]
+# Durable single-file SQLite storage backend (bundles libsqlite3 — compiles C).
+sqlite = ["dep:rusqlite"]
+# HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
+# deployments (e.g. fly.io) where workers share one durable store.
+http-storage = []
+
 [dependencies]
 vgi-rpc = { workspace = true }
 arrow = { workspace = true }
@@ -32,6 +40,9 @@ serde_json = { workspace = true }
 log = { workspace = true }
 ctrlc = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+# SQLite storage backend (feature `sqlite`). `bundled` compiles a vendored
+# libsqlite3 so there is no system dependency; this is the one C-compiled dep.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 # Unix-only: used to namespace the cross-process store base dir by uid (so users
 # sharing a /tmp don't collide) and to chmod it 0o700. `libc` is pure Rust (extern

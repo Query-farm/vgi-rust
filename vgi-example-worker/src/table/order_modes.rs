@@ -4,17 +4,14 @@
 //! three `partitioned_*` order-preservation-mode variants. All push (start,
 //! end) work items at `on_init` and emit `n = idx * increment` in 1k batches.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use vgi::buffering::BufferingStore;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
-static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 const BATCH_SIZE: i64 = 1000;
 
 pub fn register(w: &mut vgi::Worker) {
@@ -50,9 +47,8 @@ fn schema_n() -> SchemaRef {
 
 struct QueueSeqProducer {
     schema: SchemaRef,
-    storage: Arc<BufferingStore>,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
-    claim_tag: String,
     increment: i64,
     cur: Option<(i64, i64)>, // (idx, end)
 }
@@ -60,7 +56,7 @@ impl TableProducer for QueueSeqProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         loop {
             if self.cur.is_none() {
-                match self.storage.queue_pop(&self.execution_id, &self.claim_tag) {
+                match self.storage.queue_pop(&self.execution_id) {
                     None => return Ok(None),
                     Some(data) => {
                         let g = |o: usize| {
@@ -200,16 +196,10 @@ impl TableFunction for QueueSeqFunction {
         } else {
             1
         };
-        let tag = format!(
-            "{}_{}",
-            std::process::id(),
-            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
         Ok(Box::new(QueueSeqProducer {
             schema: schema_n(),
             storage,
             execution_id: params.execution_id.clone(),
-            claim_tag: tag,
             increment,
             cur: None,
         }))

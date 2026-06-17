@@ -168,7 +168,7 @@ pub trait TableFunction: Send + Sync {
     fn dynamic_to_string(
         &self,
         _global_execution_id: &[u8],
-        _storage: &crate::buffering::BufferingStore,
+        _storage: &dyn crate::storage::FunctionStorage,
     ) -> Vec<(String, String)> {
         Vec::new()
     }

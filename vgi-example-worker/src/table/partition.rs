@@ -5,18 +5,15 @@
 //! partitioned aggregates.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use vgi::buffering::BufferingStore;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::partition::partition_field;
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
-static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::CountrySales);
@@ -291,15 +288,14 @@ impl PartitionFunction {
 struct PartitionProducer {
     kind: PartitionFunction,
     schema: SchemaRef,
-    storage: Arc<BufferingStore>,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
-    claim_tag: String,
     rows: i64,
     meta: Option<HashMap<String, String>>,
 }
 impl TableProducer for PartitionProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
-        let Some(item) = self.storage.queue_pop(&self.execution_id, &self.claim_tag) else {
+        let Some(item) = self.storage.queue_pop(&self.execution_id) else {
             return Ok(None);
         };
         let mut a = [0u8; 8];
@@ -374,17 +370,11 @@ impl TableFunction for PartitionFunction {
             .storage
             .clone()
             .ok_or_else(|| RpcError::runtime_error("partition fixture requires storage"))?;
-        let tag = format!(
-            "{}_{}",
-            std::process::id(),
-            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
         Ok(Box::new(PartitionProducer {
             kind: *self,
             schema: self.schema(),
             storage,
             execution_id: params.execution_id.clone(),
-            claim_tag: tag,
             rows: self.rows(params),
             meta: None,
         }))

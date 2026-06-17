@@ -283,7 +283,7 @@ impl TableFunction for ProfilingDemoFunction {
     fn dynamic_to_string(
         &self,
         global_execution_id: &[u8],
-        storage: &vgi::buffering::BufferingStore,
+        storage: &dyn vgi::storage::FunctionStorage,
     ) -> Vec<(String, String)> {
         let snap = storage.kv_get(global_execution_id, b"profiling");
         let (rows, batches, start_ns) = match snap {
@@ -308,7 +308,7 @@ struct ProfilingProducer {
     offset: usize,
     batch_size: usize,
     schema: SchemaRef,
-    store: Option<Arc<vgi::buffering::BufferingStore>>,
+    store: Option<Arc<dyn vgi::storage::FunctionStorage>>,
     exec: Vec<u8>,
     rows: u64,
     batches: u64,

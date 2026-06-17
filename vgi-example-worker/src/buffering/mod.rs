@@ -51,7 +51,7 @@ const NS: &[u8] = b"buf";
 /// Drains a per-execution batch log, one batch per tick. An optional
 /// `error` makes the first tick fail (crash_on_finalize / exception_finalize).
 struct LogDrain {
-    storage: Arc<vgi::buffering::BufferingStore>,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
     ns: &'static [u8],
     after_id: i64,

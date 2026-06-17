@@ -16,8 +16,9 @@ use vgi_rpc::{
 };
 
 use crate::aggregate::{AggregateBindParams, AggregateFunction, GROUP_COLUMN_NAME};
-use crate::buffering::{BufferingParams, BufferingStore, TableBufferingFunction};
+use crate::buffering::{BufferingParams, TableBufferingFunction};
 use crate::catalog;
+use crate::storage::{default_storage, FunctionStorage};
 use crate::function::{BindParams, ProcessParams, ScalarFunction};
 use crate::ipc;
 use crate::protocol::dtos::*;
@@ -46,7 +47,7 @@ pub struct Dispatcher {
     /// Aggregate function registry.
     pub aggregates: HashMap<String, Vec<Arc<dyn AggregateFunction>>>,
     /// Shared cross-process state store (buffering + aggregate).
-    pub store: Arc<BufferingStore>,
+    pub store: Arc<dyn FunctionStorage>,
     /// Declarative catalog (views / macros / function-backed tables).
     pub catalog: catalog::CatalogModel,
     /// Additional catalogs this worker serves (MetaWorker model). Each is
@@ -74,7 +75,7 @@ impl Dispatcher {
             tableinouts: HashMap::new(),
             buffering: HashMap::new(),
             aggregates: HashMap::new(),
-            store: Arc::new(BufferingStore::new()),
+            store: default_storage(),
             catalog: catalog::CatalogModel::default(),
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
@@ -1319,7 +1320,7 @@ impl Dispatcher {
             .tables
             .get(&bind_call.function_name)
             .and_then(|v| v.first())
-            .map(|f| f.dynamic_to_string(&dto.global_execution_id.0, &self.store))
+            .map(|f| f.dynamic_to_string(&dto.global_execution_id.0, self.store.as_ref()))
             .unwrap_or_default();
         let (keys, values): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
         Ok(Some(wire::to_result_batch(DynamicToStringResponse {

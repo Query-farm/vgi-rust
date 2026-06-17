@@ -6,12 +6,10 @@
 //! so DuckDB's ordered sinks reassemble parallel output in partition order.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use vgi::buffering::BufferingStore;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
@@ -138,7 +136,6 @@ impl TableFunction for BrokenBatchIndexFunction {
 
 const BATCH_TAG: &str = "vgi_batch_index";
 const BATCH_SIZE: i64 = 1000;
-static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn batch_index_meta(desc: &str, projection: bool) -> FunctionMetadata {
     FunctionMetadata {
@@ -189,9 +186,8 @@ fn push_work(params: &ProcessParams, count: i64, chunk_size: i64) -> Result<()> 
 /// Producer that drains the shared work queue, one item's batches at a time.
 struct QueueProducer {
     schema: SchemaRef,
-    storage: Arc<BufferingStore>,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
-    claim_tag: String,
     marked: bool,
     // current item: (partition_id, idx, end, start)
     cur: Option<(i64, i64, i64, i64)>,
@@ -224,7 +220,7 @@ impl TableProducer for QueueProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         loop {
             if self.cur.is_none() {
-                match self.storage.queue_pop(&self.execution_id, &self.claim_tag) {
+                match self.storage.queue_pop(&self.execution_id) {
                     None => return Ok(None),
                     Some(data) => {
                         let (pid, start, end) = unpack_item(&data);
@@ -284,16 +280,10 @@ fn make_producer(
         .storage
         .clone()
         .ok_or_else(|| RpcError::runtime_error("batch_index requires storage"))?;
-    let tag = format!(
-        "{}_{}",
-        std::process::id(),
-        CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
     Ok(Box::new(QueueProducer {
         schema,
         storage,
         execution_id: params.execution_id.clone(),
-        claim_tag: tag,
         marked,
         cur: None,
         partition_id: 0,

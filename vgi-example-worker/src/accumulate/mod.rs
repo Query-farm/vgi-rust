@@ -312,7 +312,7 @@ impl TableProducer for BatchListProducer {
 
 /// Drains the execution-scoped output log (NS_OUT), one batch per tick.
 struct OutDrain {
-    storage: Arc<vgi::buffering::BufferingStore>,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
     after_id: i64,
     output_schema: SchemaRef,
@@ -338,7 +338,7 @@ impl TableProducer for OutDrain {
 /// Re-chunk `table` (a list of batches) into `≤ OUT_BATCH_ROWS` slices staged
 /// into the execution-scoped output log for the source phase to drain.
 fn stage_batches(
-    storage: &vgi::buffering::BufferingStore,
+    storage: &dyn vgi::storage::FunctionStorage,
     exec: &[u8],
     batches: &[RecordBatch],
 ) -> Result<()> {
@@ -496,10 +496,10 @@ impl TableBufferingFunction for AccumulateFunction {
             .unwrap_or("all")
         {
             "none" => {}
-            "new" => stage_batches(&params.storage, &params.execution_id, &[new_table])?,
+            "new" => stage_batches(params.storage.as_ref(), &params.execution_id, &[new_table])?,
             _ => {
                 let all = store.read_all(&scope, &name)?;
-                stage_batches(&params.storage, &params.execution_id, &all)?;
+                stage_batches(params.storage.as_ref(), &params.execution_id, &all)?;
             }
         }
         Ok(vec![params.execution_id.clone()])

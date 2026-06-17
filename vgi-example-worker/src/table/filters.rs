@@ -522,9 +522,8 @@ fn fep_schema() -> SchemaRef {
 
 struct FepProducer {
     schema: SchemaRef,
-    storage: std::sync::Arc<vgi::buffering::BufferingStore>,
+    storage: std::sync::Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
-    claim_tag: String,
     filter_str: String,
     pid: i64,
     cur: Option<(i64, i64)>,
@@ -533,7 +532,7 @@ impl TableProducer for FepProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         loop {
             if self.cur.is_none() {
-                match self.storage.queue_pop(&self.execution_id, &self.claim_tag) {
+                match self.storage.queue_pop(&self.execution_id) {
                     None => return Ok(None),
                     Some(data) => {
                         let g = |o: usize| {
@@ -638,7 +637,6 @@ impl TableFunction for FilterEchoPartitionedFunction {
             schema: fep_schema(),
             storage,
             execution_id: params.execution_id.clone(),
-            claim_tag: format!("{}_{}", std::process::id(), params.execution_id.len()),
             filter_str: pushed_filter_str(params),
             pid: std::process::id() as i64,
             cur: None,
