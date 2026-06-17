@@ -13,6 +13,7 @@ mod rff;
 mod settings_fixtures;
 mod static_scan;
 pub mod tt_pushdown;
+mod typed_probe;
 mod versioned_scan;
 
 use std::sync::Arc;
@@ -47,6 +48,7 @@ pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     tt_pushdown::register(w);
     rff::register(w);
     settings_fixtures::register(w);
+    typed_probe::register(w);
     // The versioned_tables catalog's per-table scan helpers only belong to
     // that catalog's function surface.
     if catalog_name == "versioned_tables" {

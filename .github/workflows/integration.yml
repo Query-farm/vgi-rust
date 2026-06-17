@@ -26,7 +26,7 @@ env:
   # The Query-farm/vgi commit whose test/sql/integration suite we run. Pinned for
   # reproducibility; bump deliberately and re-validate against the then-current
   # community extension (see ci/README.md).
-  VGI_REF: 3e4b68da081cae8215018221092e2408f100766a
+  VGI_REF: 281941479114b52b4a8a2e2d7acdf522bcc8a14b
   # The Haybarn release providing the prebuilt haybarn-unittest binary. Must be
   # ABI-compatible with the community-published vgi extension.
   HAYBARN_RELEASE: haybarn-v1.5.3-rc7
