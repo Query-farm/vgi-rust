@@ -41,18 +41,118 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
+/// Owner of the store tree, used to namespace the base dir. On unix this is the
+/// real uid; elsewhere temp dirs are already per-user, so a fixed token is fine.
+fn process_uid() -> String {
+    #[cfg(unix)]
+    {
+        // Safe: getuid() is always successful and has no preconditions.
+        (unsafe { libc::getuid() }).to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        "user".to_string()
+    }
+}
+
+/// Restrict a directory to owner-only (0o700) so other users on a shared host
+/// can't traverse into (and read) buffered state, which may be secret-derived.
+/// No-op on non-unix, where the temp dir is already per-user.
+fn harden_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn orphan_ttl() -> std::time::Duration {
+    let secs = std::env::var("VGI_BUFFERING_STORE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ORPHAN_TTL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Most recent modification time found anywhere in `path`'s subtree (including
+/// `path` itself), or `None` if nothing could be stat'd.
+fn newest_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let m = if p.is_dir() {
+                newest_mtime(&p)
+            } else {
+                std::fs::metadata(&p).and_then(|m| m.modified()).ok()
+            };
+            if let Some(t) = m {
+                newest = Some(newest.map_or(t, |cur| cur.max(t)));
+            }
+        }
+    }
+    newest
+}
+
 impl Default for BufferingStore {
     fn default() -> Self {
         BufferingStore::new()
     }
 }
 
+/// Default age after which an idle execution directory is treated as a
+/// crashed-worker orphan and swept on startup. Overridable via
+/// `VGI_BUFFERING_STORE_TTL_SECS`. Conservative (24h) so a long-running
+/// buffering job is never reclaimed out from under itself.
+const DEFAULT_ORPHAN_TTL_SECS: u64 = 24 * 60 * 60;
+
 impl BufferingStore {
     pub fn new() -> Self {
         let mut base = std::env::temp_dir();
-        base.push("vgi-rust-buffering");
+        // Namespace by uid: on a host with a shared /tmp, two users must not
+        // share (and so be able to read) each other's buffered state, and the
+        // first creator's 0o700 dir must not lock the others out.
+        base.push(format!("vgi-rust-buffering-{}", process_uid()));
         let _ = std::fs::create_dir_all(&base);
-        BufferingStore { base }
+        harden_dir(&base);
+        let store = BufferingStore { base };
+        store.gc_orphans(orphan_ttl());
+        store
+    }
+
+    /// Sweep execution directories whose most recent activity is older than
+    /// `ttl`. Buffering state is exec-scoped and reclaimed by the
+    /// `table_buffering_destructor` RPC; a worker that crashes mid-execution
+    /// never sends it, leaking its directory forever. This bounds that leak
+    /// without touching live executions (which have recent mtimes).
+    pub fn gc_orphans(&self, ttl: std::time::Duration) {
+        self.gc_orphans_at(std::time::SystemTime::now(), ttl);
+    }
+
+    /// `gc_orphans` against an explicit clock — the seam tests drive so they
+    /// don't depend on wall-clock timing or mtime manipulation.
+    fn gc_orphans_at(&self, now: std::time::SystemTime, ttl: std::time::Duration) {
+        let entries = match std::fs::read_dir(&self.base) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // Use the newest mtime anywhere in the subtree: appends land in
+            // nested `ns__key/` dirs that don't bump the top-level mtime, so a
+            // shallow check could reclaim an actively-appending execution.
+            let last = newest_mtime(&path).unwrap_or(now);
+            if now.duration_since(last).map(|age| age > ttl).unwrap_or(false) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 
     fn log_dir(&self, exec: &[u8], ns: &[u8], key: &[u8]) -> PathBuf {
@@ -279,4 +379,79 @@ pub trait TableBufferingFunction: Send + Sync {
         params: &BufferingParams,
         finalize_state_id: Vec<u8>,
     ) -> Result<Box<dyn TableProducer>>;
+}
+
+#[cfg(test)]
+mod store_hardening_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    // Isolate each test in its own base dir so they don't see each other's
+    // (or a real worker's) executions in the shared uid-namespaced tree.
+    fn isolated_store(tag: &str) -> BufferingStore {
+        let mut base = std::env::temp_dir();
+        base.push(format!("vgi-rust-buffering-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(&base);
+        harden_dir(&base);
+        BufferingStore { base }
+    }
+
+    #[test]
+    fn base_dir_is_owner_only_on_unix() {
+        let s = isolated_store("perms");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&s.base).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "base dir must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&s.base);
+    }
+
+    #[test]
+    fn gc_sweeps_stale_executions_but_keeps_fresh_ones() {
+        let s = isolated_store("gc");
+        // Two executions with live state.
+        s.kv_put(b"old-exec", b"k", b"v");
+        s.append(b"old-exec", b"ns", b"key", b"payload".to_vec());
+        s.kv_put(b"fresh-exec", b"k", b"v");
+
+        // Nothing is older than `now`, so a same-clock sweep keeps both.
+        s.gc_orphans_at(SystemTime::now(), Duration::from_secs(3600));
+        assert!(s.kv_get(b"old-exec", b"k").is_some());
+        assert!(s.kv_get(b"fresh-exec", b"k").is_some());
+
+        // Advance the clock 48h: relative to that, both dirs are >24h idle.
+        let future = SystemTime::now() + Duration::from_secs(48 * 3600);
+        s.gc_orphans_at(future, Duration::from_secs(24 * 3600));
+        assert!(s.kv_get(b"old-exec", b"k").is_none(), "stale exec must be swept");
+        assert!(s.kv_get(b"fresh-exec", b"k").is_none());
+        let _ = std::fs::remove_dir_all(&s.base);
+    }
+
+    #[test]
+    fn gc_uses_newest_mtime_so_active_appends_survive() {
+        // An execution that only appends into a nested ns dir must not be
+        // reclaimed: newest_mtime walks the subtree, not just the top dir.
+        let s = isolated_store("active");
+        s.append(b"appending-exec", b"ns", b"key", b"a".to_vec());
+        let newest = newest_mtime(&{
+            let mut p = s.base.clone();
+            p.push(hex(b"appending-exec"));
+            p
+        });
+        assert!(newest.is_some());
+        // Just-written → not older than a 1h ttl at the real clock.
+        s.gc_orphans_at(SystemTime::now(), Duration::from_secs(3600));
+        assert_eq!(s.scan(b"appending-exec", b"ns", b"key", -1, 10).len(), 1);
+        let _ = std::fs::remove_dir_all(&s.base);
+    }
+
+    #[test]
+    fn gc_on_empty_base_is_a_noop() {
+        let s = isolated_store("empty");
+        s.gc_orphans(Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&s.base);
+    }
 }

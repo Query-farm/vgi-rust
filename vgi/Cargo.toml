@@ -32,3 +32,9 @@ serde_json = { workspace = true }
 log = { workspace = true }
 ctrlc = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+
+# Unix-only: used to namespace the cross-process store base dir by uid (so users
+# sharing a /tmp don't collide) and to chmod it 0o700. `libc` is pure Rust (extern
+# declarations only — it compiles no C), so the single-binary build is unaffected.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
