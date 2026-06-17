@@ -1,0 +1,22 @@
+# Build context = repo root:  docker build -f deploy/fly/Dockerfile.storage-server .
+# (fly.io: `fly deploy` from deploy/fly/ with build.dockerfile set, root context.)
+
+FROM rust:1.86-slim AS build
+# rusqlite `bundled` vendors + compiles libsqlite3, so the build stage needs a C
+# toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p vgi-storage-server
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/vgi-storage-server /usr/local/bin/vgi-storage-server
+# The DB lives on a mounted volume (see fly.toml [mounts]); bind on all
+# interfaces so workers can reach it over the private network.
+ENV VGI_STORAGE_BIND=0.0.0.0:8080 \
+    VGI_STORAGE_DB=/data/state.db
+EXPOSE 8080
+CMD ["vgi-storage-server"]

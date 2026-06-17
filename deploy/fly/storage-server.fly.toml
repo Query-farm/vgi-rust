@@ -1,0 +1,44 @@
+# fly.io config for the VGI durable storage service.
+#
+#   fly apps create vgi-storage
+#   fly volumes create vgi_storage_data --region iad --size 10   # persistent SQLite
+#   fly secrets set VGI_STORAGE_TOKEN=$(openssl rand -hex 32) -a vgi-storage
+#   fly deploy -c deploy/fly/storage-server.fly.toml
+#
+# Internal-only: no public [http_service]. Workers reach it over the private
+# 6PN network at  vgi-storage.internal:8080.  Run a SINGLE instance — it is the
+# one writer to its SQLite file, so there is no cross-process contention. For HA
+# see the LiteFS / shard-routing notes in deploy/fly/README.md.
+
+app = "vgi-storage"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.storage-server"
+
+[env]
+  VGI_STORAGE_BIND = "0.0.0.0:8080"
+  VGI_STORAGE_DB = "/data/state.db"
+  RUST_LOG = "info"
+  # VGI_STORAGE_TOKEN is injected from `fly secrets`, never committed.
+
+[mounts]
+  source = "vgi_storage_data"
+  destination = "/data"
+
+# Internal TCP service with a liveness check; no public `ports`, so it is not
+# reachable from the internet — only from other apps in the org over .internal.
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

@@ -1,0 +1,24 @@
+# Build context = repo root:  docker build -f deploy/fly/Dockerfile.worker .
+#
+# Template: builds `vgi-example-worker`. Swap in your own worker binary by
+# changing the `-p <crate>` and the COPY/CMD below.
+
+FROM rust:1.86-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# `http-storage` so the worker can use VGI_WORKER_SHARED_STORAGE=http.
+RUN cargo build --release -p vgi-example-worker
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/vgi-example-worker /usr/local/bin/vgi-worker
+# Serve the VGI HTTP transport on all interfaces so remote DuckDB clients can
+# ATTACH; share state via the internal storage service.
+ENV VGI_HTTP_BIND=0.0.0.0:8080 \
+    VGI_WORKER_SHARED_STORAGE=http \
+    VGI_STORAGE_URL=http://vgi-storage.internal:8080
+EXPOSE 8080
+CMD ["vgi-worker", "--http"]

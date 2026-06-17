@@ -126,9 +126,13 @@ pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenti
             builder = builder.authenticate(auth);
         }
         let state = builder.build();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        // Default to loopback + ephemeral port (the local test harness reads the
+        // `PORT:` line). A deployed worker (e.g. on fly.io, reached by remote
+        // DuckDB clients) sets `VGI_HTTP_BIND=0.0.0.0:8080`.
+        let bind = std::env::var("VGI_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_string());
+        let listener = tokio::net::TcpListener::bind(&bind)
             .await
-            .expect("bind tcp");
+            .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
         let port = listener.local_addr().unwrap().port();
         println!("PORT:{port}");
         io::stdout().flush().ok();

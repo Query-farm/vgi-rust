@@ -1,0 +1,37 @@
+# fly.io config for VGI workers (stateless; scale horizontally).
+#
+#   fly apps create vgi-worker
+#   fly secrets set VGI_STORAGE_TOKEN=<same token as vgi-storage> \
+#                   VGI_BEARER_TOKENS="<client-token>=<principal>" -a vgi-worker
+#   fly deploy -c deploy/fly/worker.fly.toml
+#   fly scale count 3 -a vgi-worker
+#
+# Workers hold NO local state — all shared state goes to vgi-storage.internal —
+# so they scale out freely and DuckDB clients are load-balanced across them.
+
+app = "vgi-worker"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.worker"
+
+[env]
+  VGI_HTTP_BIND = "0.0.0.0:8080"
+  VGI_WORKER_SHARED_STORAGE = "http"
+  VGI_STORAGE_URL = "http://vgi-storage.internal:8080"
+  RUST_LOG = "info"
+  # VGI_STORAGE_TOKEN (to call the storage service) and VGI_BEARER_TOKENS (to
+  # authenticate DuckDB clients) come from `fly secrets`.
+
+# Public HTTPS endpoint DuckDB clients ATTACH to; fly load-balances across all
+# running machines.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 2
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
