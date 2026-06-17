@@ -110,7 +110,22 @@ impl Worker {
     }
 
     /// Install the declarative catalog (views / macros / tables).
+    ///
+    /// Any catalog table built with [`crate::catalog::CatTable::with_function`]
+    /// carries an embedded scan function; these are auto-registered into the
+    /// dispatch table here (deduped by name), so a function-backed table needs no
+    /// separate [`Worker::register_table`] call — parity with the Go
+    /// `CatalogTable.Function` ergonomics.
     pub fn set_catalog(&mut self, model: crate::catalog::CatalogModel) {
+        let base = model.schemas.iter();
+        let versioned = model.version_schemas.values().flatten();
+        for schema in base.chain(versioned) {
+            for table in &schema.tables {
+                if let Some(f) = &table.scan_function_impl {
+                    self.disp.register_table_if_absent(f.clone());
+                }
+            }
+        }
         self.disp.set_catalog(model);
     }
 

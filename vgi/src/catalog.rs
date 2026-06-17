@@ -662,6 +662,12 @@ pub struct CatTable {
     /// rather than the catalog resolving it to a version. Mirrors the Python
     /// `Table(supports_time_travel=True)` on a non-versioned table.
     pub supports_time_travel: bool,
+    /// An optional embedded scan function. When set (e.g. via
+    /// [`CatTable::with_function`]), [`crate::Worker::set_catalog`] auto-registers
+    /// it into the dispatch table, so callers don't need a separate
+    /// `register_table` call — mirroring the Go `CatalogTable.Function`
+    /// ergonomics. Not serialized; only the `scan_function` name reaches the wire.
+    pub scan_function_impl: Option<std::sync::Arc<dyn crate::table_function::TableFunction>>,
 }
 
 /// One historical version of a time-travel table.
@@ -830,7 +836,35 @@ impl CatTable {
             time_travel: Vec::new(),
             required_field_filter_paths: Vec::new(),
             supports_time_travel: false,
+            scan_function_impl: None,
         }
+    }
+
+    /// Build a function-backed table from a [`TableFunction`](crate::table_function::TableFunction)
+    /// instance: stores the function (auto-registered by
+    /// [`crate::Worker::set_catalog`]) and sets `scan_function` to its `name()`.
+    /// This is the one-call ergonomic equivalent of the Go
+    /// `CatalogTable{ Function: ... }` (vs. the name-based [`CatTable::new`],
+    /// which requires a separate `Worker::register_table`). The scan is inlined.
+    pub fn with_function(
+        name: &str,
+        columns: SchemaRef,
+        function: std::sync::Arc<dyn crate::table_function::TableFunction>,
+        comment: Option<String>,
+        cardinality: Option<i64>,
+    ) -> Self {
+        let scan_function = function.name().to_string();
+        let mut t = CatTable::new(
+            name,
+            columns,
+            &scan_function,
+            Vec::new(),
+            comment,
+            cardinality,
+        );
+        t.inline_scan = true;
+        t.scan_function_impl = Some(function);
+        t
     }
 }
 

@@ -134,6 +134,15 @@ impl Dispatcher {
         self.tables.entry(f.name().to_string()).or_default().push(f);
     }
 
+    /// Register `f` only if no table function with its name is registered yet.
+    /// Used by `Worker::set_catalog` to auto-register catalog tables' embedded
+    /// `scan_function_impl` without clobbering an explicit `register_table`.
+    pub fn register_table_if_absent(&mut self, f: Arc<dyn TableFunction>) {
+        if !self.tables.contains_key(f.name()) {
+            self.tables.entry(f.name().to_string()).or_default().push(f);
+        }
+    }
+
     pub fn register_table_in_out(&mut self, f: Arc<dyn TableInOutFunction>) {
         self.tableinouts
             .entry(f.name().to_string())

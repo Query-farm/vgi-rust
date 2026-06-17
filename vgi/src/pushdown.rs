@@ -89,6 +89,100 @@ pub struct PushdownFilters {
     join_keys: std::collections::HashMap<String, ArrayRef>,
 }
 
+/// Numeric `[min, max]` bounds on a column implied by pushed-down comparison
+/// filters (integer-coerced). Returned by
+/// [`PushdownFilters::get_column_bounds`]; mirrors the Python/Go `ColumnBounds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnBounds {
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+/// A read-only view of one pushed-down filter — a structural projection of the
+/// internal filter AST, mirroring the Python/Go filter objects. Returned by
+/// [`PushdownFilters::get_column_filters`] / [`PushdownFilters::filters`].
+#[derive(Debug, Clone)]
+pub enum Filter {
+    /// `column <op> value` (`op` is one of `eq`/`ne`/`lt`/`le`/`gt`/`ge`).
+    Constant { column_name: String, op: String },
+    /// `column IN (...)`.
+    In { column_name: String },
+    /// `column IN (...)` resolved from side join keys.
+    JoinKeys { column_name: String },
+    /// `column IS NULL`.
+    IsNull { column_name: String },
+    /// `column IS NOT NULL`.
+    IsNotNull { column_name: String },
+    /// Conjunction of child filters.
+    And(Vec<Filter>),
+    /// Disjunction of child filters.
+    Or(Vec<Filter>),
+    /// A filter on `column.child_name` (a struct subfield).
+    Struct {
+        column_name: String,
+        child_name: String,
+        child: Box<Filter>,
+    },
+    /// Any other filter kind (e.g. an expression filter), with its raw tag.
+    Other { kind: String, column_name: String },
+}
+
+impl Filter {
+    fn from_spec(spec: &FilterSpec) -> Filter {
+        match spec.kind.as_str() {
+            "constant" => Filter::Constant {
+                column_name: spec.column_name.clone(),
+                op: spec.op.clone().unwrap_or_default(),
+            },
+            "in" => Filter::In {
+                column_name: spec.column_name.clone(),
+            },
+            "join_keys" => Filter::JoinKeys {
+                column_name: spec.column_name.clone(),
+            },
+            "is_null" => Filter::IsNull {
+                column_name: spec.column_name.clone(),
+            },
+            "is_not_null" => Filter::IsNotNull {
+                column_name: spec.column_name.clone(),
+            },
+            "and" => Filter::And(spec.children.iter().map(Filter::from_spec).collect()),
+            "or" => Filter::Or(spec.children.iter().map(Filter::from_spec).collect()),
+            "struct" => Filter::Struct {
+                column_name: spec.column_name.clone(),
+                child_name: spec.child_name.clone(),
+                child: Box::new(
+                    spec.child_filter
+                        .as_ref()
+                        .map(|c| Filter::from_spec(c))
+                        .unwrap_or(Filter::Other {
+                            kind: "struct".to_string(),
+                            column_name: spec.column_name.clone(),
+                        }),
+                ),
+            },
+            other => Filter::Other {
+                kind: other.to_string(),
+                column_name: spec.column_name.clone(),
+            },
+        }
+    }
+
+    /// The column this filter references (empty string for `And`/`Or`).
+    pub fn column_name(&self) -> &str {
+        match self {
+            Filter::Constant { column_name, .. }
+            | Filter::In { column_name }
+            | Filter::JoinKeys { column_name }
+            | Filter::IsNull { column_name }
+            | Filter::IsNotNull { column_name }
+            | Filter::Struct { column_name, .. }
+            | Filter::Other { column_name, .. } => column_name,
+            Filter::And(_) | Filter::Or(_) => "",
+        }
+    }
+}
+
 impl PushdownFilters {
     /// Parse the `pushdown_filters` IPC blob (no join keys).
     pub fn parse(bytes: &[u8]) -> Result<PushdownFilters> {
@@ -388,11 +482,12 @@ impl PushdownFilters {
         }
     }
 
-    /// Resolve the discrete value set for a column from the pushed-down
-    /// filters (the partition-pruning idiom). Returns `None` when the
-    /// predicate is not enumerable (no filter, bare range, OR with a
-    /// non-discrete branch). Mirrors Python `get_column_values`.
-    pub fn get_column_values(&self, column: &str) -> Option<Vec<i64>> {
+    /// Resolve the discrete value set for a column as `i64`s (the
+    /// partition-pruning idiom; values coerced to integer). Returns `None` when
+    /// the predicate is not enumerable (no filter, bare range, OR with a
+    /// non-discrete branch). For string columns or to preserve the native type,
+    /// use [`PushdownFilters::get_column_values`].
+    pub fn get_column_values_i64(&self, column: &str) -> Option<Vec<i64>> {
         let mut acc: Option<Vec<i64>> = None;
         for spec in &self.specs {
             let vs = self.column_values_of(spec, column)?;
@@ -424,11 +519,13 @@ impl PushdownFilters {
     }
 
     /// Resolve the discrete `=`/`IN` value set for `column` as a *typed* Arrow
-    /// array (not coerced to i64), so string columns like `path` are usable.
-    /// Mirrors Python `PushdownFilters.get_column_values` (which returns the
-    /// Arrow array) and the Go `GetColumnValues`. Returns `None` when the
-    /// predicate is not a simple enumerable equality/IN on `column`.
-    pub fn get_column_values_array(&self, column: &str) -> Option<ArrayRef> {
+    /// array (preserving the column's native type, so string columns like `path`
+    /// are usable). Descends one level into a top-level `AND`. Mirrors Python
+    /// `PushdownFilters.get_column_values` and the Go `GetColumnValues`. Returns
+    /// `None` when the predicate is not a simple enumerable equality/IN on
+    /// `column`. For an integer-coerced `Vec<i64>`, use
+    /// [`PushdownFilters::get_column_values_i64`].
+    pub fn get_column_values(&self, column: &str) -> Option<ArrayRef> {
         for spec in &self.specs {
             if let Some(a) = self.column_values_array_of(spec, column) {
                 return Some(a);
@@ -450,6 +547,66 @@ impl PushdownFilters {
                 .find_map(|c| self.column_values_array_of(c, column)),
             _ => None,
         }
+    }
+
+    /// The single `=` constant for `column` as a length-1 Arrow array, or `None`
+    /// if there is no equality filter on it. Mirrors Python
+    /// `get_column_constant` and the Go `GetColumnConstant`. Descends one level
+    /// into a top-level `AND`.
+    pub fn get_column_constant(&self, column: &str) -> Option<ArrayRef> {
+        fn find(this: &PushdownFilters, spec: &FilterSpec, column: &str) -> Option<ArrayRef> {
+            match spec.kind.as_str() {
+                "constant" if spec.column_name == column && spec.op.as_deref() == Some("eq") => {
+                    this.value(spec).ok().map(|v| v.slice(0, 1))
+                }
+                "and" => spec.children.iter().find_map(|c| find(this, c, column)),
+                _ => None,
+            }
+        }
+        self.specs.iter().find_map(|s| find(self, s, column))
+    }
+
+    /// The `IN (...)` value set for `column` as a typed Arrow array, or `None` if
+    /// there is no `IN` filter on it. Mirrors Python `get_column_in_values` and
+    /// the Go `GetColumnInValues`. Descends one level into a top-level `AND`.
+    pub fn get_column_in_values(&self, column: &str) -> Option<ArrayRef> {
+        fn find(this: &PushdownFilters, spec: &FilterSpec, column: &str) -> Option<ArrayRef> {
+            match spec.kind.as_str() {
+                "in" if spec.column_name == column => this.value(spec).ok().cloned(),
+                "join_keys" if spec.column_name == column => this.join_value(spec).cloned(),
+                "and" => spec.children.iter().find_map(|c| find(this, c, column)),
+                _ => None,
+            }
+        }
+        self.specs.iter().find_map(|s| find(self, s, column))
+    }
+
+    /// The numeric `[min, max]` bounds implied by comparison filters on
+    /// `column` (from `=`/`<`/`<=`/`>`/`>=`/`IN`), or `None` if the column is not
+    /// constrained. Mirrors Python `get_column_bounds` and the Go
+    /// `GetColumnBounds`. Bounds are integer-coerced (see [`ColumnBounds`]).
+    pub fn get_column_bounds(&self, column: &str) -> Option<ColumnBounds> {
+        let (count, lo, hi) = self.column_summary(column);
+        if count == 0 && lo.is_none() && hi.is_none() {
+            return None;
+        }
+        Some(ColumnBounds { min: lo, max: hi })
+    }
+
+    /// The top-level filters that reference `column`, as read-only [`Filter`]
+    /// views. Mirrors Python `get_column_filters` and the Go `GetColumnFilters`.
+    pub fn get_column_filters(&self, column: &str) -> Vec<Filter> {
+        self.specs
+            .iter()
+            .filter(|s| spec_mentions(s, column))
+            .map(Filter::from_spec)
+            .collect()
+    }
+
+    /// All top-level filters as read-only [`Filter`] views (the conjunction
+    /// DuckDB pushed down). Mirrors Python iterating a `PushdownFilters`.
+    pub fn filters(&self) -> Vec<Filter> {
+        self.specs.iter().map(Filter::from_spec).collect()
     }
 
     fn column_values_of(&self, spec: &FilterSpec, column: &str) -> Option<Vec<i64>> {

@@ -836,7 +836,7 @@ impl TableFunction for ValuePruneFunction {
             .and_then(|b| {
                 vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
             })
-            .and_then(|f| f.get_column_values("n"));
+            .and_then(|f| f.get_column_values_i64("n"));
         let (values, resolved) = match discrete {
             Some(mut vs) => {
                 vs.sort_unstable();
@@ -865,7 +865,7 @@ impl TableFunction for ValuePruneFunction {
 // filtered_columns_echo(count) -> {n, tag, filtered_cols, has_n, has_tag, tag_values}
 //   Echoes the column-introspection accessors on the pushed-down filter set:
 //   `filtered_columns()`, `has_filter_for_column()`, and the typed (string-
-//   capable) `get_column_values_array()`.
+//   capable) `get_column_values()`.
 // ---------------------------------------------------------------------------
 
 fn fce_schema() -> SchemaRef {
@@ -935,10 +935,15 @@ impl TableFunction for FilteredColumnsEchoFunction {
         "filtered_columns_echo"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta("Echoes filtered_columns / has_filter_for_column / get_column_values_array")
+        meta("Echoes filtered_columns / has_filter_for_column / get_column_values")
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate")]
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Number of rows to generate",
+        )]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         Ok(BindResponse {
@@ -963,7 +968,7 @@ impl TableFunction for FilteredColumnsEchoFunction {
                 let mut cols: Vec<String> = f.filtered_columns().into_iter().collect();
                 cols.sort();
                 let tag_values = f
-                    .get_column_values_array("tag")
+                    .get_column_values("tag")
                     .map(|a| render_values(&a))
                     .unwrap_or_else(|| "(none)".to_string());
                 (
