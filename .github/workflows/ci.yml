@@ -35,8 +35,16 @@ jobs:
       - name: cargo clippy (vgi)
         run: cargo clippy -p vgi --all-targets --all-features -- -D warnings
 
-      - name: cargo build
-        run: cargo build --workspace --all-features
+      # `vgi-example-worker`'s `coverage` feature FFI-links the LLVM profiling
+      # runtime (`__llvm_profile_write_file`), which only exists under
+      # `-Cinstrument-coverage` (set by the integration `coverage` lane). A plain
+      # `--all-features` build would fail to link it, so exclude the fixture from
+      # the all-features sweep and build it separately with its default features.
+      - name: cargo build (workspace, all features)
+        run: cargo build --workspace --exclude vgi-example-worker --all-features
+
+      - name: cargo build (example worker)
+        run: cargo build -p vgi-example-worker
 
       - name: cargo test --doc (vgi)
         run: cargo test --doc -p vgi --all-features
