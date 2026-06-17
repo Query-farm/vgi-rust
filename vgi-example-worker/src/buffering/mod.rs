@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata};
 use vgi::ipc;
@@ -559,6 +559,49 @@ impl SumAllColumnsFunction {
             ))),
         }
     }
+
+    /// Map an input schema to the summed output schema: integers → Int64,
+    /// floating-point/decimal → Float64, other columns dropped. Errors when no
+    /// numeric column remains.
+    ///
+    /// `process`/`combine` derive the output schema with this from data on hand
+    /// (the input batch / the stored partial batches) rather than trusting
+    /// `params.output_schema`. That field is populated from a file-backed side
+    /// store written at sink-init, but a `process`/`combine` RPC can land on a
+    /// *different* pooled worker that never wrote it (launcher transport); the
+    /// SDK then falls back to the raw input schema, whose decimal/Int32/Float32
+    /// columns `sum_column` can't emit. Deriving here keeps the function correct
+    /// and transport-independent. `finalize` is unaffected — it receives the
+    /// bound output schema directly in its RPC.
+    fn derive_output_schema(input: &SchemaRef) -> Result<SchemaRef> {
+        let mut fields: Vec<Field> = Vec::new();
+        for f in input.fields() {
+            let t = f.data_type();
+            let out = if t.is_integer() {
+                DataType::Int64
+            } else if matches!(t, DataType::Float16 | DataType::Float32 | DataType::Float64)
+                || matches!(t, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
+            {
+                DataType::Float64
+            } else {
+                continue;
+            };
+            fields.push(Field::new(f.name(), out, true));
+        }
+        if fields.is_empty() {
+            let summary: Vec<String> = input
+                .fields()
+                .iter()
+                .map(|f| format!("{}: {}", f.name(), f.data_type()))
+                .collect();
+            return Err(RpcError::value_error(format!(
+                "sum_all_columns requires at least one numeric (integer, \
+                 floating-point, or decimal) input column, got [{}]",
+                summary.join(", ")
+            )));
+        }
+        Ok(Arc::new(Schema::new(fields)))
+    }
 }
 
 impl TableBufferingFunction for SumAllColumnsFunction {
@@ -588,34 +631,8 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             .input_schema
             .clone()
             .ok_or_else(|| RpcError::value_error("sum_all_columns requires input schema"))?;
-        let mut fields: Vec<Field> = Vec::new();
-        for f in input.fields() {
-            let t = f.data_type();
-            let out = if t.is_integer() {
-                DataType::Int64
-            } else if matches!(t, DataType::Float16 | DataType::Float32 | DataType::Float64)
-                || matches!(t, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
-            {
-                DataType::Float64
-            } else {
-                continue;
-            };
-            fields.push(Field::new(f.name(), out, true));
-        }
-        if fields.is_empty() {
-            let summary: Vec<String> = input
-                .fields()
-                .iter()
-                .map(|f| format!("{}: {}", f.name(), f.data_type()))
-                .collect();
-            return Err(RpcError::value_error(format!(
-                "sum_all_columns requires at least one numeric (integer, \
-                 floating-point, or decimal) input column, got [{}]",
-                summary.join(", ")
-            )));
-        }
         Ok(BindResponse {
-            output_schema: Arc::new(Schema::new(fields)),
+            output_schema: Self::derive_output_schema(&input)?,
             opaque_data: Vec::new(),
         })
     }
@@ -638,7 +655,9 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         if Self::logging_enabled(params) {
             params.log(format!("Processing batch with {} rows", batch.num_rows()));
         }
-        let out = &params.output_schema;
+        // Derive from the input batch, not params.output_schema (see
+        // derive_output_schema — a pooled worker may lack the side-stored schema).
+        let out = Self::derive_output_schema(&batch.schema())?;
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(out.fields().len());
         for f in out.fields() {
             let col = batch
@@ -660,15 +679,24 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         if Self::logging_enabled(params) {
             params.log(format!("Combining {} state_ids", state_ids.len()));
         }
-        let out = &params.output_schema;
+        // Read the partials process stored; take the output schema from them
+        // (process derived it from the input) rather than params.output_schema,
+        // which a pooled worker handling combine may not have (see
+        // derive_output_schema). Fall back to the side-stored schema only when
+        // there were no partials (empty input — nothing to sum).
+        let partials: Vec<RecordBatch> = params
+            .storage
+            .scan(&params.execution_id, PARTIAL_NS, b"", -1, usize::MAX)
+            .into_iter()
+            .map(|(_id, blob)| ipc::read_batch(&blob))
+            .collect::<Result<_>>()?;
+        let out = partials
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| params.output_schema.clone());
         let mut int_acc: Vec<i64> = vec![0; out.fields().len()];
         let mut flt_acc: Vec<f64> = vec![0.0; out.fields().len()];
-        for (_id, blob) in
-            params
-                .storage
-                .scan(&params.execution_id, PARTIAL_NS, b"", -1, usize::MAX)
-        {
-            let pb = ipc::read_batch(&blob)?;
+        for pb in &partials {
             for (i, f) in out.fields().iter().enumerate() {
                 let c = pb.column(i);
                 match f.data_type() {
