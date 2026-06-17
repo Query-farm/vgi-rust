@@ -92,7 +92,10 @@ fn http_backend_conforms_end_to_end() {
     let id1 = store.append(b"e1", b"ns", b"", b"b".to_vec());
     assert!(id1 > id0);
     let all = store.scan(b"e1", b"ns", b"", -1, usize::MAX);
-    assert_eq!(all.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(), vec![b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(
+        all.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        vec![b"a".to_vec(), b"b".to_vec()]
+    );
     assert_eq!(store.scan(b"e1", b"ns", b"", id0, usize::MAX).len(), 1);
 
     // queue FIFO
@@ -116,10 +119,8 @@ fn bearer_auth_is_enforced() {
     assert_eq!(good.kv_get(b"e", b"k").as_deref(), Some(&b"v"[..]));
     // Wrong/no token: the client panics on the server's 401 — assert that.
     let bad = client(&server, Some("wrong"));
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bad.kv_get(b"e", b"k")
-    }))
-    .is_err();
+    let panicked =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bad.kv_get(b"e", b"k"))).is_err();
     assert!(panicked, "unauthorized request should be rejected");
 }
 
@@ -135,7 +136,9 @@ fn idempotent_retry_replays_queue_pop() {
     // Issue a raw QueuePop twice with the SAME idempotency key.
     let req = StorageRequest {
         idempotency_key: Some("fixed-key-123".to_string()),
-        op: StorageOp::QueuePop { scope: b"qi".to_vec() },
+        op: StorageOp::QueuePop {
+            scope: b"qi".to_vec(),
+        },
     };
     let body = bincode::serialize(&req).unwrap();
     let pop_once = || -> Vec<u8> {

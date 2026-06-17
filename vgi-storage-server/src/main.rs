@@ -48,16 +48,24 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let bind = std::env::var("VGI_STORAGE_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let db_path = std::env::var("VGI_STORAGE_DB").map(Into::into).unwrap_or_else(|_| {
-        let mut p = std::env::temp_dir();
-        p.push("vgi-storage");
-        let _ = std::fs::create_dir_all(&p);
-        p.push("state.db");
-        p
-    });
-    let token = std::env::var("VGI_STORAGE_TOKEN").ok().filter(|t| !t.is_empty());
+    let db_path = std::env::var("VGI_STORAGE_DB")
+        .map(Into::into)
+        .unwrap_or_else(|_| {
+            let mut p = std::env::temp_dir();
+            p.push("vgi-storage");
+            let _ = std::fs::create_dir_all(&p);
+            p.push("state.db");
+            p
+        });
+    let token = std::env::var("VGI_STORAGE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
-    log::info!("vgi-storage-server: db={}, auth={}", db_path.display(), token.is_some());
+    log::info!(
+        "vgi-storage-server: db={}, auth={}",
+        db_path.display(),
+        token.is_some()
+    );
 
     let state = Arc::new(AppState {
         store: SqliteStorage::open(db_path),
@@ -75,7 +83,10 @@ async fn main() {
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     log::info!("vgi-storage-server listening on {bind}");
     // Announce the bound port so a supervisor / test harness can read it.
-    println!("PORT:{}", listener.local_addr().map(|a| a.port()).unwrap_or(0));
+    println!(
+        "PORT:{}",
+        listener.local_addr().map(|a| a.port()).unwrap_or(0)
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -118,7 +129,11 @@ async fn rpc(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes
     let bytes = match bincode::serialize(&reply) {
         Ok(b) => b,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode reply: {e}")).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("encode reply: {e}"),
+            )
+                .into_response()
         }
     };
 

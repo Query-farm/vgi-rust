@@ -98,7 +98,11 @@ impl FsStorage {
                 continue;
             }
             let last = newest_mtime(&path).unwrap_or(now);
-            if now.duration_since(last).map(|age| age > ttl).unwrap_or(false) {
+            if now
+                .duration_since(last)
+                .map(|age| age > ttl)
+                .unwrap_or(false)
+            {
                 let _ = std::fs::remove_dir_all(&path);
             }
         }

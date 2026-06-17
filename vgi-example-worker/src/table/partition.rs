@@ -14,7 +14,6 @@ use vgi::partition::partition_field;
 use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
-
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::CountrySales);
     w.register_table(PartitionFunction::RegionYear);

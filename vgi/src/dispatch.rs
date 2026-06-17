@@ -18,10 +18,10 @@ use vgi_rpc::{
 use crate::aggregate::{AggregateBindParams, AggregateFunction, GROUP_COLUMN_NAME};
 use crate::buffering::{BufferingParams, TableBufferingFunction};
 use crate::catalog;
-use crate::storage::{default_storage, FunctionStorage};
 use crate::function::{BindParams, ProcessParams, ScalarFunction};
 use crate::ipc;
 use crate::protocol::dtos::*;
+use crate::storage::{default_storage, FunctionStorage};
 use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
 use crate::wire;
@@ -2517,7 +2517,11 @@ mod malformed_input_tests {
         for n in 0..=enc.len() {
             let got = Dispatcher::de_state_map(&enc[..n]);
             for (k, v) in &got {
-                assert_eq!(m.get(k), Some(v), "decoded a key/value that was never encoded");
+                assert_eq!(
+                    m.get(k),
+                    Some(v),
+                    "decoded a key/value that was never encoded"
+                );
             }
         }
     }

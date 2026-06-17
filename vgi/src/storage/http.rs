@@ -23,15 +23,45 @@ use super::{process_uid, FunctionStorage};
 /// One storage operation. Shared by the client and `vgi-storage-server`.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum StorageOp {
-    KvGet { scope: Vec<u8>, key: Vec<u8> },
-    KvPut { scope: Vec<u8>, key: Vec<u8>, value: Vec<u8> },
-    KvDel { scope: Vec<u8>, key: Vec<u8> },
-    Append { scope: Vec<u8>, ns: Vec<u8>, key: Vec<u8>, value: Vec<u8> },
-    Scan { scope: Vec<u8>, ns: Vec<u8>, key: Vec<u8>, after_id: i64, limit: u64 },
-    QueuePush { scope: Vec<u8>, items: Vec<Vec<u8>> },
-    QueuePop { scope: Vec<u8> },
-    Clear { scope: Vec<u8> },
-    Gc { ttl_secs: u64 },
+    KvGet {
+        scope: Vec<u8>,
+        key: Vec<u8>,
+    },
+    KvPut {
+        scope: Vec<u8>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    KvDel {
+        scope: Vec<u8>,
+        key: Vec<u8>,
+    },
+    Append {
+        scope: Vec<u8>,
+        ns: Vec<u8>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Scan {
+        scope: Vec<u8>,
+        ns: Vec<u8>,
+        key: Vec<u8>,
+        after_id: i64,
+        limit: u64,
+    },
+    QueuePush {
+        scope: Vec<u8>,
+        items: Vec<Vec<u8>>,
+    },
+    QueuePop {
+        scope: Vec<u8>,
+    },
+    Clear {
+        scope: Vec<u8>,
+    },
+    Gc {
+        ttl_secs: u64,
+    },
 }
 
 /// A request envelope: an op plus an optional idempotency key (set for
@@ -106,7 +136,10 @@ impl HttpStorage {
     /// Send a request, retrying transient failures. Panics after `MAX_ATTEMPTS`.
     fn call(&self, op: StorageOp, idempotent: bool) -> StorageReply {
         let idempotency_key = (!idempotent).then(|| self.idem_key());
-        let req = StorageRequest { idempotency_key, op };
+        let req = StorageRequest {
+            idempotency_key,
+            op,
+        };
         let body = bincode::serialize(&req).expect("serialize storage request");
         let endpoint = format!("{}/rpc", self.url);
 
@@ -148,7 +181,10 @@ impl HttpStorage {
 impl FunctionStorage for HttpStorage {
     fn kv_get(&self, scope: &[u8], key: &[u8]) -> Option<Vec<u8>> {
         match self.call(
-            StorageOp::KvGet { scope: scope.to_vec(), key: key.to_vec() },
+            StorageOp::KvGet {
+                scope: scope.to_vec(),
+                key: key.to_vec(),
+            },
             true,
         ) {
             StorageReply::MaybeBytes(b) => b,
@@ -169,7 +205,10 @@ impl FunctionStorage for HttpStorage {
 
     fn kv_del(&self, scope: &[u8], key: &[u8]) {
         self.call(
-            StorageOp::KvDel { scope: scope.to_vec(), key: key.to_vec() },
+            StorageOp::KvDel {
+                scope: scope.to_vec(),
+                key: key.to_vec(),
+            },
             true,
         );
     }
@@ -214,24 +253,42 @@ impl FunctionStorage for HttpStorage {
 
     fn queue_push(&self, scope: &[u8], items: &[Vec<u8>]) {
         self.call(
-            StorageOp::QueuePush { scope: scope.to_vec(), items: items.to_vec() },
+            StorageOp::QueuePush {
+                scope: scope.to_vec(),
+                items: items.to_vec(),
+            },
             false,
         );
     }
 
     fn queue_pop(&self, scope: &[u8]) -> Option<Vec<u8>> {
-        match self.call(StorageOp::QueuePop { scope: scope.to_vec() }, false) {
+        match self.call(
+            StorageOp::QueuePop {
+                scope: scope.to_vec(),
+            },
+            false,
+        ) {
             StorageReply::MaybeBytes(b) => b,
             _ => None,
         }
     }
 
     fn clear(&self, scope: &[u8]) {
-        self.call(StorageOp::Clear { scope: scope.to_vec() }, true);
+        self.call(
+            StorageOp::Clear {
+                scope: scope.to_vec(),
+            },
+            true,
+        );
     }
 
     fn gc(&self, ttl: Duration) {
-        self.call(StorageOp::Gc { ttl_secs: ttl.as_secs() }, true);
+        self.call(
+            StorageOp::Gc {
+                ttl_secs: ttl.as_secs(),
+            },
+            true,
+        );
     }
 }
 
@@ -249,10 +306,19 @@ pub fn apply_op(store: &dyn FunctionStorage, op: StorageOp) -> StorageReply {
             store.kv_del(&scope, &key);
             StorageReply::Unit
         }
-        StorageOp::Append { scope, ns, key, value } => {
-            StorageReply::Id(store.append(&scope, &ns, &key, value))
-        }
-        StorageOp::Scan { scope, ns, key, after_id, limit } => StorageReply::Entries(store.scan(
+        StorageOp::Append {
+            scope,
+            ns,
+            key,
+            value,
+        } => StorageReply::Id(store.append(&scope, &ns, &key, value)),
+        StorageOp::Scan {
+            scope,
+            ns,
+            key,
+            after_id,
+            limit,
+        } => StorageReply::Entries(store.scan(
             &scope,
             &ns,
             &key,
