@@ -21,7 +21,7 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
 # deployments (e.g. fly.io) where workers share one durable store.
-http-storage = []
+http-storage = ["dep:ureq", "dep:bincode"]
 
 [dependencies]
 vgi-rpc = { workspace = true }
@@ -43,6 +43,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 # SQLite storage backend (feature `sqlite`). `bundled` compiles a vendored
 # libsqlite3 so there is no system dependency; this is the one C-compiled dep.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# HTTP storage client (feature `http-storage`). `ureq` is a pure-sync blocking
+# client — safe to call from a worker served over stdio OR inside a tokio HTTP
+# runtime (no async nesting). `bincode` frames the request/response.
+ureq = { version = "2", default-features = false, optional = true }
+bincode = { version = "1", optional = true }
 
 # Unix-only: used to namespace the cross-process store base dir by uid (so users
 # sharing a /tmp don't collide) and to chmod it 0o700. `libc` is pure Rust (extern

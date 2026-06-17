@@ -1,0 +1,24 @@
+[package]
+name = "vgi-storage-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Durable storage service for VGI workers — backs the http FunctionStorage so stateless workers (e.g. fly.io instances) share one SQLite-backed store"
+publish = false
+
+[dependencies]
+# Reuse the protocol types (storage::http) and the SQLite backend.
+vgi = { path = "../vgi", features = ["sqlite", "http-storage"] }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+bytes = "1"
+bincode = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false }

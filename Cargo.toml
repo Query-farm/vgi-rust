@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vgi", "vgi-example-worker"]
+members = ["vgi", "vgi-example-worker", "vgi-storage-server"]
 
 [workspace.package]
 version = "0.1.3"

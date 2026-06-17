@@ -12,11 +12,13 @@ use super::FunctionStorage;
 type Scope = Vec<u8>;
 type Key = Vec<u8>;
 type Ns = Vec<u8>;
+/// `(id, value)` log entries for one `(scope, ns, key)`.
+type LogEntries = Vec<(i64, Vec<u8>)>;
 
 #[derive(Default)]
 struct Inner {
     kv: BTreeMap<(Scope, Key), Vec<u8>>,
-    log: BTreeMap<(Scope, Ns, Key), Vec<(i64, Vec<u8>)>>,
+    log: BTreeMap<(Scope, Ns, Key), LogEntries>,
     queue: BTreeMap<Scope, VecDeque<Vec<u8>>>,
     next_id: i64,
 }

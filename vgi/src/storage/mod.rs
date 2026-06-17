@@ -139,7 +139,7 @@ pub fn default_storage() -> Arc<dyn FunctionStorage> {
 }
 
 #[cfg(feature = "http-storage")]
-mod http;
+pub mod http;
 #[cfg(feature = "http-storage")]
 pub use http::HttpStorage;
 
