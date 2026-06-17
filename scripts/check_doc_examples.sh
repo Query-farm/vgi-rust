@@ -73,7 +73,12 @@ for rs in "${names[@]}"; do
   sql="INSTALL vgi FROM community; LOAD vgi;
        ATTACH 'demo' (TYPE vgi, LOCATION '$bin');
        SELECT demo.main.upper_case('$PROBE') AS r;"
-  out="$(uvx haybarn-cli :memory: -noheader -list -cmd ".bail on" -c "$sql" 2>&1 || true)"
+  # Pin haybarn-cli to the same 1.5.3-rc7 line the integration suite uses
+  # (HAYBARN_RELEASE in .github/workflows/integration.yml). Floating to the
+  # latest pulls a DuckDB version for which the community `vgi` extension may
+  # not yet be published (e.g. v1.5.4 → INSTALL vgi FROM community 404s). Bump
+  # this in lockstep with HAYBARN_RELEASE once the extension is published.
+  out="$(uvx haybarn-cli@1.5.3rc7 :memory: -noheader -list -cmd ".bail on" -c "$sql" 2>&1 || true)"
   if ! grep -q "$EXPECTED" <<<"$out"; then
     echo "✗ $name: expected upper_case('$PROBE') = '$EXPECTED', got:"
     echo "$out"
