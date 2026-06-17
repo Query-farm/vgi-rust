@@ -3,10 +3,10 @@
 //! Aggregate function model (update / combine / finalize).
 //!
 //! DuckDB drives aggregates with per-group state. The worker keeps state in
-//! the cross-process [`crate::buffering::BufferingStore`] (KV mode), keyed by
-//! `(execution_id, group_id)`, because update / combine / finalize can run in
-//! different pooled worker processes. States are opaque to the C++ extension —
-//! the worker chooses any encoding.
+//! the cross-process [`FunctionStorage`](crate::storage::FunctionStorage) (KV
+//! mode), keyed by `(execution_id, group_id)`, because update / combine /
+//! finalize can run in different pooled worker processes. States are opaque to
+//! the C++ extension — the worker chooses any encoding.
 
 use std::collections::HashMap;
 
