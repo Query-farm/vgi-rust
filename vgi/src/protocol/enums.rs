@@ -29,9 +29,15 @@ pub mod stability {
 }
 
 /// `NullHandling`.
+///
+/// Wire values are the Python `NullHandling` enum member names (`.name`), which
+/// the C++ vgi extension's `ParseFunctionNullHandling` matches exactly. They
+/// MUST be uppercase — lowercase values are silently ignored by the extension
+/// (falling back to DEFAULT), which notably breaks scalar functions that rely
+/// on SPECIAL handling to receive NULL arguments.
 pub mod null_handling {
-    pub const DEFAULT: &str = "default";
-    pub const SPECIAL: &str = "special";
+    pub const DEFAULT: &str = "DEFAULT";
+    pub const SPECIAL: &str = "SPECIAL";
 }
 
 /// `OrderPreservation`.
