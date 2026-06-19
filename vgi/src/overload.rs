@@ -163,10 +163,46 @@ fn score_type(actual: &DataType, spec: &ArgSpec) -> Option<i64> {
     if *actual == expected {
         return Some(2);
     }
+    // Nested types (List/Struct/Map/…) compare structurally: `DataType` equality
+    // includes inner field *names* and *nullability*, which a hand-built
+    // `column_typed(List(Field("item", …)))` will never match against the list
+    // type DuckDB actually sends (different child field name/nullability). Treat
+    // structurally-equal nested types as an exact match so nested `column_typed`
+    // overloads resolve.
+    if nested_structurally_equal(actual, &expected) {
+        return Some(2);
+    }
     if same_family(actual, &expected) {
         return Some(1);
     }
     None
+}
+
+/// Structural type equality that ignores field names and nullability (so it sees
+/// through the field-name/nullability differences in DuckDB-supplied nested
+/// types). Scalars must still be exactly equal.
+fn nested_structurally_equal(a: &DataType, b: &DataType) -> bool {
+    use DataType::*;
+    match (a, b) {
+        (List(x), List(y))
+        | (LargeList(x), LargeList(y))
+        | (List(x), LargeList(y))
+        | (LargeList(x), List(y)) => nested_structurally_equal(x.data_type(), y.data_type()),
+        (FixedSizeList(x, nx), FixedSizeList(y, ny)) => {
+            nx == ny && nested_structurally_equal(x.data_type(), y.data_type())
+        }
+        (Map(x, _), Map(y, _)) => nested_structurally_equal(x.data_type(), y.data_type()),
+        (Struct(fx), Struct(fy)) => {
+            fx.len() == fy.len()
+                && fx
+                    .iter()
+                    .zip(fy.iter())
+                    .all(|(f1, f2)| nested_structurally_equal(f1.data_type(), f2.data_type()))
+        }
+        // Non-nested: require exact equality (no widening here; `same_family`
+        // handles same-family scalar widening separately).
+        _ => a == b,
+    }
 }
 
 fn is_integer(t: &DataType) -> bool {
@@ -194,4 +230,39 @@ fn same_family(a: &DataType, b: &DataType) -> bool {
         || (is_float_or_decimal(a) && is_float_or_decimal(b))
         || (is_string(a) && is_string(b))
         || (is_binary(a) && is_binary(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::function::ArgSpec;
+    use std::sync::Arc;
+
+    fn list_u8(item_name: &str, nullable: bool) -> DataType {
+        DataType::List(Arc::new(arrow_schema::Field::new(
+            item_name,
+            DataType::UInt8,
+            nullable,
+        )))
+    }
+
+    #[test]
+    fn column_typed_list_matches_despite_field_name_and_nullability() {
+        // Spec built with one inner field name/nullability; the actual list the
+        // engine supplies uses different ones — must still resolve (score 2).
+        let spec = ArgSpec::column_typed("qual", 1, list_u8("item", true), "");
+        let actual = list_u8("l", false);
+        assert_eq!(score_type(&actual, &spec), Some(2));
+    }
+
+    #[test]
+    fn column_typed_list_rejects_mismatched_child() {
+        let spec = ArgSpec::column_typed("qual", 1, list_u8("item", true), "");
+        let actual = DataType::List(Arc::new(arrow_schema::Field::new(
+            "l",
+            DataType::Utf8,
+            true,
+        )));
+        assert_eq!(score_type(&actual, &spec), None);
+    }
 }
