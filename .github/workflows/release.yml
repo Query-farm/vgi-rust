@@ -54,7 +54,12 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy -p vgi --all-targets --all-features -- -D warnings
-          cargo build --workspace --all-features
+          # Build every crate with default features, then the published crate
+          # with all of ITS features. Not `--workspace --all-features`: that
+          # turns on vgi-example-worker's `coverage` feature, whose FFI into the
+          # LLVM profile runtime only links under `-Cinstrument-coverage`.
+          cargo build --workspace
+          cargo build -p vgi --all-features
           cargo test --doc -p vgi --all-features
 
       - name: Authenticate to crates.io via OIDC
