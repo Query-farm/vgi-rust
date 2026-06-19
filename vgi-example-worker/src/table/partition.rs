@@ -19,6 +19,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::RegionYear);
     w.register_table(PartitionFunction::Override);
     w.register_table(PartitionFunction::Disjoint);
+    w.register_table(PartitionFunction::Overlapping);
     w.register_table(BrokenPartitionFunction {
         name: "broken_missing_partition_values",
         mode: BrokenPart::MissingMeta,
@@ -192,6 +193,7 @@ pub enum PartitionFunction {
     RegionYear,
     Override,
     Disjoint,
+    Overlapping,
 }
 
 impl PartitionFunction {
@@ -210,10 +212,12 @@ impl PartitionFunction {
                 partition_field("category", DataType::Utf8),
                 Field::new("revenue", DataType::Int64, true),
             ])),
-            PartitionFunction::Disjoint => Arc::new(Schema::new(vec![
-                partition_field("key", DataType::Int64),
-                Field::new("value", DataType::Int64, true),
-            ])),
+            PartitionFunction::Disjoint | PartitionFunction::Overlapping => {
+                Arc::new(Schema::new(vec![
+                    partition_field("key", DataType::Int64),
+                    Field::new("value", DataType::Int64, true),
+                ]))
+            }
         }
     }
     fn num_partitions(&self, params: &ProcessParams) -> i64 {
@@ -221,12 +225,14 @@ impl PartitionFunction {
             PartitionFunction::CountrySales => COUNTRIES.len() as i64,
             PartitionFunction::RegionYear => REGIONS_YEARS.len() as i64,
             PartitionFunction::Override => CATEGORIES.len() as i64,
-            PartitionFunction::Disjoint => params.arguments.const_i64(0).unwrap_or(0).max(0),
+            PartitionFunction::Disjoint | PartitionFunction::Overlapping => {
+                params.arguments.const_i64(0).unwrap_or(0).max(0)
+            }
         }
     }
     fn rows(&self, params: &ProcessParams) -> i64 {
         match self {
-            PartitionFunction::Disjoint => params
+            PartitionFunction::Disjoint | PartitionFunction::Overlapping => params
                 .arguments
                 .named_i64("rows_per_partition")
                 .unwrap_or(10)
@@ -267,8 +273,15 @@ impl PartitionFunction {
                     )),
                 ]
             }
-            PartitionFunction::Disjoint => {
-                let base = idx * 1000;
+            PartitionFunction::Disjoint | PartitionFunction::Overlapping => {
+                // Disjoint strides by 1000 (ranges never touch); overlapping
+                // strides by 500 so consecutive chunks share keys when callers
+                // pass rows_per_partition > 500.
+                let stride = match self {
+                    PartitionFunction::Overlapping => 500,
+                    _ => 1000,
+                };
+                let base = idx * stride;
                 vec![
                     Arc::new(Int64Array::from(
                         (0..rows).map(|i| base + i).collect::<Vec<_>>(),
@@ -316,12 +329,16 @@ impl TableFunction for PartitionFunction {
             PartitionFunction::RegionYear => "region_year_partitioned",
             PartitionFunction::Override => "partitioned_with_explicit_override",
             PartitionFunction::Disjoint => "disjoint_range_partitioned",
+            PartitionFunction::Overlapping => "overlapping_range_partitioned",
         }
     }
     fn metadata(&self) -> FunctionMetadata {
         let kind = match self {
             PartitionFunction::Disjoint => {
                 vgi::protocol::enums::partition_kind::DISJOINT_PARTITIONS
+            }
+            PartitionFunction::Overlapping => {
+                vgi::protocol::enums::partition_kind::OVERLAPPING_PARTITIONS
             }
             _ => vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS,
         };
@@ -336,6 +353,10 @@ impl TableFunction for PartitionFunction {
         match self {
             PartitionFunction::Disjoint => vec![
                 ArgSpec::const_arg("partitions", 0, "int64", "Number of disjoint partitions"),
+                ArgSpec::const_arg("rows_per_partition", -1, "int64", "Rows per partition"),
+            ],
+            PartitionFunction::Overlapping => vec![
+                ArgSpec::const_arg("partitions", 0, "int64", "Number of overlapping partitions"),
                 ArgSpec::const_arg("rows_per_partition", -1, "int64", "Rows per partition"),
             ],
             _ => vec![ArgSpec::const_arg("rows", 0, "int64", "Rows per partition")],

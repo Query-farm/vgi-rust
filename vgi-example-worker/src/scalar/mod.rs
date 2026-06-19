@@ -33,6 +33,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(NullHandlingFunction);
     w.register_scalar(ConditionalMessageFunction);
     w.register_scalar(HashSeedFunction);
+    w.register_scalar(QuerySeedFunction);
     w.register_scalar(BernoulliFunction);
     w.register_scalar(RandomIntFunction);
     w.register_scalar(RandomBytesFunction);
@@ -451,6 +452,38 @@ impl ScalarFunction for HashSeedFunction {
         let seed = params.arguments.const_i64(0).unwrap_or(0);
         let n = output_len(batch);
         let out: Int64Array = (0..n as i64).map(|i| Some(seed + i)).collect();
+        result(params, arc(out))
+    }
+}
+
+/// `query_seed(value)` — adds a per-query-stable seed (CONSISTENT_WITHIN_QUERY).
+///
+/// The only fixture emitting `CONSISTENT_WITHIN_QUERY`; the offset is a fixed
+/// constant here so SQL tests have a stable expected output — the stability
+/// flag is what's under test, not the numeric result.
+pub struct QuerySeedFunction;
+impl ScalarFunction for QuerySeedFunction {
+    fn name(&self) -> &str {
+        "query_seed"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = meta_ret(
+            "Add a per-query-stable seed to each value (demonstrates CONSISTENT_WITHIN_QUERY stability)",
+            DataType::Int64,
+        );
+        m.stability = Some(vgi::protocol::enums::stability::CONSISTENT_WITHIN_QUERY.to_string());
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "int64", "Value to offset")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let value = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let out: Int64Array = (0..value.len())
+            .map(|i| (!value.is_null(i)).then(|| value.value(i) + 1000))
+            .collect();
         result(params, arc(out))
     }
 }

@@ -14,6 +14,7 @@ mod buffering;
 mod catalog_def;
 #[cfg(feature = "coverage")]
 mod coverage;
+mod narrow_bind;
 mod scalar;
 mod table;
 mod table_in_out;
@@ -55,6 +56,8 @@ fn main() {
     if catalog.name == "example" {
         accumulate::register(&mut worker);
         worker.register_secondary_catalog(accumulate::catalog(), accumulate::function_names());
+        narrow_bind::register(&mut worker);
+        worker.register_secondary_catalog(narrow_bind::catalog(), narrow_bind::function_names());
     }
     worker.set_catalog(catalog);
     worker.run();
