@@ -56,15 +56,25 @@ pub mod partition_kind {
 }
 
 /// `OrderDependence`.
+///
+/// Wire values are the Python `OrderDependence` enum member names (`.name`),
+/// which the C++ vgi extension's `ParseAggregateOrderDependent` matches exactly
+/// (via `RequireKnownEnum`). They MUST be uppercase — a lowercase value is
+/// rejected outright, failing catalog load for every function. See the sibling
+/// note on [`null_handling`].
 pub mod order_dependence {
-    pub const ORDER_DEPENDENT: &str = "order_dependent";
-    pub const NOT_ORDER_DEPENDENT: &str = "not_order_dependent";
+    pub const ORDER_DEPENDENT: &str = "ORDER_DEPENDENT";
+    pub const NOT_ORDER_DEPENDENT: &str = "NOT_ORDER_DEPENDENT";
 }
 
 /// `DistinctDependence`.
+///
+/// Wire values are the Python `DistinctDependence` enum member names (`.name`),
+/// matched exactly by the C++ `ParseAggregateDistinctDependent` via
+/// `RequireKnownEnum`. They MUST be uppercase — see [`order_dependence`].
 pub mod distinct_dependence {
-    pub const DISTINCT_DEPENDENT: &str = "distinct_dependent";
-    pub const NOT_DISTINCT_DEPENDENT: &str = "not_distinct_dependent";
+    pub const DISTINCT_DEPENDENT: &str = "DISTINCT_DEPENDENT";
+    pub const NOT_DISTINCT_DEPENDENT: &str = "NOT_DISTINCT_DEPENDENT";
 }
 
 /// `TableInOutFunctionInitPhase` — the `init` request `phase` enum.
