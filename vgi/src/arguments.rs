@@ -211,7 +211,11 @@ impl Arguments {
     /// Read a const bool.
     pub fn const_bool(&self, pos: usize) -> Option<bool> {
         let a = self.nonnull(pos)?;
-        a.as_boolean_opt().map(|b| b.value(0))
+        if let Some(b) = a.as_boolean_opt() {
+            return Some(b.value(0));
+        }
+        // `arrow_lossless_conversion` encodes BOOLEAN as Int8.
+        crate::numeric::array_value_i64(a, 0).map(|v| v != 0)
     }
 
     /// Read const binary bytes.
@@ -267,9 +271,13 @@ impl Arguments {
 
     /// Read a named const bool argument.
     pub fn named_bool(&self, name: &str) -> Option<bool> {
-        self.named_nonnull(name)?
-            .as_boolean_opt()
-            .map(|b| b.value(0))
+        let a = self.named_nonnull(name)?;
+        if let Some(b) = a.as_boolean_opt() {
+            return Some(b.value(0));
+        }
+        // `arrow_lossless_conversion` encodes BOOLEAN as Int8 — accept any
+        // integer encoding (nonzero = true).
+        crate::numeric::array_value_i64(a, 0).map(|v| v != 0)
     }
 
     /// Expand compacted const-only positional args to their declared positions
