@@ -90,17 +90,24 @@ fn score_candidate(
 
     let mut score: i64 = 0;
 
-    // Score const args against the positional arg arrays.
+    // Score const args against the positional arg arrays. Resolution runs
+    // BEFORE `remap_positional`, so the wire `positional` array is densely packed
+    // in const-spec order (const arg #k at index k) regardless of the spec's
+    // declared `position` — which is offset past any leading column args. Index
+    // by ordinal, not by `spec.position`, or a const whose declared position
+    // exceeds the dense length is scored against the wrong arg (or skipped).
+    let mut const_ord = 0usize;
     for spec in &const_specs {
         if spec.is_varargs {
             continue;
         }
-        if let Some(a) = args.arg(spec.position as usize) {
+        if let Some(a) = args.arg(const_ord) {
             match score_type(a.data_type(), spec) {
                 Some(s) => score += s,
                 None => return None,
             }
         }
+        const_ord += 1;
     }
 
     // Score const VARARGS: every positional arg at or past the varargs spec's
