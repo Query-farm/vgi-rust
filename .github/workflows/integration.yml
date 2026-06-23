@@ -62,8 +62,8 @@ jobs:
           ref: ${{ env.VGI_REF }}
           path: vgi-upstream
 
-      - name: Install Rust toolchain (MSRV 1.86)
-        uses: dtolnay/rust-toolchain@1.86.0
+      - name: Install Rust toolchain (MSRV 1.90)
+        uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -120,8 +120,8 @@ jobs:
           ref: ${{ env.VGI_REF }}
           path: vgi-upstream
 
-      - name: Install Rust toolchain (MSRV 1.86) + llvm-tools
-        uses: dtolnay/rust-toolchain@1.86.0
+      - name: Install Rust toolchain (MSRV 1.90) + llvm-tools
+        uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: llvm-tools-preview
 
