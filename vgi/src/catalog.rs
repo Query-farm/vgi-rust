@@ -575,7 +575,7 @@ pub fn resolve_version_npm(
     // Bare major.minor `X.Y` → pin to X.Y.0
     if !matches!(prefix, '^' | '~') && nums.len() == 2 {
         let pinned = format!("{}.{}.0", nums[0], nums[1]);
-        return if supported.iter().any(|s| *s == pinned) {
+        return if supported.contains(&pinned) {
             Ok(pinned)
         } else {
             Err(unsupported())
