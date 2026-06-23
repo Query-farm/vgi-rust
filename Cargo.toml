@@ -3,7 +3,7 @@ resolver = "2"
 members = ["vgi", "vgi-example-worker", "vgi-storage-server"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.90"
 license-file = "LICENSE"
@@ -16,18 +16,18 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # vgi-rpc, add an (uncommitted) `[patch.crates-io]` pointing at the checkout:
 #   [patch.crates-io]
 #   vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
-vgi-rpc = { version = "0.4.0", default-features = false, features = ["macros", "http"] }
-arrow = { version = "58", default-features = false, features = ["ipc"] }
-arrow-array = "58"
-arrow-buffer = "58"
-arrow-data = "58"
-arrow-ipc = "58"
-arrow-schema = "58"
-arrow-select = "58"
-arrow-row = "58"
-arrow-cast = "58"
-arrow-arith = "58"
-arrow-ord = "58"
+vgi-rpc = { version = "0.5.0", default-features = false, features = ["macros", "http"] }
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-data = "59"
+arrow-ipc = "59"
+arrow-schema = "59"
+arrow-select = "59"
+arrow-row = "59"
+arrow-cast = "59"
+arrow-arith = "59"
+arrow-ord = "59"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"

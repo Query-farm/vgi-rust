@@ -23,7 +23,7 @@ for you when a query needs it — you never run a server by hand.
 wire-compatible with the canonical
 [Python](https://github.com/Query-farm/vgi-python) SDK, so a Rust worker
 drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
-[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 58.x, **MSRV 1.90**.
+[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 59.x, **MSRV 1.90**.
 
 ## Why a worker instead of a C++ extension?
 
@@ -48,8 +48,8 @@ example below needs):
 [dependencies]
 vgi = "0.1"
 vgi-rpc = "0.2"
-arrow-array = "58"
-arrow-schema = "58"
+arrow-array = "59"
+arrow-schema = "59"
 ```
 
 **2. Write a function and serve it:**
