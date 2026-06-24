@@ -1131,6 +1131,9 @@ impl Dispatcher {
             cat.name.as_bytes().to_vec()
         };
         let mut si = catalog::schema_info(name, comment, &attach);
+        // Schema-level tags (e.g. vgi.description_llm / vgi.description_md) come
+        // from the declarative CatSchema, surfaced via duckdb_schemas().tags.
+        si.tags = cat.schema(name).map(|s| s.tags.clone()).unwrap_or_default();
         // Object counts come from the (primary) worker-global function
         // registries, so only advertise them for the primary, non-version-shaped
         // catalog. Version-shaped catalogs vary their object set per attach, and

@@ -107,7 +107,7 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     let rel_field = Arc::new(Field::new("item", DataType::Struct(rel_fields), true));
     let releases = one_empty_list(rel_field, rel_values);
 
-    let source_url = Arc::new(StringArray::from(vec![Option::<String>::None])) as ArrayRef;
+    let source_url = Arc::new(StringArray::from(vec![model.source_url.clone()])) as ArrayRef;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -478,6 +478,9 @@ pub struct CatalogModel {
     pub comment: Option<String>,
     /// Database-level tags (surfaced via `duckdb_databases().tags`).
     pub tags: Vec<(String, String)>,
+    /// Provenance URL (repo / docs / dataset homepage) advertised via
+    /// `catalog_catalogs().source_url` so consumers can verify provenance.
+    pub source_url: Option<String>,
     /// Whether the catalog supports time-travel (`AT`) queries.
     pub supports_time_travel: bool,
     /// Worker software version (singular per worker). `None` = no opinion.
@@ -595,10 +598,13 @@ pub fn resolve_version_npm(
     Err(unsupported())
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct CatSchema {
     pub name: String,
     pub comment: Option<String>,
+    /// Schema-level tags (surfaced via `duckdb_schemas().tags`), e.g.
+    /// `vgi.description_llm` / `vgi.description_md`.
+    pub tags: Vec<(String, String)>,
     pub views: Vec<CatView>,
     pub macros: Vec<CatMacro>,
     pub tables: Vec<CatTable>,

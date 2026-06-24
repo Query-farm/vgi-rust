@@ -958,10 +958,12 @@ pub fn versioned() -> CatalogModel {
                 .to_string(),
         ),
         tags: Vec::new(),
+        source_url: None,
         supports_time_travel: false,
         schemas: vec![CatSchema {
             name: "main".to_string(),
             comment: None,
+            tags: Vec::new(),
             views: Vec::new(),
             macros: Vec::new(),
             tables: Vec::new(),
@@ -977,6 +979,7 @@ pub fn versioned_tables() -> CatalogModel {
     let main = |tables: Vec<CatTable>| CatSchema {
         name: "main".to_string(),
         comment: None,
+        tags: Vec::new(),
         views: Vec::new(),
         macros: Vec::new(),
         tables,
@@ -1020,6 +1023,7 @@ pub fn versioned_tables() -> CatalogModel {
     version_schemas.insert("3.0.0".to_string(), vec![main(vec![plants.clone()])]);
     CatalogModel {
         name: "versioned_tables".to_string(),
+        source_url: None,
         implementation_version: Some("11.0.0".to_string()),
         data_version_spec: Some(">=1.0.0,<4.0.0".to_string()),
         supported_data_versions: vec![
@@ -1060,6 +1064,7 @@ pub fn build_by_name(name: &str) -> CatalogModel {
 pub fn build() -> CatalogModel {
     CatalogModel {
         name: "example".to_string(),
+        source_url: None,
         implementation_version: None,
         data_version_spec: None,
         supported_data_versions: Vec::new(),
@@ -1079,6 +1084,7 @@ pub fn build() -> CatalogModel {
             CatSchema {
                 name: "main".to_string(),
                 comment: Some("Example functions for testing VGI".to_string()),
+                tags: Vec::new(),
                 views: vec![
                     CatView {
                         comment: Some("First 10 integers".to_string()),
@@ -1111,6 +1117,7 @@ pub fn build() -> CatalogModel {
             CatSchema {
                 name: "data".to_string(),
                 comment: Some("Example tables backed by functions".to_string()),
+                tags: Vec::new(),
                 views: vec![CatView {
                     column_comments: kv(&[("value", "Single-digit value 0..9")]),
                     ..view("small_numbers", "SELECT * FROM numbers WHERE value < 10")
