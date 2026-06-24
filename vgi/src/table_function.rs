@@ -42,9 +42,24 @@ pub trait TableProducer: Send {
     fn encode_resume(&self) -> Vec<u8> {
         Vec::new()
     }
-    /// Restore the partial-chunk cursor after rebuilding from an HTTP state
-    /// token. Inverse of [`encode_resume`](Self::encode_resume).
+    /// Restore the scan position after rebuilding from an HTTP state token.
+    /// Inverse of [`encode_resume`](Self::encode_resume).
     fn restore_resume(&mut self, _bytes: &[u8]) {}
+    /// Whether this producer can serialize its scan position for HTTP
+    /// continuation. When `true`, the HTTP transport returns one batch per
+    /// response and resumes via a state token (so the whole result set never
+    /// has to fit in memory), exactly like the Python and Go workers. When
+    /// `false` (the default), the producer is drained fully into a single init
+    /// response — correct, but unbounded in memory.
+    ///
+    /// A producer is rebuilt fresh from its bind params on resume and then has
+    /// [`restore_resume`](Self::restore_resume) called, so
+    /// [`encode_resume`](Self::encode_resume) only needs to carry the scan
+    /// *position* — never anything regenerable from the params. Override this to
+    /// `true` whenever you implement those two hooks.
+    fn resume_supported(&self) -> bool {
+        false
+    }
     /// Per-batch wire metadata for the batch just returned by `next_batch`
     /// (e.g. `vgi_batch_index` for `supports_batch_index` functions). Default
     /// none. Called once after each `next_batch` that returns `Some`.
@@ -171,6 +186,39 @@ pub trait TableFunction: Send + Sync {
         _storage: &dyn crate::storage::FunctionStorage,
     ) -> Vec<(String, String)> {
         Vec::new()
+    }
+}
+
+/// Helpers for serializing a producer's scan position into an HTTP continuation
+/// token. A resumable producer is rebuilt fresh from its bind params and then
+/// re-seeded via [`TableProducer::restore_resume`], so these encode only the
+/// cursor integers (current index, remaining, a 0/1 done flag, …) — never
+/// anything that the params already regenerate.
+pub mod resume {
+    /// Pack a slice of `i64` cursor values little-endian.
+    pub fn pack(vals: &[i64]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(vals.len() * 8);
+        for x in vals {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    /// Unpack exactly `n` `i64` values; returns `None` if the byte length does
+    /// not match (e.g. an empty/corrupt token), so callers degrade to a fresh
+    /// start rather than panic.
+    pub fn unpack(bytes: &[u8], n: usize) -> Option<Vec<i64>> {
+        if bytes.len() != n * 8 {
+            return None;
+        }
+        Some(
+            (0..n)
+                .map(|i| {
+                    let o = i * 8;
+                    i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap())
+                })
+                .collect(),
+        )
     }
 }
 

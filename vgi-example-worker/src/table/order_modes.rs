@@ -104,6 +104,9 @@ impl TableProducer for QueueSeqProducer {
             self.cur = Some((g(0), g(8)));
         }
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
 }
 
 pub struct QueueSeqFunction {

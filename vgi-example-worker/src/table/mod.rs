@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 /// Register all table fixtures. `catalog_name` gates catalog-specific scans.
@@ -140,6 +140,17 @@ impl TableProducer for Countdown {
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         self.offset = end;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.offset as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.offset = v[0] as usize;
+        }
     }
 }
 
@@ -336,6 +347,9 @@ impl TableProducer for ProfilingProducer {
         }
         Ok(Some(batch))
     }
+    // NOT resumable: the EXPLAIN ANALYZE counters (`rows`/`batches`) accumulate in
+    // the producer and are snapshotted to storage each batch. A resumed rebuild
+    // would reset them to zero and undercount, so drain in one response.
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +511,17 @@ impl TableProducer for LateMatProducer {
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.offset])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.offset = v[0];
+        }
     }
 }
 
@@ -683,6 +708,17 @@ impl TableProducer for NestedSeqProducer {
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.done { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.done = v[0] != 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +890,17 @@ impl TableProducer for FloatSeq {
             RecordBatch::try_new(self.schema.clone(), vec![Arc::new(arr)])
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         ))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.emitted { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.emitted = v[0] != 0;
+        }
     }
 }
 impl TableFunction for MakeSeriesFloat {

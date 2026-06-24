@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -126,10 +126,26 @@ fn meta(desc: &str) -> FunctionMetadata {
 
 struct OneShot {
     batch: Option<RecordBatch>,
+    done: bool,
 }
 impl TableProducer for OneShot {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
         Ok(self.batch.take())
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.done { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.done = v[0] != 0;
+        }
     }
 }
 
@@ -155,7 +171,10 @@ impl TableFunction for TimeTravelPushdownFunction {
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let version = resolve_tt_version(params.at_unit.as_deref(), params.at_value.as_deref())?;
         let batch = build_batch(version, &pushed_filter_str(params))?;
-        Ok(Box::new(OneShot { batch: Some(batch) }))
+        Ok(Box::new(OneShot {
+            batch: Some(batch),
+            done: false,
+        }))
     }
 }
 
@@ -194,6 +213,9 @@ impl TableFunction for TtPushdownColsScanFunction {
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let version = params.arguments.const_i64(0).unwrap_or(CURRENT_VERSION);
         let batch = build_batch(version, &pushed_filter_str(params))?;
-        Ok(Box::new(OneShot { batch: Some(batch) }))
+        Ok(Box::new(OneShot {
+            batch: Some(batch),
+            done: false,
+        }))
     }
 }

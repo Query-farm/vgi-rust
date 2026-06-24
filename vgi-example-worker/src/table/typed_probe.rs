@@ -16,7 +16,7 @@ use arrow_array::types::{IntervalMonthDayNanoType, TimestampMicrosecondType, UIn
 use arrow_array::{BinaryArray, Float64Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -178,5 +178,17 @@ impl TableProducer for TypedProbeProducer {
         self.cursor += size;
         self.remaining -= size;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
     }
 }

@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -87,16 +87,38 @@ impl TableFunction for FilterEchoTableScan {
             vec![Arc::new(ns), Arc::new(ss), Arc::new(pf)],
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        Ok(Box::new(OneBatch { batch: Some(batch) }))
+        Ok(Box::new(OneBatch {
+            batch: Some(batch),
+            done: false,
+        }))
     }
 }
 
 struct OneBatch {
     batch: Option<RecordBatch>,
+    done: bool,
 }
 impl TableProducer for OneBatch {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
         Ok(self.batch.take())
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.done { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.done = v[0] != 0;
+            if self.done {
+                self.batch = None;
+            }
+        }
     }
 }
 
@@ -220,6 +242,17 @@ impl TableProducer for SpatialProducer {
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.index])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.index = v[0];
+        }
+    }
 }
 
 /// `expression_filter_test(count, batch_size := 1024)` — rows with
@@ -324,6 +357,17 @@ impl TableProducer for ExprFilterProducer {
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.index])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.index = v[0];
+        }
+    }
 }
 
 /// `dynamic_filter_echo(count)` — descending integers; each batch's
@@ -422,6 +466,17 @@ impl TableProducer for DynFilterEchoProducer {
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.offset])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.offset = v[0];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +526,18 @@ impl TableProducer for DictEchoProducer {
         self.cursor += size;
         self.remaining -= size;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
     }
 }
 
@@ -565,6 +632,24 @@ impl TableProducer for FepProducer {
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
             self.cur = Some((bend, end));
             return Ok(Some(batch));
+        }
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// Carry the partial-chunk cursor `(idx, end)` so an HTTP continuation
+    /// resumes mid-chunk — the chunk was destructively popped from the shared
+    /// queue, so its remaining rows live only in `cur`. Empty between chunks
+    /// (the rebuilt producer pops the next item from the durable queue).
+    fn encode_resume(&self) -> Vec<u8> {
+        match self.cur {
+            Some((idx, end)) if idx < end => resume::pack(&[idx, end]),
+            _ => Vec::new(),
+        }
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cur = Some((v[0], v[1]));
         }
     }
 }
@@ -715,6 +800,18 @@ impl TableProducer for FilterEchoProducer {
         self.remaining -= size;
         Ok(Some(batch))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
+    }
 }
 
 pub struct FilterEchoFunction;
@@ -795,6 +892,10 @@ impl TableProducer for ValuePruneProducer {
         self.cursor = end;
         Ok(Some(batch))
     }
+    // NOT resumable: the pruned `values` come from a *dynamic* `get_column_values`
+    // filter that is not part of the bind params an HTTP continuation rebuilds
+    // from, so a resumed producer would regenerate the unpruned set. Drain in one
+    // response instead (the key set is small).
 }
 
 pub struct ValuePruneFunction;
@@ -925,6 +1026,18 @@ impl TableProducer for FceProducer {
         self.remaining -= size;
         Ok(Some(batch))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
+    }
 }
 
 pub struct FilteredColumnsEchoFunction;
@@ -1039,6 +1152,18 @@ impl TableProducer for NamedParamsProducer {
         self.cursor += size;
         self.remaining -= size;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
     }
 }
 

@@ -630,20 +630,21 @@ impl Dispatcher {
             // pre-narrowed the output via projection pushdown.
             let project_to = Some(output_schema.clone());
             let producer = f.producer(&params)?;
-            let resume_blob = if max_workers > 1 {
-                Some(self.exchange_blob(
-                    "table",
-                    bind_call.function_name.clone(),
-                    &output_schema,
-                    None,
-                    &bind_call,
-                    &dto,
-                    &execution_id,
-                    auto_apply,
-                )?)
-            } else {
-                None
-            };
+            // Always carry the rebuild blob so any resumable producer can yield a
+            // continuation token over HTTP (one batch per response, like the
+            // Python/Go workers) instead of draining the whole scan into memory.
+            // Producers that can't serialize their position drain anyway — see
+            // `TableProducerState::batch_limit`.
+            let resume_blob = Some(self.exchange_blob(
+                "table",
+                bind_call.function_name.clone(),
+                &output_schema,
+                None,
+                &bind_call,
+                &dto,
+                &execution_id,
+                auto_apply,
+            )?);
             let header = wire::to_batch(GlobalInitResponse {
                 execution_id: Bytes::from(execution_id),
                 max_workers,
@@ -2192,16 +2193,11 @@ struct TableProducerState {
     /// When set, narrow each (post-filter) batch to this projected schema —
     /// the producer emitted the full schema so filters could see all columns.
     project_to: Option<arrow_schema::SchemaRef>,
-    /// HTTP continuation token for resumable (work-queue) producers; `None`
-    /// means drain fully in one response.
+    /// Rebuild blob for resuming this producer from an HTTP state token. `None`
+    /// for producers that can't be rebuilt from bind params (buffering/finalize
+    /// flushes), which always drain in one response.
     resume_blob: Option<Vec<u8>>,
 }
-
-/// Per-response batch cap for resumable work-queue producers over HTTP: low
-/// enough that the global init yields early (so the parallel secondary workers
-/// each get a share of the shared queue) yet large enough to keep round-trips
-/// reasonable.
-const HTTP_WORKQUEUE_BATCH_LIMIT: usize = 4;
 
 impl vgi_rpc::ProducerState for TableProducerState {
     fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
@@ -2235,9 +2231,16 @@ impl vgi_rpc::ProducerState for TableProducerState {
         }
     }
     fn batch_limit(&self) -> Option<usize> {
-        self.resume_blob
-            .as_ref()
-            .map(|_| HTTP_WORKQUEUE_BATCH_LIMIT)
+        // Paginate (yield after the server-default batch count, i.e. one batch
+        // per HTTP response — matching the Python/Go workers) only when we can
+        // both rebuild the producer from a token AND the producer serializes its
+        // scan position. Otherwise drain fully (`Some(0)` = unlimited) so a
+        // producer never silently restarts from row 0 on resume.
+        if self.resume_blob.is_some() && self.inner.resume_supported() {
+            None
+        } else {
+            Some(0)
+        }
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         match &self.resume_blob {

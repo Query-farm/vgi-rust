@@ -117,11 +117,13 @@ pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenti
             .server(server)
             // Sticky sessions for the versioned HTTP fixtures' cookie routing.
             .enable_sticky(true)
-            // Drain each producer entirely within the init response so table
-            // scans never require a stateless continuation token (only the
-            // stateless scalar/table-in-out exchange paths need a state
-            // decoder; producers carry scan position that we don't serialize).
-            .producer_batch_limit(0);
+            // One output batch per producer HTTP response, then yield a
+            // continuation token — matching the Python and Go workers
+            // (`SetProducerBatchLimit(1)`). Resumable table scans serialize their
+            // position into the token so the whole result set never has to fit in
+            // memory; producers that can't serialize their position drain fully
+            // via a per-producer override (see `TableProducerState::batch_limit`).
+            .producer_batch_limit(1);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
         }

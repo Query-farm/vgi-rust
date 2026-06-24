@@ -13,7 +13,7 @@ use arrow_array::builder::{
 use arrow_array::{RecordBatch, TimestampMillisecondArray};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -193,5 +193,16 @@ impl TableProducer for WideProducer {
         let batch = build_wide_batch(&self.schema, self.pos, size)?;
         self.pos += size;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.pos])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.pos = v[0];
+        }
     }
 }

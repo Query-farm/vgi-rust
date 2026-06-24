@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableFunction, TableProducer};
+use vgi::table_function::{resume, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -88,5 +88,17 @@ impl TableProducer for SlowProducer {
         self.next += 1;
         self.remaining -= 1;
         Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.next, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.next = v[0];
+            self.remaining = v[1];
+        }
     }
 }

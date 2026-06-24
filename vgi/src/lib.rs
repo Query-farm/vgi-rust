@@ -140,6 +140,9 @@ pub mod transport;
 pub mod wire;
 pub mod worker;
 
+#[cfg(test)]
+mod http_continuation_tests;
+
 pub use function::{
     ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
     ScalarFunction,

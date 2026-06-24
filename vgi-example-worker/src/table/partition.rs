@@ -320,6 +320,14 @@ impl TableProducer for PartitionProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    /// Each `next_batch` atomically pops one whole partition from the shared
+    /// queue and emits it as a single batch, so the scan position lives entirely
+    /// in the durable queue — an HTTP continuation needs no in-memory cursor (the
+    /// rebuilt producer simply pops the next partition). The default empty
+    /// `encode_resume`/`restore_resume` are correct here.
+    fn resume_supported(&self) -> bool {
+        true
+    }
 }
 
 impl TableFunction for PartitionFunction {

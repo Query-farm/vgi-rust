@@ -269,6 +269,9 @@ impl TableProducer for QueueProducer {
             self.partition_id = g(0);
         }
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
 }
 
 fn make_producer(

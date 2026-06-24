@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -123,7 +123,10 @@ impl TableFunction for RffRowidScan {
             .collect();
         let batch =
             RecordBatch::try_new(out, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        Ok(Box::new(OneShot { batch: Some(batch) }))
+        Ok(Box::new(OneShot {
+            batch: Some(batch),
+            done: false,
+        }))
     }
 }
 
@@ -222,10 +225,26 @@ impl RffScan {
 
 struct OneShot {
     batch: Option<RecordBatch>,
+    done: bool,
 }
 impl TableProducer for OneShot {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
         Ok(self.batch.take())
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.done { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.done = v[0] != 0;
+        }
     }
 }
 
@@ -259,6 +278,9 @@ impl TableFunction for RffScan {
     fn producer(&self, _params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let batch = RecordBatch::try_new(self.schema.clone(), self.columns.clone())
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        Ok(Box::new(OneShot { batch: Some(batch) }))
+        Ok(Box::new(OneShot {
+            batch: Some(batch),
+            done: false,
+        }))
     }
 }
