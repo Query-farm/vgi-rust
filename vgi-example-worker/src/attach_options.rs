@@ -219,6 +219,7 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
         schemas: vec![vgi::catalog::CatSchema {
             name: "main".to_string(),
             comment: None,
+            tags: Vec::new(),
             views: Vec::new(),
             macros: Vec::new(),
             tables: Vec::new(),

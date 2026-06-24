@@ -675,6 +675,7 @@ pub fn catalog() -> CatalogModel {
         schemas: vec![CatSchema {
             name: "main".to_string(),
             comment: Some("Stateful row accumulation functions".to_string()),
+            tags: Vec::new(),
             views: Vec::new(),
             macros: Vec::new(),
             tables: Vec::new(),
