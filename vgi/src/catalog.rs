@@ -317,6 +317,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.null_handling = meta.null_handling.as_deref().map(enums::dict);
     fi.categories = meta.categories.clone();
     fi.examples = meta.examples.clone();
+    fi.tags = meta.tags.clone();
     if meta.projection_pushdown {
         fi.projection_pushdown = Some(true);
     }

@@ -190,6 +190,10 @@ pub struct FunctionMetadata {
     pub categories: Vec<String>,
     /// SQL usage examples surfaced in `FunctionInfo` for discovery.
     pub examples: Vec<FunctionExample>,
+    /// Arbitrary worker-set tags surfaced via `FunctionInfo.tags`
+    /// (`duckdb_functions().tags`), e.g. `vgi.columns_md` documenting a table
+    /// function's returned columns. Merged with any extension-derived tags.
+    pub tags: Vec<(String, String)>,
     /// Fixed scalar return type, when not computed dynamically at bind.
     pub return_type: Option<DataType>,
     pub projection_pushdown: bool,
@@ -221,6 +225,7 @@ impl Default for FunctionMetadata {
             null_handling: None,
             categories: Vec::new(),
             examples: Vec::new(),
+            tags: Vec::new(),
             return_type: None,
             projection_pushdown: false,
             filter_pushdown: false,
