@@ -52,8 +52,11 @@ impl TableProducer for SeqProducer {
         }
         let end = (self.n + BATCH).min(self.count);
         let vals: Vec<i64> = (self.n..end).collect();
-        let batch = RecordBatch::try_new(schema_n(), vec![Arc::new(Int64Array::from(vals)) as ArrayRef])
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let batch = RecordBatch::try_new(
+            schema_n(),
+            vec![Arc::new(Int64Array::from(vals)) as ArrayRef],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         self.n = end;
         Ok(Some(batch))
     }
@@ -327,7 +330,10 @@ fn resumable_scan_paginates_over_http() {
     // exhaustion on the same cycle as its final batch, so a last empty response
     // discovers `None` (matching the Python/Go workers).
     let data_batches = (count + BATCH - 1) / BATCH;
-    assert!(responses > 1, "scan did not paginate (drained in one response)");
+    assert!(
+        responses > 1,
+        "scan did not paginate (drained in one response)"
+    );
     assert_eq!(
         responses,
         data_batches + 1,
