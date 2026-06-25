@@ -1104,20 +1104,31 @@ pub fn build() -> CatalogModel {
                 macros: vec![
                     CatMacro {
                         parameter_docs: vec![
-                            ("x".to_string(), "Left operand".to_string()),
-                            ("y".to_string(), "Right operand".to_string()),
+                            ("x".to_string(), "First factor".to_string()),
+                            ("y".to_string(), "Second factor".to_string()),
                         ],
                         ..smacro("vgi_multiply", &["x", "y"], "x * y")
                     },
                     CatMacro {
                         defaults: vec![("lo".to_string(), 0), ("hi".to_string(), 100)],
+                        parameter_docs: vec![
+                            ("val".to_string(), "Value to clamp".to_string()),
+                            ("lo".to_string(), "Lower bound (inclusive)".to_string()),
+                            ("hi".to_string(), "Upper bound (inclusive)".to_string()),
+                        ],
                         ..smacro(
                             "vgi_clamp",
                             &["val", "lo", "hi"],
                             "GREATEST(lo, LEAST(hi, val))",
                         )
                     },
-                    tmacro("vgi_range_table", &["n"], "SELECT * FROM range(n)"),
+                    CatMacro {
+                        parameter_docs: vec![(
+                            "n".to_string(),
+                            "Number of rows to generate".to_string(),
+                        )],
+                        ..tmacro("vgi_range_table", &["n"], "SELECT * FROM range(n)")
+                    },
                 ],
                 tables: vec![],
             },

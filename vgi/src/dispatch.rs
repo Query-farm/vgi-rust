@@ -1425,8 +1425,14 @@ impl Dispatcher {
                 s.macros
                     .iter()
                     .filter(|m| match want.as_deref() {
-                        Some("table") => m.table_macro,
-                        Some("scalar") => !m.table_macro,
+                        // The C++ extension scans scalar and table macros via two
+                        // separate RPCs (`type=SCALAR_MACRO` / `TABLE_MACRO`).
+                        // Match both the `_macro`-suffixed wire values and the
+                        // bare `scalar`/`table` forms so each kind is returned
+                        // exactly once (returning all on a kind-scoped request
+                        // double-counts every macro across the two RPCs).
+                        Some("table") | Some("table_macro") => m.table_macro,
+                        Some("scalar") | Some("scalar_macro") => !m.table_macro,
                         _ => true,
                     })
                     .map(|m| catalog::macro_info(&name, m))
