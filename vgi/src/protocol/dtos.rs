@@ -486,6 +486,15 @@ pub struct MacroInfo {
     pub parameters: Vec<String>,
     pub parameter_default_values: Bytes,
     pub definition: String,
+    /// Optional Arrow schema (IPC bytes) with one nullable field per parameter,
+    /// in `parameters` order. Each field's type is the parameter's default value
+    /// type when known (else null), and the `vgi_doc` field metadata key carries
+    /// the parameter's description (UTF-8, presence-only — omitted when
+    /// undocumented). Mirrors the per-argument doc channel functions expose via
+    /// `FunctionInfo.arguments`. Empty means the worker supplied no per-parameter
+    /// docs (older workers); readers fall back to `parameters` for names. Appended
+    /// last for consistency with the reference wire contract.
+    pub arguments_schema: Bytes,
 }
 
 /// `ScanFunctionResult` — names the table function that scans a catalog table.

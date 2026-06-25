@@ -241,6 +241,7 @@ fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
         table_macro: false,
         comment: None,
         defaults: Vec::new(),
+        parameter_docs: Vec::new(),
     }
 }
 fn tmacro(name: &str, params: &[&str], def: &str) -> CatMacro {
@@ -1101,7 +1102,13 @@ pub fn build() -> CatalogModel {
                     },
                 ],
                 macros: vec![
-                    smacro("vgi_multiply", &["x", "y"], "x * y"),
+                    CatMacro {
+                        parameter_docs: vec![
+                            ("x".to_string(), "Left operand".to_string()),
+                            ("y".to_string(), "Right operand".to_string()),
+                        ],
+                        ..smacro("vgi_multiply", &["x", "y"], "x * y")
+                    },
                     CatMacro {
                         defaults: vec![("lo".to_string(), 0), ("hi".to_string(), 100)],
                         ..smacro(

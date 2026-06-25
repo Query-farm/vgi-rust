@@ -633,6 +633,12 @@ pub struct CatMacro {
     pub comment: Option<String>,
     /// Default values for trailing parameters: `(param_name, int64 default)`.
     pub defaults: Vec<(String, i64)>,
+    /// Per-parameter descriptions: `(param_name, description)`. Names must
+    /// appear in `parameters`. Descriptions flow over the wire via the macro
+    /// `arguments_schema`'s `vgi_doc` field metadata (the same channel functions
+    /// use for per-argument docs), so the DuckDB extension's
+    /// `vgi_function_arguments()` can surface them. Empty = no per-parameter docs.
+    pub parameter_docs: Vec<(String, String)>,
 }
 
 /// A function-backed catalog table: scanned by `scan_function(scan_args)`.
@@ -968,7 +974,75 @@ pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInf
             build_macro_defaults(&m.defaults).unwrap_or_default(),
         ),
         definition: m.definition.clone(),
+        arguments_schema: Bytes::from(build_macro_arguments_schema(m).unwrap_or_default()),
     }
+}
+
+/// Build a macro `arguments_schema`: one nullable Arrow field per parameter, in
+/// `parameters` order. A parameter's field type is the type of its default value
+/// when one is known (else `Null`). The per-parameter description rides as
+/// `vgi_doc` field metadata (UTF-8, presence-only — the key is omitted entirely
+/// when there is no doc), the exact same mechanism functions use for per-argument
+/// docs. Returns empty IPC bytes when the macro has no parameters and no docs,
+/// so older readers are unaffected.
+pub fn build_macro_arguments_schema(m: &CatMacro) -> Result<Vec<u8>> {
+    // Nothing to carry: no parameters and no docs -> emit nothing.
+    if m.parameters.is_empty() && m.parameter_docs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = macro_arguments_schema(&m.parameters, &m.defaults, &m.parameter_docs);
+    ipc::write_schema(&schema)
+}
+
+/// Construct the macro `arguments_schema` from the parameter names (order is
+/// load-bearing), the typed defaults (`(param, int64)` — present params get an
+/// `Int64` field type, others `Null`), and per-parameter docs (`vgi_doc` field
+/// metadata, presence-only).
+pub fn macro_arguments_schema(
+    parameters: &[String],
+    defaults: &[(String, i64)],
+    parameter_docs: &[(String, String)],
+) -> Schema {
+    let default_names: std::collections::HashSet<&str> =
+        defaults.iter().map(|(n, _)| n.as_str()).collect();
+    let fields: Vec<Field> = parameters
+        .iter()
+        .map(|name| {
+            // Type from the default value when known (macro defaults are int64),
+            // else Null.
+            let ty = if default_names.contains(name.as_str()) {
+                DataType::Int64
+            } else {
+                DataType::Null
+            };
+            let mut field = Field::new(name, ty, true);
+            // Per-parameter description (UTF-8; presence-only — omit when empty).
+            if let Some((_, doc)) = parameter_docs.iter().find(|(n, _)| n == name) {
+                if !doc.is_empty() {
+                    let mut meta: HashMap<String, String> = HashMap::new();
+                    meta.insert("vgi_doc".to_string(), doc.clone());
+                    field = field.with_metadata(meta);
+                }
+            }
+            field
+        })
+        .collect();
+    Schema::new(fields)
+}
+
+/// Extract per-parameter descriptions from a macro `arguments_schema` (inverse of
+/// [`macro_arguments_schema`]'s `vgi_doc` handling). Fields without the `vgi_doc`
+/// key (undocumented) are omitted.
+pub fn macro_parameter_docs_from_schema(schema: &Schema) -> Vec<(String, String)> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            f.metadata()
+                .get("vgi_doc")
+                .map(|doc| (f.name().clone(), doc.clone()))
+        })
+        .collect()
 }
 
 /// Build the 1-row IPC batch of macro parameter defaults (column per param).
@@ -1123,5 +1197,122 @@ mod tests {
         assert_eq!(fi.examples[0].expected_output.as_deref(), Some("1"));
         assert_eq!(fi.examples[1].sql, "SELECT example_scalar(x) FROM t");
         assert_eq!(fi.examples[1].expected_output, None);
+    }
+
+    fn macro_with_docs() -> CatMacro {
+        CatMacro {
+            name: "vgi_clamp".to_string(),
+            parameters: vec!["val".to_string(), "lo".to_string(), "hi".to_string()],
+            definition: "GREATEST(lo, LEAST(hi, val))".to_string(),
+            table_macro: false,
+            comment: None,
+            // `lo`/`hi` have int64 defaults; `val` does not.
+            defaults: vec![("lo".to_string(), 0), ("hi".to_string(), 100)],
+            parameter_docs: vec![
+                ("val".to_string(), "Value to clamp".to_string()),
+                ("hi".to_string(), "Upper bound — µ ≥ note".to_string()),
+                // `lo` deliberately left undocumented.
+            ],
+        }
+    }
+
+    #[test]
+    fn test_macro_arguments_schema_carries_vgi_doc_per_documented_param() {
+        let m = macro_with_docs();
+        let schema = macro_arguments_schema(&m.parameters, &m.defaults, &m.parameter_docs);
+
+        // One field per parameter, in `parameters` order.
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "val");
+        assert_eq!(schema.field(1).name(), "lo");
+        assert_eq!(schema.field(2).name(), "hi");
+
+        // Every field is nullable.
+        assert!(schema.fields().iter().all(|f| f.is_nullable()));
+
+        // Field type = default value type when known (int64), else Null.
+        assert_eq!(schema.field(0).data_type(), &DataType::Null); // val: no default
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64); // lo: int64 default
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64); // hi: int64 default
+
+        // Documented params carry vgi_doc (UTF-8, including non-ASCII).
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("vgi_doc")
+                .map(String::as_str),
+            Some("Value to clamp"),
+        );
+        assert_eq!(
+            schema
+                .field(2)
+                .metadata()
+                .get("vgi_doc")
+                .map(String::as_str),
+            Some("Upper bound — µ ≥ note"),
+        );
+
+        // Undocumented param has NO vgi_doc key (presence-only semantics).
+        assert!(
+            !schema.field(1).metadata().contains_key("vgi_doc"),
+            "undocumented parameter must not emit a vgi_doc metadata key",
+        );
+
+        // Round-trips through IPC and back to the docs map.
+        let bytes = build_macro_arguments_schema(&m).expect("serialize arguments_schema");
+        assert!(!bytes.is_empty());
+        let decoded = ipc::read_schema(&bytes).expect("read arguments_schema");
+        let docs = macro_parameter_docs_from_schema(&decoded);
+        assert_eq!(docs.len(), 2);
+        assert!(docs
+            .iter()
+            .any(|(n, d)| n == "val" && d == "Value to clamp"),);
+        assert!(docs
+            .iter()
+            .any(|(n, d)| n == "hi" && d == "Upper bound — µ ≥ note"),);
+        assert!(
+            !docs.iter().any(|(n, _)| n == "lo"),
+            "undocumented parameter must not appear in the decoded docs",
+        );
+    }
+
+    #[test]
+    fn test_macro_info_appends_arguments_schema_with_docs() {
+        let info = macro_info("main", &macro_with_docs());
+        // arguments_schema is populated for a documented macro.
+        assert!(!info.arguments_schema.0.is_empty());
+        let decoded =
+            ipc::read_schema(&info.arguments_schema.0).expect("read MacroInfo.arguments_schema");
+        assert_eq!(decoded.fields().len(), 3);
+        assert_eq!(
+            decoded
+                .field(0)
+                .metadata()
+                .get("vgi_doc")
+                .map(String::as_str),
+            Some("Value to clamp"),
+        );
+    }
+
+    #[test]
+    fn test_macro_arguments_schema_empty_when_no_params_and_no_docs() {
+        let m = CatMacro {
+            name: "no_args".to_string(),
+            parameters: vec![],
+            definition: "42".to_string(),
+            table_macro: false,
+            comment: None,
+            defaults: vec![],
+            parameter_docs: vec![],
+        };
+        let bytes = build_macro_arguments_schema(&m).expect("serialize");
+        assert!(
+            bytes.is_empty(),
+            "macro with no parameters and no docs emits empty arguments_schema",
+        );
+        // And the DTO carries empty bytes (older readers unaffected).
+        let info = macro_info("main", &m);
+        assert!(info.arguments_schema.0.is_empty());
     }
 }
