@@ -237,6 +237,10 @@ pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
         if spec.is_varargs {
             meta.insert("vgi_varargs".to_string(), "true".to_string());
         }
+        // Per-argument description (UTF-8; presence-only — omit when empty).
+        if !spec.doc.is_empty() {
+            meta.insert("vgi_doc".to_string(), spec.doc.clone());
+        }
 
         let mut field = Field::new(&spec.name, ty, false);
         if !meta.is_empty() {
@@ -1071,6 +1075,43 @@ mod tests {
         fn process(&self, _params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
             Ok(batch.clone())
         }
+    }
+
+    #[test]
+    fn test_build_arg_schema_emits_vgi_doc() {
+        let documented_doc = "Integer value to multiply";
+        let unicode_doc = "µ ≥ value — note";
+        let specs = vec![
+            ArgSpec::column("multiplier", 0, "int64", documented_doc),
+            ArgSpec::column("plain", 1, "int64", ""),
+            ArgSpec::column("scaled", 2, "int64", unicode_doc),
+        ];
+
+        let schema = build_arg_schema(&specs);
+
+        // Documented arg carries vgi_doc equal to the doc string.
+        let documented = schema.field(0);
+        assert_eq!(documented.name(), "multiplier");
+        assert_eq!(
+            documented.metadata().get("vgi_doc").map(String::as_str),
+            Some(documented_doc),
+        );
+
+        // Empty-doc arg has NO vgi_doc key (presence-only semantics).
+        let plain = schema.field(1);
+        assert_eq!(plain.name(), "plain");
+        assert!(
+            !plain.metadata().contains_key("vgi_doc"),
+            "empty doc must not emit a vgi_doc metadata key",
+        );
+
+        // Unicode doc round-trips as UTF-8.
+        let scaled = schema.field(2);
+        assert_eq!(scaled.name(), "scaled");
+        assert_eq!(
+            scaled.metadata().get("vgi_doc").map(String::as_str),
+            Some(unicode_doc),
+        );
     }
 
     #[test]
