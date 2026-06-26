@@ -81,6 +81,14 @@ pub trait CopyFromFunction: Send + Sync {
     /// types / docs become the option metadata surfaced by `vgi_copy_formats()`.
     fn argument_specs(&self) -> Vec<ArgSpec>;
 
+    /// Secret types this reader needs (triggers the two-phase secret bind). The
+    /// COPY source path is in `params.copy_from` (e.g. for a cloud `COPY ... FROM
+    /// 's3://…'`), so a reader can scope its request to it. Resolved secrets then
+    /// arrive in `ctx.params.secrets` at [`read`](Self::read). Defaults to none.
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        Vec::new()
+    }
+
     /// Parse `ctx.path` and return Arrow batches whose schema matches
     /// `ctx.expected_schema` exactly. The whole source is read here (single-shot
     /// — mirrors the Python reader). `out` is provided for `client_log` only.
@@ -118,6 +126,12 @@ impl TableFunction for CopyFromTable {
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
         self.0.argument_specs()
+    }
+
+    fn secret_lookups(&self, params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        // Forward to the COPY reader, which can scope its request to the COPY
+        // source path in `params.copy_from`.
+        self.0.secret_lookups(params)
     }
 
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
