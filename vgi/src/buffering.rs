@@ -32,6 +32,10 @@ pub struct BufferingParams {
     pub output_schema: SchemaRef,
     pub arguments: Arguments,
     pub settings: Settings,
+    /// Resolved secrets for this call (two-phase secret bind). Populated at the
+    /// finalize phase from the C++-replayed bind call; empty at process/combine
+    /// (the connector only replays secrets on bind/init).
+    pub secrets: crate::secrets::Secrets,
     /// The (plaintext) attach state for this call, when carried by the request.
     /// Persisted at the sink-init phase and replayed to process/combine, which
     /// otherwise carry no per-attach context (stateful functions scope storage
@@ -59,6 +63,14 @@ pub trait TableBufferingFunction: Send + Sync {
     fn name(&self) -> &str;
     fn metadata(&self) -> FunctionMetadata;
     fn argument_specs(&self) -> Vec<ArgSpec>;
+    /// Secret types this function needs (triggers the two-phase secret bind).
+    /// Returning a non-empty list on the first bind makes the connector resolve
+    /// the named/scoped secrets and re-bind with `resolved_secrets_provided`;
+    /// the resolved values then arrive in `BindParams::secrets` at `on_bind` and
+    /// in `BufferingParams::secrets` at the finalize phase.
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        Vec::new()
+    }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse>;
     /// Sink one batch; return an opaque state_id.
     fn process(

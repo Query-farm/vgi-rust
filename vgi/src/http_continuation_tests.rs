@@ -361,3 +361,162 @@ fn non_resumable_scan_drains_in_one_response() {
         "drain must return the full result set in one response"
     );
 }
+
+// --- Two-phase secret bind for a TABLE-BUFFERING function. The buffering bind
+//     path used to hardcode empty secret lookups, so a buffering sink could not
+//     request DuckDB secrets the way scalar/table functions can. These tests
+//     drive the `bind` RPC directly and assert the buffering function now both
+//     triggers the lookup request (first pass) and binds normally once the
+//     connector re-binds with resolved_secrets_provided. ---
+
+use crate::buffering::{BufferingParams, TableBufferingFunction};
+use crate::secrets::SecretLookup;
+
+/// A buffering sink that needs an `s3` secret scoped to its `path` argument.
+struct SecretSink;
+impl TableBufferingFunction for SecretSink {
+    fn name(&self) -> &str {
+        "secret_sink"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("path", 0, "varchar", "destination path")]
+    }
+    fn secret_lookups(&self, params: &BindParams) -> Vec<SecretLookup> {
+        let scope = params.arguments.const_str(0);
+        vec![SecretLookup {
+            secret_type: "s3".to_string(),
+            scope,
+            name: None,
+        }]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, _p: &BufferingParams, _b: &RecordBatch) -> Result<Vec<u8>> {
+        unimplemented!()
+    }
+    fn combine(&self, _p: &BufferingParams, _s: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        unimplemented!()
+    }
+    fn finalize_producer(
+        &self,
+        _p: &BufferingParams,
+        _f: Vec<u8>,
+    ) -> Result<Box<dyn TableProducer>> {
+        unimplemented!()
+    }
+}
+
+fn start_secret_server() -> u16 {
+    let mut w = Worker::new();
+    w.register_buffering(SecretSink);
+    let server = Arc::new(w.build_server());
+    let state = HttpState::builder().server(server).build();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        rt.block_on(vgi_rpc::http::serve_with_shutdown(state, listener))
+            .ok();
+    });
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    port
+}
+
+/// Frame a unary `bind` request body for `function(path)`.
+fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec<u8> {
+    let args = crate::arguments::Arguments::serialize_positional(&[Arc::new(
+        arrow_array::StringArray::from(vec![path]),
+    ) as ArrayRef])
+    .unwrap();
+    let bind = BindRequest {
+        function_name: function.to_string(),
+        arguments: Bytes::from(args),
+        function_type: DictString("table_buffering".to_string()),
+        input_schema: None,
+        settings: None,
+        secrets: None,
+        attach_opaque_data: None,
+        transaction_opaque_data: None,
+        resolved_secrets_provided,
+        at_unit: None,
+        at_value: None,
+    };
+    let inner = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
+    let req_schema = Arc::new(Schema::new(vec![Field::new(
+        "request",
+        DataType::Binary,
+        false,
+    )]));
+    let req = RecordBatch::try_new(
+        req_schema,
+        vec![Arc::new(BinaryArray::from(vec![inner.as_slice()])) as ArrayRef],
+    )
+    .unwrap();
+    frame(&req, "bind", None)
+}
+
+/// Decode the `{result: binary}` envelope of a unary `bind` response into the
+/// wire `BindResponse` DTO.
+fn parse_bind_response(body: &[u8]) -> crate::protocol::dtos::BindResponse {
+    let mut cursor = std::io::Cursor::new(body);
+    let mut r = StreamReader::new(&mut cursor).unwrap();
+    let (envelope, _) = r.read_next().unwrap().expect("a bind response batch");
+    let col = envelope
+        .column(envelope.schema().index_of("result").unwrap())
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    let inner = ipc::read_batch(col.value(0)).unwrap();
+    wire::from_batch::<crate::protocol::dtos::BindResponse>(&inner).unwrap()
+}
+
+/// First pass (resolved_secrets_provided=false): a buffering function with a
+/// non-empty `secret_lookups` makes bind return the lookup request, scoped to
+/// the path argument — so the connector knows to resolve and re-bind.
+#[test]
+fn buffering_bind_requests_secrets_first_pass() {
+    let port = start_secret_server();
+    let resp = parse_bind_response(&post(
+        port,
+        "bind",
+        bind_body("secret_sink", "s3://bucket/out.dat", false),
+    ));
+    assert_eq!(resp.lookup_secret_types, vec!["s3".to_string()]);
+    assert_eq!(resp.lookup_scopes, vec!["s3://bucket/out.dat".to_string()]);
+    // The lookup short-circuits before on_bind, so no output schema yet.
+    assert!(resp.output_schema.0.is_empty());
+}
+
+/// Second pass (resolved_secrets_provided=true): bind runs on_bind normally and
+/// returns the output schema with no further secret lookups.
+#[test]
+fn buffering_bind_resolves_after_secrets_provided() {
+    let port = start_secret_server();
+    let resp = parse_bind_response(&post(
+        port,
+        "bind",
+        bind_body("secret_sink", "s3://bucket/out.dat", true),
+    ));
+    assert!(resp.lookup_secret_types.is_empty());
+    assert!(
+        !resp.output_schema.0.is_empty(),
+        "on_bind should have produced the output schema"
+    );
+}

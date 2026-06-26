@@ -275,6 +275,30 @@ impl Dispatcher {
         if self.buffering.contains_key(&dto.function_name) {
             let f = self.resolve_buffering(&dto.function_name)?;
             params.arguments.remap_positional(&f.argument_specs());
+            // Two-phase secret bind: first pass requests the secret types; the
+            // C++ resolves them and re-binds with `resolved_secrets_provided`.
+            if !params.resolved_secrets_provided {
+                let lookups = f.secret_lookups(&params);
+                if !lookups.is_empty() {
+                    let resp = BindResponse {
+                        output_schema: Bytes::from(Vec::new()),
+                        opaque_data: Bytes::from(Vec::new()),
+                        lookup_secret_types: lookups
+                            .iter()
+                            .map(|l| l.secret_type.clone())
+                            .collect(),
+                        lookup_scopes: lookups
+                            .iter()
+                            .map(|l| l.scope.clone().unwrap_or_default())
+                            .collect(),
+                        lookup_names: lookups
+                            .iter()
+                            .map(|l| l.name.clone().unwrap_or_default())
+                            .collect(),
+                    };
+                    return Ok(Some(wire::to_result_batch(resp)?));
+                }
+            }
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
@@ -467,6 +491,7 @@ impl Dispatcher {
                     output_schema: output_schema.clone(),
                     arguments: bp.arguments,
                     settings: bp.settings,
+                    secrets: bp.secrets,
                     attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
                     batch_index: None,
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1626,6 +1651,8 @@ impl Dispatcher {
             output_schema,
             arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
+            // process/combine carry no secrets — the connector only replays them on bind/init.
+            secrets: crate::secrets::Secrets::default(),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: dto.batch_index,
             logs: logs.clone(),
@@ -1666,6 +1693,8 @@ impl Dispatcher {
             output_schema,
             arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
+            // process/combine carry no secrets — the connector only replays them on bind/init.
+            secrets: crate::secrets::Secrets::default(),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: None,
             logs: logs.clone(),
