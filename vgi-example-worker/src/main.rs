@@ -12,6 +12,7 @@ mod aggregate;
 mod attach_options;
 mod buffering;
 mod catalog_def;
+mod copy_from;
 #[cfg(feature = "coverage")]
 mod coverage;
 mod narrow_bind;
@@ -54,6 +55,9 @@ fn main() {
     // The `accumulate` fixture catalog is served (MetaWorker-style) alongside
     // the example catalog — the accumulate tests attach it via the plain worker.
     if catalog.name == "example" {
+        // Custom COPY ... FROM format reader (example_lines) — only on the
+        // primary `example` catalog, matching the Python fixture worker.
+        copy_from::register(&mut worker);
         accumulate::register(&mut worker);
         worker.register_secondary_catalog(accumulate::catalog(), accumulate::function_names());
         narrow_bind::register(&mut worker);

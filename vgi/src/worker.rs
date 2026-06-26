@@ -109,6 +109,20 @@ impl Worker {
         self.disp.register_aggregate(Arc::new(f));
     }
 
+    /// Register a custom `COPY ... FROM` format reader.
+    ///
+    /// The reader is exposed two ways: as a producer-mode table function (so the
+    /// whole table bind/init/scan path is reused) and as an advertised
+    /// `COPY ... FROM` format via `catalog_copy_from_formats`. Users then run
+    /// `COPY target FROM 'path' (FORMAT <alias>.<format>, opt val, ...)`.
+    /// See [`crate::copy_from::CopyFromFunction`].
+    pub fn register_copy_from(&mut self, f: impl crate::copy_from::CopyFromFunction + 'static) {
+        let arc: Arc<dyn crate::copy_from::CopyFromFunction> = Arc::new(f);
+        self.disp
+            .register_table(Arc::new(crate::copy_from::CopyFromTable(arc.clone())));
+        self.disp.register_copy_from(arc);
+    }
+
     /// Install the declarative catalog (views / macros / tables).
     ///
     /// Any catalog table built with [`crate::catalog::CatTable::with_function`]

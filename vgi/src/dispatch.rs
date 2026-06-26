@@ -63,6 +63,10 @@ pub struct Dispatcher {
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
     pub settings: Vec<catalog::SettingSpec>,
+    /// Custom `COPY ... FROM` format readers (advertised via
+    /// `catalog_copy_from_formats`). Each is also registered as a table function
+    /// in `tables` (under its handler name) by `Worker::register_copy_from`.
+    pub copy_from_formats: Vec<Arc<dyn crate::copy_from::CopyFromFunction>>,
     exec_counter: AtomicU64,
 }
 
@@ -81,6 +85,7 @@ impl Dispatcher {
             secondary_functions: Vec::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
+            copy_from_formats: Vec::new(),
             exec_counter: AtomicU64::new(1),
         }
     }
@@ -107,6 +112,14 @@ impl Dispatcher {
 
     pub fn register_setting(&mut self, spec: catalog::SettingSpec) {
         self.settings.push(spec);
+    }
+
+    /// Record a custom `COPY ... FROM` format reader for advertisement via
+    /// `catalog_copy_from_formats`. The reader must also be registered as a
+    /// table function under its handler name (done by
+    /// `Worker::register_copy_from`).
+    pub fn register_copy_from(&mut self, f: Arc<dyn crate::copy_from::CopyFromFunction>) {
+        self.copy_from_formats.push(f);
     }
 
     pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
@@ -261,14 +274,22 @@ impl Dispatcher {
             attach_opaque_data: dto.attach_opaque_data.clone().map(|b| b.into()),
             transaction_opaque_data: dto.transaction_opaque_data.clone().map(|b| b.into()),
             storage: Some(self.store.clone()),
+            // `copy_from` is read out-of-band from the request batch (the C++
+            // extension omits the column for non-COPY binds) and set by the
+            // caller — see `handle_bind` / `handle_init`.
+            copy_from: None,
         })
     }
 
     // -- bind ---------------------------------------------------------------
 
     pub fn handle_bind(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
-        let dto: BindRequest = boxed(req)?;
+        let inner = request_inner_batch(req)?;
+        let dto: BindRequest = wire::from_batch(&inner)?;
         let mut params = self.bind_params(&dto, ctx)?;
+        // The COPY ... FROM context (when present) rides as an out-of-band
+        // nested-struct column the C++ extension omits for ordinary binds.
+        params.copy_from = read_copy_from(&inner)?;
         let ft = normalize_function_type(&dto.function_type.0).unwrap_or_default();
 
         // Table buffering.
@@ -420,8 +441,13 @@ impl Dispatcher {
     pub fn handle_init(&self, req: &Request, ctx: &CallContext) -> Result<StreamResult> {
         let dto: InitRequest = boxed(req)?;
         // bind_call is an IPC-serialized BindRequest.
-        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bind_call_batch = ipc::read_batch(&dto.bind_call.0)?;
+        let bind_call: BindRequest = wire::from_batch(&bind_call_batch)?;
+        // COPY ... FROM context (out-of-band struct column, absent for ordinary
+        // scans) — threaded onto every ProcessParams built below.
+        let copy_from = read_copy_from(&bind_call_batch)?;
         let mut bp = self.bind_params(&bind_call, ctx)?;
+        bp.copy_from = copy_from.clone();
         // Projection pushdown: the C++ sends the full bind output schema plus
         // projection_ids; narrow the schema the worker emits to those columns.
         let output_schema = crate::table_function::project_schema(
@@ -467,6 +493,7 @@ impl Dispatcher {
                 attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
                 at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
                 at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
+                copy_from: copy_from.clone(),
             };
 
         // Table buffering: sink (header-only) or finalize source (producer).
@@ -823,6 +850,9 @@ impl Dispatcher {
             attach_opaque_data: None,
             at_unit: Some(blob.at_unit.clone()).filter(|s| !s.is_empty()),
             at_value: Some(blob.at_value.clone()).filter(|s| !s.is_empty()),
+            // COPY-FROM producers drain fully (no HTTP continuation token is
+            // issued), so a resumed stream never carries copy_from context.
+            copy_from: None,
         };
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
@@ -1559,6 +1589,36 @@ impl Dispatcher {
             }
         }
         let items = catalog::serialize_items(infos)?;
+        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+    }
+
+    /// `catalog_copy_from_formats` — advertise the worker's custom
+    /// `COPY ... FROM` formats. Catalog-level (not schema-scoped). Only the
+    /// primary catalog owns these formats; secondaries advertise none.
+    pub fn handle_catalog_copy_from_formats(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let active = self.active_catalog(req);
+        let items = if std::ptr::eq(active, &self.catalog) {
+            let infos: Vec<CopyFromFormatInfo> = self
+                .copy_from_formats
+                .iter()
+                .map(|f| -> Result<CopyFromFormatInfo> {
+                    let meta = f.metadata();
+                    let arg_schema = catalog::build_arg_schema(&f.argument_specs());
+                    Ok(CopyFromFormatInfo {
+                        comment: f.comment(),
+                        tags: meta.tags.clone(),
+                        format_name: f.format().to_string(),
+                        handler: f.handler_name().to_string(),
+                        options: Bytes::from(ipc::write_schema(&arg_schema)?),
+                        direction: "from".to_string(),
+                        description: meta.description.clone(),
+                    })
+                })
+                .collect::<Result<_>>()?;
+            catalog::serialize_items(infos)?
+        } else {
+            Vec::new()
+        };
         Ok(Some(wire::to_result_batch(ItemsResult { items })?))
     }
 
@@ -2314,7 +2374,8 @@ fn read_le_i64(b: &[u8]) -> Option<i64> {
     Some(i64::from_le_bytes(arr))
 }
 
-fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
+/// Decode the IPC batch carried in the request's `request` binary column.
+fn request_inner_batch(req: &Request) -> Result<RecordBatch> {
     let col = req
         .column("request")
         .ok_or_else(|| RpcError::type_error("request missing 'request' column"))?;
@@ -2325,7 +2386,11 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
     if ba.is_empty() || ba.is_null(0) {
         return Err(RpcError::type_error("'request' column is empty"));
     }
-    let batch = ipc::read_batch(ba.value(0))?;
+    ipc::read_batch(ba.value(0))
+}
+
+fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
+    let batch = request_inner_batch(req)?;
     if std::env::var("VGI_WIRE_DEBUG").is_ok() {
         eprintln!(
             "[vgi-wire] {} inner schema: {:?}",

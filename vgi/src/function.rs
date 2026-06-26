@@ -266,6 +266,9 @@ pub struct BindParams {
     pub transaction_opaque_data: Option<Vec<u8>>,
     /// Cross-process kv/work store (for transaction-scoped caching, etc.).
     pub storage: Option<crate::storage::SharedStorage>,
+    /// `COPY ... FROM` context — `Some` only when this bind opens a COPY-FROM
+    /// scan (see [`crate::copy_from::CopyFromFunction`]). `None` otherwise.
+    pub copy_from: Option<crate::protocol::dtos::CopyFromContext>,
 }
 
 /// Result of `on_bind`.
@@ -325,6 +328,10 @@ pub struct ProcessParams {
     /// without an AT clause. Function-backed tables read these to time-travel.
     pub at_unit: Option<String>,
     pub at_value: Option<String>,
+    /// `COPY ... FROM` context — `Some` only when this scan is a COPY-FROM read
+    /// (see [`crate::copy_from::CopyFromFunction`]). Carries the source
+    /// `file_path` and the COPY target's `expected_schema`.
+    pub copy_from: Option<crate::protocol::dtos::CopyFromContext>,
 }
 
 /// A scalar VGI function: one output row per input row.

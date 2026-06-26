@@ -66,6 +66,25 @@ impl VgiArrow for InlineI64 {
 // bind
 // ---------------------------------------------------------------------------
 
+/// `CopyFromContext` — the `COPY ... FROM` context threaded onto a
+/// [`BindRequest`] when a bind/init opens a custom COPY-FROM scan. Present only
+/// for COPY-FROM (the `copy_from` field is `None` otherwise). Encoded on the
+/// wire as a nested **struct** column (not IPC binary), matching the Python
+/// `vgi.protocol.CopyFromContext`. The handler's options arrive through the
+/// normal [`BindRequest::arguments`], so they are not duplicated here.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CopyFromContext {
+    /// The `FORMAT` name resolved at COPY bind time.
+    pub format: String,
+    /// The source path from the `COPY ... FROM 'path'` statement.
+    pub file_path: String,
+    /// IPC-serialized Arrow schema of the COPY target's columns (name + type,
+    /// in target order). The worker must bind its output to, and emit columns
+    /// whose types match, this schema exactly — DuckDB inserts no cast between
+    /// the scan and the INSERT.
+    pub expected_schema: Bytes,
+}
+
 /// `BindRequest` — carried IPC-serialized inside the `request` binary column
 /// of `bind`, and as the nested `bind_call` struct of `init` / cardinality.
 #[derive(Debug, Clone, VgiArrow)]
@@ -87,6 +106,24 @@ pub struct BindRequest {
     /// init. Additive nullable columns — the C++ always emits them.
     pub at_unit: Option<String>,
     pub at_value: Option<String>,
+    // NOTE: the `copy_from` struct column is intentionally NOT a derived field
+    // here. The C++ extension only appends it to the BindRequest schema for a
+    // COPY ... FROM scan (omitting it entirely for ordinary binds — matching
+    // Python's match-by-name / default-None semantics). The `VgiArrow` derive
+    // would reject the missing column, so `copy_from` is read out-of-band via
+    // [`read_copy_from`] from the request batch. See `dispatch.rs`.
+}
+
+/// Read the optional `copy_from` nested-struct column from a (flat) BindRequest
+/// batch. Returns `None` when the column is absent (ordinary bind) or null.
+pub fn read_copy_from(batch: &arrow_array::RecordBatch) -> Result<Option<CopyFromContext>> {
+    use arrow_array::Array;
+    match batch.column_by_name("copy_from") {
+        Some(col) if col.len() > 0 && !col.is_null(0) => {
+            Ok(Some(<CopyFromContext as VgiArrow>::read(col.as_ref(), 0)?))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// `BindResponse` — flat result of `bind`.
@@ -539,6 +576,28 @@ pub struct FunctionInfo {
     pub requires_input_batch_index: bool,
     pub required_settings: Vec<String>,
     pub required_secrets: Vec<RequiredSecret>,
+}
+
+/// `CopyFromFormatInfo` item — a custom `COPY ... FROM` format advertised by a
+/// catalog via `catalog_copy_from_formats`. Field order/names mirror the Python
+/// `vgi.catalog.catalog_interface.CopyFromFormatInfo` (inherits `comment` /
+/// `tags` from `CatalogObject`). The C++ extension reads each field by name.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CopyFromFormatInfo {
+    pub comment: Option<String>,
+    pub tags: StrMap,
+    /// The `FORMAT` identifier users type (e.g. `example_lines`).
+    pub format_name: String,
+    /// Registered name of the worker function that performs the read.
+    pub handler: String,
+    /// IPC-serialized Arrow schema of the format's options (same encoding as
+    /// `FunctionInfo.arguments`); each field's metadata carries the option
+    /// type / `vgi_doc` description.
+    pub options: Bytes,
+    /// `"from"` — the only direction supported today (`"to"` is reserved).
+    pub direction: String,
+    /// Intrinsic documentation from the handler's metadata description.
+    pub description: String,
 }
 
 // ---------------------------------------------------------------------------

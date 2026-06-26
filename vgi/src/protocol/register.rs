@@ -339,6 +339,14 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             move |req, _ctx| d.handle_catalog_catalogs(req),
         );
     }
+    {
+        let d = disp.clone();
+        srv.register_unary(
+            "catalog_copy_from_formats",
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_catalog_copy_from_formats(req),
+        );
+    }
 
     // --- discovery methods that return empty lists for now ---
     for name in [
