@@ -188,11 +188,15 @@ impl Worker {
         let args: Vec<String> = std::env::args().collect();
         let server = Arc::new(self.build_server());
 
+        #[cfg(feature = "transport-http")]
         if args.iter().any(|a| a == "--http") {
             crate::transport::serve_http(server, build_authenticate());
             return;
         }
 
+        // Native thread-per-connection TCP. (A wasm single-thread serve_tcp is
+        // wired separately for the wasip2 shared-worker path.)
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(i) = args.iter().position(|a| a == "--tcp") {
             let spec = args.get(i + 1).expect("--tcp requires [HOST:]PORT").clone();
             let (host, port) = parse_tcp_spec(&spec);
@@ -236,6 +240,7 @@ impl Worker {
 
 /// Parse a `[HOST:]PORT` `--tcp` bind spec. A bare `PORT` (no colon) binds
 /// `127.0.0.1`; an empty host (leading `":"`) also defaults to loopback.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_tcp_spec(spec: &str) -> (String, u16) {
     match spec.rsplit_once(':') {
         Some((host, port)) => {
@@ -257,6 +262,7 @@ fn parse_tcp_spec(spec: &str) -> (String, u16) {
 /// `VGI_TEST_BEARER_TOKEN` is set. A bearer token that is *present but invalid*
 /// is rejected (401); a missing token is allowed as anonymous so the same
 /// server can serve the non-auth tests.
+#[cfg(feature = "transport-http")]
 fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
     let mut tokens: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Ok(pairs) = std::env::var("VGI_BEARER_TOKENS") {

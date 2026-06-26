@@ -214,8 +214,15 @@ impl Dispatcher {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        // wasm32-wasi has no process ids (`std::process::id()` aborts). A wasm
+        // worker is single-process (stdio one-shot, or the shared TCP worker),
+        // so time+counter already make the id unique; use 0 for the pid slot.
+        #[cfg(not(target_arch = "wasm32"))]
+        let pid = std::process::id();
+        #[cfg(target_arch = "wasm32")]
+        let pid: u32 = 0;
         let mut v = b"vgi-exec-".to_vec();
-        v.extend_from_slice(&std::process::id().to_le_bytes());
+        v.extend_from_slice(&pid.to_le_bytes());
         v.extend_from_slice(&t.to_le_bytes());
         v.extend_from_slice(&n.to_le_bytes());
         v

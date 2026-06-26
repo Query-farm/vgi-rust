@@ -107,6 +107,11 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
 ///
 /// Raw TCP framing carries no authentication or TLS — bind loopback / a trusted
 /// network only; use [`serve_http`] for untrusted networks.
+///
+/// Native only: this thread-per-connection variant needs `std::thread`, which
+/// wasm lacks. A single-thread wasm `serve_tcp` (wasip2 `std::net`, no threads)
+/// is added separately for the in-browser/wasmtime shared-worker path.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f64) {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +176,9 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
 
 /// Serve over HTTP: bind a TCP port, announce it with `PORT:<n>`, and serve
 /// the axum router. An optional `authenticate` callback enables bearer auth.
+///
+/// Gated on `transport-http` (tokio/axum) so the crate stays wasm-buildable.
+#[cfg(feature = "transport-http")]
 pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenticate>) {
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();

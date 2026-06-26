@@ -16,12 +16,16 @@ categories = ["database", "api-bindings"]
 all-features = true
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "transport-http"]
 # Durable single-file SQLite storage backend (bundles libsqlite3 — compiles C).
 sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
 # deployments (e.g. fly.io) where workers share one durable store.
 http-storage = ["dep:ureq", "dep:bincode"]
+# HTTP *worker* transport (`--http`, axum/tokio). Pulls the tokio runtime and the
+# vgi-rpc http stack. Off for wasm builds (tokio/mio/zstd don't compile to wasm);
+# the wasm worker serves over stdio (and, on wasip2, raw TCP).
+transport-http = ["dep:tokio", "vgi-rpc/http"]
 
 [dependencies]
 vgi-rpc = { workspace = true }
@@ -38,8 +42,9 @@ arrow-ord = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-ctrlc = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+# tokio only backs the HTTP worker transport; optional + gated so the crate
+# compiles for wasm (where tokio's rt-multi-thread/net features are unsupported).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"], optional = true }
 # SQLite storage backend (feature `sqlite`). `bundled` compiles a vendored
 # libsqlite3 so there is no system dependency; this is the one C-compiled dep.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
@@ -54,6 +59,12 @@ bincode = { version = "1", optional = true }
 # declarations only — it compiles no C), so the single-binary build is unaffected.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# ctrlc installs an OS signal handler for the unix/tcp launcher transports'
+# graceful shutdown — not available (or needed) on wasm, which serves over stdio
+# and exits on EOF.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ctrlc = "3"
 
 [dev-dependencies]
 # Lightweight blocking HTTP client to drive the loopback HTTP server in the
