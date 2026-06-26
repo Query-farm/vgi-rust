@@ -27,6 +27,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(MakePairs::IntStr);
     w.register_table(RepeatValue::Int);
     w.register_table(RepeatValue::Str);
+    w.register_table(UnionVarargsFunction);
 }
 
 fn schema_n() -> SchemaRef {
@@ -815,6 +816,138 @@ impl TableProducer for OneShot {
                 self.batch = None;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// union_varargs(values...) — echo each union vararg's active member tag+value.
+//
+// Each argument is a SQL UNION(i BIGINT, s VARCHAR), which DuckDB serializes as
+// a sparse Arrow union. The function emits one row per vararg:
+//   {idx: int64, tag: utf8, value: utf8}
+// where `tag` is the active member name and `value` is its stringified value.
+// ---------------------------------------------------------------------------
+
+/// The sparse union shared by every `union_varargs` argument. Declared with an
+/// explicit Arrow type so DuckDB renders the vararg type as exactly
+/// `UNION(i BIGINT, s VARCHAR)`. DuckDB only ever emits sparse unions over Arrow.
+fn union_varargs_arg_type() -> DataType {
+    let fields: arrow_schema::UnionFields = [
+        (0_i8, Arc::new(Field::new("i", DataType::Int64, true))),
+        (1_i8, Arc::new(Field::new("s", DataType::Utf8, true))),
+    ]
+    .into_iter()
+    .collect();
+    DataType::Union(fields, arrow_schema::UnionMode::Sparse)
+}
+
+fn union_varargs_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("idx", DataType::Int64, true),
+        Field::new("tag", DataType::Utf8, true),
+        Field::new("value", DataType::Utf8, true),
+    ]))
+}
+
+/// Decode a 1-row sparse `UnionArray` into its active member (tag, value).
+fn decode_union_member(arr: &ArrayRef) -> Result<(String, String)> {
+    let union = arr
+        .as_any()
+        .downcast_ref::<arrow_array::UnionArray>()
+        .ok_or_else(|| {
+            RpcError::value_error(format!(
+                "union_varargs: expected a union argument, got {}",
+                arr.data_type()
+            ))
+        })?;
+    // The discriminator at row 0 selects the active member; map it to its name.
+    let type_id = union.type_id(0);
+    let tag = union
+        .fields()
+        .iter()
+        .find(|(code, _)| *code == type_id)
+        .map(|(_, f)| f.name().to_string())
+        .ok_or_else(|| {
+            RpcError::value_error(format!("union_varargs: unknown union type id {type_id}"))
+        })?;
+    // Pull the active child's slot (sparse: one value per row in each child).
+    let child = union.value(0);
+    let value = stringify_scalar(&child)?;
+    Ok((tag, value))
+}
+
+/// Stringify the single element of a 1-row array (Int64 -> "1", Utf8 -> "x").
+fn stringify_scalar(arr: &ArrayRef) -> Result<String> {
+    if arr.is_null(0) {
+        return Ok("NULL".to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Ok(a.value(0).to_string());
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(0).to_string());
+    }
+    Err(RpcError::value_error(format!(
+        "union_varargs: unsupported member type {}",
+        arr.data_type()
+    )))
+}
+
+pub struct UnionVarargsFunction;
+impl TableFunction for UnionVarargsFunction {
+    fn name(&self) -> &str {
+        "union_varargs"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        gen_meta(
+            "Echo the active member tag and value of each union vararg",
+            false,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_typed(
+            "configs",
+            0,
+            union_varargs_arg_type(),
+            "Union values whose active member tag is echoed back",
+        )
+        .varargs()]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: union_varargs_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, p: &BindParams) -> Option<vgi::table_function::TableCardinality> {
+        let n = p.arguments.num_positional() as i64;
+        Some(vgi::table_function::TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
+    }
+    fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let mut idx = Vec::new();
+        let mut tags = Vec::new();
+        let mut values = Vec::new();
+        for i in 0..p.arguments.num_positional() {
+            if let Some(arr) = p.arguments.arg(i) {
+                let (tag, value) = decode_union_member(arr)?;
+                idx.push(i as i64);
+                tags.push(tag);
+                values.push(value);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            union_varargs_schema(),
+            vec![
+                Arc::new(Int64Array::from(idx)),
+                Arc::new(StringArray::from(tags)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Box::new(OneShot { batch: Some(batch) }))
     }
 }
 
