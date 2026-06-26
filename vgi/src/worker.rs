@@ -179,6 +179,9 @@ impl Worker {
     /// - *(none)* — **stdio** (the default).
     /// - `--unix <path>` — **Unix-socket** launcher transport
     ///   (`--idle-timeout <secs>` optional; Unix only).
+    /// - `--tcp [<host>:]<port>` — **TCP** launcher transport (raw Arrow-IPC
+    ///   framing, no auth/TLS; host defaults to `127.0.0.1`, port `0`
+    ///   auto-selects; `--idle-timeout <secs>` optional).
     /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Bearer auth is
     ///   enabled by setting `VGI_BEARER_TOKENS` (`token=principal,…`).
     pub fn run(self) {
@@ -187,6 +190,19 @@ impl Worker {
 
         if args.iter().any(|a| a == "--http") {
             crate::transport::serve_http(server, build_authenticate());
+            return;
+        }
+
+        if let Some(i) = args.iter().position(|a| a == "--tcp") {
+            let spec = args.get(i + 1).expect("--tcp requires [HOST:]PORT").clone();
+            let (host, port) = parse_tcp_spec(&spec);
+            let idle = args
+                .iter()
+                .position(|a| a == "--idle-timeout")
+                .and_then(|j| args.get(j + 1))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(300.0);
+            crate::transport::serve_tcp(server, &host, port, idle);
             return;
         }
 
@@ -215,6 +231,24 @@ impl Worker {
         }
 
         crate::transport::serve_stdio(server);
+    }
+}
+
+/// Parse a `[HOST:]PORT` `--tcp` bind spec. A bare `PORT` (no colon) binds
+/// `127.0.0.1`; an empty host (leading `":"`) also defaults to loopback.
+fn parse_tcp_spec(spec: &str) -> (String, u16) {
+    match spec.rsplit_once(':') {
+        Some((host, port)) => {
+            let host = if host.is_empty() { "127.0.0.1" } else { host };
+            (
+                host.to_string(),
+                port.parse::<u16>().expect("--tcp expects [HOST:]PORT"),
+            )
+        }
+        None => (
+            "127.0.0.1".to_string(),
+            spec.parse::<u16>().expect("--tcp expects [HOST:]PORT"),
+        ),
     }
 }
 

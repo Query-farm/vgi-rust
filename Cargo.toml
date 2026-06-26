@@ -16,7 +16,7 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # vgi-rpc, add an (uncommitted) `[patch.crates-io]` pointing at the checkout:
 #   [patch.crates-io]
 #   vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
-vgi-rpc = { version = "0.5.0", default-features = false, features = ["macros", "http"] }
+vgi-rpc = { version = "0.6.0", default-features = false, features = ["macros", "http"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"

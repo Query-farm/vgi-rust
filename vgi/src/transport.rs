@@ -1,11 +1,13 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Worker transport selection: stdio (default), AF_UNIX (launcher), HTTP.
+//! Worker transport selection: stdio (default), AF_UNIX (launcher), TCP, HTTP.
 //!
 //! Mirrors the conformance worker contract:
 //! - stdio: serve a single sequential Arrow-IPC stream over stdin/stdout.
 //! - `--unix <path>`: bind the socket, print `UNIX:<path>\n`, serve each
 //!   connection on its own thread until SIGTERM/SIGINT.
+//! - `--tcp [<host>:]<port>`: bind a TCP socket, print `TCP:<host>:<port>\n`,
+//!   serve each connection on its own thread (raw framing, no auth/TLS).
 //! - `--http`: print `PORT:<n>\n`, serve axum (added with the `http` feature).
 
 use std::io::{self, Write};
@@ -88,6 +90,76 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
     }
     drop(listener);
     let _ = std::fs::remove_file(path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    for t in threads {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let _ = t.join();
+    }
+}
+
+/// Bind a TCP socket, announce it with `TCP:<host>:<port>` (the actual bound
+/// port, so `port == 0` ephemeral binds are discoverable), and serve each
+/// inbound connection on a worker thread. `idle_timeout` (seconds, 0 = never)
+/// self-shuts the worker after that long without a new connection, matching the
+/// launcher protocol.
+///
+/// Raw TCP framing carries no authentication or TLS — bind loopback / a trusted
+/// network only; use [`serve_http`] for untrusted networks.
+pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f64) {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    server.notify_transport(TransportKind::Tcp, TransportCapabilities::none());
+    let listener = TcpListener::bind((host, port)).expect("bind tcp socket");
+    let bound_port = listener.local_addr().expect("tcp local_addr").port();
+    listener.set_nonblocking(true).ok();
+    println!("TCP:{host}:{bound_port}");
+    io::stdout().flush().ok();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let sd = shutdown.clone();
+        let _ = ctrlc::try_set_handler(move || sd.store(true, Ordering::Relaxed));
+    }
+
+    let idle = if idle_timeout > 0.0 {
+        Some(std::time::Duration::from_secs_f64(idle_timeout))
+    } else {
+        None
+    };
+    let mut last_activity = std::time::Instant::now();
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                last_activity = std::time::Instant::now();
+                conn.set_nonblocking(false).ok();
+                // Disable Nagle so the lockstep request/response framing is not
+                // delayed waiting to coalesce writes.
+                conn.set_nodelay(true).ok();
+                let srv = server.clone();
+                threads.push(std::thread::spawn(move || {
+                    let Ok(mut reader) = conn.try_clone() else {
+                        return;
+                    };
+                    srv.serve(&mut reader, &mut conn);
+                }));
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(timeout) = idle {
+                    if last_activity.elapsed() >= timeout {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(listener);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     for t in threads {
         if std::time::Instant::now() >= deadline {
