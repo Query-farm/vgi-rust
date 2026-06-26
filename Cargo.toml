@@ -3,7 +3,7 @@ resolver = "2"
 members = ["vgi", "vgi-example-worker", "vgi-storage-server"]
 
 [workspace.package]
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 rust-version = "1.90"
 license-file = "LICENSE"
