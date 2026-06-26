@@ -56,7 +56,7 @@ publish = false
 vgi = { path = "$REPO/vgi" }
 # Must track vgi's vgi-rpc dep: a version skew pulls two vgi-rpc copies into
 # the example crate, so vgi_rpc error types stop matching vgi's trait bounds.
-vgi-rpc = "0.5"
+vgi-rpc = "0.6"
 arrow-array = "59"
 arrow-schema = "59"
 
