@@ -106,8 +106,8 @@ impl TableFunction for SecretDemoFunction {
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let mut rows: Vec<(String, String, String)> = params
             .secrets
-            .by_name
-            .get("vgi_example")
+            .of_type("vgi_example")
+            .next()
             .map(|m| {
                 m.iter()
                     .map(|(k, v)| (k.clone(), v.clone(), arrow_type_of(k).to_string()))
@@ -201,7 +201,7 @@ impl TableFunction for ScopedSecretDemoFunction {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let scope = params.arguments.const_str(0).unwrap_or_default();
-        let secret = params.secrets.by_name.get("vgi_example");
+        let secret = params.secrets.of_type("vgi_example").next();
         let found = secret.map(|m| !m.is_empty()).unwrap_or(false);
         let mut keys: Vec<String> = secret
             .map(|m| m.keys().cloned().collect())
