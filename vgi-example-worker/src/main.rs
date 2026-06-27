@@ -13,6 +13,7 @@ mod attach_options;
 mod buffering;
 mod catalog_def;
 mod copy_from;
+mod copy_to;
 #[cfg(feature = "coverage")]
 mod coverage;
 mod narrow_bind;
@@ -58,6 +59,9 @@ fn main() {
         // Custom COPY ... FROM format reader (example_lines) — only on the
         // primary `example` catalog, matching the Python fixture worker.
         copy_from::register(&mut worker);
+        // Custom COPY ... TO format writers (example_lines_out +
+        // example_lines_ordered_out) — only on the primary `example` catalog.
+        copy_to::register(&mut worker);
         accumulate::register(&mut worker);
         worker.register_secondary_catalog(accumulate::catalog(), accumulate::function_names());
         narrow_bind::register(&mut worker);

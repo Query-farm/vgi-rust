@@ -123,6 +123,7 @@ pub mod arguments;
 pub mod buffering;
 pub mod catalog;
 pub mod copy_from;
+pub mod copy_to;
 pub mod dispatch;
 pub mod function;
 pub mod ipc;

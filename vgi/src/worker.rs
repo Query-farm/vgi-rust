@@ -123,6 +123,22 @@ impl Worker {
         self.disp.register_copy_from(arc);
     }
 
+    /// Register a custom `COPY ... TO` format writer.
+    ///
+    /// The writer is exposed two ways: as a table-buffering (Sink+Combine)
+    /// function (so the whole buffering RPC path is reused — `write()` per shard,
+    /// `close()` for the terminal destination write; no Source phase) and as an
+    /// advertised `COPY ... TO` format via `catalog_copy_from_formats`
+    /// (`direction="to"`). Users then run
+    /// `COPY (source) TO 'path' (FORMAT <alias>.<format>, opt val, ...)`.
+    /// See [`crate::copy_to::CopyToFunction`].
+    pub fn register_copy_to(&mut self, f: impl crate::copy_to::CopyToFunction + 'static) {
+        let arc: Arc<dyn crate::copy_to::CopyToFunction> = Arc::new(f);
+        self.disp
+            .register_buffering(Arc::new(crate::copy_to::CopyToBuffering(arc.clone())));
+        self.disp.register_copy_to(arc);
+    }
+
     /// Install the declarative catalog (views / macros / tables).
     ///
     /// Any catalog table built with [`crate::catalog::CatTable::with_function`]

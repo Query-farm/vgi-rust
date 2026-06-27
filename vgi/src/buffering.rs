@@ -44,6 +44,17 @@ pub struct BufferingParams {
     /// DuckDB per-chunk batch index, when the function declares
     /// `requires_input_batch_index` (only set on the process RPC).
     pub batch_index: Option<i64>,
+    /// The `COPY ... TO` context (destination format + path), present only when
+    /// this buffering execution backs a [`CopyToFunction`](crate::copy_to). The
+    /// process/combine RPCs carry no bind_call, so it is persisted at sink-init
+    /// (keyed by `execution_id`) and replayed here. `None` for ordinary buffered
+    /// functions.
+    pub copy_to: Option<crate::protocol::dtos::CopyToContext>,
+    /// The source (input) schema this buffering execution bound to, persisted at
+    /// sink-init and replayed to process/combine (which otherwise carry no
+    /// schema). Used by COPY-TO writers for empty-input header generation. `None`
+    /// when no input schema was bound or persisted.
+    pub input_schema: Option<SchemaRef>,
     /// In-band INFO logs to surface in `duckdb_logs()`; the unary process /
     /// combine handlers drain this into the call context after returning.
     pub logs: Arc<std::sync::Mutex<Vec<String>>>,

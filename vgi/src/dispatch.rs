@@ -67,6 +67,11 @@ pub struct Dispatcher {
     /// `catalog_copy_from_formats`). Each is also registered as a table function
     /// in `tables` (under its handler name) by `Worker::register_copy_from`.
     pub copy_from_formats: Vec<Arc<dyn crate::copy_from::CopyFromFunction>>,
+    /// Custom `COPY ... TO` format writers (advertised via
+    /// `catalog_copy_from_formats` with `direction="to"`). Each is also
+    /// registered as a table-buffering function in `buffering` (under its handler
+    /// name) by `Worker::register_copy_to`.
+    pub copy_to_formats: Vec<Arc<dyn crate::copy_to::CopyToFunction>>,
     exec_counter: AtomicU64,
 }
 
@@ -86,6 +91,7 @@ impl Dispatcher {
             secret_types: Vec::new(),
             settings: Vec::new(),
             copy_from_formats: Vec::new(),
+            copy_to_formats: Vec::new(),
             exec_counter: AtomicU64::new(1),
         }
     }
@@ -120,6 +126,14 @@ impl Dispatcher {
     /// `Worker::register_copy_from`).
     pub fn register_copy_from(&mut self, f: Arc<dyn crate::copy_from::CopyFromFunction>) {
         self.copy_from_formats.push(f);
+    }
+
+    /// Record a custom `COPY ... TO` format writer for advertisement via
+    /// `catalog_copy_from_formats` (`direction="to"`). The writer must also be
+    /// registered as a table-buffering function under its handler name (done by
+    /// `Worker::register_copy_to`).
+    pub fn register_copy_to(&mut self, f: Arc<dyn crate::copy_to::CopyToFunction>) {
+        self.copy_to_formats.push(f);
     }
 
     pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
@@ -446,6 +460,9 @@ impl Dispatcher {
         // COPY ... FROM context (out-of-band struct column, absent for ordinary
         // scans) — threaded onto every ProcessParams built below.
         let copy_from = read_copy_from(&bind_call_batch)?;
+        // COPY ... TO context (out-of-band struct column, absent for ordinary
+        // scans) — persisted at sink-init for the process/combine RPCs.
+        let copy_to = read_copy_to(&bind_call_batch)?;
         let mut bp = self.bind_params(&bind_call, ctx)?;
         bp.copy_from = copy_from.clone();
         // Projection pushdown: the C++ sends the full bind output schema plus
@@ -521,6 +538,8 @@ impl Dispatcher {
                     secrets: bp.secrets,
                     attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
                     batch_index: None,
+                    copy_to: copy_to.clone(),
+                    input_schema: input_schema.clone(),
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
                 let auto_apply = f.metadata().auto_apply_filters;
@@ -559,6 +578,15 @@ impl Dispatcher {
             if let Some(insc) = input_schema.as_ref() {
                 self.store
                     .kv_put(&execution_id, b"insc", &ipc::write_schema_ref(insc)?);
+            }
+            // COPY ... TO context (destination format + path): the process /
+            // combine RPCs carry no bind_call, so persist it keyed by
+            // execution_id for them to replay. See `handle_buffering_*`.
+            if let Some(ct) = copy_to.as_ref() {
+                self.store
+                    .kv_put(&execution_id, b"copytofmt", ct.format.as_bytes());
+                self.store
+                    .kv_put(&execution_id, b"copytopath", ct.file_path.as_bytes());
             }
             // Persist named flags the process/combine RPCs need (e.g. `logging`),
             // since those RPCs carry no arguments and may run in another worker.
@@ -1598,7 +1626,7 @@ impl Dispatcher {
     pub fn handle_catalog_copy_from_formats(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let active = self.active_catalog(req);
         let items = if std::ptr::eq(active, &self.catalog) {
-            let infos: Vec<CopyFromFormatInfo> = self
+            let mut infos: Vec<CopyFromFormatInfo> = self
                 .copy_from_formats
                 .iter()
                 .map(|f| -> Result<CopyFromFormatInfo> {
@@ -1611,10 +1639,28 @@ impl Dispatcher {
                         handler: f.handler_name().to_string(),
                         options: Bytes::from(ipc::write_schema(&arg_schema)?),
                         direction: "from".to_string(),
+                        ordered: false,
                         description: meta.description.clone(),
                     })
                 })
                 .collect::<Result<_>>()?;
+            // COPY ... TO writers advertise direction="to"; an ordered writer
+            // (sink_order_dependent) sets ordered=true so the extension installs
+            // a single-thread sink.
+            for f in &self.copy_to_formats {
+                let meta = f.metadata();
+                let arg_schema = catalog::build_arg_schema(&f.argument_specs());
+                infos.push(CopyFromFormatInfo {
+                    comment: f.comment(),
+                    tags: meta.tags.clone(),
+                    format_name: f.format().to_string(),
+                    handler: f.handler_name().to_string(),
+                    options: Bytes::from(ipc::write_schema(&arg_schema)?),
+                    direction: "to".to_string(),
+                    ordered: f.ordered(),
+                    description: meta.description.clone(),
+                });
+            }
             catalog::serialize_items(infos)?
         } else {
             Vec::new()
@@ -1694,6 +1740,27 @@ impl Dispatcher {
         args
     }
 
+    /// Replay the `COPY ... TO` context persisted by the sink-init (process /
+    /// combine carry no bind_call). `None` for ordinary buffered functions.
+    fn buffering_copy_to(&self, execution_id: &[u8]) -> Option<CopyToContext> {
+        let path = self.store.kv_get(execution_id, b"copytopath")?;
+        let format = self
+            .store
+            .kv_get(execution_id, b"copytofmt")
+            .unwrap_or_default();
+        Some(CopyToContext {
+            format: String::from_utf8_lossy(&format).into_owned(),
+            file_path: String::from_utf8_lossy(&path).into_owned(),
+        })
+    }
+
+    /// Replay the source (input) schema persisted by the sink-init.
+    fn buffering_input_schema(&self, execution_id: &[u8]) -> Option<arrow_schema::SchemaRef> {
+        self.store
+            .kv_get(execution_id, b"insc")
+            .and_then(|b| ipc::read_schema(&b).ok())
+    }
+
     pub fn handle_buffering_process(
         &self,
         req: &Request,
@@ -1715,6 +1782,8 @@ impl Dispatcher {
             secrets: crate::secrets::Secrets::default(),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: dto.batch_index,
+            copy_to: self.buffering_copy_to(&dto.execution_id.0),
+            input_schema: self.buffering_input_schema(&dto.execution_id.0),
             logs: logs.clone(),
         };
         let state_id = f.process(&params, &batch)?;
@@ -1757,6 +1826,8 @@ impl Dispatcher {
             secrets: crate::secrets::Secrets::default(),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: None,
+            copy_to: self.buffering_copy_to(&dto.execution_id.0),
+            input_schema: self.buffering_input_schema(&dto.execution_id.0),
             logs: logs.clone(),
         };
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();

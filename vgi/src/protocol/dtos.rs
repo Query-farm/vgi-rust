@@ -85,6 +85,21 @@ pub struct CopyFromContext {
     pub expected_schema: Bytes,
 }
 
+/// `CopyToContext` — the `COPY ... TO` context threaded onto a [`BindRequest`]
+/// when a bind/init opens a custom COPY-TO sink. Present only for COPY-TO (the
+/// `copy_to` field is `None` otherwise). Encoded on the wire as a nested
+/// **struct** column (not IPC binary), matching the Python
+/// `vgi.protocol.CopyToContext`. The handler's options arrive through the normal
+/// [`BindRequest::arguments`]; the **source** columns ride the existing
+/// [`BindRequest::input_schema`], so neither is duplicated here.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CopyToContext {
+    /// The `FORMAT` name resolved at COPY bind time.
+    pub format: String,
+    /// The destination path from the `COPY ... TO 'path'` statement.
+    pub file_path: String,
+}
+
 /// `BindRequest` — carried IPC-serialized inside the `request` binary column
 /// of `bind`, and as the nested `bind_call` struct of `init` / cardinality.
 #[derive(Debug, Clone, VgiArrow)]
@@ -106,12 +121,13 @@ pub struct BindRequest {
     /// init. Additive nullable columns — the C++ always emits them.
     pub at_unit: Option<String>,
     pub at_value: Option<String>,
-    // NOTE: the `copy_from` struct column is intentionally NOT a derived field
-    // here. The C++ extension only appends it to the BindRequest schema for a
-    // COPY ... FROM scan (omitting it entirely for ordinary binds — matching
-    // Python's match-by-name / default-None semantics). The `VgiArrow` derive
-    // would reject the missing column, so `copy_from` is read out-of-band via
-    // [`read_copy_from`] from the request batch. See `dispatch.rs`.
+    // NOTE: the `copy_from` / `copy_to` struct columns are intentionally NOT
+    // derived fields here. The C++ extension only appends them to the
+    // BindRequest schema for a COPY ... FROM / COPY ... TO scan (omitting them
+    // entirely for ordinary binds — matching Python's match-by-name /
+    // default-None semantics). The `VgiArrow` derive would reject the missing
+    // column, so they are read out-of-band via [`read_copy_from`] /
+    // [`read_copy_to`] from the request batch. See `dispatch.rs`.
 }
 
 /// Read the optional `copy_from` nested-struct column from a (flat) BindRequest
@@ -121,6 +137,18 @@ pub fn read_copy_from(batch: &arrow_array::RecordBatch) -> Result<Option<CopyFro
     match batch.column_by_name("copy_from") {
         Some(col) if col.len() > 0 && !col.is_null(0) => {
             Ok(Some(<CopyFromContext as VgiArrow>::read(col.as_ref(), 0)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Read the optional `copy_to` nested-struct column from a (flat) BindRequest
+/// batch. Returns `None` when the column is absent (ordinary bind) or null.
+pub fn read_copy_to(batch: &arrow_array::RecordBatch) -> Result<Option<CopyToContext>> {
+    use arrow_array::Array;
+    match batch.column_by_name("copy_to") {
+        Some(col) if col.len() > 0 && !col.is_null(0) => {
+            Ok(Some(<CopyToContext as VgiArrow>::read(col.as_ref(), 0)?))
         }
         _ => Ok(None),
     }
@@ -594,10 +622,18 @@ pub struct CopyFromFormatInfo {
     /// `FunctionInfo.arguments`); each field's metadata carries the option
     /// type / `vgi_doc` description.
     pub options: Bytes,
-    /// `"from"` — the only direction supported today (`"to"` is reserved).
+    /// `"from"` | `"to"` | `"both"` — which COPY direction(s) this format
+    /// serves. COPY-FROM readers advertise `"from"`; COPY-TO writers `"to"`.
     pub direction: String,
     /// Intrinsic documentation from the handler's metadata description.
     pub description: String,
+    /// COPY ... TO only — when true the writer requires rows in source order, so
+    /// the extension installs a single-thread sink. Set from a
+    /// [`CopyToFunction::ordered`](crate::copy_to::CopyToFunction::ordered)
+    /// (`Meta.sink_order_dependent` in the Python model). Always `false` for
+    /// COPY-FROM readers. Field order (after `description`) matches the canonical
+    /// wire schema the C++ extension validates positionally.
+    pub ordered: bool,
 }
 
 // ---------------------------------------------------------------------------
