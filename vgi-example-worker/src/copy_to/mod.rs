@@ -70,6 +70,8 @@ struct Options {
     null_string: String,
     delimiter: String,
     header: bool,
+    header_repeat: i64,
+    fail_on_value: String,
 }
 
 impl ExampleLinesCopyTo {
@@ -93,6 +95,13 @@ impl ExampleLinesCopyTo {
             )));
         }
         let header = options.named_bool("header").unwrap_or(false);
+        let header_repeat = options.named_i64("header_repeat").unwrap_or(1);
+        if !(0..=3).contains(&header_repeat) {
+            return Err(RpcError::value_error(format!(
+                "{}: 'header_repeat' must be between 0 and 3, got {header_repeat}",
+                self.format
+            )));
+        }
         let on_exists = options
             .named_str("on_exists")
             .unwrap_or_else(|| "overwrite".to_string());
@@ -102,10 +111,13 @@ impl ExampleLinesCopyTo {
                 self.format
             )));
         }
+        let fail_on_value = options.named_str("fail_on_value").unwrap_or_default();
         Ok(Options {
             null_string,
             delimiter,
             header,
+            header_repeat,
+            fail_on_value,
         })
     }
 }
@@ -147,10 +159,22 @@ impl CopyToFunction for ExampleLinesCopyTo {
                 "Write a header row of column names",
             ),
             ArgSpec::column(
+                "header_repeat",
+                -1,
+                "int64",
+                "When header=true, write the header line this many times",
+            ),
+            ArgSpec::column(
                 "on_exists",
                 -1,
                 "varchar",
                 "Behavior when the destination file already exists",
+            ),
+            ArgSpec::column(
+                "fail_on_value",
+                -1,
+                "varchar",
+                "If non-empty, fail mid-write when a cell equals this value",
             ),
         ]
     }
@@ -162,7 +186,27 @@ impl CopyToFunction for ExampleLinesCopyTo {
     fn write(&self, ctx: &CopyToWriteContext, batch: &RecordBatch) -> Result<()> {
         // Validate options eagerly (surfaces e.g. a missing required option even
         // for a single-batch COPY before the terminal write).
-        let _ = self.parse_options(ctx.options)?;
+        let opts = self.parse_options(ctx.options)?;
+        // Mid-sink failure trigger: raise during a process() call when a cell's
+        // string form matches fail_on_value. Exercises the in-flight
+        // teardown/recovery path under a parallel sink.
+        if !opts.fail_on_value.is_empty() {
+            for col in batch.columns() {
+                let casted =
+                    arrow_cast::cast(col, &arrow_schema::DataType::Utf8).map_err(|e| {
+                        RpcError::runtime_error(format!("{}: cast: {e}", self.format))
+                    })?;
+                let str_col = StringArray::from(casted.to_data());
+                for r in 0..str_col.len() {
+                    if !str_col.is_null(r) && str_col.value(r) == opts.fail_on_value {
+                        return Err(RpcError::value_error(format!(
+                            "{}: fail_on_value hit: {:?}",
+                            self.format, opts.fail_on_value
+                        )));
+                    }
+                }
+            }
+        }
         // Buffer one input batch as an IPC blob in execution-scoped storage.
         // `append` is atomic + race-safe across parallel sink threads/workers.
         let blob = ipc::write_batch(batch)?;
@@ -205,7 +249,11 @@ impl CopyToFunction for ExampleLinesCopyTo {
                 .map(|f| f.name().clone())
                 .collect();
             if opts.header && !wrote_header {
-                writeln!(file, "{}", names.join(&opts.delimiter)).map_err(write_err)?;
+                // header=true writes the column-name line `header_repeat` times.
+                let line = names.join(&opts.delimiter);
+                for _ in 0..opts.header_repeat {
+                    writeln!(file, "{line}").map_err(write_err)?;
+                }
                 wrote_header = true;
             }
             // Cast each column to Utf8 so cell rendering matches the reader's
@@ -237,7 +285,7 @@ impl CopyToFunction for ExampleLinesCopyTo {
             }
         }
 
-        // Empty COPY with header=true still emits the header row. The source
+        // Empty COPY with header=true still emits the header row(s). The source
         // column names ride the bind's input_schema.
         if opts.header && !wrote_header {
             if let Some(in_schema) = ctx.input_schema {
@@ -246,7 +294,10 @@ impl CopyToFunction for ExampleLinesCopyTo {
                     .iter()
                     .map(|f| f.name().clone())
                     .collect();
-                writeln!(file, "{}", names.join(&opts.delimiter)).map_err(write_err)?;
+                let line = names.join(&opts.delimiter);
+                for _ in 0..opts.header_repeat {
+                    writeln!(file, "{line}").map_err(write_err)?;
+                }
             }
         }
 
