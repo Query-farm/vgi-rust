@@ -148,6 +148,30 @@ impl Secrets {
     }
 }
 
+/// Render a single array element as a string (best-effort).
+fn render(arr: &dyn Array, i: usize) -> String {
+    if arr.is_null(i) {
+        return String::new();
+    }
+    if let Some(s) = arr.as_string_opt::<i32>() {
+        return s.value(i).to_string();
+    }
+    if let Some(s) = arr.as_string_opt::<i64>() {
+        return s.value(i).to_string();
+    }
+    if let Some(b) = arr.as_boolean_opt() {
+        return b.value(i).to_string();
+    }
+    if let Some(v) = crate::numeric::array_value_i64(&arr_to_ref(arr), i) {
+        return v.to_string();
+    }
+    String::new()
+}
+
+fn arr_to_ref(arr: &dyn Array) -> arrow_array::ArrayRef {
+    arrow_array::make_array(arr.to_data())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +185,10 @@ mod tests {
 
     fn secrets(entries: &[(&str, HashMap<String, String>)]) -> Secrets {
         Secrets {
-            by_name: entries.iter().map(|(n, m)| (n.to_string(), m.clone())).collect(),
+            by_name: entries
+                .iter()
+                .map(|(n, m)| (n.to_string(), m.clone()))
+                .collect(),
         }
     }
 
@@ -191,7 +218,10 @@ mod tests {
     #[test]
     fn for_scope_prefers_more_specific_scope() {
         let s = secrets(&[
-            ("s3", secret(&[("key_id", "broad"), ("scope", "s3://bucket")])),
+            (
+                "s3",
+                secret(&[("key_id", "broad"), ("scope", "s3://bucket")]),
+            ),
             (
                 "s3:narrow",
                 secret(&[("key_id", "narrow"), ("scope", "s3://bucket/data")]),
@@ -213,10 +243,16 @@ mod tests {
     fn for_scope_falls_back_to_unscoped() {
         // No scope field (old connector) → the single secret is the fallback.
         let s = secrets(&[("s3", secret(&[("key_id", "only")]))]);
-        assert_eq!(s.field_for("s3://any/x.dat", "key_id").as_deref(), Some("only"));
+        assert_eq!(
+            s.field_for("s3://any/x.dat", "key_id").as_deref(),
+            Some("only")
+        );
         // Empty scope also counts as unscoped.
         let s2 = secrets(&[("s3", secret(&[("key_id", "u"), ("scope", "")]))]);
-        assert_eq!(s2.field_for("s3://any/x.dat", "key_id").as_deref(), Some("u"));
+        assert_eq!(
+            s2.field_for("s3://any/x.dat", "key_id").as_deref(),
+            Some("u")
+        );
     }
 
     #[test]
@@ -234,8 +270,14 @@ mod tests {
     #[test]
     fn type_aware_accessors() {
         let s = secrets(&[
-            ("my_s3", secret(&[("type", "s3"), ("key_id", "A"), ("scope", "s3://a")])),
-            ("my_s3_b", secret(&[("type", "s3"), ("key_id", "B"), ("scope", "s3://b")])),
+            (
+                "my_s3",
+                secret(&[("type", "s3"), ("key_id", "A"), ("scope", "s3://a")]),
+            ),
+            (
+                "my_s3_b",
+                secret(&[("type", "s3"), ("key_id", "B"), ("scope", "s3://b")]),
+            ),
             ("my_gcs", secret(&[("type", "gcs"), ("key_id", "G")])),
         ]);
         // know the type of a named secret
@@ -247,7 +289,9 @@ mod tests {
         assert_eq!(s.of_type("azure").count(), 0);
         // scope + type selection picks the right s3 secret per path
         assert_eq!(
-            s.for_scope_of_type("s3://b/x.dat", "s3").and_then(|m| m.get("key_id")).map(String::as_str),
+            s.for_scope_of_type("s3://b/x.dat", "s3")
+                .and_then(|m| m.get("key_id"))
+                .map(String::as_str),
             Some("B")
         );
         // iter exposes names
@@ -255,28 +299,4 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["my_gcs", "my_s3", "my_s3_b"]);
     }
-}
-
-/// Render a single array element as a string (best-effort).
-fn render(arr: &dyn Array, i: usize) -> String {
-    if arr.is_null(i) {
-        return String::new();
-    }
-    if let Some(s) = arr.as_string_opt::<i32>() {
-        return s.value(i).to_string();
-    }
-    if let Some(s) = arr.as_string_opt::<i64>() {
-        return s.value(i).to_string();
-    }
-    if let Some(b) = arr.as_boolean_opt() {
-        return b.value(i).to_string();
-    }
-    if let Some(v) = crate::numeric::array_value_i64(&arr_to_ref(arr), i) {
-        return v.to_string();
-    }
-    String::new()
-}
-
-fn arr_to_ref(arr: &dyn Array) -> arrow_array::ArrayRef {
-    arrow_array::make_array(arr.to_data())
 }

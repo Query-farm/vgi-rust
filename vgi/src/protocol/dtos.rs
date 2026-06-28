@@ -135,7 +135,7 @@ pub struct BindRequest {
 pub fn read_copy_from(batch: &arrow_array::RecordBatch) -> Result<Option<CopyFromContext>> {
     use arrow_array::Array;
     match batch.column_by_name("copy_from") {
-        Some(col) if col.len() > 0 && !col.is_null(0) => {
+        Some(col) if !col.is_empty() && !col.is_null(0) => {
             Ok(Some(<CopyFromContext as VgiArrow>::read(col.as_ref(), 0)?))
         }
         _ => Ok(None),
@@ -147,7 +147,7 @@ pub fn read_copy_from(batch: &arrow_array::RecordBatch) -> Result<Option<CopyFro
 pub fn read_copy_to(batch: &arrow_array::RecordBatch) -> Result<Option<CopyToContext>> {
     use arrow_array::Array;
     match batch.column_by_name("copy_to") {
-        Some(col) if col.len() > 0 && !col.is_null(0) => {
+        Some(col) if !col.is_empty() && !col.is_null(0) => {
             Ok(Some(<CopyToContext as VgiArrow>::read(col.as_ref(), 0)?))
         }
         _ => Ok(None),

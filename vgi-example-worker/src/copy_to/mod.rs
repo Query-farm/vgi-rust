@@ -192,10 +192,8 @@ impl CopyToFunction for ExampleLinesCopyTo {
         // teardown/recovery path under a parallel sink.
         if !opts.fail_on_value.is_empty() {
             for col in batch.columns() {
-                let casted =
-                    arrow_cast::cast(col, &arrow_schema::DataType::Utf8).map_err(|e| {
-                        RpcError::runtime_error(format!("{}: cast: {e}", self.format))
-                    })?;
+                let casted = arrow_cast::cast(col, &arrow_schema::DataType::Utf8)
+                    .map_err(|e| RpcError::runtime_error(format!("{}: cast: {e}", self.format)))?;
                 let str_col = StringArray::from(casted.to_data());
                 for r in 0..str_col.len() {
                     if !str_col.is_null(r) && str_col.value(r) == opts.fail_on_value {
