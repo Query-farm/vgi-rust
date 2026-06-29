@@ -66,6 +66,7 @@ if [ "$WINDOWS" = "1" ]; then
   # These fixtures stage and read parquet/csv from POSIX `/tmp/...` paths the
   # worker's catalog hard-codes, which don't exist on Windows.
   WIN_SKIP=(-not -name 'multi_branch_heterogeneous.test'
+            -not -name 'multi_branch_join_optimizer.test'
             -not -name 'multi_branch_pushdown_incapable.test'
             -not -name 'multi_branch_reconciliation.test'
             -not -name 'required_field_filter_paths_native.test')
