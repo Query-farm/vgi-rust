@@ -214,6 +214,10 @@ impl TableInOutFunction for EchoFunction {
         FunctionMetadata {
             description: "Passthrough function that emits each input batch unchanged".to_string(),
             categories: vec!["utility".into(), "debug".into()],
+            tags: vec![
+                ("category".into(), "debug".into()),
+                ("type".into(), "passthrough".into()),
+            ],
             projection_pushdown: true,
             filter_pushdown: true,
             auto_apply_filters: true,

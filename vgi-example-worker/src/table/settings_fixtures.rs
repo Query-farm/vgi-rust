@@ -18,6 +18,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(StructSettingsFunction);
     w.register_table(SecretDemoFunction);
     w.register_table(ScopedSecretDemoFunction);
+    w.register_table(MultiSecretDemoFunction);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +224,108 @@ fn meta(desc: &str) -> FunctionMetadata {
         categories: vec!["generator".into(), "settings".into()],
         required_settings: Vec::new(),
         ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// multi_secret_demo(path) -> {api_key}
+//
+// Resolves TWO same-type scoped secrets in one bind, then selects the one
+// matching the `path` argument via `Secrets::for_scope_of_type`. Phase 1
+// requests the `vgi_example` secret for both `s3://bucket-a/` and
+// `s3://bucket-b/`; because resolved secrets are keyed by name both survive,
+// and the per-path scope selection picks the right `api_key`.
+// ---------------------------------------------------------------------------
+
+struct MultiSecretRow {
+    schema: SchemaRef,
+    api_key: String,
+    emitted: bool,
+}
+impl TableProducer for MultiSecretRow {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        Ok(Some(
+            RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(StringArray::from(vec![self.api_key.clone()])) as ArrayRef],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        ))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[if self.emitted { 1 } else { 0 }])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.emitted = v[0] != 0;
+        }
+    }
+}
+
+pub struct MultiSecretDemoFunction;
+impl TableFunction for MultiSecretDemoFunction {
+    fn name(&self) -> &str {
+        "multi_secret_demo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Demo: two same-type scoped secrets resolved in one bind".to_string(),
+            stability: Some(vgi::protocol::enums::stability::VOLATILE.to_string()),
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "path",
+            0,
+            "varchar",
+            "Path for scoped secret lookup",
+        )]
+    }
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
+        // Phase 1: request the vgi_example secret for two distinct scopes.
+        vec![
+            vgi::secrets::SecretLookup {
+                secret_type: "vgi_example".into(),
+                scope: Some("s3://bucket-a/".into()),
+                name: None,
+            },
+            vgi::secrets::SecretLookup {
+                secret_type: "vgi_example".into(),
+                scope: Some("s3://bucket-b/".into()),
+                name: None,
+            },
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                "api_key",
+                DataType::Utf8,
+                true,
+            )])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let path = params.arguments.const_str(0).unwrap_or_default();
+        let api_key = params
+            .secrets
+            .for_scope_of_type(&path, "vgi_example")
+            .and_then(|m| m.get("api_key").cloned())
+            .unwrap_or_default();
+        Ok(Box::new(MultiSecretRow {
+            schema: params.output_schema.clone(),
+            api_key,
+            emitted: false,
+        }))
     }
 }
 

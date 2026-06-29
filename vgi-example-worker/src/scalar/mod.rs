@@ -801,9 +801,14 @@ impl ScalarFunction for SecretFieldFunction {
         }]
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        // `port` is a named field on the first secret of type `vgi_example`.
+        // Secrets are keyed by their DuckDB secret name (e.g. `test_secret`),
+        // not by type, so select by type and read the field — mirroring the Go
+        // worker's `namedSecretField`.
         let port = params
             .secrets
-            .named_field("vgi_example", "port")
+            .of_type("vgi_example")
+            .find_map(|m| m.get("port").cloned())
             .unwrap_or_default();
         let name = params.secrets.field("secret_string").unwrap_or_default();
         let s = format!("port={port};name={name}");
