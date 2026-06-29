@@ -288,10 +288,19 @@ fn parse_tcp_spec(spec: &str) -> (String, u16) {
 }
 
 /// Build the HTTP bearer-auth callback from the environment. Returns `None`
-/// (anonymous-only) unless `VGI_BEARER_TOKENS` (`token=principal,…`) or
-/// `VGI_TEST_BEARER_TOKEN` is set. A bearer token that is *present but invalid*
-/// is rejected (401); a missing token is allowed as anonymous so the same
-/// server can serve the non-auth tests.
+/// (anonymous-only) unless `VGI_BEARER_TOKENS` (`token=principal,…`) is set.
+/// A server with tokens configured is bearer-protected: a missing or invalid
+/// token is rejected (401); a server with no tokens installs no callback and
+/// serves everyone anonymously.
+///
+/// Keyed solely off `VGI_BEARER_TOKENS`, mirroring the Go worker
+/// (`cmd/vgi-example-worker/auth.go`). `VGI_TEST_BEARER_TOKEN` is deliberately
+/// NOT read here: it is the token *value* the integration tests send in the
+/// `ATTACH ... bearer_token '…'` option, not worker configuration. Reading it
+/// would bearer-protect the shared example worker the whole suite attaches —
+/// the integration harness exports `VGI_TEST_BEARER_TOKEN` globally, so every
+/// non-auth test over http would then 401 (and skip on the "HTTP" error). The
+/// bearer-auth suite boots its own dedicated worker with `VGI_BEARER_TOKENS`.
 #[cfg(feature = "transport-http")]
 fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
     let mut tokens: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -301,11 +310,6 @@ fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
                 tokens.insert(tok.trim().to_string(), principal.trim().to_string());
             }
         }
-    }
-    if let Ok(tok) = std::env::var("VGI_TEST_BEARER_TOKEN") {
-        tokens
-            .entry(tok)
-            .or_insert_with(|| "test-principal".to_string());
     }
     if tokens.is_empty() {
         return None;
