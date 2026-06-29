@@ -23,13 +23,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The Query-farm/vgi commit whose test/sql/integration suite we run. Pinned for
-  # reproducibility; bump deliberately and re-validate against the then-current
-  # community extension (see ci/README.md).
-  VGI_REF: 129aff14afb4419812f9ea3e925188cf661e1753
-  # The Haybarn release providing the prebuilt haybarn-unittest binary. Must be
-  # ABI-compatible with the community-published vgi extension.
-  HAYBARN_RELEASE: haybarn-v1.5.4-rc1
+  # The Query-farm/vgi commit whose test/sql/integration suite we run. Tracks
+  # main alongside the other SDK CIs; the worker registers the current canonical
+  # fixture set (copy-from/to, union_varargs, multi_secret_demo) so the suite's
+  # function-inventory expectations match (see ci/README.md).
+  VGI_REF: main
+  # The Haybarn release providing the prebuilt haybarn-unittest binary is
+  # resolved to the latest release at run time (see the "Resolve latest haybarn
+  # release" step) so the unittest host stays ABI-compatible with the rebuilt
+  # community-published vgi extension, mirroring the vgi-typescript CI.
 
 jobs:
   integration:
@@ -69,6 +71,15 @@ jobs:
 
       - name: Build example worker
         run: cargo build --release -p vgi-example-worker
+
+      - name: Resolve latest haybarn release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REL=$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)
+          echo "HAYBARN_RELEASE=$REL" >> "$GITHUB_ENV"
+          echo "Latest haybarn release: $REL"
 
       - name: Download + extract haybarn-unittest
         shell: bash
@@ -133,6 +144,15 @@ jobs:
         run: cargo build --release -p vgi-example-worker --features coverage
         env:
           RUSTFLAGS: -Cinstrument-coverage
+
+      - name: Resolve latest haybarn release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REL=$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)
+          echo "HAYBARN_RELEASE=$REL" >> "$GITHUB_ENV"
+          echo "Latest haybarn release: $REL"
 
       - name: Download + extract haybarn-unittest
         shell: bash
