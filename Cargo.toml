@@ -19,7 +19,7 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.7.0", default-features = false, features = ["macros", "stream-codec"] }
+vgi-rpc = { version = "0.8.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
