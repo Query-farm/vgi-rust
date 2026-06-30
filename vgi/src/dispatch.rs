@@ -288,10 +288,11 @@ impl Dispatcher {
             attach_opaque_data: dto.attach_opaque_data.clone().map(|b| b.into()),
             transaction_opaque_data: dto.transaction_opaque_data.clone().map(|b| b.into()),
             storage: Some(self.store.clone()),
-            // `copy_from` is read out-of-band from the request batch (the C++
-            // extension omits the column for non-COPY binds) and set by the
-            // caller — see `handle_bind` / `handle_init`.
+            // `copy_from` / `copy_to` are read out-of-band from the request batch
+            // (the C++ extension omits the columns for non-COPY binds) and set by
+            // the caller — see `handle_bind` / `handle_init`.
             copy_from: None,
+            copy_to: None,
         })
     }
 
@@ -301,9 +302,11 @@ impl Dispatcher {
         let inner = request_inner_batch(req)?;
         let dto: BindRequest = wire::from_batch(&inner)?;
         let mut params = self.bind_params(&dto, ctx)?;
-        // The COPY ... FROM context (when present) rides as an out-of-band
-        // nested-struct column the C++ extension omits for ordinary binds.
+        // The COPY ... FROM / ... TO contexts (when present) ride as out-of-band
+        // nested-struct columns the C++ extension omits for ordinary binds. A
+        // COPY-TO writer scopes its secret_lookups by the destination path here.
         params.copy_from = read_copy_from(&inner)?;
+        params.copy_to = read_copy_to(&inner)?;
         let ft = normalize_function_type(&dto.function_type.0).unwrap_or_default();
 
         // Table buffering.
@@ -465,6 +468,7 @@ impl Dispatcher {
         let copy_to = read_copy_to(&bind_call_batch)?;
         let mut bp = self.bind_params(&bind_call, ctx)?;
         bp.copy_from = copy_from.clone();
+        bp.copy_to = copy_to.clone();
         // Projection pushdown: the C++ sends the full bind output schema plus
         // projection_ids; narrow the schema the worker emits to those columns.
         let output_schema = crate::table_function::project_schema(
@@ -587,6 +591,14 @@ impl Dispatcher {
                     .kv_put(&execution_id, b"copytofmt", ct.format.as_bytes());
                 self.store
                     .kv_put(&execution_id, b"copytopath", ct.file_path.as_bytes());
+            }
+            // Resolved secrets (forwarded via the two-phase secret bind): the
+            // process/combine RPCs carry no bind_call, so persist the secrets IPC
+            // blob keyed by execution_id for them to replay onto BufferingParams.
+            // This is what lets a COPY-TO writer's write()/close() read the
+            // caller's CREATE SECRET credentials. See `handle_buffering_*`.
+            if let Some(s) = bind_call.secrets.as_ref() {
+                self.store.kv_put(&execution_id, b"bufsecrets", &s.0);
             }
             // Persist named flags the process/combine RPCs need (e.g. `logging`),
             // since those RPCs carry no arguments and may run in another worker.
@@ -1761,6 +1773,16 @@ impl Dispatcher {
             .and_then(|b| ipc::read_schema(&b).ok())
     }
 
+    /// Replay the resolved secrets persisted by the sink-init (process / combine
+    /// carry no bind_call). Empty when none were forwarded. This is what surfaces
+    /// CREATE SECRET credentials on a COPY-TO writer's write()/close() params.
+    fn buffering_secrets(&self, execution_id: &[u8]) -> crate::secrets::Secrets {
+        self.store
+            .kv_get(execution_id, b"bufsecrets")
+            .and_then(|b| crate::secrets::Secrets::parse(&b).ok())
+            .unwrap_or_default()
+    }
+
     pub fn handle_buffering_process(
         &self,
         req: &Request,
@@ -1778,8 +1800,9 @@ impl Dispatcher {
             output_schema,
             arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
-            // process/combine carry no secrets — the connector only replays them on bind/init.
-            secrets: crate::secrets::Secrets::default(),
+            // Resolved secrets replayed from the sink-init (the process RPC carries
+            // no bind_call) — lets a COPY-TO writer read CREATE SECRET creds.
+            secrets: self.buffering_secrets(&dto.execution_id.0),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: dto.batch_index,
             copy_to: self.buffering_copy_to(&dto.execution_id.0),
@@ -1822,8 +1845,9 @@ impl Dispatcher {
             output_schema,
             arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
             settings: crate::settings::Settings::default(),
-            // process/combine carry no secrets — the connector only replays them on bind/init.
-            secrets: crate::secrets::Secrets::default(),
+            // Resolved secrets replayed from the sink-init (the combine RPC carries
+            // no bind_call) — lets a COPY-TO writer's close() read CREATE SECRET creds.
+            secrets: self.buffering_secrets(&dto.execution_id.0),
             attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
             batch_index: None,
             copy_to: self.buffering_copy_to(&dto.execution_id.0),

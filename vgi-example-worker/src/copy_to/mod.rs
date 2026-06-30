@@ -29,15 +29,19 @@ use std::io::Write;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use vgi::copy_to::{CopyToCloseContext, CopyToFunction, CopyToWriteContext};
-use vgi::function::{ArgSpec, FunctionMetadata};
+use vgi::function::{ArgSpec, BindParams, FunctionMetadata};
 use vgi::ipc;
+use vgi::secrets::SecretLookup;
 use vgi_rpc::{Result, RpcError};
 
 /// Append-only shard namespace (execution-scoped). Each `write()` appends one
 /// IPC-serialized input batch; `close()` scans them back in append order.
 const SHARD_NS: &[u8] = b"copy_to_shard";
 
-/// Register the COPY-TO fixtures (default + ordered).
+/// Append-only namespace the secret writer counts shards under.
+const SECRET_SHARD_NS: &[u8] = b"copy_to_secret_shard";
+
+/// Register the COPY-TO fixtures (default + ordered + secret-forwarding).
 pub fn register(w: &mut vgi::Worker) {
     w.register_copy_to(ExampleLinesCopyTo {
         format: "example_lines_out",
@@ -53,6 +57,7 @@ pub fn register(w: &mut vgi::Worker) {
         description: "Write the COPY source to a delimited file, preserving source order",
         ordered: true,
     });
+    w.register_copy_to(SecretLinesCopyTo);
 }
 
 /// Toy delimited-text `COPY ... TO` writer (test fixture). The ordered variant
@@ -306,4 +311,110 @@ impl CopyToFunction for ExampleLinesCopyTo {
 
 fn write_err(e: std::io::Error) -> RpcError {
     RpcError::runtime_error(format!("example_lines_out: write failed: {e}"))
+}
+
+/// `COPY ... TO` writer that forwards a `CREATE SECRET` credential. Exercises the
+/// COPY-TO secret-bind hook (`secret_lookups`): it requests the `secret_type`
+/// secret scoped to the destination path during bind, and `close()` writes the
+/// resolved secret's `api_key` (or `NONE`) plus the row count — so a test can
+/// assert the caller's secret reached the writer for a secret-backed cloud write.
+/// Mirrors the Python `SecretLinesCopyToFunction`.
+struct SecretLinesCopyTo;
+
+impl SecretLinesCopyTo {
+    fn secret_type(options: &vgi::arguments::Arguments) -> String {
+        options
+            .named_str("secret_type")
+            .unwrap_or_else(|| "vgi_example".to_string())
+    }
+}
+
+impl CopyToFunction for SecretLinesCopyTo {
+    fn format(&self) -> &str {
+        "secret_lines_out"
+    }
+
+    fn handler_name(&self) -> &str {
+        "secret_lines_writer"
+    }
+
+    fn comment(&self) -> Option<String> {
+        Some("Writer that forwards a CREATE SECRET credential (test fixture)".to_string())
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Write the resolved secret's api_key + row count to the destination"
+                .to_string(),
+            tags: vec![
+                ("category".to_string(), "copy_to".to_string()),
+                ("stability".to_string(), "test".to_string()),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column(
+            "secret_type",
+            -1,
+            "varchar",
+            "Secret type to fetch, scoped by the destination path",
+        )]
+    }
+
+    fn secret_lookups(&self, params: &BindParams) -> Vec<SecretLookup> {
+        // Request the destination-scoped secret; the framework's two-phase secret
+        // bind resolves it and surfaces it on ctx.params.secrets at close time.
+        let Some(ct) = params.copy_to.as_ref() else {
+            return Vec::new();
+        };
+        vec![SecretLookup {
+            secret_type: Self::secret_type(&params.arguments),
+            scope: Some(ct.file_path.clone()),
+            name: None,
+        }]
+    }
+
+    fn write(&self, ctx: &CopyToWriteContext, batch: &RecordBatch) -> Result<()> {
+        // Record this shard's row count (cross-process-safe append).
+        ctx.storage.append(
+            ctx.execution_id,
+            SECRET_SHARD_NS,
+            b"",
+            batch.num_rows().to_string().into_bytes(),
+        );
+        Ok(())
+    }
+
+    fn close(&self, ctx: &CopyToCloseContext) -> Result<i64> {
+        let secret_type = Self::secret_type(ctx.options);
+        let api_key = ctx
+            .params
+            .secrets
+            .for_scope_of_type(ctx.path, &secret_type)
+            .and_then(|m| m.get("api_key").cloned())
+            .unwrap_or_else(|| "NONE".to_string());
+
+        let shards = ctx
+            .storage
+            .scan(ctx.execution_id, SECRET_SHARD_NS, b"", -1, usize::MAX);
+        let mut total: i64 = 0;
+        for (_id, blob) in &shards {
+            if let Ok(s) = std::str::from_utf8(blob) {
+                total += s.trim().parse::<i64>().unwrap_or(0);
+            }
+        }
+
+        let mut file = std::fs::File::create(ctx.path).map_err(|e| {
+            RpcError::runtime_error(format!("secret_lines_out: cannot create {}: {e}", ctx.path))
+        })?;
+        write!(file, "api_key={api_key}\nrows={total}\n").map_err(|e| {
+            RpcError::runtime_error(format!("secret_lines_out: write failed: {e}"))
+        })?;
+        file.flush().map_err(|e| {
+            RpcError::runtime_error(format!("secret_lines_out: write failed: {e}"))
+        })?;
+        Ok(total)
+    }
 }

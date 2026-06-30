@@ -269,6 +269,10 @@ pub struct BindParams {
     /// `COPY ... FROM` context — `Some` only when this bind opens a COPY-FROM
     /// scan (see [`crate::copy_from::CopyFromFunction`]). `None` otherwise.
     pub copy_from: Option<crate::protocol::dtos::CopyFromContext>,
+    /// `COPY ... TO` context — `Some` only when this bind opens a COPY-TO sink
+    /// (see [`crate::copy_to::CopyToFunction`]). A COPY-TO writer scopes its
+    /// `secret_lookups` request to `copy_to.file_path`. `None` otherwise.
+    pub copy_to: Option<crate::protocol::dtos::CopyToContext>,
 }
 
 /// Result of `on_bind`.

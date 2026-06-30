@@ -114,6 +114,17 @@ pub trait CopyToFunction: Send + Sync {
     /// types / docs become the option metadata surfaced by `vgi_copy_formats()`.
     fn argument_specs(&self) -> Vec<ArgSpec>;
 
+    /// Secret types this writer needs (triggers the two-phase secret bind),
+    /// forwarding `CREATE SECRET` credentials for secret-backed cloud writes
+    /// (S3/GCS/HTTP/…). The COPY destination path is in `params.copy_to` (e.g. for
+    /// a cloud `COPY … TO 's3://…'`), so a writer can scope its request to it.
+    /// Resolved secrets then arrive in `ctx.params.secrets` at [`write`](Self::write)
+    /// / [`close`](Self::close). Defaults to none. Mirrors Python's
+    /// `CopyToFunction.on_secrets`.
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        Vec::new()
+    }
+
     /// Whether this writer requires rows in **source order**. When `true`,
     /// discovery advertises `ordered=true` and the extension installs a
     /// single-thread sink (DuckDB `REGULAR_COPY_TO_FILE`), so one worker receives
@@ -166,6 +177,14 @@ impl TableBufferingFunction for CopyToBuffering {
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
         self.0.argument_specs()
+    }
+
+    fn secret_lookups(&self, params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        // Forward to the COPY writer, which can scope its request to the COPY
+        // destination path in `params.copy_to`. The dispatch buffering-bind path
+        // consumes these and drives the two-phase secret bind; the resolved
+        // secrets are replayed onto the process/combine params (see dispatch).
+        self.0.secret_lookups(params)
     }
 
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {

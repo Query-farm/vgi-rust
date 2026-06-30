@@ -19,12 +19,14 @@
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use vgi::copy_from::{CopyFromFunction, CopyFromReadContext};
-use vgi::function::{ArgSpec, FunctionMetadata};
+use vgi::function::{ArgSpec, BindParams, FunctionMetadata};
+use vgi::secrets::SecretLookup;
 use vgi_rpc::{OutputCollector, Result, RpcError};
 
-/// Register the `example_lines` COPY-FROM fixture.
+/// Register the COPY-FROM fixtures (delimited reader + secret-forwarding reader).
 pub fn register(w: &mut vgi::Worker) {
     w.register_copy_from(ExampleLinesCopyFrom);
+    w.register_copy_from(SecretLinesCopyFrom);
 }
 
 /// Toy delimited-text `COPY ... FROM` reader (test fixture).
@@ -170,6 +172,97 @@ impl CopyFromFunction for ExampleLinesCopyFrom {
 
         let batch = RecordBatch::try_new(schema, columns)
             .map_err(|e| RpcError::runtime_error(format!("example_lines: build batch: {e}")))?;
+        Ok(vec![batch])
+    }
+}
+
+/// `COPY ... FROM` reader that forwards a `CREATE SECRET` credential. Exercises
+/// the COPY-FROM secret-bind hook (`secret_lookups`): it requests the
+/// `secret_type` secret scoped to the source path during bind, and `read` emits a
+/// single VARCHAR row holding the resolved secret's `api_key` (or `NONE`) — so a
+/// test can assert the caller's secret reached the reader. Mirrors the Python
+/// `SecretLinesCopyFromFunction`.
+struct SecretLinesCopyFrom;
+
+impl SecretLinesCopyFrom {
+    fn secret_type(options: &vgi::arguments::Arguments) -> String {
+        options
+            .named_str("secret_type")
+            .unwrap_or_else(|| "vgi_example".to_string())
+    }
+}
+
+impl CopyFromFunction for SecretLinesCopyFrom {
+    fn format(&self) -> &str {
+        "secret_lines_in"
+    }
+
+    fn handler_name(&self) -> &str {
+        "secret_lines_reader"
+    }
+
+    fn comment(&self) -> Option<String> {
+        Some("Reader that forwards a CREATE SECRET credential (test fixture)".to_string())
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Emit the resolved secret's api_key as a single VARCHAR row".to_string(),
+            tags: vec![
+                ("category".to_string(), "copy_from".to_string()),
+                ("stability".to_string(), "test".to_string()),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column(
+            "secret_type",
+            -1,
+            "varchar",
+            "Secret type to fetch, scoped by the source path",
+        )]
+    }
+
+    fn secret_lookups(&self, params: &BindParams) -> Vec<SecretLookup> {
+        // Request the source-scoped secret; the framework's two-phase secret bind
+        // resolves it and surfaces it on ctx.params.secrets at read time.
+        let Some(cf) = params.copy_from.as_ref() else {
+            return Vec::new();
+        };
+        vec![SecretLookup {
+            secret_type: Self::secret_type(&params.arguments),
+            scope: Some(cf.file_path.clone()),
+            name: None,
+        }]
+    }
+
+    fn read(
+        &self,
+        ctx: &CopyFromReadContext,
+        _out: &mut OutputCollector,
+    ) -> Result<Vec<RecordBatch>> {
+        let secret_type = Self::secret_type(ctx.options);
+        let api_key = ctx
+            .params
+            .secrets
+            .for_scope_of_type(ctx.path, &secret_type)
+            .and_then(|m| m.get("api_key").cloned())
+            .unwrap_or_else(|| "NONE".to_string());
+
+        let schema = ctx.expected_schema.clone();
+        if schema.fields().len() != 1 {
+            return Err(RpcError::value_error(format!(
+                "secret_lines_in: expected a single-column target, got {}",
+                schema.fields().len()
+            )));
+        }
+        let str_arr = StringArray::from(vec![Some(api_key)]);
+        let casted: ArrayRef = arrow_cast::cast(&str_arr, schema.field(0).data_type())
+            .map_err(|e| RpcError::runtime_error(format!("secret_lines_in: cast: {e}")))?;
+        let batch = RecordBatch::try_new(schema, vec![casted])
+            .map_err(|e| RpcError::runtime_error(format!("secret_lines_in: build batch: {e}")))?;
         Ok(vec![batch])
     }
 }
