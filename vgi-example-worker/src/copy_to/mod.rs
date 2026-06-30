@@ -409,12 +409,10 @@ impl CopyToFunction for SecretLinesCopyTo {
         let mut file = std::fs::File::create(ctx.path).map_err(|e| {
             RpcError::runtime_error(format!("secret_lines_out: cannot create {}: {e}", ctx.path))
         })?;
-        write!(file, "api_key={api_key}\nrows={total}\n").map_err(|e| {
-            RpcError::runtime_error(format!("secret_lines_out: write failed: {e}"))
-        })?;
-        file.flush().map_err(|e| {
-            RpcError::runtime_error(format!("secret_lines_out: write failed: {e}"))
-        })?;
+        write!(file, "api_key={api_key}\nrows={total}\n")
+            .map_err(|e| RpcError::runtime_error(format!("secret_lines_out: write failed: {e}")))?;
+        file.flush()
+            .map_err(|e| RpcError::runtime_error(format!("secret_lines_out: write failed: {e}")))?;
         Ok(total)
     }
 }
