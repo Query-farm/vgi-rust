@@ -26,6 +26,13 @@ pub struct AggregateBindParams {
     pub arguments: Arguments,
     pub input_schema: Option<SchemaRef>,
     pub settings: Settings,
+    /// Statically pre-resolved secrets, delivered on `AggregateBindRequest.secrets`
+    /// when the aggregate advertises a required secret (see
+    /// [`FunctionMetadata::required_secrets`](crate::function::FunctionMetadata::required_secrets)).
+    /// Aggregates read a secret *value* here at bind time only — two-phase
+    /// `.get()`-style secret resolution is not supported for aggregates. Empty
+    /// when nothing was requested / resolved.
+    pub secrets: crate::secrets::Secrets,
 }
 
 /// An aggregate VGI function.

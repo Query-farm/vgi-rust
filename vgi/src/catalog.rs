@@ -11,7 +11,7 @@ use vgi_rpc::{Bytes, DictString, Result};
 
 use crate::function::{ArgSpec, FunctionMetadata, ScalarFunction};
 use crate::ipc;
-use crate::protocol::dtos::{FunctionInfo, SchemaInfo};
+use crate::protocol::dtos::{FunctionInfo, RequiredSecret, SchemaInfo};
 use crate::protocol::enums;
 
 /// The default schema name every registered function lives under.
@@ -343,6 +343,15 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.streaming_partitioned = meta.streaming_partitioned;
     fi.late_materialization = Some(meta.late_materialization);
     fi.required_settings = meta.required_settings.clone();
+    fi.required_secrets = meta
+        .required_secrets
+        .iter()
+        .map(|s| RequiredSecret {
+            secret_type: s.secret_type.clone(),
+            scope: s.scope.clone(),
+            secret_name: s.name.clone(),
+        })
+        .collect();
 }
 
 /// Build the `FunctionInfo` for a scalar function.
@@ -426,6 +435,7 @@ pub fn aggregate_function_info(
         arguments: crate::arguments::Arguments::default(),
         input_schema: None,
         settings: crate::settings::Settings::default(),
+        secrets: crate::secrets::Secrets::default(),
     };
     // A fixed `return_type` in metadata wins (covers aggregates whose `on_bind`
     // requires an input schema but still have a concrete output type).

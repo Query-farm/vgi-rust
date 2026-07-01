@@ -215,6 +215,12 @@ pub struct FunctionMetadata {
     pub late_materialization: bool,
     /// Settings the function requires (surfaced in `FunctionInfo`).
     pub required_settings: Vec<String>,
+    /// Secrets the function requires (surfaced in `FunctionInfo.required_secrets`).
+    /// The extension pre-resolves each advertised secret and delivers it on the
+    /// bind request. Used by aggregates (which cannot do two-phase `.get()`
+    /// resolution) to read a secret *value* statically at bind time via
+    /// `params.secrets`.
+    pub required_secrets: Vec<crate::secrets::SecretLookup>,
 }
 
 impl Default for FunctionMetadata {
@@ -241,6 +247,7 @@ impl Default for FunctionMetadata {
             streaming_partitioned: false,
             late_materialization: false,
             required_settings: Vec::new(),
+            required_secrets: Vec::new(),
         }
     }
 }

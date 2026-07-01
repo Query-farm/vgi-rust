@@ -18,6 +18,14 @@ pub trait TableInOutFunction: Send + Sync {
     fn name(&self) -> &str;
     fn metadata(&self) -> FunctionMetadata;
     fn argument_specs(&self) -> Vec<ArgSpec>;
+    /// Secret lookups to request at bind (two-phase secret resolution). When
+    /// non-empty and secrets are not yet resolved, `bind` returns these and the
+    /// extension re-binds with the resolved values (preserving the input
+    /// schema). The resolved secret is then available on `params.secrets` at
+    /// `process` time. Mirrors [`TableFunction::secret_lookups`](crate::table_function::TableFunction::secret_lookups).
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<crate::secrets::SecretLookup> {
+        Vec::new()
+    }
     /// Resolve the output schema. Default: passthrough the input schema.
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
         let input = params

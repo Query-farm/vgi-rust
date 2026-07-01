@@ -22,6 +22,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_aggregate(AvgFunction);
     w.register_aggregate(WeightedSumFunction);
     w.register_aggregate(GenericSumFunction);
+    w.register_aggregate(SecretTypedSumFunction);
     w.register_aggregate(SumAllFunction);
     w.register_aggregate(ListAggFunction);
     w.register_aggregate(PercentileFunction);
@@ -948,6 +949,94 @@ impl AggregateFunction for GenericSumFunction {
             .ok_or_else(|| {
                 RpcError::runtime_error("vgi_generic_sum: input type deferred to bind")
             })?;
+        Ok(BindResponse {
+            output_schema: result_schema(ty),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn initial_state(&self) -> Vec<u8> {
+        le_f64(0.0)
+    }
+    fn update(
+        &self,
+        states: &mut HashMap<i64, Vec<u8>>,
+        gids: &Int64Array,
+        cols: &[ArrayRef],
+    ) -> Result<()> {
+        let v = cast_f64(&cols[0])?;
+        for i in 0..gids.len() {
+            if v.is_null(i) {
+                continue;
+            }
+            let st = states.entry(gids.value(i)).or_insert_with(|| le_f64(0.0));
+            *st = le_f64(read_f64(st) + v.value(i));
+        }
+        Ok(())
+    }
+    fn combine(&self, t: Vec<u8>, s: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(le_f64(read_f64(&t) + read_f64(&s)))
+    }
+    fn finalize(
+        &self,
+        os: &Arc<Schema>,
+        gids: &Int64Array,
+        states: &[Option<Vec<u8>>],
+    ) -> Result<RecordBatch> {
+        let f: Float64Array = (0..gids.len())
+            .map(|i| states[i].as_ref().map(|s| read_f64(s)))
+            .collect();
+        let ty = os.field(0).data_type();
+        let col = arrow_cast::cast(&(Arc::new(f) as ArrayRef), ty)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        RecordBatch::try_new(os.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
+
+/// `secret_typed_sum(value)` — sum an int64 column, choosing the result type
+/// from a statically-resolved secret. When the `vgi_example` secret's `use_ssl`
+/// field is true the aggregate returns DOUBLE, otherwise BIGINT. The secret is
+/// advertised via `metadata().required_secrets`, so the C++ extension pre-
+/// resolves it and delivers it on `AggregateBindRequest.secrets`; `on_bind`
+/// reads the value (bind-time only — no two-phase `.get()` for aggregates).
+/// Reported as return_type ANY (on_bind errors at registration since it needs
+/// the input schema).
+pub struct SecretTypedSumFunction;
+impl AggregateFunction for SecretTypedSumFunction {
+    fn name(&self) -> &str {
+        "secret_typed_sum"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        let mut m = agg_meta("Sum an integer column; the result type is chosen from a secret");
+        m.categories = vec!["aggregate".into(), "secret".into()];
+        m.required_secrets = vec![vgi::secrets::SecretLookup {
+            secret_type: "vgi_example".into(),
+            scope: None,
+            name: None,
+        }];
+        m
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::any_column("value", 0, "Integer column to sum")]
+    }
+    fn on_bind(&self, p: &AggregateBindParams) -> Result<BindResponse> {
+        // Require the input schema so registration (no schema) reports ANY.
+        p.input_schema.as_ref().ok_or_else(|| {
+            RpcError::runtime_error("secret_typed_sum: result type deferred to bind")
+        })?;
+        // Read the statically pre-resolved secret's `use_ssl` value.
+        let as_double = p
+            .secrets
+            .of_type("vgi_example")
+            .next()
+            .and_then(|m| m.get("use_ssl"))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let ty = if as_double {
+            DataType::Float64
+        } else {
+            DataType::Int64
+        };
         Ok(BindResponse {
             output_schema: result_schema(ty),
             opaque_data: Vec::new(),

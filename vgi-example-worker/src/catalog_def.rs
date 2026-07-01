@@ -418,6 +418,19 @@ fn data_tables() -> Vec<CatTable> {
             Some(10000),
             "Function-backed table with inlined cardinality (10000 rows)",
         )),
+        // Function-backed table whose backing function (`secret_demo`) performs a
+        // two-phase secret lookup in on_bind. NOT inlined — the producer table
+        // bind path must run the two-phase secret block so the schema derives
+        // (not the empty scope-request schema) and the scan resolves the secret.
+        // See secret/secret_function_backed_table.test.
+        fn_table(
+            "secret_demo_table",
+            &[("key", Utf8), ("value", Utf8), ("arrow_type", Utf8)],
+            "secret_demo",
+            vec![],
+            None,
+            "Function-backed table over the secret-using secret_demo function",
+        ),
         fn_table(
             "numbers",
             &[("value", Int64)],

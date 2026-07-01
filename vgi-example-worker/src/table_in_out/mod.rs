@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_schema::{Field, Schema};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_in_out::{project_batch, TableInOutFunction};
 use vgi_rpc::{Result, RpcError};
@@ -14,6 +15,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(EchoFunction);
     w.register_table_in_out(EchoWitnessFunction);
     w.register_table_in_out(FilterBySettingFunction);
+    w.register_table_in_out(SecretInOutFunction);
     w.register_table_in_out(RepeatInputsFunction);
     w.register_table_in_out(SumAllColumnsSimpleDistributed);
     w.register_table_in_out(SlowCancellableInOutFunction);
@@ -197,6 +199,65 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
         let batch = RecordBatch::try_new(out.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![batch])
+    }
+}
+
+/// `secret_in_out(input)` — resolves the `vgi_example` secret in on_bind
+/// (two-phase) and appends its `secret_string` value as a constant column on
+/// every input row. Exercises the secret × table-in-out intersection: the bind
+/// must retry with resolved secrets AND preserve the input schema, and the
+/// resolved secret must reach `process` via `params.secrets`.
+pub struct SecretInOutFunction;
+impl TableInOutFunction for SecretInOutFunction {
+    fn name(&self) -> &str {
+        "secret_in_out"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Append a resolved secret value to each input row".to_string(),
+            categories: vec!["transform".into(), "secret".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![table_arg("data", 0)]
+    }
+    fn secret_lookups(&self, _params: &BindParams) -> Vec<vgi::secrets::SecretLookup> {
+        vec![vgi::secrets::SecretLookup {
+            secret_type: "vgi_example".into(),
+            scope: None,
+            name: None,
+        }]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| RpcError::value_error("secret_in_out requires an input schema"))?;
+        let mut fields: Vec<Field> = input.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.push(Field::new(
+            "secret_string",
+            arrow_schema::DataType::Utf8,
+            true,
+        ));
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(fields)),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        let value = params
+            .secrets
+            .of_type("vgi_example")
+            .next()
+            .and_then(|m| m.get("secret_string").cloned());
+        let n = batch.num_rows();
+        let mut cols: Vec<Arc<dyn Array>> = batch.columns().to_vec();
+        let secret_col: StringArray = std::iter::repeat_n(value.as_deref(), n).collect();
+        cols.push(Arc::new(secret_col));
+        let out = RecordBatch::try_new(params.output_schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(vec![out])
     }
 }
 
