@@ -815,7 +815,10 @@ mod federation_tests {
         let back: AttachCatalogInfo = crate::wire::from_batch(&batch).unwrap();
         assert_eq!(back.alias, "acme_lake");
         assert_eq!(back.target, "ducklake:sqlite:/data/meta.sqlite");
-        assert_eq!(back.options, vec![("DATA_PATH".to_string(), "/data/".to_string())]);
+        assert_eq!(
+            back.options,
+            vec![("DATA_PATH".to_string(), "/data/".to_string())]
+        );
         assert!(back.hidden);
         assert!(back.required);
         assert_eq!(back.secret_ref, "pg");

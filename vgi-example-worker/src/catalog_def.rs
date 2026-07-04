@@ -651,6 +651,7 @@ fn data_tables() -> Vec<CatTable> {
         scan_arguments: Arguments::serialize_scan_args(&[i64_arg(count)]).unwrap_or_default(),
         branch_filter: None,
         writable: false,
+        ..Default::default()
     };
     let native = |func: &str, path: &str| vgi::catalog::CatBranch {
         function_name: func.to_string(),
@@ -660,6 +661,7 @@ fn data_tables() -> Vec<CatTable> {
         .unwrap_or_default(),
         branch_filter: None,
         writable: false,
+        ..Default::default()
     };
     let mb = |name: &str, comment: &str, branches: Vec<vgi::catalog::CatBranch>| {
         let mut t = dtable(name, vec![f("n", Int64)], comment);
