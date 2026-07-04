@@ -63,6 +63,9 @@ pub struct Dispatcher {
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
     pub settings: Vec<catalog::SettingSpec>,
+    /// Companion catalogs advertised for the client to ATTACH (surfaced in
+    /// `catalog_attach.attach_catalogs`; lakehouse federation).
+    pub attach_catalogs: Vec<crate::protocol::dtos::AttachCatalogInfo>,
     /// Custom `COPY ... FROM` format readers (advertised via
     /// `catalog_copy_from_formats`). Each is also registered as a table function
     /// in `tables` (under its handler name) by `Worker::register_copy_from`.
@@ -90,6 +93,7 @@ impl Dispatcher {
             secondary_functions: Vec::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
+            attach_catalogs: Vec::new(),
             copy_from_formats: Vec::new(),
             copy_to_formats: Vec::new(),
             exec_counter: AtomicU64::new(1),
@@ -118,6 +122,12 @@ impl Dispatcher {
 
     pub fn register_setting(&mut self, spec: catalog::SettingSpec) {
         self.settings.push(spec);
+    }
+
+    /// Advertise a companion catalog for the client to ATTACH at VGI-attach time
+    /// (surfaced in `catalog_attach.attach_catalogs`; lakehouse federation).
+    pub fn register_attach_catalog(&mut self, info: crate::protocol::dtos::AttachCatalogInfo) {
+        self.attach_catalogs.push(info);
     }
 
     /// Record a custom `COPY ... FROM` format reader for advertisement via
@@ -1045,6 +1055,7 @@ impl Dispatcher {
                 default_schema: catalog::MAIN_SCHEMA.to_string(),
                 settings: Vec::new(),
                 secret_types: Vec::new(),
+                attach_catalogs: Vec::new(),
                 comment: sec.comment.clone(),
                 tags: sec.tags.clone(),
                 supports_column_statistics: false,
@@ -1130,6 +1141,11 @@ impl Dispatcher {
                 .secret_types
                 .iter()
                 .map(|s| Ok(Bytes::from(catalog::serialize_secret_type(s)?)))
+                .collect::<Result<Vec<_>>>()?,
+            attach_catalogs: self
+                .attach_catalogs
+                .iter()
+                .map(|c| Ok(Bytes::from(catalog::serialize_attach_catalog(c)?)))
                 .collect::<Result<Vec<_>>>()?,
             comment: self.catalog.comment.clone(),
             tags: self.catalog.tags.clone(),
@@ -1528,6 +1544,9 @@ impl Dispatcher {
                         arguments: Bytes::from(d.scan_arguments.clone()),
                         branch_filter: d.branch_filter.clone(),
                         writable: d.writable,
+                        source_catalog: d.source_catalog.clone(),
+                        source_schema: d.source_schema.clone(),
+                        source_table: d.source_table.clone(),
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -1537,6 +1556,9 @@ impl Dispatcher {
                 arguments: Bytes::from(t.scan_arguments.clone()),
                 branch_filter: None,
                 writable: false,
+                source_catalog: None,
+                source_schema: None,
+                source_table: None,
             })?],
         };
         Ok(Some(wire::to_result_batch(ScanBranchesResult {

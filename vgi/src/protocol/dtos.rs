@@ -339,12 +339,20 @@ pub struct AggregateStreamingCloseRequest {
 }
 
 /// One physical source backing a (possibly multi-branch) table scan.
+///
+/// A branch is either a *function* branch (`function_name` names a table
+/// function) or a *catalog-table* branch (`function_name` is empty and
+/// `source_table` is set — it scans `source_catalog.source_schema.source_table`
+/// in a companion catalog).
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {
     pub function_name: String,
     pub arguments: Bytes,
     pub branch_filter: Option<String>,
     pub writable: bool,
+    pub source_catalog: Option<String>,
+    pub source_schema: Option<String>,
+    pub source_table: Option<String>,
 }
 
 /// Response for `catalog_table_scan_branches_get`. The `branches` list must be
@@ -364,6 +372,19 @@ pub struct SecretTypeWire {
     pub parameters_schema: Bytes,
 }
 
+/// A companion catalog the client should ATTACH when this VGI catalog attaches
+/// (lakehouse federation). IPC-serialized into `CatalogAttachResult.attach_catalogs`.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct AttachCatalogInfo {
+    pub alias: String,
+    pub target: String,
+    pub db_type: String,
+    pub options: StrMap,
+    pub hidden: bool,
+    pub required: bool,
+    pub secret_ref: String,
+}
+
 /// `CatalogAttachResult` — flat result of `catalog_attach`.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CatalogAttachResult {
@@ -376,6 +397,7 @@ pub struct CatalogAttachResult {
     pub default_schema: String,
     pub settings: Vec<Bytes>,
     pub secret_types: Vec<Bytes>,
+    pub attach_catalogs: Vec<Bytes>,
     pub comment: Option<String>,
     pub tags: StrMap,
     pub supports_column_statistics: bool,
@@ -752,4 +774,50 @@ pub struct AggregateFinalizeResponse {
 pub struct AggregateDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
+}
+
+#[cfg(test)]
+mod federation_tests {
+    use super::*;
+
+    #[test]
+    fn scan_branch_catalog_table_roundtrips() {
+        let b = ScanBranch {
+            function_name: String::new(),
+            arguments: Bytes::from(Vec::<u8>::new()),
+            branch_filter: Some("id < 100".to_string()),
+            writable: false,
+            source_catalog: Some("acme_lake".to_string()),
+            source_schema: Some("main".to_string()),
+            source_table: Some("events".to_string()),
+        };
+        let batch = crate::wire::to_batch(b).unwrap();
+        let back: ScanBranch = crate::wire::from_batch(&batch).unwrap();
+        assert_eq!(back.function_name, "");
+        assert_eq!(back.branch_filter.as_deref(), Some("id < 100"));
+        assert_eq!(back.source_catalog.as_deref(), Some("acme_lake"));
+        assert_eq!(back.source_schema.as_deref(), Some("main"));
+        assert_eq!(back.source_table.as_deref(), Some("events"));
+    }
+
+    #[test]
+    fn attach_catalog_info_roundtrips() {
+        let info = AttachCatalogInfo {
+            alias: "acme_lake".to_string(),
+            target: "ducklake:sqlite:/data/meta.sqlite".to_string(),
+            db_type: String::new(),
+            options: vec![("DATA_PATH".to_string(), "/data/".to_string())],
+            hidden: true,
+            required: true,
+            secret_ref: "pg".to_string(),
+        };
+        let batch = crate::wire::to_batch(info).unwrap();
+        let back: AttachCatalogInfo = crate::wire::from_batch(&batch).unwrap();
+        assert_eq!(back.alias, "acme_lake");
+        assert_eq!(back.target, "ducklake:sqlite:/data/meta.sqlite");
+        assert_eq!(back.options, vec![("DATA_PATH".to_string(), "/data/".to_string())]);
+        assert!(back.hidden);
+        assert!(back.required);
+        assert_eq!(back.secret_ref, "pg");
+    }
 }

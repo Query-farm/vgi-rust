@@ -45,6 +45,14 @@ pub fn serialize_secret_type(spec: &SecretTypeSpec) -> Result<Vec<u8>> {
     ipc::write_batch(&crate::wire::to_batch(wire)?)
 }
 
+/// Serialize an [`AttachCatalogInfo`](crate::protocol::dtos::AttachCatalogInfo)
+/// to its IPC `attach_catalogs` entry (companion catalog for lakehouse federation).
+pub fn serialize_attach_catalog(
+    info: &crate::protocol::dtos::AttachCatalogInfo,
+) -> Result<Vec<u8>> {
+    ipc::write_batch(&crate::wire::to_batch(info.clone())?)
+}
+
 /// Serialize a [`SettingSpec`] to its IPC `settings` entry. The batch schema is
 /// `{name: string, description: string, type: binary, default_value: binary?}`
 /// where `type` is the IPC schema of a single `value` field of the setting's
@@ -781,12 +789,20 @@ impl CatTable {
 }
 
 /// One physical branch of a multi-branch table.
-#[derive(Clone)]
+///
+/// A *function* branch sets `function_name` (+ `scan_arguments`); a
+/// *catalog-table* branch leaves `function_name` empty and sets
+/// `source_catalog`/`source_schema`/`source_table` to scan a companion-catalog
+/// base table.
+#[derive(Clone, Default)]
 pub struct CatBranch {
     pub function_name: String,
     pub scan_arguments: Vec<u8>,
     pub branch_filter: Option<String>,
     pub writable: bool,
+    pub source_catalog: Option<String>,
+    pub source_schema: Option<String>,
+    pub source_table: Option<String>,
 }
 
 /// A foreign-key constraint (referenced table in the same schema by default).

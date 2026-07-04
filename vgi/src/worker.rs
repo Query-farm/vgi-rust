@@ -180,6 +180,12 @@ impl Worker {
         self.disp.register_setting(spec);
     }
 
+    /// Advertise a companion catalog for the client to ATTACH at VGI-attach time
+    /// (surfaced via `catalog_attach.attach_catalogs`; lakehouse federation).
+    pub fn register_attach_catalog(&mut self, info: crate::protocol::dtos::AttachCatalogInfo) {
+        self.disp.register_attach_catalog(info);
+    }
+
     /// Build the configured [`RpcServer`], registering every VGI method.
     pub fn build_server(self) -> RpcServer {
         let server_id = self
