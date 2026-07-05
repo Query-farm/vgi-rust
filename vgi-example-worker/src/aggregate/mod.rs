@@ -522,7 +522,9 @@ impl AggregateFunction for PercentileFunction {
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
             ArgSpec::column("value", 0, "double", "Values"),
-            ArgSpec::const_arg("percentile", 1, "double", "Percentile (0-1)"),
+            ArgSpec::const_arg("percentile", 1, "double", "Percentile (0-1)")
+                .with_ge(0.0)
+                .with_le(1.0),
         ]
     }
     fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {

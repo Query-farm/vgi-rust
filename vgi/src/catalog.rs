@@ -199,6 +199,70 @@ pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
     ipc::write_batch(&batch)
 }
 
+// Arrow field-metadata keys carrying per-argument constraint metadata for agent
+// discovery. Presence-only, value-encoded as UTF-8. Kept byte-for-byte in sync
+// with the C++ reader in the vgi extension and `vgi/argument_spec.py` in the
+// Python reference:
+//   vgi_default — JSON scalar (the arg's default value)
+//   vgi_choices — JSON array (the closed set of allowed values)
+//   vgi_range   — interval notation built from ge/le/gt/lt (e.g. "[0, 100]",
+//                 "(0, +inf)", "[1, 10)"); a discovery surface, not raw bounds
+//   vgi_pattern — raw regex the value must match (open set)
+const VGI_DEFAULT_KEY: &str = "vgi_default";
+const VGI_CHOICES_KEY: &str = "vgi_choices";
+const VGI_RANGE_KEY: &str = "vgi_range";
+const VGI_PATTERN_KEY: &str = "vgi_pattern";
+
+/// JSON-encode a value, falling back to the JSON of its `Debug` form rather than
+/// dropping the constraint registration if serialization somehow fails. A
+/// `serde_json::Value` always serializes, so the fallback is defensive.
+fn json_or_debug(value: &serde_json::Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")).to_string())
+}
+
+/// Format a single numeric bound without a trailing `.0` for whole numbers
+/// (e.g. `0` rather than `0.0`), keeping a decimal for genuinely fractional
+/// bounds (e.g. `0.5`).
+fn format_bound(v: f64) -> String {
+    if v.is_finite() && v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Build interval notation from an argument's numeric bounds. Inclusive bounds
+/// (`ge`/`le`) render as square brackets, exclusive bounds (`gt`/`lt`) as
+/// parentheses, and an open side as `-inf`/`+inf`. Returns `None` when the
+/// argument has no numeric bound at all. Mirrors `_format_range` in the Python
+/// reference (`vgi/argument_spec.py`).
+pub fn format_range(
+    ge: Option<f64>,
+    le: Option<f64>,
+    gt: Option<f64>,
+    lt: Option<f64>,
+) -> Option<String> {
+    if ge.is_none() && le.is_none() && gt.is_none() && lt.is_none() {
+        return None;
+    }
+    let low = if let Some(gt) = gt {
+        format!("({}", format_bound(gt))
+    } else if let Some(ge) = ge {
+        format!("[{}", format_bound(ge))
+    } else {
+        "(-inf".to_string()
+    };
+    let high = if let Some(lt) = lt {
+        format!("{})", format_bound(lt))
+    } else if let Some(le) = le {
+        format!("{}]", format_bound(le))
+    } else {
+        "+inf)".to_string()
+    };
+    Some(format!("{low}, {high}"))
+}
+
 /// Build the wire arg schema (`FunctionInfo.arguments`) from arg specs,
 /// attaching `vgi_*` field-metadata markers.
 pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
@@ -248,6 +312,24 @@ pub fn build_arg_schema(specs: &[ArgSpec]) -> Schema {
         // Per-argument description (UTF-8; presence-only — omit when empty).
         if !spec.doc.is_empty() {
             meta.insert("vgi_doc".to_string(), spec.doc.clone());
+        }
+
+        // Per-argument constraint metadata for agent discovery. All keys are
+        // presence-only (omitted when the constraint is absent) and value-encoded
+        // as UTF-8. Kept byte-for-byte in sync with the C++ reader in the vgi
+        // extension and the Python reference in `vgi/argument_spec.py`.
+        if let Some(default) = &spec.default {
+            meta.insert(VGI_DEFAULT_KEY.to_string(), json_or_debug(default));
+        }
+        if let Some(choices) = &spec.choices {
+            let value = serde_json::Value::Array(choices.clone());
+            meta.insert(VGI_CHOICES_KEY.to_string(), json_or_debug(&value));
+        }
+        if let Some(range) = format_range(spec.ge, spec.le, spec.gt, spec.lt) {
+            meta.insert(VGI_RANGE_KEY.to_string(), range);
+        }
+        if let Some(pattern) = &spec.pattern {
+            meta.insert(VGI_PATTERN_KEY.to_string(), pattern.clone());
         }
 
         let mut field = Field::new(&spec.name, ty, false);
@@ -1211,6 +1293,124 @@ mod tests {
         assert_eq!(
             scaled.metadata().get("vgi_doc").map(String::as_str),
             Some(unicode_doc),
+        );
+    }
+
+    #[test]
+    fn test_format_range_notation() {
+        // Inclusive both sides -> square brackets.
+        assert_eq!(
+            format_range(Some(0.0), Some(100.0), None, None).as_deref(),
+            Some("[0, 100]"),
+        );
+        // Exclusive lower, open upper.
+        assert_eq!(
+            format_range(None, None, Some(0.0), None).as_deref(),
+            Some("(0, +inf)"),
+        );
+        // Inclusive lower, exclusive upper.
+        assert_eq!(
+            format_range(Some(1.0), None, None, Some(10.0)).as_deref(),
+            Some("[1, 10)"),
+        );
+        // Open lower, inclusive upper.
+        assert_eq!(
+            format_range(None, Some(5.0), None, None).as_deref(),
+            Some("(-inf, 5]"),
+        );
+        // Exclusive both sides.
+        assert_eq!(
+            format_range(None, None, Some(0.0), Some(1.0)).as_deref(),
+            Some("(0, 1)"),
+        );
+        // gt takes precedence over ge; lt over le (mirrors the Python priority).
+        assert_eq!(
+            format_range(Some(2.0), Some(9.0), Some(3.0), Some(8.0)).as_deref(),
+            Some("(3, 8)"),
+        );
+        // No bounds -> None.
+        assert_eq!(format_range(None, None, None, None), None);
+        // Fractional bounds keep their decimal; whole numbers drop the ".0".
+        assert_eq!(
+            format_range(Some(0.5), Some(2.5), None, None).as_deref(),
+            Some("[0.5, 2.5]"),
+        );
+        // Negative whole numbers still drop the trailing ".0".
+        assert_eq!(
+            format_range(Some(-10.0), Some(10.0), None, None).as_deref(),
+            Some("[-10, 10]"),
+        );
+    }
+
+    #[test]
+    fn test_build_arg_schema_emits_constraint_keys() {
+        let specs = vec![
+            ArgSpec::const_arg("unit", -1, "varchar", "Output unit")
+                .with_choices(["mm", "cm", "m"])
+                .with_default("mm")
+                .with_pattern("^[a-z]+$"),
+            ArgSpec::const_arg("precision", 0, "int64", "Decimals")
+                .with_ge(0.0)
+                .with_le(10.0),
+            // A plain arg carries none of the constraint keys.
+            ArgSpec::column("value", 1, "double", "Value"),
+        ];
+
+        let schema = build_arg_schema(&specs);
+
+        let unit = schema.field(0).metadata();
+        assert_eq!(
+            unit.get("vgi_choices").map(String::as_str),
+            Some(r#"["mm","cm","m"]"#)
+        );
+        assert_eq!(unit.get("vgi_default").map(String::as_str), Some(r#""mm""#));
+        assert_eq!(
+            unit.get("vgi_pattern").map(String::as_str),
+            Some("^[a-z]+$")
+        );
+        // No numeric bounds -> no range key.
+        assert!(!unit.contains_key("vgi_range"));
+
+        let precision = schema.field(1).metadata();
+        assert_eq!(
+            precision.get("vgi_range").map(String::as_str),
+            Some("[0, 10]")
+        );
+        assert!(!precision.contains_key("vgi_choices"));
+        assert!(!precision.contains_key("vgi_default"));
+        assert!(!precision.contains_key("vgi_pattern"));
+
+        // Unconstrained arg: none of the four keys present (presence-only).
+        let value = schema.field(2).metadata();
+        for key in ["vgi_default", "vgi_choices", "vgi_range", "vgi_pattern"] {
+            assert!(
+                !value.contains_key(key),
+                "unconstrained arg must not emit {key}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_constraint_keys_encode_typed_values() {
+        // Numeric choices and default encode as JSON scalars/arrays (not strings).
+        let specs = vec![ArgSpec::const_arg("level", 0, "int64", "Level")
+            .with_choices([1, 2, 3])
+            .with_default(2)];
+        let schema = build_arg_schema(&specs);
+        let meta = schema.field(0).metadata();
+        assert_eq!(meta.get("vgi_choices").map(String::as_str), Some("[1,2,3]"));
+        assert_eq!(meta.get("vgi_default").map(String::as_str), Some("2"));
+
+        // Boolean and list defaults encode faithfully.
+        let specs = vec![ArgSpec::const_arg("flag", -1, "boolean", "Flag")
+            .with_default(true)
+            .with_choices([true, false])];
+        let schema = build_arg_schema(&specs);
+        let meta = schema.field(0).metadata();
+        assert_eq!(meta.get("vgi_default").map(String::as_str), Some("true"));
+        assert_eq!(
+            meta.get("vgi_choices").map(String::as_str),
+            Some("[true,false]")
         );
     }
 

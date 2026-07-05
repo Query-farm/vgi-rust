@@ -85,6 +85,24 @@ pub struct ArgSpec {
     pub arrow_data_type: Option<DataType>,
     /// Optional bind-time type bound for ANY-typed args.
     pub type_bound: Option<TypeBound>,
+    /// Discovery-facing validation constraints (surfaced via
+    /// `vgi_function_arguments()` as Arrow field metadata). All optional;
+    /// `None` = the constraint is absent. See [`crate::catalog::build_arg_schema`].
+    ///
+    /// Closed set of allowed values (`vgi_choices`).
+    pub choices: Option<Vec<serde_json::Value>>,
+    /// Inclusive lower bound, value >= ge (`vgi_range`).
+    pub ge: Option<f64>,
+    /// Inclusive upper bound, value <= le (`vgi_range`).
+    pub le: Option<f64>,
+    /// Exclusive lower bound, value > gt (`vgi_range`).
+    pub gt: Option<f64>,
+    /// Exclusive upper bound, value < lt (`vgi_range`).
+    pub lt: Option<f64>,
+    /// Regex the value must match (`vgi_pattern`).
+    pub pattern: Option<String>,
+    /// Default value for the argument (`vgi_default`).
+    pub default: Option<serde_json::Value>,
 }
 
 impl ArgSpec {
@@ -98,6 +116,13 @@ impl ArgSpec {
             is_varargs: false,
             arrow_data_type: None,
             type_bound: None,
+            choices: None,
+            ge: None,
+            le: None,
+            gt: None,
+            lt: None,
+            pattern: None,
+            default: None,
         }
     }
 
@@ -149,6 +174,52 @@ impl ArgSpec {
     /// Attach a type bound.
     pub fn with_bound(mut self, bound: TypeBound) -> Self {
         self.type_bound = Some(bound);
+        self
+    }
+
+    /// Declare the closed set of allowed values (`vgi_choices`).
+    pub fn with_choices<I, V>(mut self, choices: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<serde_json::Value>,
+    {
+        self.choices = Some(choices.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Inclusive lower bound (value >= `v`), surfaced in `vgi_range`.
+    pub fn with_ge(mut self, v: f64) -> Self {
+        self.ge = Some(v);
+        self
+    }
+
+    /// Inclusive upper bound (value <= `v`), surfaced in `vgi_range`.
+    pub fn with_le(mut self, v: f64) -> Self {
+        self.le = Some(v);
+        self
+    }
+
+    /// Exclusive lower bound (value > `v`), surfaced in `vgi_range`.
+    pub fn with_gt(mut self, v: f64) -> Self {
+        self.gt = Some(v);
+        self
+    }
+
+    /// Exclusive upper bound (value < `v`), surfaced in `vgi_range`.
+    pub fn with_lt(mut self, v: f64) -> Self {
+        self.lt = Some(v);
+        self
+    }
+
+    /// Regex the value must match (`vgi_pattern`).
+    pub fn with_pattern(mut self, pattern: &str) -> Self {
+        self.pattern = Some(pattern.to_string());
+        self
+    }
+
+    /// Default value for the argument (`vgi_default`).
+    pub fn with_default<V: Into<serde_json::Value>>(mut self, default: V) -> Self {
+        self.default = Some(default.into());
         self
     }
 }
