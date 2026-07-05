@@ -1563,7 +1563,7 @@ impl Dispatcher {
         };
         Ok(Some(wire::to_result_batch(ScanBranchesResult {
             branches,
-            required_extensions: Vec::new(),
+            required_extensions: t.required_extensions.clone(),
         })?))
     }
 

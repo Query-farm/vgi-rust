@@ -695,6 +695,19 @@ fn data_tables() -> Vec<CatTable> {
             native("read_parquet", "/tmp/vgi_hetero_branch.parquet"),
         ],
     ));
+    {
+        // sequence(50) hot arm + iceberg_scan cold arm. The gated
+        // multi_branch_iceberg.test (require-env VGI_TEST_ICEBERG) is the only
+        // consumer of the iceberg branch; the language suites leave it unset, so
+        // the branch is declared for parity but never scanned here.
+        let mut t = mb(
+            "multi_branch_iceberg",
+            "Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test",
+            vec![seq(50), native("iceberg_scan", "/tmp/vgi_iceberg_branch")],
+        );
+        t.required_extensions = vec!["iceberg".to_string()];
+        tables.push(t);
+    }
     tables.push(mb(
         "multi_branch_nopushdown",
         "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",

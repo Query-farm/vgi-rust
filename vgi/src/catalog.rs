@@ -764,6 +764,10 @@ pub struct CatTable {
     /// Multi-branch sources. `Some` (even empty) overrides the single-branch
     /// default in `catalog_table_scan_branches_get`.
     pub branches: Option<Vec<CatBranch>>,
+    /// DuckDB extensions the scan branches require (e.g. `["iceberg"]`);
+    /// surfaced as `ScanBranchesResult.required_extensions` and via the C++
+    /// `vgi_table_branches().table_required_extensions` diagnostic. Empty = none.
+    pub required_extensions: Vec<String>,
     /// Per-column optimizer statistics (served via
     /// `catalog_table_column_statistics_get`).
     pub statistics: Vec<crate::statistics::CatColStat>,
@@ -957,6 +961,7 @@ impl CatTable {
             foreign_keys: Vec::new(),
             inline_scan: false,
             branches: None,
+            required_extensions: Vec::new(),
             statistics: Vec::new(),
             time_travel: Vec::new(),
             required_field_filter_paths: Vec::new(),
