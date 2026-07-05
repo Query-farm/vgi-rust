@@ -522,9 +522,11 @@ impl AggregateFunction for PercentileFunction {
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
             ArgSpec::column("value", 0, "double", "Values"),
-            ArgSpec::const_arg("percentile", 1, "double", "Percentile (0-1)")
-                .with_ge(0.0)
-                .with_le(1.0),
+            // NOTE: percentile is validated by this fixture's own on_bind (which
+            // gives NaN/inf/range-specific messages the shared const_param.test
+            // asserts). Declaring framework ge/le here would pre-empt that with a
+            // generic message, so the range constraint is intentionally omitted.
+            ArgSpec::const_arg("percentile", 1, "double", "Percentile (0-1)"),
         ]
     }
     fn on_bind(&self, _p: &AggregateBindParams) -> Result<BindResponse> {
