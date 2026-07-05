@@ -59,11 +59,15 @@ impl ScalarFunction for FormatNumber {
         match self {
             FormatNumber::Default => vec![ArgSpec::column("value", 0, "float64", "Number")],
             FormatNumber::Precision => vec![
-                ArgSpec::const_arg("precision", 0, "int64", "Decimals"),
+                ArgSpec::const_arg("precision", 0, "int64", "Decimals")
+                    .with_ge(0.0)
+                    .with_le(10.0),
                 ArgSpec::column("value", 1, "float64", "Number"),
             ],
             FormatNumber::Full => vec![
-                ArgSpec::const_arg("precision", 0, "int64", "Decimals"),
+                ArgSpec::const_arg("precision", 0, "int64", "Decimals")
+                    .with_ge(0.0)
+                    .with_le(10.0),
                 ArgSpec::const_arg("prefix", 1, "varchar", "Prefix"),
                 ArgSpec::column("value", 2, "float64", "Number"),
             ],

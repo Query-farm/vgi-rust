@@ -41,6 +41,7 @@ arrow-arith = { workspace = true }
 arrow-ord = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
 log = { workspace = true }
 # tokio only backs the HTTP worker transport; optional + gated so the crate
 # compiles for wasm (where tokio's rt-multi-thread/net features are unsupported).

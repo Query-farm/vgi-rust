@@ -478,7 +478,9 @@ impl Dispatcher {
             }
         }
 
-        crate::function::validate_type_bounds(&f.argument_specs(), params.input_schema.as_ref())?;
+        let specs = f.argument_specs();
+        crate::function::validate_type_bounds(&specs, params.input_schema.as_ref())?;
+        crate::function::validate_arg_constraints(&specs, &params.arguments)?;
         let bind = f.on_bind(&params)?;
         let resp = BindResponse {
             output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
