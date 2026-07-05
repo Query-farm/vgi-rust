@@ -323,6 +323,7 @@ impl Dispatcher {
         if self.buffering.contains_key(&dto.function_name) {
             let f = self.resolve_buffering(&dto.function_name)?;
             params.arguments.remap_positional(&f.argument_specs());
+            crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
             // Two-phase secret bind: first pass requests the secret types; the
             // C++ resolves them and re-binds with `resolved_secrets_provided`.
             if !params.resolved_secrets_provided {
@@ -366,6 +367,7 @@ impl Dispatcher {
                 params.input_schema.as_ref(),
             )?;
             params.arguments.remap_positional(&f.argument_specs());
+            crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
             // Two-phase secret bind: first pass requests the secret types; the
             // C++ resolves them and re-binds with `resolved_secrets_provided`
             // and the same input schema (so the retry can derive an output
@@ -415,6 +417,7 @@ impl Dispatcher {
                 params.input_schema.as_ref(),
             )?;
             params.arguments.remap_positional(&f.argument_specs());
+            crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
             // Two-phase secret bind: first pass requests the secret types; the
             // C++ resolves them and re-binds with `resolved_secrets_provided`.
             if !params.resolved_secrets_provided {
@@ -1937,6 +1940,9 @@ impl Dispatcher {
         let input_schema = opt_schema(&dto.input_schema)?;
         let f = self.resolve_aggregate(&dto.function_name)?;
         args.remap_positional(&f.argument_specs());
+        // Enforce declared const-argument constraints at bind (parity with the
+        // scalar/table path); a violating value fails the aggregate_bind.
+        crate::function::validate_arg_constraints(&f.argument_specs(), &args)?;
         let _ = ctx;
         let params = AggregateBindParams {
             arguments: args,
