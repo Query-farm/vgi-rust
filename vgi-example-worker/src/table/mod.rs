@@ -781,7 +781,9 @@ impl TableFunction for MakeSeries {
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         match self {
-            MakeSeries::Count => vec![ArgSpec::const_arg("count", 0, "int64", "Number of values")],
+            MakeSeries::Count => {
+                vec![ArgSpec::const_arg("count", 0, "int64", "Number of values").with_ge(0.0)]
+            }
             MakeSeries::Range => vec![
                 ArgSpec::const_arg("start", 0, "int64", "Start (inclusive)"),
                 ArgSpec::const_arg("stop", 1, "int64", "Stop (exclusive)"),
@@ -789,7 +791,7 @@ impl TableFunction for MakeSeries {
             MakeSeries::Step => vec![
                 ArgSpec::const_arg("start", 0, "int64", "Start (inclusive)"),
                 ArgSpec::const_arg("stop", 1, "int64", "Stop (exclusive)"),
-                ArgSpec::const_arg("step", 2, "int64", "Step"),
+                ArgSpec::const_arg("step", 2, "int64", "Step").with_ge(1.0),
             ],
         }
     }
