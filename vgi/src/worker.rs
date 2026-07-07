@@ -188,6 +188,13 @@ impl Worker {
 
     /// Build the configured [`RpcServer`], registering every VGI method.
     pub fn build_server(self) -> RpcServer {
+        self.build_parts().0
+    }
+
+    /// Build the [`RpcServer`] and return the shared [`Dispatcher`] handle
+    /// alongside it. The HTTP transport reuses the dispatcher to serve the
+    /// landing contract (`describe.json`) via catalog introspection.
+    fn build_parts(self) -> (RpcServer, Arc<Dispatcher>) {
         let server_id = self
             .server_id
             .clone()
@@ -202,8 +209,9 @@ impl Worker {
             .protocol_version(protocol_version)
             .enable_describe(true)
             .build();
-        register::register(&mut srv, Arc::new(self.disp));
-        srv
+        let disp = Arc::new(self.disp);
+        register::register(&mut srv, disp.clone());
+        (srv, disp)
     }
 
     /// Parse `argv` and serve over the selected transport, blocking until the
@@ -222,13 +230,24 @@ impl Worker {
     ///   enabled by setting `VGI_BEARER_TOKENS` (`token=principal,…`).
     pub fn run(self) {
         let args: Vec<String> = std::env::args().collect();
-        let server = Arc::new(self.build_server());
+        // Capture the worker's display name / doc from the primary catalog
+        // before the dispatcher is moved into the server (used by the HTTP
+        // landing contract).
+        let worker_name = self.disp.catalog.name.clone();
+        let worker_doc = self.disp.catalog.comment.clone().unwrap_or_default();
+        let (server, disp) = self.build_parts();
+        let server = Arc::new(server);
 
         #[cfg(feature = "transport-http")]
         if args.iter().any(|a| a == "--http") {
-            crate::transport::serve_http(server, build_authenticate());
+            let provider: Arc<dyn vgi_rpc::http::DescribeProvider> = Arc::new(
+                crate::describe::VgiDescribeProvider::new(disp, worker_name, worker_doc),
+            );
+            crate::transport::serve_http(server, build_authenticate(), Some(provider));
             return;
         }
+        // The dispatcher handle is only needed by the HTTP landing contract.
+        let _ = (&disp, &worker_name, &worker_doc);
 
         // Native thread-per-connection TCP. (A wasm single-thread serve_tcp is
         // wired separately for the wasip2 shared-worker path.)

@@ -179,7 +179,11 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
 ///
 /// Gated on `transport-http` (tokio/axum) so the crate stays wasm-buildable.
 #[cfg(feature = "transport-http")]
-pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenticate>) {
+pub fn serve_http(
+    server: Arc<RpcServer>,
+    authenticate: Option<vgi_rpc::Authenticate>,
+    describe_provider: Option<Arc<dyn vgi_rpc::http::DescribeProvider>>,
+) {
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -206,6 +210,11 @@ pub fn serve_http(server: Arc<RpcServer>, authenticate: Option<vgi_rpc::Authenti
             .producer_batch_limit(1);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
+        }
+        // Standardized landing surface: serve `describe.json` + lazy columns
+        // from the worker's catalog introspection.
+        if let Some(provider) = describe_provider {
+            builder = builder.describe_provider(provider);
         }
         let state = builder.build();
         // Default to loopback + ephemeral port (the local test harness reads the

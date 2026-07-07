@@ -89,3 +89,61 @@ jobs:
 
       - name: Build and run the doc examples
         run: bash scripts/check_doc_examples.sh
+
+  # Boot the example worker over HTTP and validate the standardized landing
+  # surface (GET / landing.html marker, describe.json, lazy columns) against
+  # the vendored `test/landing/describe.schema.json`, using the cross-language
+  # conformance runner from the canonical Query-farm/vgi repo. The runner only
+  # drives HTTP (schema + marker + column endpoints); it is language-agnostic,
+  # so the Python-derived golden is intentionally NOT applied to the Rust
+  # worker (its catalog differs). The dependency-free Rust guard runs first via
+  # the cargo integration test.
+  landing-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout canonical vgi (conformance runner)
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: main
+          path: vgi-upstream
+          sparse-checkout: |
+            test/landing
+
+      - name: Install Rust toolchain (MSRV 1.90)
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install jsonschema
+        run: pip install jsonschema
+
+      - name: Build example worker
+        run: cargo build -p vgi-example-worker
+
+      - name: Rust landing conformance guard (cargo test)
+        run: cargo test -p vgi-example-worker --test landing_conformance
+
+      - name: Landing conformance (schema + marker + columns)
+        run: |
+          set -euo pipefail
+          ./target/debug/vgi-example-worker --http >/tmp/worker.out 2>/tmp/worker.err &
+          WPID=$!
+          trap 'kill $WPID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            PORT=$(grep -o 'PORT:[0-9]*' /tmp/worker.out 2>/dev/null | head -1 | cut -d: -f2 || true)
+            [ -n "${PORT:-}" ] && break
+            sleep 0.2
+          done
+          if [ -z "${PORT:-}" ]; then echo "worker did not announce a PORT"; cat /tmp/worker.err; exit 1; fi
+          echo "worker on port $PORT"
+          python vgi-upstream/test/landing/run_landing_conformance.py \
+            --url "http://127.0.0.1:$PORT" \
+            --schema test/landing/describe.schema.json

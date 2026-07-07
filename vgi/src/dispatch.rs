@@ -58,7 +58,7 @@ pub struct Dispatcher {
     /// Functions live in the worker-global registries, so these scope which
     /// names a catalog's `catalog_schema_contents_functions` advertises: a
     /// secondary shows only its own, and the primary hides every secondary's.
-    secondary_functions: Vec<Vec<String>>,
+    pub(crate) secondary_functions: Vec<Vec<String>>,
     /// Secret types registered by the worker (surfaced in `catalog_attach`).
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
