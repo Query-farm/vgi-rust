@@ -4,7 +4,7 @@ members = ["vgi", "vgi-example-worker", "vgi-storage-server"]
 
 
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.90"
 license-file = "LICENSE"
@@ -20,7 +20,7 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.10.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
+vgi-rpc = { version = "0.11.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"

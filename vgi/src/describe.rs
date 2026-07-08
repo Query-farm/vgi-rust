@@ -165,12 +165,19 @@ fn build_catalog(model: &CatalogModel, functions: &[FunctionInfo]) -> Value {
         n_tables += tables.len() as i64;
         n_views += views.len() as i64;
         n_functions += fns.len() as i64;
-        schemas.push(json!({
-            "name": name,
-            "tables": tables,
-            "views": views,
-            "functions": fns,
-        }));
+        let mut schema_obj = Map::new();
+        schema_obj.insert("name".to_string(), Value::String(name.clone()));
+        // Optional per-schema doc: the schema's comment when non-empty (omit
+        // otherwise), mirroring the Python reference producer.
+        if let Some(doc) = sch.and_then(|s| s.comment.as_deref()) {
+            if !doc.is_empty() {
+                schema_obj.insert("doc".to_string(), Value::String(doc.to_string()));
+            }
+        }
+        schema_obj.insert("tables".to_string(), Value::Array(tables));
+        schema_obj.insert("views".to_string(), Value::Array(views));
+        schema_obj.insert("functions".to_string(), Value::Array(fns));
+        schemas.push(Value::Object(schema_obj));
     }
 
     json!({
