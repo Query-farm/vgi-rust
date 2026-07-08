@@ -475,8 +475,14 @@ fn function_returns(fi: &FunctionInfo) -> Option<String> {
 fn sort_function_values(fns: &mut [Value]) {
     fns.sort_by_key(|v| {
         (
-            v.get("type").and_then(Value::as_str).unwrap_or("").to_string(),
-            v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            v.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         )
     });
 }
