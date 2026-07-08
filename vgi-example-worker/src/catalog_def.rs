@@ -1131,6 +1131,7 @@ pub fn build() -> CatalogModel {
                 ],
                 macros: vec![
                     CatMacro {
+                        comment: Some("Multiply two values".to_string()),
                         parameter_docs: vec![
                             ("x".to_string(), "First factor".to_string()),
                             ("y".to_string(), "Second factor".to_string()),
@@ -1138,6 +1139,9 @@ pub fn build() -> CatalogModel {
                         ..smacro("vgi_multiply", &["x", "y"], "x * y")
                     },
                     CatMacro {
+                        comment: Some(
+                            "Clamp a value between lo and hi (defaults: 0..100)".to_string(),
+                        ),
                         defaults: vec![("lo".to_string(), 0), ("hi".to_string(), 100)],
                         parameter_docs: vec![
                             ("val".to_string(), "Value to clamp".to_string()),
@@ -1151,6 +1155,7 @@ pub fn build() -> CatalogModel {
                         )
                     },
                     CatMacro {
+                        comment: Some("Table macro returning range of values".to_string()),
                         parameter_docs: vec![(
                             "n".to_string(),
                             "Number of rows to generate".to_string(),

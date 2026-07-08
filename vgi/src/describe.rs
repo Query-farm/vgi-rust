@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 
 use crate::catalog::{self, CatSchema, CatalogModel};
 use crate::dispatch::Dispatcher;
-use crate::protocol::dtos::FunctionInfo;
+use crate::protocol::dtos::{FunctionInfo, MacroInfo};
 
 /// This contract's version (independent of the VGI wire protocol version).
 const LANDING_SCHEMA_VERSION: i64 = 1;
@@ -144,11 +144,23 @@ fn build_catalog(model: &CatalogModel, functions: &[FunctionInfo]) -> Value {
         let sch = schemas_slice.iter().find(|s| &s.name == name);
         let tables = sch.map(schema_tables).unwrap_or_default();
         let views = sch.map(schema_views).unwrap_or_default();
-        let fns: Vec<Value> = if name == catalog::MAIN_SCHEMA {
+        let mut fns: Vec<Value> = if name == catalog::MAIN_SCHEMA {
             functions.iter().map(function_json).collect()
         } else {
             Vec::new()
         };
+        // Fold the schema's declarative macros into the same `functions` array:
+        // a scalar macro is invoked exactly like a scalar function in SQL and a
+        // table macro like a table function, so they share the landing page's
+        // scalar/table buckets (mirrors the Python reference producer, which
+        // commonly exposes a catalog's callable surface as macros).
+        if let Some(s) = sch {
+            for m in &s.macros {
+                fns.push(macro_json(&catalog::macro_info(&s.name, m)));
+            }
+        }
+        // Deterministic ordering across functions + macros by (type, name).
+        sort_function_values(&mut fns);
         n_schemas += 1;
         n_tables += tables.len() as i64;
         n_views += views.len() as i64;
@@ -454,6 +466,114 @@ fn function_returns(fi: &FunctionInfo) -> Option<String> {
             Some(format!("TABLE({})", cols.join(", ")))
         }
     }
+}
+
+/// Sort the combined function + macro JSON objects by `(type, name)` — the
+/// display `type` field, not the raw registry type — matching the Python
+/// reference producer so both languages list the merged callable surface in the
+/// same order.
+fn sort_function_values(fns: &mut [Value]) {
+    fns.sort_by_key(|v| {
+        (
+            v.get("type").and_then(Value::as_str).unwrap_or("").to_string(),
+            v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+        )
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Macros (scalar + table macros fold into the `functions` array)
+// ---------------------------------------------------------------------------
+
+fn macro_json(mi: &MacroInfo) -> Value {
+    let mut obj = Map::new();
+    obj.insert("name".to_string(), Value::String(mi.name.clone()));
+    obj.insert(
+        "type".to_string(),
+        Value::String(macro_display_type(mi).to_string()),
+    );
+    obj.insert(
+        "doc".to_string(),
+        Value::String(mi.comment.clone().unwrap_or_default()),
+    );
+    obj.insert("args".to_string(), Value::Array(macro_args(mi)));
+    // Macros carry no `returns` field (their result type is not declared).
+    Value::Object(obj)
+}
+
+/// A scalar macro surfaces as `scalar`, a table macro as `table` — they are
+/// invoked exactly like the corresponding function kind in SQL.
+fn macro_display_type(mi: &MacroInfo) -> &'static str {
+    if mi.macro_type.0 == "table" {
+        "table"
+    } else {
+        "scalar"
+    }
+}
+
+fn macro_args(mi: &MacroInfo) -> Vec<Value> {
+    // Defaulted parameters are optional and callable by name in DuckDB, so they
+    // are presented as named args carrying their default value.
+    let defaults = macro_defaults(&mi.parameter_default_values.0);
+    // `arguments_schema` has one nullable field per parameter (in order): the
+    // field's type pins the parameter type (or Null when untyped), and the
+    // `vgi_doc` metadata carries its description. Fall back to the bare
+    // parameter names when a worker supplied no schema.
+    let schema = crate::ipc::read_schema(&mi.arguments_schema.0).ok();
+    let names: Vec<String> = match &schema {
+        Some(s) => s.fields().iter().map(|f| f.name().clone()).collect(),
+        None => mi.parameters.clone(),
+    };
+    let mut args = Vec::new();
+    for name in names {
+        let field = schema
+            .as_ref()
+            .and_then(|s| s.fields().iter().find(|f| f.name() == &name).cloned());
+        let mut arg = Map::new();
+        arg.insert("name".to_string(), Value::String(name.clone()));
+        // An untyped macro param (no typed default pinning it) surfaces as ANY
+        // rather than the Arrow null placeholder.
+        let ty = match &field {
+            Some(f) if !matches!(f.data_type(), arrow_schema::DataType::Null) => {
+                type_str(f.data_type())
+            }
+            _ => "ANY".to_string(),
+        };
+        arg.insert("type".to_string(), Value::String(ty));
+        if let Some(doc) = field.as_ref().and_then(|f| f.metadata().get("vgi_doc")) {
+            if !doc.is_empty() {
+                arg.insert("desc".to_string(), Value::String(doc.clone()));
+            }
+        }
+        if let Some(default) = defaults.get(&name) {
+            arg.insert("named".to_string(), Value::Bool(true));
+            // Stored JSON-encoded for a stable display form (int 0 -> "0").
+            arg.insert("default".to_string(), Value::String(default.to_string()));
+        }
+        args.push(Value::Object(arg));
+    }
+    args
+}
+
+/// Decode the 1-row macro parameter-default batch into `name -> JSON value`
+/// (defaults are int64 in the catalog model). Empty or undecodable bytes yield
+/// an empty map.
+fn macro_defaults(bytes: &[u8]) -> std::collections::HashMap<String, Value> {
+    use arrow_array::Array;
+    let mut out = std::collections::HashMap::new();
+    let Ok(batch) = crate::ipc::read_batch(bytes) else {
+        return out;
+    };
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let col = batch.column(i);
+        if col.is_empty() || col.is_null(0) {
+            continue;
+        }
+        if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+            out.insert(field.name().clone(), Value::from(a.value(0)));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
