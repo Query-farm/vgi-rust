@@ -61,16 +61,12 @@ if [ "$TRANSPORT" = "http" ]; then
   AWK_HTTP=1
   HTTP_SKIP=(-not -name 'projection_pushdown_repro.test' -not -name 'dynamic_filter.test')
 fi
+# The native-branch fixtures (multi_branch_*, required_field_filter_paths_native)
+# used to stage and read parquet/csv from POSIX `/tmp/...` paths the worker's
+# catalog hard-coded, so they had to be skipped on Windows, which has no `/tmp`.
+# Both sides now resolve the same $VGI_TEST_BRANCH_DIR (exported below), so they
+# run everywhere.
 WIN_SKIP=()
-if [ "$WINDOWS" = "1" ]; then
-  # These fixtures stage and read parquet/csv from POSIX `/tmp/...` paths the
-  # worker's catalog hard-codes, which don't exist on Windows.
-  WIN_SKIP=(-not -name 'multi_branch_heterogeneous.test'
-            -not -name 'multi_branch_join_optimizer.test'
-            -not -name 'multi_branch_pushdown_incapable.test'
-            -not -name 'multi_branch_reconciliation.test'
-            -not -name 'required_field_filter_paths_native.test')
-fi
 
 echo "Staging preprocessed tests into $STAGE (transport=$TRANSPORT, windows=$WINDOWS) ..."
 mkdir -p "$STAGE/test/sql/integration"
@@ -123,6 +119,18 @@ boot_http_worker() {
 
 export VGI_WORKER_BIN
 export VGI_TEST_BEARER_TOKEN="test-secret-token"
+# Scratch dir shared by the native-branch fixtures (their read_parquet /
+# read_csv / iceberg_scan arms) and the .test files' COPY-TO targets. The worker
+# reads the same variable; the multi_branch_* and rff_*_native tests `require-env`
+# it and skip without it. Not /tmp — Windows has none.
+# Forward-slashed with no trailing separator: the .test files substitute this
+# value verbatim into their COPY-TO targets, and the worker normalizes the same
+# way, so both name a byte-identical path on Windows too.
+VGI_TEST_BRANCH_DIR="${VGI_TEST_BRANCH_DIR:-$STAGE/branches}"
+VGI_TEST_BRANCH_DIR="${VGI_TEST_BRANCH_DIR//\\//}"
+VGI_TEST_BRANCH_DIR="${VGI_TEST_BRANCH_DIR%/}"
+export VGI_TEST_BRANCH_DIR
+mkdir -p "$VGI_TEST_BRANCH_DIR"
 
 WV="$HERE/wrappers/vgi-worker-versioned"
 WVT="$HERE/wrappers/vgi-worker-versioned-tables"
@@ -165,8 +173,17 @@ case "$TRANSPORT" in
     # Whole-suite-over-HTTP. Every ATTACH goes over http://, so staging injected
     # `LOAD httpfs`. VGI_REQUIRE_LAUNCHER_TRANSPORT is deliberately unset (the
     # launcher-only tests must skip here). bearer_auth runs separately below.
-    boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=example"
+    #
+    # The two OPTIONAL bearer tokens let the result cache's identity-isolation
+    # test attach this same worker as alice and as bob; an absent or unknown
+    # token still resolves to anonymous, so no other test on this shared server
+    # starts 401ing. (The *required*-token server for bearer_auth/* boots below.)
+    boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=example" \
+      "VGI_OPTIONAL_BEARER_TOKENS=vgi-test-alice=alice,vgi-test-bob=bob"
     export VGI_TEST_WORKER="http://localhost:${BOOTED_PORT}"
+    # Lets HTTP-only tests (bearer/OAuth identity, which subprocess can't carry)
+    # gate themselves via `require-env VGI_HTTP_TRANSPORT` instead of skipping.
+    export VGI_HTTP_TRANSPORT=1
     # Only the *_HTTP_WORKER variants are set: tests read VGI_TEST_WORKER /
     # VGI_*_HTTP_WORKER over http, while the plain VGI_VERSIONED_WORKER etc.
     # remain a subprocess-path contract (unset here, so those subprocess-only
@@ -211,14 +228,47 @@ rm -f "$STAGE/test/_warm.test"
 # worker; on stdio/launch it runs inline (VGI_TEST_BEARER_TOKEN is set).
 echo "Running suite (transport=$TRANSPORT) ..."
 rc=0
+
+# run_unittest — invoke haybarn-unittest, streaming its output, and additionally
+# fail on a fatal-signal report that the process's own exit code cannot express.
+#
+# Catch2 arms handlers for SIGTERM/SIGINT/SIGSEGV/... for the duration of a test
+# case. Those handlers are inherited by any process the extension fork()s, and
+# run in the child if a signal lands before it execs. The child then prints a
+# full "FAILED: ... due to a fatal error condition: SIGTERM" block plus a run
+# summary — the *parent's* accumulated counters, since it's an address-space
+# copy — and dies. The parent never sees it, records no failure, and exits 0.
+# The only trace is on stdout, so that is what we scan. The fork window itself is
+# fixed in Query-farm/vgi (SubProcess now resets signal dispositions in the
+# child), but this class of failure can never reach the exit code, so the guard
+# is worth keeping regardless of source.
+run_unittest() {
+  local log unittest_rc=0
+  log="$(mktemp)"
+  "$HAYBARN_UNITTEST" "$@" 2>&1 | tee "$log"
+  # Read PIPESTATUS immediately: any command in between (including `|| true`)
+  # overwrites it and would silently swallow every real test failure.
+  unittest_rc="${PIPESTATUS[0]}"
+  if grep -q 'due to a fatal error condition' "$log"; then
+    echo "::error::a forked child ran the test harness's signal handler (see the" \
+         "'fatal error condition' block above). The parent exited $unittest_rc and" \
+         "would otherwise have passed. This is invisible to the exit code by construction."
+    unittest_rc=1
+  fi
+  rm -f "$log"
+  return "$unittest_rc"
+}
+
 if [ "$TRANSPORT" = "http" ]; then
-  "$HAYBARN_UNITTEST" "test/sql/integration/*" "~test/sql/integration/bearer_auth/*" || rc=$?
+  run_unittest "test/sql/integration/*" "~test/sql/integration/bearer_auth/*" || rc=$?
   echo "Running bearer_auth/* against a bearer-protected http worker ..."
   boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=example" "VGI_BEARER_TOKENS=test-secret-token=test-principal"
-  VGI_TEST_WORKER="http://localhost:${BOOTED_PORT}" \
-    "$HAYBARN_UNITTEST" "test/sql/integration/bearer_auth/*" || rc=$?
+  # Subshell so the override doesn't outlive the call: a `VAR=v func` prefix
+  # persists after the function returns in bash, unlike `VAR=v some_binary`.
+  ( export VGI_TEST_WORKER="http://localhost:${BOOTED_PORT}"
+    run_unittest "test/sql/integration/bearer_auth/*" ) || rc=$?
 else
-  "$HAYBARN_UNITTEST" "test/sql/integration/*" || rc=$?
+  run_unittest "test/sql/integration/*" || rc=$?
 fi
 
 exit "$rc"

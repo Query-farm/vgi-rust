@@ -22,6 +22,13 @@ BIN="$VGI_RUST/target/release/vgi-example-worker"
 CACHE="/tmp/vgi-rust-test-cache"
 mkdir -p "$CACHE"
 
+# Scratch dir the native-branch fixtures (read_parquet / read_csv / iceberg_scan
+# arms) and their .test COPY-TO targets must agree on. The worker reads the same
+# env var; the multi_branch_* and rff_*_native tests `require-env` it and skip
+# without it.
+BRANCH_DIR="${VGI_TEST_BRANCH_DIR:-$CACHE/branches}"
+mkdir -p "$BRANCH_DIR"
+
 BUILD=1
 if [[ "${1:-}" == "--no-build" ]]; then BUILD=0; shift; fi
 
@@ -89,6 +96,7 @@ fi
 echo "[harness] running: ${ARGS[*]}"
 env \
   "${LAUNCHER_ENV[@]}" \
+  VGI_TEST_BRANCH_DIR="$BRANCH_DIR" \
   VGI_TEST_WORKER="$TEST_WORKER" \
   VGI_VERSIONED_WORKER="$W_VERSIONED" \
   VGI_VERSIONED_TABLES_WORKER="$W_VERSIONED_TABLES" \

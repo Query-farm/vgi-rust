@@ -21,6 +21,12 @@ BIN="$VGI_RUST/target/release/vgi-example-worker"
 CACHE="/tmp/vgi-rust-http-cache"
 mkdir -p "$CACHE"
 
+# Scratch dir the native-branch fixtures and their .test COPY-TO targets must
+# agree on; exported to both the workers and unittest.
+BRANCH_DIR="${VGI_TEST_BRANCH_DIR:-$CACHE/branches}"
+mkdir -p "$BRANCH_DIR"
+export VGI_TEST_BRANCH_DIR="$BRANCH_DIR"
+
 BUILD=1
 if [[ "${1:-}" == "--no-build" ]]; then BUILD=0; shift; fi
 if [[ $BUILD == 1 ]]; then
@@ -37,7 +43,12 @@ trap cleanup EXIT
 start_worker() {
   local log="$1"; shift
   : > "$log"
-  ( for kv in "$@"; do export "$kv"; done; exec "$BIN" --http ) > "$log" 2>>"$CACHE/worker.log" &
+  # Run the worker with its cwd set to $VGI_EXT — the directory unittest runs
+  # from — so DuckDB's per-test temp dir (__TEST_DIR__ → duckdb_unittest_tempdir/
+  # <pid>) and the worker resolve the SAME relative path. Without this the http
+  # worker (a separate process) cannot create the COPY ... TO destination the
+  # test hands it as a relative path, and every copy_to/copy_from test fails.
+  ( cd "$VGI_EXT" || exit 1; for kv in "$@"; do export "$kv"; done; exec "$BIN" --http ) > "$log" 2>>"$CACHE/worker.log" &
   PIDS+=("$!")
   local port=""
   for _ in $(seq 1 40); do
@@ -52,9 +63,13 @@ start_worker() {
 : > "$CACHE/worker.log"
 ZSTD_ENV="VGI_HTTP_DISABLE_ZSTD=${VGI_HTTP_DISABLE_ZSTD:-}"
 
-# Main example server: NO bearer tokens → anonymous allowed (serves the
-# non-auth suite). The bearer_auth tests run separately against W_BEARER below.
-W_EXAMPLE=$(start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV")
+# Main example server: NO required bearer tokens → anonymous allowed (serves the
+# non-auth suite). It does accept two OPTIONAL tokens so the result cache's
+# identity-isolation test can attach the same worker as alice and as bob; an
+# absent/unknown token still resolves to anonymous, so no other test 401s.
+# The bearer_auth tests run separately against W_BEARER below.
+W_EXAMPLE=$(start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" \
+  "VGI_OPTIONAL_BEARER_TOKENS=vgi-test-alice=alice,vgi-test-bob=bob")
 # Bearer-protected example server (rejects anonymous) for bearer_auth/*.
 W_BEARER=$(start_worker "$CACHE/bearer.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" "VGI_BEARER_TOKENS=test-secret-token=test-principal")
 W_VERSIONED=$(start_worker "$CACHE/versioned.log" "VGI_WORKER_CATALOG_NAME=versioned" "$ZSTD_ENV")
@@ -80,6 +95,8 @@ fi
 
 echo "[http-harness] running: ${ARGS[*]}"
 env \
+  VGI_TEST_BRANCH_DIR="$BRANCH_DIR" \
+  VGI_HTTP_TRANSPORT=1 \
   VGI_TEST_WORKER="$W_EXAMPLE" \
   VGI_VERSIONED_HTTP_WORKER="$W_VERSIONED" \
   VGI_VERSIONED_TABLES_HTTP_WORKER="$W_VERSIONED_TABLES" \
