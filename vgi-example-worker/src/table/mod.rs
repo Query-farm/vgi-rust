@@ -3,6 +3,7 @@
 //! Table (producer) example fixtures.
 
 mod batch_index;
+mod cache;
 mod cancellable;
 mod filters;
 mod more;
@@ -41,6 +42,7 @@ pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     filters::register(w);
     cancellable::register(w);
     batch_index::register(w);
+    cache::register(w);
     partition::register(w);
     order_modes::register(w);
     static_scan::register(w);

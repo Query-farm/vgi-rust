@@ -121,6 +121,7 @@
 pub mod aggregate;
 pub mod arguments;
 pub mod buffering;
+pub mod cache_control;
 pub mod catalog;
 pub mod copy_from;
 pub mod copy_to;

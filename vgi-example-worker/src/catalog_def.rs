@@ -206,8 +206,31 @@ fn rff_native(
     t
 }
 
-fn str_arg(s: &str) -> ArrayRef {
-    Arc::new(arrow_array::StringArray::from(vec![s]))
+/// Shared scratch dir for the native-branch fixtures (their `read_parquet` /
+/// `read_csv` / `iceberg_scan` arms).
+///
+/// This fixture and the coupled `.test` files must name the SAME concrete path:
+/// the tests reference it via `${VGI_TEST_BRANCH_DIR}` and this reads the same
+/// env var, defaulting to the OS temp dir. Hardcoding `/tmp` broke on Windows
+/// (no `/tmp`). Kept forward-slashed (DuckDB and Rust both accept `/` on
+/// Windows) with no trailing separator, so `branch_path("name")` matches the
+/// test's COPY-TO target byte-for-byte.
+fn branch_dir() -> String {
+    let raw = std::env::var("VGI_TEST_BRANCH_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+    raw.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+/// A path under the shared native-branch scratch dir.
+fn branch_path(name: &str) -> String {
+    format!("{}/{name}", branch_dir())
+}
+
+/// A string scan argument naming a file under the native-branch scratch dir.
+fn branch_arg(name: &str) -> ArrayRef {
+    Arc::new(arrow_array::StringArray::from(vec![branch_path(name)]))
 }
 
 /// WKB (little-endian) for `POINT(x y)` — the GEOMETRY internal blob format.
@@ -344,7 +367,7 @@ fn data_tables() -> Vec<CatTable> {
             "rff_parquet",
             vec![fbbox(), f("other", Int64)],
             "read_parquet",
-            vec![str_arg("/tmp/rff_seg.parquet")],
+            vec![branch_arg("rff_seg.parquet")],
             &[],
             &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
             "rff_parquet — native read_parquet delegation with bbox.* required filters.",
@@ -360,7 +383,7 @@ fn data_tables() -> Vec<CatTable> {
                 f("type", Utf8),
             ],
             "read_parquet",
-            vec![str_arg("/tmp/rff_hive/*/*/*.parquet")],
+            vec![branch_arg("rff_hive/*/*/*.parquet")],
             &[(
                 "hive_partitioning",
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
@@ -379,7 +402,7 @@ fn data_tables() -> Vec<CatTable> {
                 f("type", Utf8),
             ],
             "read_parquet",
-            vec![str_arg("/tmp/rff_hive/*/*/*.parquet")],
+            vec![branch_arg("rff_hive/*/*/*.parquet")],
             &[(
                 "hive_partitioning",
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
@@ -645,6 +668,103 @@ fn data_tables() -> Vec<CatTable> {
         ));
     }
 
+    // Result-cache fixtures, exposed as function-backed tables so the
+    // catalog-attached path (SELECT ... FROM ex.data.<name>) exercises the C++
+    // result cache. See vgi-example-worker/src/table/cache.rs.
+    //
+    // NB: cache_bench / cache_parallel / cache_interleaved / cache_types /
+    // cache_partitioned are intentionally NOT data tables — each takes a required
+    // positional arg a function-backed table can't supply at bind. Their tests use
+    // the direct `vgi_table_function(w, '<name>', [rows])` path instead.
+    let cache_table = |name: &str, cols: &[(&str, DataType)], comment: &str| -> CatTable {
+        inline(CatTable::new(
+            name,
+            col_schema(cols),
+            name,
+            Vec::new(),
+            Some(comment.to_string()),
+            None,
+        ))
+    };
+    tables.extend([
+        cache_table(
+            "cacheable_numbers",
+            &[("n", Int64)],
+            "Cacheable 10-row result advertising vgi.cache.ttl",
+        ),
+        cache_table(
+            "cache_nonce",
+            &[("nonce", Int64)],
+            "One-row cacheable result whose value changes per real invocation",
+        ),
+        cache_table(
+            "cache_multicol",
+            &[("a", Int64), ("b", Int64), ("c", Int64)],
+            "Multi-column cacheable result (projection-coverage reuse)",
+        ),
+        cache_table(
+            "cache_no_store",
+            &[("n", Int64)],
+            "Advertises vgi.cache.no_store — must never be cached",
+        ),
+        cache_table(
+            "cache_scoped_txn",
+            &[("n", Int64), ("nonce", Int64)],
+            "Advertises vgi.cache.scope=transaction",
+        ),
+        cache_table(
+            "cache_filtered",
+            &[("n", Int64)],
+            "Cacheable sequence with static filter pushdown (filter_bytes keying)",
+        ),
+        cache_table(
+            "cache_big",
+            &[("n", Int64)],
+            "Large multi-batch cacheable result (advertises vgi.cache.ttl)",
+        ),
+        cache_table(
+            "cache_ordered",
+            &[("n", Int64)],
+            "Multi-worker order-sensitive cacheable result (batch_index; parallel capture, ordered serve)",
+        ),
+        cache_table(
+            "cache_revalidatable",
+            &[("nonce", Int64)],
+            "Always-revalidate result (304 not_modified reuses stored bytes)",
+        ),
+        cache_table(
+            "cache_whoami",
+            &[("who", Utf8)],
+            "Cacheable result echoing the caller's auth principal (identity-scoped)",
+        ),
+        cache_table(
+            "cache_projection",
+            &[("a", Int64), ("b", Int64), ("c", Int64)],
+            "Projection-pushdown cacheable result (SELECT a vs b are distinct keys)",
+        ),
+        cache_table(
+            "cache_poison",
+            &[("n", Int64)],
+            "Cacheable first batch then a mid-stream error (never-partial check)",
+        ),
+        cache_table(
+            "cache_external_fail",
+            &[("n", Int64)],
+            "Cacheable first batch then an unresolvable external-location pointer",
+        ),
+    ]);
+    // Time-travel + cacheable: AT (VERSION => n) resolves to the scan function's
+    // version argument, so each version keys its own cache entry.
+    tables.push(tt_table(
+        "cache_versioned",
+        "Version-specific cacheable rows (AT-keyed cache isolation)",
+        vec![
+            ttv(1, vec![f("v", Int64)], "cache_versioned_scan", 2020),
+            ttv(2, vec![f("v", Int64)], "cache_versioned_scan", 2021),
+            ttv(3, vec![f("v", Int64)], "cache_versioned_scan", 2022),
+        ],
+    ));
+
     // Multi-branch tables: each declares its physical branches.
     let seq = |count: i64| vgi::catalog::CatBranch {
         function_name: "sequence".to_string(),
@@ -692,7 +812,7 @@ fn data_tables() -> Vec<CatTable> {
         "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
         vec![
             seq(50),
-            native("read_parquet", "/tmp/vgi_hetero_branch.parquet"),
+            native("read_parquet", &branch_path("vgi_hetero_branch.parquet")),
         ],
     ));
     {
@@ -703,7 +823,10 @@ fn data_tables() -> Vec<CatTable> {
         let mut t = mb(
             "multi_branch_iceberg",
             "Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test",
-            vec![seq(50), native("iceberg_scan", "/tmp/vgi_iceberg_branch")],
+            vec![
+                seq(50),
+                native("iceberg_scan", &branch_path("vgi_iceberg_branch")),
+            ],
         );
         t.required_extensions = vec!["iceberg".to_string()];
         tables.push(t);
@@ -713,7 +836,7 @@ fn data_tables() -> Vec<CatTable> {
         "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
         vec![
             seq(50),
-            native("read_csv_auto", "/tmp/vgi_nopushdown_branch.csv"),
+            native("read_csv_auto", &branch_path("vgi_nopushdown_branch.csv")),
         ],
     ));
     tables.push(mb(
@@ -728,9 +851,9 @@ fn data_tables() -> Vec<CatTable> {
             "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
         );
         t.branches = Some(vec![
-            native("read_parquet", "/tmp/vgi_recon_a_b.parquet"),
-            native("read_parquet", "/tmp/vgi_recon_b_a.parquet"),
-            native("read_parquet", "/tmp/vgi_recon_a_only.parquet"),
+            native("read_parquet", &branch_path("vgi_recon_a_b.parquet")),
+            native("read_parquet", &branch_path("vgi_recon_b_a.parquet")),
+            native("read_parquet", &branch_path("vgi_recon_a_only.parquet")),
         ]);
         tables.push(t);
     }

@@ -59,6 +59,12 @@ pub struct Dispatcher {
     /// names a catalog's `catalog_schema_contents_functions` advertises: a
     /// secondary shows only its own, and the primary hides every secondary's.
     pub(crate) secondary_functions: Vec<Vec<String>>,
+    /// Function names registered for binding but hidden from
+    /// `catalog_schema_contents_functions`. A function-backed catalog table
+    /// needs its backing function resolvable at scan time, but the table may be
+    /// the only intended entry point — advertising the function too would create
+    /// a redundant SQL callable. See [`Dispatcher::hide_function`].
+    pub(crate) hidden_functions: std::collections::HashSet<String>,
     /// Secret types registered by the worker (surfaced in `catalog_attach`).
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
@@ -91,6 +97,7 @@ impl Dispatcher {
             catalog: catalog::CatalogModel::default(),
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
+            hidden_functions: std::collections::HashSet::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -170,6 +177,14 @@ impl Dispatcher {
 
     pub fn register_table(&mut self, f: Arc<dyn TableFunction>) {
         self.tables.entry(f.name().to_string()).or_default().push(f);
+    }
+
+    /// Hide `name` from `catalog_schema_contents_functions` without
+    /// unregistering it. The function stays bindable — a function-backed catalog
+    /// table still resolves its scan — but DuckDB never creates a SQL callable
+    /// for it, so the table is the only entry point.
+    pub fn hide_function(&mut self, name: impl Into<String>) {
+        self.hidden_functions.insert(name.into());
     }
 
     /// Register `f` only if no table function with its name is registered yet.
@@ -603,6 +618,7 @@ impl Dispatcher {
                     filters,
                     project_to: None,
                     resume_blob: None,
+                    conditional_checked: false,
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
@@ -662,6 +678,7 @@ impl Dispatcher {
                 filters: None,
                 project_to: None,
                 resume_blob: None,
+                conditional_checked: false,
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -690,6 +707,7 @@ impl Dispatcher {
                     filters: None,
                     project_to: None,
                     resume_blob: None,
+                    conditional_checked: false,
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
@@ -796,6 +814,7 @@ impl Dispatcher {
                 filters,
                 project_to,
                 resume_blob,
+                conditional_checked: false,
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -963,6 +982,7 @@ impl Dispatcher {
                     filters,
                     project_to,
                     resume_blob: Some(bytes.to_vec()),
+                    conditional_checked: false,
                 },
             )));
         }
@@ -1626,6 +1646,9 @@ impl Dispatcher {
             .map(|s| s.as_str())
             .collect();
         let visible = |name: &str| {
+            if self.hidden_functions.contains(name) {
+                return false;
+            }
             if name.starts_with(PROJ_REPRO_PREFIX) != is_proj_repro {
                 return false;
             }
@@ -2446,6 +2469,15 @@ impl ExchangeState for TableInOutExchangeState {
     }
 }
 
+/// Read one conditional-revalidation validator, preferring this tick's metadata
+/// (subprocess) and falling back to the request metadata (HTTP `init`). An
+/// empty string clears the key, matching the C++ client's "unset" encoding.
+fn cond_validator(ctx: &CallContext, key: &str) -> Option<String> {
+    ctx.tick_metadata(key)
+        .or_else(|| ctx.transport_metadata.get(key).cloned())
+        .filter(|v| !v.is_empty())
+}
+
 /// Adapter from a [`TableProducer`] to a vgi-rpc [`ProducerState`]. Applies
 /// auto-filter pushdown to each batch before emitting.
 struct TableProducerState {
@@ -2458,6 +2490,10 @@ struct TableProducerState {
     /// for producers that can't be rebuilt from bind params (buffering/finalize
     /// flushes), which always drain in one response.
     resume_blob: Option<Vec<u8>>,
+    /// Whether the conditional-revalidation validators have been looked for yet.
+    /// They only ever ride the first tick, so checking once keeps the per-batch
+    /// hot path free of the two `tick_metadata` mutex acquisitions.
+    conditional_checked: bool,
 }
 
 impl vgi_rpc::ProducerState for TableProducerState {
@@ -2468,6 +2504,23 @@ impl vgi_rpc::ProducerState for TableProducerState {
             .tick_metadata("vgi_pushdown_filters")
             .and_then(|enc| crate::pushdown::PushdownFilters::parse_b64(&enc, &[]));
         self.inner.on_dynamic_filters(dynamic.as_ref());
+        // Conditional-revalidation validators. The client sends them on the
+        // FIRST producer tick over subprocess, and folds them into the `init`
+        // request over HTTP (where there is no tick before the first batch) — so
+        // look in both places, and only once: a later tick never carries them.
+        if !self.conditional_checked {
+            self.conditional_checked = true;
+            let conditional = crate::cache_control::ConditionalRequest {
+                if_none_match: cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY),
+                if_modified_since: cond_validator(
+                    ctx,
+                    crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY,
+                ),
+            };
+            if conditional.is_conditional() {
+                self.inner.on_conditional_request(&conditional);
+            }
+        }
         match self.inner.next_batch(out)? {
             None => {
                 out.finish();

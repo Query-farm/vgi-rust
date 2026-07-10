@@ -70,6 +70,17 @@ pub trait TableProducer: Send {
     /// filters (from the `vgi_pushdown_filters` request metadata), if any. Lets
     /// a producer observe a tightening Top-N filter. Default ignores them.
     fn on_dynamic_filters(&mut self, _filters: Option<&crate::pushdown::PushdownFilters>) {}
+    /// Called before each `next_batch` with the client's conditional-revalidation
+    /// validators, when it sent any. The client holds a stale-but-revalidatable
+    /// cached result (one this function advertised with
+    /// [`CacheControl::with_revalidatable`](crate::cache_control::CacheControl::with_revalidatable))
+    /// and is asking whether it is still fresh. A producer that recognizes the
+    /// validators answers with a 0-row batch whose
+    /// [`last_metadata`](Self::last_metadata) carries
+    /// [`CacheControl::with_not_modified`](crate::cache_control::CacheControl::with_not_modified),
+    /// instead of re-streaming the payload. Default ignores them, which simply
+    /// recomputes the result.
+    fn on_conditional_request(&mut self, _request: &crate::cache_control::ConditionalRequest) {}
 }
 
 /// A table (producer) VGI function: generates rows with no row input.

@@ -88,6 +88,15 @@ impl Worker {
         self.disp.register_table(Arc::new(f));
     }
 
+    /// Hide an already-registered function from the catalog's advertised
+    /// function list. It stays bindable, so a function-backed catalog table can
+    /// still resolve it as a scan function, but the client creates no SQL
+    /// callable for it — use this when the table is the only intended entry
+    /// point.
+    pub fn hide_function(&mut self, name: impl Into<String>) {
+        self.disp.hide_function(name);
+    }
+
     /// Register a table-in-out function.
     pub fn register_table_in_out(
         &mut self,
@@ -312,61 +321,111 @@ fn parse_tcp_spec(spec: &str) -> (String, u16) {
     }
 }
 
-/// Build the HTTP bearer-auth callback from the environment. Returns `None`
-/// (anonymous-only) unless `VGI_BEARER_TOKENS` (`token=principal,…`) is set.
-/// A server with tokens configured is bearer-protected: a missing or invalid
-/// token is rejected (401); a server with no tokens installs no callback and
-/// serves everyone anonymously.
+/// Parse a `token=principal,…` environment value into a lookup map.
 ///
-/// Keyed solely off `VGI_BEARER_TOKENS`, mirroring the Go worker
-/// (`cmd/vgi-example-worker/auth.go`). `VGI_TEST_BEARER_TOKEN` is deliberately
-/// NOT read here: it is the token *value* the integration tests send in the
-/// `ATTACH ... bearer_token '…'` option, not worker configuration. Reading it
-/// would bearer-protect the shared example worker the whole suite attaches —
-/// the integration harness exports `VGI_TEST_BEARER_TOKEN` globally, so every
-/// non-auth test over http would then 401 (and skip on the "HTTP" error). The
-/// bearer-auth suite boots its own dedicated worker with `VGI_BEARER_TOKENS`.
+/// Returns `None` when `var` is unset or blank. Returns `Some(map)` when it is
+/// set — and **panics** when a set value yields no usable entries, because the
+/// alternative is to silently serve a worker the operator believes is protected.
+/// A `token` with no `=principal` is a config error, not an empty config.
 #[cfg(feature = "transport-http")]
-fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
-    let mut tokens: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Ok(pairs) = std::env::var("VGI_BEARER_TOKENS") {
-        for pair in pairs.split(',') {
-            if let Some((tok, principal)) = pair.split_once('=') {
-                tokens.insert(tok.trim().to_string(), principal.trim().to_string());
-            }
-        }
-    }
-    if tokens.is_empty() {
+fn parse_token_map(var: &str) -> Option<std::collections::HashMap<String, String>> {
+    let raw = std::env::var(var).ok()?;
+    if raw.trim().is_empty() {
         return None;
     }
-    Some(std::sync::Arc::new(
-        move |req: &vgi_rpc::AuthRequest<'_>| {
-            let token = req
-                .header("authorization")
-                .and_then(|h| {
-                    h.strip_prefix("Bearer ")
-                        .or_else(|| h.strip_prefix("bearer "))
-                })
-                .map(|t| t.trim());
-            match token {
+    let mut tokens = std::collections::HashMap::new();
+    for pair in raw.split(',') {
+        if let Some((tok, principal)) = pair.split_once('=') {
+            tokens.insert(tok.trim().to_string(), principal.trim().to_string());
+        }
+    }
+    assert!(
+        !tokens.is_empty(),
+        "{var} is set but contains no `token=principal` pair (got {raw:?}); \
+         refusing to start rather than serve an unprotected worker"
+    );
+    Some(tokens)
+}
+
+/// Extract the bearer token from an `Authorization` header, if present.
+///
+/// A present-but-blank token (`Authorization: Bearer `) yields `Some("")`, not
+/// `None`: the caller *did* offer a bearer credential, it is simply not a valid
+/// one. The required-bearer path must reject it as such, and the optional path
+/// must fall through to anonymous — collapsing it to `None` here would change
+/// which of those two answers the required path gives.
+#[cfg(feature = "transport-http")]
+fn bearer_token<'a>(req: &'a vgi_rpc::AuthRequest<'a>) -> Option<&'a str> {
+    req.header("authorization")
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+}
+
+/// Build the HTTP bearer-auth callback from the environment. Returns `None`
+/// (anonymous-only) unless one of two variables is set.
+///
+/// `VGI_BEARER_TOKENS` (`token=principal,…`) makes the server **bearer-protected**:
+/// a missing or invalid token is rejected (401).
+///
+/// `VGI_OPTIONAL_BEARER_TOKENS` (same format) makes bearer identity **optional**:
+/// a known token resolves to its principal, and no/blank/unknown token falls back
+/// to anonymous — never a 401. That lets one shared server host both anonymous
+/// tests and tests that need distinct principals (e.g. the result cache's
+/// identity-isolation test attaching the same worker as alice and as bob).
+/// `VGI_BEARER_TOKENS` wins when both are set.
+///
+/// Either variable set to an unparseable value aborts startup (see
+/// [`parse_token_map`]) rather than quietly serving everyone.
+///
+/// `VGI_TEST_BEARER_TOKEN` is deliberately NOT read here: it is the token *value*
+/// the integration tests send in the `ATTACH ... bearer_token '…'` option, not
+/// worker configuration. Reading it would bearer-protect the shared example
+/// worker the whole suite attaches — the integration harness exports it globally,
+/// so every non-auth test over http would then 401 (and skip on the "HTTP"
+/// error). The bearer-auth suite boots its own dedicated worker with
+/// `VGI_BEARER_TOKENS`.
+#[cfg(feature = "transport-http")]
+fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
+    let principal_of = |tokens: &std::collections::HashMap<String, String>, tok: &str| {
+        tokens.get(tok).map(|principal| vgi_rpc::AuthContext {
+            domain: "bearer".to_string(),
+            authenticated: true,
+            principal: principal.clone(),
+            claims: Default::default(),
+        })
+    };
+
+    if let Some(required) = parse_token_map("VGI_BEARER_TOKENS") {
+        return Some(std::sync::Arc::new(
+            move |req: &vgi_rpc::AuthRequest<'_>| match bearer_token(req) {
                 // A server with tokens configured is bearer-protected: reject
-                // anonymous (no/blank token) access. A server with NO tokens never
+                // anonymous (no token) access. A server with NO tokens never
                 // installs this callback, so it allows all (the non-auth tests).
                 None => Err(vgi_rpc::RpcError::permission_error(
                     "bearer token required but not provided",
                 )),
-                Some(tok) => match tokens.get(tok) {
-                    Some(principal) => Ok(vgi_rpc::AuthContext {
-                        domain: "bearer".to_string(),
-                        authenticated: true,
-                        principal: principal.clone(),
-                        claims: Default::default(),
-                    }),
-                    None => Err(vgi_rpc::RpcError::permission_error(
-                        "bearer token was rejected",
-                    )),
-                },
-            }
-        },
-    ))
+                // A blank token reaches here as `Some("")` and falls out of the
+                // map lookup as "rejected", not "not provided".
+                Some(tok) => principal_of(&required, tok).ok_or_else(|| {
+                    vgi_rpc::RpcError::permission_error("bearer token was rejected")
+                }),
+            },
+        ));
+    }
+
+    if let Some(optional) = parse_token_map("VGI_OPTIONAL_BEARER_TOKENS") {
+        return Some(std::sync::Arc::new(
+            move |req: &vgi_rpc::AuthRequest<'_>| {
+                // No/blank/unknown token → anonymous. This callback never errors,
+                // so an optional-bearer server can never 401.
+                Ok(bearer_token(req)
+                    .and_then(|tok| principal_of(&optional, tok))
+                    .unwrap_or_else(vgi_rpc::AuthContext::anonymous))
+            },
+        ));
+    }
+    None
 }
