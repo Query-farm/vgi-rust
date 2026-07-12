@@ -4,7 +4,7 @@ members = ["vgi", "vgi-example-worker", "vgi-storage-server"]
 
 
 [workspace.package]
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.90"
 license-file = "LICENSE"
