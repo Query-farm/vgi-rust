@@ -1,7 +1,7 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! Scan functions backing the `rff_*` catalog tables that exercise
-//! `Table.required_field_filter_paths` (the C++ optimizer enforces the
+//! `Table.required_filters` (the C++ optimizer enforces the
 //! WHERE-filter requirement; the worker just serves the metadata + rows).
 
 use std::sync::Arc;
@@ -174,7 +174,7 @@ impl RffScan {
     fn none() -> Self {
         Self::flat(
             "rff_none_scan",
-            "rff_none — control table with no required_field_filter_paths",
+            "rff_none — control table with no required_filters",
         )
     }
     fn struct_() -> Self {

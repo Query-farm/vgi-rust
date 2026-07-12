@@ -775,9 +775,13 @@ pub struct CatTable {
     /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
     /// matching the request's `at_value` (or the highest version when absent).
     pub time_travel: Vec<TimeTravelVersion>,
-    /// Field paths the scan must materialize (surfaced in `TableInfo`). Empty
-    /// = none.
-    pub required_field_filter_paths: Vec<String>,
+    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
+    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
+    /// A group is satisfied when any one of its member paths carries a WHERE
+    /// filter; every group must be satisfied. A single-path group is a plain
+    /// mandatory filter; a multi-path group `["ticker", "cik"]` means "one of".
+    /// Empty = no enforcement. Surfaced in `TableInfo.required_filters`.
+    pub required_filters: Vec<Vec<String>>,
     /// Accept `AT` clauses even without declared `time_travel` versions: the
     /// backing function reads the AT clause itself (carried on the bind request)
     /// rather than the catalog resolving it to a version. Mirrors the Python
@@ -964,7 +968,7 @@ impl CatTable {
             required_extensions: Vec::new(),
             statistics: Vec::new(),
             time_travel: Vec::new(),
-            required_field_filter_paths: Vec::new(),
+            required_filters: Vec::new(),
             supports_time_travel: false,
             scan_function_impl: None,
         }
@@ -1029,6 +1033,38 @@ pub fn scan_function_result(t: &CatTable) -> Result<crate::protocol::dtos::ScanF
     })
 }
 
+/// Validate a table's `required_filters` (CNF). Each OR-group must be
+/// non-empty, must contain no empty strings, and the leading dotted segment of
+/// every path must name a real column on the table. Struct subfield validity is
+/// left to DuckDB's binder (the descriptor doesn't unpack STRUCT subfields).
+fn validate_required_filters(
+    name: &str,
+    columns: &SchemaRef,
+    required_filters: &[Vec<String>],
+) -> Result<()> {
+    for group in required_filters {
+        if group.is_empty() {
+            return Err(vgi_rpc::RpcError::value_error(format!(
+                "Table '{name}': required_filters must not contain empty groups"
+            )));
+        }
+        for path in group {
+            if path.is_empty() {
+                return Err(vgi_rpc::RpcError::value_error(format!(
+                    "Table '{name}': required_filters must not contain empty strings"
+                )));
+            }
+            let head = path.split('.').next().unwrap_or(path);
+            if columns.field_with_name(head).is_err() {
+                return Err(vgi_rpc::RpcError::value_error(format!(
+                    "Table '{name}': required_filters path '{path}' references unknown column '{head}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
     // Inline the scan function only for tables that opt in; otherwise the C++
@@ -1038,6 +1074,7 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
     } else {
         Vec::new()
     };
+    validate_required_filters(&t.name, &t.columns, &t.required_filters)?;
     Ok(TableInfo {
         comment: t.comment.clone(),
         tags: t.tags.clone(),
@@ -1064,7 +1101,7 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         delete_function: Bytes::from(Vec::new()),
         cardinality_estimate: t.cardinality.into(),
         cardinality_max: t.cardinality.into(),
-        required_field_filter_paths: t.required_field_filter_paths.clone(),
+        required_filters: t.required_filters.clone(),
         column_statistics: Bytes::from(Vec::new()),
         bind_result: Bytes::from(Vec::new()),
     })
@@ -1229,6 +1266,7 @@ mod tests {
     use super::*;
     use crate::function::{ArgSpec, FunctionExample, ProcessParams};
     use arrow_array::RecordBatch;
+    use vgi_rpc::VgiArrow;
 
     /// A minimal scalar whose `metadata()` advertises SQL examples.
     struct ExampleScalar;
@@ -1545,5 +1583,93 @@ mod tests {
         // And the DTO carries empty bytes (older readers unaffected).
         let info = macro_info("main", &m);
         assert!(info.arguments_schema.0.is_empty());
+    }
+
+    fn ab_table(required: Vec<Vec<String>>) -> CatTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let mut t = CatTable::new("rff", schema, "rff_scan", Vec::new(), None, Some(3));
+        t.required_filters = required;
+        t
+    }
+
+    #[test]
+    fn test_required_filters_cnf_wire_roundtrip() {
+        use crate::protocol::dtos::TableInfo;
+        // A CNF requirement: (a AND one-of(a,b)) — a singleton group plus a
+        // genuine OR-group. Verifies the trailing `required_filters` field
+        // survives the list<list<utf8>> wire round-trip intact.
+        let t = ab_table(vec![
+            vec!["a".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+        ]);
+        let info = table_info("data", &t).expect("table_info");
+        assert_eq!(
+            info.required_filters,
+            vec![
+                vec!["a".to_string()],
+                vec!["a".to_string(), "b".to_string()]
+            ]
+        );
+
+        // The wire schema for the field must be list<list<utf8>>.
+        let dt = TableInfo::arrow_data_type();
+        let arrow_schema::DataType::Struct(fields) = dt else {
+            panic!("TableInfo is not a struct");
+        };
+        let rf = fields
+            .iter()
+            .find(|f| f.name() == "required_filters")
+            .expect("required_filters field present");
+        assert_eq!(rf, fields.last().unwrap(), "must be the trailing field");
+        let arrow_schema::DataType::List(inner) = rf.data_type() else {
+            panic!("required_filters is not a List, got {:?}", rf.data_type());
+        };
+        let arrow_schema::DataType::List(leaf) = inner.data_type() else {
+            panic!("required_filters inner is not a List");
+        };
+        assert_eq!(leaf.data_type(), &DataType::Utf8);
+
+        // Full DTO round-trip through the flat batch.
+        let batch = crate::wire::to_batch(info).expect("to_batch");
+        let back: TableInfo = crate::wire::from_batch(&batch).expect("from_batch");
+        assert_eq!(
+            back.required_filters,
+            vec![
+                vec!["a".to_string()],
+                vec!["a".to_string(), "b".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_required_filters_rejects_empty_group() {
+        let t = ab_table(vec![vec![]]);
+        let err = table_info("data", &t).expect_err("empty group must be rejected");
+        assert!(err.to_string().contains("empty groups"), "got: {err}");
+    }
+
+    #[test]
+    fn test_required_filters_rejects_empty_string() {
+        let t = ab_table(vec![vec!["".to_string()]]);
+        let err = table_info("data", &t).expect_err("empty string must be rejected");
+        assert!(err.to_string().contains("empty strings"), "got: {err}");
+    }
+
+    #[test]
+    fn test_required_filters_rejects_unknown_column() {
+        let t = ab_table(vec![vec!["nope".to_string()]]);
+        let err = table_info("data", &t).expect_err("unknown column must be rejected");
+        assert!(err.to_string().contains("unknown column"), "got: {err}");
+    }
+
+    #[test]
+    fn test_required_filters_accepts_struct_subfield_head() {
+        // A dotted path's leading segment ('a') is a real column; the subfield
+        // ('x') is left to DuckDB's binder — validation must accept it.
+        let t = ab_table(vec![vec!["a.x".to_string()]]);
+        assert!(table_info("data", &t).is_ok());
     }
 }

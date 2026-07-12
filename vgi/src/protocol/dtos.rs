@@ -546,9 +546,12 @@ pub struct TableInfo {
     pub cardinality_max: InlineI64,
     pub column_statistics: Bytes,
     pub bind_result: Bytes,
-    /// Field paths the scan requires to be materialized (struct/list pushdown).
-    /// Empty = no constraint. Added in the C++ protocol's 24-field TableInfo.
-    pub required_field_filter_paths: Vec<String>,
+    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
+    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
+    /// A group is satisfied when any one of its member paths has a WHERE filter;
+    /// every group must be satisfied. Empty = no enforcement. Wire type
+    /// `list<list<utf8>>`. Trailing field of the C++ protocol's TableInfo.
+    pub required_filters: Vec<Vec<String>>,
 }
 
 /// `ViewInfo` item.

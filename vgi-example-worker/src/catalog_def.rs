@@ -148,17 +148,24 @@ fn i64_arg(v: i64) -> ArrayRef {
     Arc::new(Int64Array::from(vec![v]))
 }
 
-/// A `required_field_filter_paths` fixture table backed by a static `rff_*_scan`.
+/// Build CNF `required_filters` (an AND of OR-groups) from `&[&[&str]]`.
+fn groups(gs: &[&[&str]]) -> Vec<Vec<String>> {
+    gs.iter()
+        .map(|g| g.iter().map(|s| s.to_string()).collect())
+        .collect()
+}
+
+/// A `required_filters` fixture table backed by a static `rff_*_scan`.
 fn rff_table(
     name: &str,
     fields: Vec<Field>,
     scan_fn: &str,
-    paths: &[&str],
+    required: &[&[&str]],
     comment: &str,
 ) -> CatTable {
     let mut t = dtable(name, fields, comment);
     t.scan_function = scan_fn.to_string();
-    t.required_field_filter_paths = paths.iter().map(|s| s.to_string()).collect();
+    t.required_filters = groups(required);
     t.cardinality = Some(3);
     t
 }
@@ -187,7 +194,7 @@ fn fbbox() -> Field {
     )
 }
 
-/// A `required_field_filter_paths` table that delegates its scan to a NATIVE
+/// A `required_filters` table that delegates its scan to a NATIVE
 /// DuckDB function (e.g. `read_parquet`) — `scan_function_get` returns it so the
 /// C++ binds the built-in reader directly.
 fn rff_native(
@@ -196,13 +203,13 @@ fn rff_native(
     scan_fn: &str,
     positional: Vec<ArrayRef>,
     named: &[(&str, ArrayRef)],
-    paths: &[&str],
+    required: &[&[&str]],
     comment: &str,
 ) -> CatTable {
     let mut t = dtable(name, fields, comment);
     t.scan_function = scan_fn.to_string();
     t.scan_arguments = Arguments::serialize_scan_args_named(&positional, named).unwrap_or_default();
-    t.required_field_filter_paths = paths.iter().map(|s| s.to_string()).collect();
+    t.required_filters = groups(required);
     t
 }
 
@@ -309,7 +316,8 @@ fn data_tables() -> Vec<CatTable> {
     };
     let row_struct =
         DataType::Struct(vec![Field::new("a", Int64, true), Field::new("b", Utf8, true)].into());
-    let mut tables = vec![
+    let mut tables =
+        vec![
         inline(fn_table(
             "large_sequence",
             &[("n", Int64)],
@@ -327,14 +335,23 @@ fn data_tables() -> Vec<CatTable> {
             "rff_simple",
             vec![f("a", Int64), f("b", Int64)],
             "rff_simple_scan",
-            &["a"],
+            &[&["a"]],
             "rff_simple — requires a filter referencing column 'a'.",
+        ),
+        // rff_or — a single OR-group: a filter on 'a' OR 'b' satisfies it.
+        // Reuses rff_simple_scan (columns a, b). CNF = [["a", "b"]].
+        rff_table(
+            "rff_or",
+            vec![f("a", Int64), f("b", Int64)],
+            "rff_simple_scan",
+            &[&["a", "b"]],
+            "rff_or — requires a filter on one of (a, b).",
         ),
         rff_table(
             "rff_struct",
             vec![fstruct_ab("s"), f("other", Int64)],
             "rff_struct_scan",
-            &["s.a", "s.b"],
+            &[&["s.a"], &["s.b"]],
             "rff_struct — requires filters on both struct subfields s.a and s.b.",
         ),
         rff_table(
@@ -346,14 +363,14 @@ fn data_tables() -> Vec<CatTable> {
                 ),
             )],
             "rff_nested_scan",
-            &["wrapper.mid.leaf"],
+            &[&["wrapper.mid.leaf"]],
             "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf.",
         ),
         rff_table(
             "rff_multi",
             vec![fstruct_ab("s"), f("top", Int64)],
             "rff_multi_scan",
-            &["top", "s.a"],
+            &[&["top"], &["s.a"]],
             "rff_multi — mixed top-level + struct subfield requirements.",
         ),
         rff_table(
@@ -361,7 +378,7 @@ fn data_tables() -> Vec<CatTable> {
             vec![f("a", Int64), f("b", Int64)],
             "rff_none_scan",
             &[],
-            "rff_none — control table with no required_field_filter_paths (opt-out fast path).",
+            "rff_none — control table with no required_filters (opt-out fast path).",
         ),
         rff_native(
             "rff_parquet",
@@ -369,7 +386,7 @@ fn data_tables() -> Vec<CatTable> {
             "read_parquet",
             vec![branch_arg("rff_seg.parquet")],
             &[],
-            &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
             "rff_parquet — native read_parquet delegation with bbox.* required filters.",
         ),
         rff_native(
@@ -388,7 +405,7 @@ fn data_tables() -> Vec<CatTable> {
                 "hive_partitioning",
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
             )],
-            &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
             "rff_hive — native read_parquet over Hive glob with bbox.* required filters.",
         ),
         rff_native(
@@ -407,14 +424,20 @@ fn data_tables() -> Vec<CatTable> {
                 "hive_partitioning",
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
             )],
-            &["id", "bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            &[
+                &["id"],
+                &["bbox.xmin"],
+                &["bbox.xmax"],
+                &["bbox.ymin"],
+                &["bbox.ymax"],
+            ],
             "rff_hive_mixed — native read_parquet, top-level 'id' + bbox.* required filters.",
         ),
         rff_table(
             "rff_rowid",
             vec![frow("row_id", Int64), fbbox(), f("other", Int64)],
             "rff_rowid_scan",
-            &["bbox.xmin", "bbox.xmax", "bbox.ymin", "bbox.ymax"],
+            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
             "rff_rowid — row_id virtual column + required bbox.* filters.",
         ),
         scan(

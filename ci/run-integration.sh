@@ -61,7 +61,7 @@ if [ "$TRANSPORT" = "http" ]; then
   AWK_HTTP=1
   HTTP_SKIP=(-not -name 'projection_pushdown_repro.test' -not -name 'dynamic_filter.test')
 fi
-# The native-branch fixtures (multi_branch_*, required_field_filter_paths_native)
+# The native-branch fixtures (multi_branch_*, required_filters_native)
 # used to stage and read parquet/csv from POSIX `/tmp/...` paths the worker's
 # catalog hard-coded, so they had to be skipped on Windows, which has no `/tmp`.
 # Both sides now resolve the same $VGI_TEST_BRANCH_DIR (exported below), so they
