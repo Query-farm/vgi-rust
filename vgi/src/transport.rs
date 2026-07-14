@@ -46,6 +46,11 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
     io::stdout().flush().ok();
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    // ctrlc is target-gated out on wasm32 (no signal handler there); emscripten is
+    // unix-family, so this #[cfg(unix)] body still compiles for it — gate the
+    // handler install so the wasm build doesn't reference the unlinked crate. On
+    // wasm the worker serves over stdio and exits on EOF, so no handler is needed.
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let sd = shutdown.clone();
         let _ = ctrlc::try_set_handler(move || sd.store(true, Ordering::Relaxed));
@@ -124,6 +129,11 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
     io::stdout().flush().ok();
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    // ctrlc is target-gated out on wasm32 (no signal handler there); emscripten is
+    // unix-family, so this #[cfg(unix)] body still compiles for it — gate the
+    // handler install so the wasm build doesn't reference the unlinked crate. On
+    // wasm the worker serves over stdio and exits on EOF, so no handler is needed.
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let sd = shutdown.clone();
         let _ = ctrlc::try_set_handler(move || sd.store(true, Ordering::Relaxed));
