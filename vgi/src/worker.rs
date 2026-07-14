@@ -300,6 +300,13 @@ impl Worker {
 
         crate::transport::serve_stdio(server);
     }
+
+    /// Serve the worker's RPC protocol over an arbitrary byte stream (used by the
+    /// SAB transport and native tests). Blocking; consumes the worker.
+    pub fn serve_reader_writer<R: std::io::Read, W: std::io::Write>(self, mut r: R, mut w: W) {
+        let (server, _disp) = self.build_parts();
+        std::sync::Arc::new(server).serve(&mut r, &mut w);
+    }
 }
 
 /// Parse a `[HOST:]PORT` `--tcp` bind spec. A bare `PORT` (no colon) binds
