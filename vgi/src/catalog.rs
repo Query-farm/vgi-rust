@@ -399,6 +399,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         source_order_dependent: false,
         sink_order_dependent: false,
         requires_input_batch_index: false,
+        input_from_args: false, // vgi-rust has no blended (RowTransformFunction) functions
         required_settings: Vec::new(),
         required_secrets: Vec::new(),
     }
