@@ -430,6 +430,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.sink_order_dependent = meta.sink_order_dependent;
     fi.source_order_dependent = meta.source_order_dependent;
     fi.requires_input_batch_index = meta.requires_input_batch_index;
+    fi.max_workers = meta.max_workers;
     fi.supports_window = meta.supports_window;
     fi.streaming_partitioned = meta.streaming_partitioned;
     fi.late_materialization = Some(meta.late_materialization);

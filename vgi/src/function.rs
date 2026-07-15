@@ -421,6 +421,11 @@ pub struct FunctionMetadata {
     /// resolution) to read a secret *value* statically at bind time via
     /// `params.secrets`.
     pub required_secrets: Vec<crate::secrets::SecretLookup>,
+    /// Upper bound on concurrent scan processes the extension may run for this
+    /// function (surfaced as `FunctionInfo.max_workers`; drives the table scan's
+    /// `MaxThreads`). 0 = unset (extension default). >1 lets a single scan fan out
+    /// across DuckDB scan threads, each acquiring its own worker connection.
+    pub max_workers: i32,
 }
 
 impl Default for FunctionMetadata {
@@ -448,6 +453,7 @@ impl Default for FunctionMetadata {
             late_materialization: false,
             required_settings: Vec::new(),
             required_secrets: Vec::new(),
+            max_workers: 0,
         }
     }
 }
