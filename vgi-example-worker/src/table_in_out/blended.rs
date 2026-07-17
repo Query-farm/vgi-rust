@@ -23,6 +23,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(GeoEncodeFunction);
     w.register_table_in_out(GeoEncode3Function);
     w.register_table_in_out(RowSumFunction);
+    w.register_table_in_out(BlendedDropFunction);
 }
 
 fn blended_meta(description: &str, categories: &[&str]) -> FunctionMetadata {
@@ -246,5 +247,37 @@ impl TableInOutFunction for RowSumFunction {
         let out = RecordBatch::try_new(params.output_schema.clone(), vec![Arc::new(col)])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![out])
+    }
+}
+
+/// `blended_drop(x)` — blended 1→0 map: emits a single 0-row output batch for
+/// its input row.
+///
+/// Exercises the literal scan-mode drain loop's "empty-but-not-EOS → keep
+/// reading, finish only at true EOS" branch: the worker's whole output for the
+/// one synthesized input row is a 0-row batch, so the scan must reach FINISHED
+/// cleanly and NOT infinite-loop re-feeding the input.
+pub struct BlendedDropFunction;
+impl TableInOutFunction for BlendedDropFunction {
+    fn name(&self) -> &str {
+        "blended_drop"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        blended_meta(
+            "Blended 1->0 map emitting a single 0-row batch (literal scan-mode)",
+            &["blended", "test"],
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("x", 0, "double", "Input column (ignored)")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, params: &ProcessParams, _batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(vec![RecordBatch::new_empty(params.output_schema.clone())])
     }
 }
