@@ -3,6 +3,7 @@
 //! Table-in-out example fixtures.
 
 mod blended;
+mod cached;
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(SubstreamPartialSumFunction);
     w.register_table_in_out(SlowCancellableInOutFunction);
     blended::register(w);
+    cached::register(w);
 }
 
 /// `slow_cancellable_inout(probe_path, input, sleep_ms)` — passthrough with a

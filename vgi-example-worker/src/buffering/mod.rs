@@ -38,6 +38,9 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_buffering(SumAllColumnsFunction::new(
         "sum_all_columns_simple_distributed",
     ));
+    // Cacheable buffered reducer: advertises vgi.cache.ttl on its finalize
+    // output (exchange-mode buffered result cache; cache/exchange_buffered.test).
+    w.register_buffering(SumAllColumnsFunction::new("cached_sum_all"));
     w.register_buffering(
         SumAllColumnsFunction::new("exception_finalize")
             .finalize_error("Intentional exception during finalize()"),
@@ -56,7 +59,9 @@ fn table_arg() -> ArgSpec {
 const NS: &[u8] = b"buf";
 
 /// Drains a per-execution batch log, one batch per tick. An optional
-/// `error` makes the first tick fail (crash_on_finalize / exception_finalize).
+/// `error` makes the first tick fail (crash_on_finalize / exception_finalize);
+/// optional `metadata` rides every emitted batch (the cacheable variant's
+/// `vgi.cache.*` advertisement on the finalize output).
 struct LogDrain {
     storage: Arc<dyn vgi::storage::FunctionStorage>,
     execution_id: Vec<u8>,
@@ -64,6 +69,7 @@ struct LogDrain {
     after_id: i64,
     output_schema: arrow_schema::SchemaRef,
     error: Option<String>,
+    metadata: Option<std::collections::HashMap<String, String>>,
 }
 impl TableProducer for LogDrain {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
@@ -80,6 +86,9 @@ impl TableProducer for LogDrain {
         let batch = ipc::read_batch(&value)?;
         let batch = vgi::table_in_out::project_batch(&batch, &self.output_schema)?;
         Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        self.metadata.clone()
     }
 }
 
@@ -215,6 +224,7 @@ impl TableBufferingFunction for BufferInputFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: self.finalize_error.map(|s| s.to_string()),
+            metadata: None,
         }))
     }
 }
@@ -365,6 +375,7 @@ impl TableBufferingFunction for LargeStateFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: None,
+            metadata: None,
         }))
     }
 }
@@ -449,6 +460,7 @@ impl TableBufferingFunction for BatchIndexBufferInputFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: None,
+            metadata: None,
         }))
     }
 }
@@ -622,12 +634,16 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             "sum_all_columns_simple_distributed" => {
                 "Distributed sum using the buffered (Sink+Combine+Source) model"
             }
+            "cached_sum_all" => {
+                "Cacheable column-wise sum across all input (advertises vgi.cache.ttl)"
+            }
             _ => "Computes column-wise sums across all batches",
         };
         let categories = match self.name {
             "sum_all_columns_simple_distributed" => {
                 vec!["aggregation".into(), "numeric".into(), "distributed".into()]
             }
+            "cached_sum_all" => vec!["aggregation".into(), "cache".into(), "test".into()],
             _ => vec!["aggregation".into(), "numeric".into()],
         };
         FunctionMetadata {
@@ -755,6 +771,14 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: self.finalize_error.map(|s| s.to_string()),
+            // The cacheable variant advertises vgi.cache.ttl on its finalize
+            // output — what opts a buffered function into the exchange-mode
+            // result cache (parity with the streaming emit path).
+            metadata: if self.name == "cached_sum_all" {
+                Some(vgi::cache_control::CacheControl::ttl(300).to_metadata())
+            } else {
+                None
+            },
         }))
     }
 }
