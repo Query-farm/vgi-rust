@@ -2,6 +2,7 @@
 
 //! Scalar example fixtures.
 
+mod cached;
 mod fmt;
 mod geo;
 mod util;
@@ -58,6 +59,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(AnyMixed("str", DataType::Utf8));
     geo::register(w);
     fmt::register(w);
+    cached::register(w);
 }
 
 fn meta(desc: &str) -> FunctionMetadata {

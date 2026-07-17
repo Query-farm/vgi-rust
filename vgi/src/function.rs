@@ -684,6 +684,16 @@ pub trait ScalarFunction: Send + Sync {
         params: &ProcessParams,
         batch: &arrow_array::RecordBatch,
     ) -> Result<arrow_array::RecordBatch>;
+
+    /// Result-cache opt-in. When `Some`, the returned
+    /// [`CacheControl`](crate::cache_control::CacheControl)'s `vgi.cache.*`
+    /// keys ride every output batch's custom metadata, so the extension can
+    /// memoize this scalar's output per distinct input value. A pure,
+    /// deterministic scalar only — advertising this on a non-pure scalar
+    /// serves stale rows. Default: not cacheable.
+    fn cache_control(&self) -> Option<crate::cache_control::CacheControl> {
+        None
+    }
 }
 
 #[cfg(test)]

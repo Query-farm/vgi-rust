@@ -2462,7 +2462,14 @@ impl ExchangeState for ScalarExchangeState {
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
         let result = self.func.process(&self.params, input)?;
-        out.emit(result)
+        // Result-cache opt-in: a scalar declaring cache_control() rides its
+        // vgi.cache.* keys on the emit path's per-batch custom metadata (NOT
+        // the schema — the IPC stream fixes the schema at open), so the
+        // extension can memoize the output per distinct input value.
+        match self.func.cache_control() {
+            Some(cc) => out.emit_with_metadata(result, cc.to_metadata()),
+            None => out.emit(result),
+        }
     }
 
     fn encode_state(&self) -> Result<Vec<u8>> {
