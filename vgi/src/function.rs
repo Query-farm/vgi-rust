@@ -571,6 +571,19 @@ pub struct ProcessParams {
     /// (see [`crate::copy_from::CopyFromFunction`]). Carries the source
     /// `file_path` and the COPY target's `expected_schema`.
     pub copy_from: Option<crate::protocol::dtos::CopyFromContext>,
+    /// Conditional-revalidation validator (exchange-mode result cache): the
+    /// client holds a stale cached result for THIS input unit and asks the
+    /// worker to confirm freshness cheaply. A table-in-out `process` that
+    /// advertised [`CacheControl::with_revalidatable`](crate::cache_control::CacheControl::with_revalidatable)
+    /// compares this against its current ETag and, when unchanged, answers with
+    /// a 0-row batch carrying
+    /// [`CacheControl::with_not_modified`](crate::cache_control::CacheControl::with_not_modified)
+    /// instead of recomputing. `None` on a normal call. (The producer path
+    /// surfaces the same validators via
+    /// [`TableProducer::on_conditional_request`](crate::table_function::TableProducer::on_conditional_request).)
+    pub if_none_match: Option<String>,
+    /// Companion Last-Modified validator; see [`if_none_match`](Self::if_none_match).
+    pub if_modified_since: Option<String>,
 }
 
 /// A scalar VGI function: one output row per input row.

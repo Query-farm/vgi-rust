@@ -1,7 +1,8 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! Exchange-mode result-cache table-in-out fixtures: a cacheable classic
-//! (TABLE-input) passthrough and a cacheable blended map.
+//! (TABLE-input) passthrough, a cacheable blended map, and the
+//! always-revalidate (304 `not_modified`) variants of both.
 
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(CachedEchoFunction);
     w.register_table_in_out(CachedDoubleFunction);
+    w.register_table_in_out(CachedRevalidatingEchoFunction);
+    w.register_table_in_out(CachedRevalidatingDoubleFunction);
 }
 
 const CACHE_TTL: i64 = 300;
@@ -29,6 +32,19 @@ fn cache_meta(description: &str, categories: &[&str], blended: bool) -> Function
         input_from_args: blended,
         ..Default::default()
     }
+}
+
+/// Stable etag from a batch's content (deterministic across runs for equal
+/// data). Only compared against itself by the same worker, so any stable
+/// content digest works — FNV-1a over the batch's IPC bytes, hex-rendered.
+fn content_etag(batch: &RecordBatch) -> Result<String> {
+    let bytes = vgi::ipc::write_batch(batch)?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{h:016x}"))
 }
 
 /// Compute `x * 2` (int64) from the blended input column.
@@ -136,6 +152,116 @@ impl TableInOutFunction for CachedDoubleFunction {
             doubled_batch(params, batch)?,
             EmitOptions {
                 cache_control: Some(CacheControl::ttl(CACHE_TTL)),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// `cached_reval_echo(input)` — classic (TABLE-input) passthrough with the
+/// always-revalidate (304) contract.
+///
+/// Advertises `CacheControl(ttl=0, etag, revalidatable)` on its output — the
+/// "no-cache" semantic: stored but immediately stale, so every repeat sends a
+/// conditional request (`vgi.cache.if_none_match`). On a matching validator
+/// the worker answers with a 0-row `not_modified` batch and the client reuses
+/// the stored bytes instead of re-streaming. The etag is derived from the
+/// input content so it is stable across identical repeats.
+pub struct CachedRevalidatingEchoFunction;
+impl TableInOutFunction for CachedRevalidatingEchoFunction {
+    fn name(&self) -> &str {
+        "cached_reval_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta(
+            "Classic passthrough with always-revalidate (304 not_modified) contract",
+            &["cache", "test"],
+            false,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("data", 0, "table", "Input table")]
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        let batch = project_batch(batch, &params.output_schema)?;
+        let etag = content_etag(&batch)?;
+        let fresh = CacheControl::ttl(0)
+            .with_etag(etag.clone())
+            .with_revalidatable();
+        if params.if_none_match.as_deref() == Some(etag.as_str()) {
+            // 304 Not Modified: the client's stored copy for this input is
+            // still valid — answer with a 0-row batch of the same schema.
+            return out.emit_with(
+                batch.slice(0, 0),
+                EmitOptions {
+                    cache_control: Some(fresh.with_not_modified()),
+                    ..Default::default()
+                },
+            );
+        }
+        out.emit_with(
+            batch,
+            EmitOptions {
+                cache_control: Some(fresh),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// `cached_reval_double(x)` — blended map (`x → x*2`) with the
+/// always-revalidate (304) contract.
+///
+/// Like [`CachedRevalidatingEchoFunction`] but blended, so it exercises the
+/// LATERAL exchange-cache revalidation path. The etag is derived from the
+/// worker-input content (the positional arg) — stable across identical
+/// repeats. On a matching `if_none_match` it answers 0-row `not_modified`.
+pub struct CachedRevalidatingDoubleFunction;
+impl TableInOutFunction for CachedRevalidatingDoubleFunction {
+    fn name(&self) -> &str {
+        "cached_reval_double"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta(
+            "Blended map x->x*2 with always-revalidate (304 not_modified) contract",
+            &["blended", "cache", "test"],
+            true,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("x", 0, "int64", "Input column")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        doubled_bind()
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        let etag = content_etag(batch)?;
+        let fresh = CacheControl::ttl(0)
+            .with_etag(etag.clone())
+            .with_revalidatable();
+        if params.if_none_match.as_deref() == Some(etag.as_str()) {
+            return out.emit_with(
+                RecordBatch::new_empty(params.output_schema.clone()),
+                EmitOptions {
+                    cache_control: Some(fresh.with_not_modified()),
+                    ..Default::default()
+                },
+            );
+        }
+        out.emit_with(
+            doubled_batch(params, batch)?,
+            EmitOptions {
+                cache_control: Some(fresh),
                 ..Default::default()
             },
         )

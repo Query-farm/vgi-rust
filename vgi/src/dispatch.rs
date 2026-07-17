@@ -610,6 +610,10 @@ impl Dispatcher {
                 at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
                 at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
                 copy_from: copy_from.clone(),
+                // Conditional validators ride per-tick metadata, not the init
+                // request — set per exchange tick (see TableInOutExchangeState).
+                if_none_match: None,
+                if_modified_since: None,
             };
 
         // Table buffering: sink (header-only) or finalize source (producer).
@@ -996,6 +1000,10 @@ impl Dispatcher {
             // COPY-FROM producers drain fully (no HTTP continuation token is
             // issued), so a resumed stream never carries copy_from context.
             copy_from: None,
+            // Conditional validators ride per-tick metadata — set per exchange
+            // tick (see TableInOutExchangeState), never rebuilt from the blob.
+            if_none_match: None,
+            if_modified_since: None,
         };
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
@@ -2501,6 +2509,15 @@ impl ExchangeState for TableInOutExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
+        // Conditional-revalidation validators (exchange-mode result cache): the
+        // client holds a stale cached result for THIS input unit and asks the
+        // worker to confirm freshness cheaply. They ride the input batch's
+        // custom metadata (surfaced as this tick's metadata), so re-read them
+        // on every tick — each input unit can carry its own validators.
+        self.params.if_none_match =
+            cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
+        self.params.if_modified_since =
+            cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
         let mut collected = crate::table_in_out::TableInOutOutput::default();
         self.func.process_out(&self.params, input, &mut collected)?;
         // 1:1 lockstep: the client reads exactly ONE output batch per input
