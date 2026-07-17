@@ -2501,21 +2501,25 @@ impl ExchangeState for TableInOutExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
-        let mut batches = self.func.process(&self.params, input)?;
+        let mut collected = crate::table_in_out::TableInOutOutput::default();
+        self.func.process_out(&self.params, input, &mut collected)?;
         // 1:1 lockstep: the client reads exactly ONE output batch per input
         // batch, so an accumulate-only tick (process emitted nothing, e.g.
         // substream_partial_sum) still answers with a 0-row batch — parity
         // with the Python SDK's `empty_batch` padding. Without it the client
         // blocks forever on ReadDataBatch.
-        if batches.is_empty() {
-            batches.push(RecordBatch::new_empty(out.schema()));
+        if collected.items.is_empty() {
+            collected.emit(RecordBatch::new_empty(out.schema()));
         }
-        for batch in batches {
+        for (batch, metadata) in collected.items {
             let batch = match &self.filters {
                 Some(f) => f.apply(&batch)?,
                 None => batch,
             };
-            out.emit(batch)?;
+            match metadata {
+                Some(md) => out.emit_with_metadata(batch, md)?,
+                None => out.emit(batch)?,
+            }
         }
         Ok(())
     }
