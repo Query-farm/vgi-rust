@@ -56,18 +56,11 @@ publish = false
 vgi = { path = "$REPO/vgi" }
 # Must track vgi's vgi-rpc dep: a version skew pulls two vgi-rpc copies into
 # the example crate, so vgi_rpc error types stop matching vgi's trait bounds.
-vgi-rpc = "0.12"
+vgi-rpc = "0.13"
 arrow-array = "59"
 arrow-schema = "59"
 
 [workspace]
-
-# Mirror the workspace's [patch.crates-io]: vgi-rpc 0.12.0 is not yet on
-# crates.io, so this scratch crate (its own workspace) must resolve the same
-# local checkout the repo does. Remove together with the workspace patch once
-# vgi-rpc 0.12.0 is published.
-[patch.crates-io]
-vgi-rpc = { path = "$REPO/../vgi-rpc-rust/vgi-rpc" }
 EOF
 
 echo "Compiling ${#names[@]} doc example(s)…"

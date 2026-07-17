@@ -20,7 +20,7 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.12.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
+vgi-rpc = { version = "0.13.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
@@ -41,10 +41,3 @@ env_logger = "0.11"
 
 [profile.release]
 opt-level = 2
-
-# vgi-rpc 0.12.0 carries the wasm-buildability fixes (stream-codec gate on the
-# producer/exchange decoders; windows-sys target-gated to Windows) that are not
-# yet on crates.io. Point the whole workspace at the local checkout until 0.12.0
-# is published. Remove this stanza once vgi-rpc 0.12.0 is on crates.io.
-[patch.crates-io]
-vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
