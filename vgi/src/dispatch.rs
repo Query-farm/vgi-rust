@@ -197,6 +197,39 @@ impl Dispatcher {
     }
 
     pub fn register_table_in_out(&mut self, f: Arc<dyn TableInOutFunction>) {
+        // Blended ("UNNEST-style") foot-gun guards, mirroring the Python
+        // resolve_metadata checks. Registration happens at worker startup, so
+        // an authoring error fails loudly here rather than corrupting a query.
+        if f.metadata().input_from_args {
+            let name = f.name().to_string();
+            let specs = f.argument_specs();
+            assert!(
+                !f.has_finish(),
+                "{name}: a blended (input_from_args) table-in-out function cannot \
+                 override finish() — it is a per-row map (DuckDB forbids FinalExecute \
+                 under correlated LATERAL, one of the call shapes blended must serve). \
+                 Use a classic TABLE-input table-in-out or a TableBufferingFunction \
+                 for accumulating output."
+            );
+            assert!(
+                specs.iter().all(|s| s.arrow_type != "table"),
+                "{name}: a blended (input_from_args) function must not declare a \
+                 TABLE arg — its positional args ARE the input columns."
+            );
+            assert!(
+                specs.iter().all(|s| !(s.position >= 0 && s.is_const)),
+                "{name}: a blended (input_from_args) function cannot take a \
+                 positional const arg (in the column/LATERAL form DuckDB sweeps it \
+                 into the input subquery; in the literal form it is indistinguishable \
+                 from an input column). Use classic TABLE-input mode for a REQUIRED \
+                 constant, or a named arg for optional config."
+            );
+            assert!(
+                specs.iter().any(|s| s.position >= 0 && !s.is_const),
+                "{name}: a blended (input_from_args) function needs at least one \
+                 positional column arg (its per-row input column); found none."
+            );
+        }
         self.tableinouts
             .entry(f.name().to_string())
             .or_default()
@@ -213,9 +246,13 @@ impl Dispatcher {
             .tableinouts
             .get(name)
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
-        let idx = crate::overload::resolve_overload(
+        // Blended (input_from_args) overloads resolve by input-column count /
+        // type against their declared positional args (which are the input
+        // columns, absent from the wire args) — see `resolve_overload_blended`.
+        let idx = crate::overload::resolve_overload_blended(
             cands.len(),
             |i| cands[i].argument_specs(),
+            |i| cands[i].metadata().input_from_args,
             args,
             input_schema,
         )

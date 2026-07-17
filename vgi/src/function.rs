@@ -426,6 +426,18 @@ pub struct FunctionMetadata {
     /// `MaxThreads`). 0 = unset (extension default). >1 lets a single scan fan out
     /// across DuckDB scan threads, each acquiring its own worker connection.
     pub max_workers: i32,
+    /// Blended ("UNNEST-style") table-in-out: the function's positional args ARE
+    /// its per-row input columns (real typed args, no synthetic TABLE
+    /// placeholder), so ONE registration serves `f(52,13)` (literal → 1 input
+    /// row), `FROM t, f(t.x, t.y)` (columns → streaming), and
+    /// `LATERAL f(t.x, t.y)`. Mirrors the Python SDK's `RowTransformFunction`.
+    /// Only meaningful on a [`TableInOutFunction`](crate::table_in_out::TableInOutFunction);
+    /// the registration validates the blended contract (no `finish`, no TABLE
+    /// arg, no positional const arg, ≥1 positional column arg). Positional args
+    /// are read from the input `batch` in `process` (by declared name, or
+    /// positionally for varargs); named args stay bind-time scalars on
+    /// `ProcessParams::arguments`. Surfaced as `FunctionInfo.input_from_args`.
+    pub input_from_args: bool,
 }
 
 impl Default for FunctionMetadata {
@@ -454,6 +466,7 @@ impl Default for FunctionMetadata {
             required_settings: Vec::new(),
             required_secrets: Vec::new(),
             max_workers: 0,
+            input_from_args: false,
         }
     }
 }

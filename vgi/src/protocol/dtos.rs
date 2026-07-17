@@ -643,11 +643,10 @@ pub struct FunctionInfo {
     pub sink_order_dependent: bool,
     pub requires_input_batch_index: bool,
     /// Blended ("UNNEST-style") table function marker: the function's positional
-    /// args ARE its per-row input columns (a `RowTransformFunction` in Python).
-    /// vgi-rust has no blended-function concept yet, so this is always false — but
-    /// the field must be present so the `catalog_schema_contents_functions` Arrow
-    /// schema matches what the C++ extension expects (it reads by field, and a
-    /// missing field is an item-schema-count mismatch at ATTACH discovery).
+    /// args ARE its per-row input columns (a `RowTransformFunction` in Python;
+    /// `FunctionMetadata::input_from_args` here). The C++ extension reads it to
+    /// enter the in-out registration branch with real-typed args and drive the
+    /// literal single-row scan-mode.
     pub input_from_args: bool,
     pub required_settings: Vec<String>,
     pub required_secrets: Vec<RequiredSecret>,

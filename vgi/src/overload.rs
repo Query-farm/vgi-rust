@@ -22,13 +22,36 @@ pub fn resolve_overload<F>(
 where
     F: Fn(usize) -> Vec<ArgSpec>,
 {
+    resolve_overload_blended(count, specs_of, |_| false, args, input_schema)
+}
+
+/// [`resolve_overload`] with a per-candidate blended (`input_from_args`) flag.
+///
+/// A blended candidate's positional args ARE the per-row input columns — they
+/// are NOT on the wire (`args.positional` is empty in every call shape), so it
+/// resolves by INPUT-COLUMN count against the declared positional arity
+/// (`geo_encode(52,13)` → the 2-positional overload, `geo_encode(52,13,100)` →
+/// the 3-positional one; varargs matches any input-column count >= the fixed
+/// positional count) and disambiguates same-arity overloads by scoring the
+/// declared positional types against the input schema's column types.
+pub fn resolve_overload_blended<F, B>(
+    count: usize,
+    specs_of: F,
+    blended_of: B,
+    args: &Arguments,
+    input_schema: Option<&SchemaRef>,
+) -> Option<usize>
+where
+    F: Fn(usize) -> Vec<ArgSpec>,
+    B: Fn(usize) -> bool,
+{
     if count == 1 {
         return Some(0);
     }
     let mut best: Option<(usize, i64)> = None;
     for idx in 0..count {
         let specs = specs_of(idx);
-        if let Some(score) = score_candidate(&specs, args, input_schema) {
+        if let Some(score) = score_candidate(&specs, blended_of(idx), args, input_schema) {
             if best.map(|(_, b)| score > b).unwrap_or(true) {
                 best = Some((idx, score));
             }
@@ -39,6 +62,7 @@ where
 
 fn score_candidate(
     specs: &[ArgSpec],
+    blended: bool,
     args: &Arguments,
     input_schema: Option<&SchemaRef>,
 ) -> Option<i64> {
@@ -56,6 +80,27 @@ fn score_candidate(
     let num_pos = args.num_positional();
     let num_const = const_specs.len();
     let input_fields = input_schema.map(|s| s.fields().len()).unwrap_or(0);
+
+    // Blended (input_from_args): the positional params ARE the input columns,
+    // absent from the wire args in every call shape — so ignore the wire
+    // positional count entirely and resolve by input-column count against the
+    // declared positional arity, then score the declared positional types
+    // against the input schema's column types (mirroring the Python
+    // `_match_function_arguments` / `_filter_by_argument_types` blended paths).
+    if blended {
+        if let Some(schema) = input_schema {
+            if has_varargs {
+                let fixed = nonconst_specs.iter().filter(|s| !s.is_varargs).count();
+                if input_fields < fixed {
+                    return None; // too few input columns for the fixed args
+                }
+            } else if input_fields != nonconst_specs.len() {
+                return None; // wrong number of input columns for this overload
+            }
+            return score_columns(&nonconst_specs, varargs_spec, schema);
+        }
+        return Some(0);
+    }
 
     if has_varargs {
         let vs = varargs_spec.unwrap();
@@ -128,28 +173,37 @@ fn score_candidate(
 
     // Score non-const (column) args against the input schema fields.
     if let Some(schema) = input_schema {
-        let fields = schema.fields();
-        if has_varargs && !varargs_spec.unwrap().is_const {
+        score += score_columns(&nonconst_specs, varargs_spec, schema)?;
+    }
+
+    Some(score)
+}
+
+/// Score the non-const (column) specs against the input schema's fields: a
+/// non-const varargs spec across every field, fixed specs positionally.
+/// `None` = an incompatible column type (reject the candidate).
+fn score_columns(
+    nonconst_specs: &[&ArgSpec],
+    varargs_spec: Option<&ArgSpec>,
+    schema: &SchemaRef,
+) -> Option<i64> {
+    let mut score = 0i64;
+    let fields = schema.fields();
+    match varargs_spec.filter(|vs| !vs.is_const) {
+        Some(vs) => {
             // Score every input field against the varargs column type.
-            let vs = varargs_spec.unwrap();
             for f in fields {
-                match score_type(f.data_type(), vs) {
-                    Some(s) => score += s,
-                    None => return None,
-                }
+                score += score_type(f.data_type(), vs)?;
             }
-        } else {
+        }
+        None => {
             for (i, spec) in nonconst_specs.iter().enumerate() {
                 if let Some(f) = fields.get(i) {
-                    match score_type(f.data_type(), spec) {
-                        Some(s) => score += s,
-                        None => return None,
-                    }
+                    score += score_type(f.data_type(), spec)?;
                 }
             }
         }
     }
-
     Some(score)
 }
 

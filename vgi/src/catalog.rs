@@ -399,7 +399,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         source_order_dependent: false,
         sink_order_dependent: false,
         requires_input_batch_index: false,
-        input_from_args: false, // vgi-rust has no blended (RowTransformFunction) functions
+        input_from_args: false, // set per-function from FunctionMetadata.input_from_args
         required_settings: Vec::new(),
         required_secrets: Vec::new(),
     }
@@ -492,6 +492,10 @@ pub fn table_in_out_function_info(
     let mut fi = default_function_info(f.name(), enums::function_type::TABLE);
     apply_metadata(&mut fi, &meta);
     fi.has_finalize = f.has_finish();
+    // Blended ("UNNEST-style"): the C++ extension reads this to enter the
+    // in-out registration branch with real-typed args and drive the literal
+    // single-row scan-mode.
+    fi.input_from_args = meta.input_from_args;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
