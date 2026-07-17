@@ -513,6 +513,15 @@ pub struct ProcessParams {
     pub output_schema: SchemaRef,
     pub input_schema: Option<SchemaRef>,
     pub execution_id: Vec<u8>,
+    /// Stable client-minted id for this streaming table-in-out substream.
+    ///
+    /// Present (identical across init / every `process` / `finish`) when the
+    /// client fanned this function out across per-substream workers; use it to
+    /// key per-substream accumulated state in shared storage so a `finish` that
+    /// lands on a different HTTP backend than the `process` calls still finds
+    /// it. `None` for the serial path or an old client that did not supply one.
+    /// See `InitRequest::substream_id`.
+    pub substream_id: Option<Vec<u8>>,
     pub init_opaque_data: Vec<u8>,
     /// Parsed call arguments (const values).
     pub arguments: crate::arguments::Arguments,

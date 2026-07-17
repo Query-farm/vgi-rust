@@ -182,6 +182,21 @@ pub struct InitRequest {
     pub phase: Option<DictString>,
     pub execution_id: Option<Bytes>,
     pub init_opaque_data: Option<Bytes>,
+    /// Per-substream identity for parallel streaming table-in-out functions.
+    ///
+    /// A streaming table-in-out is a per-substream map: under per-substream
+    /// worker fan-out the client (VGI extension) acquires an independent worker
+    /// per substream (per DuckDB PipelineExecutor). `substream_id` is a stable,
+    /// CLIENT-minted id for that substream, identical across this substream's
+    /// init / every process tick / finalize. Unlike a worker-minted
+    /// `execution_id`, it survives an HTTP load balancer dispatching each
+    /// request to an arbitrary backend: a finalize that lands on a different
+    /// backend than the process() calls can still key the substream's
+    /// accumulated state (in shared storage) by `substream_id`. It is folded
+    /// into the exchange rebuild blob (serialized into the HTTP state token) so
+    /// it is present on every rehydrated tick. `None` when the client did not
+    /// supply one (serial path, non-table-in-out functions, old clients).
+    pub substream_id: Option<Bytes>,
     pub order_by_column_name: Option<String>,
     pub order_by_direction: Option<DictString>,
     pub order_by_null_order: Option<DictString>,

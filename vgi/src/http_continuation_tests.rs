@@ -196,6 +196,7 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
         phase: None,
         execution_id: None,
         init_opaque_data: None,
+        substream_id: None,
         order_by_column_name: None,
         order_by_direction: None,
         order_by_null_order: None,

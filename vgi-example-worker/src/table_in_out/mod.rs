@@ -17,7 +17,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(FilterBySettingFunction);
     w.register_table_in_out(SecretInOutFunction);
     w.register_table_in_out(RepeatInputsFunction);
-    w.register_table_in_out(SumAllColumnsSimpleDistributed);
+    w.register_table_in_out(SubstreamPartialSumFunction);
     w.register_table_in_out(SlowCancellableInOutFunction);
 }
 
@@ -57,74 +57,43 @@ impl TableInOutFunction for SlowCancellableInOutFunction {
     }
 }
 
-/// `sum_all_columns_simple_distributed(input)` — distributed column-wise sum.
-/// `process` accumulates each batch's partial sums into shared storage and
-/// emits nothing; the `FINALIZE` phase merges all partials into one output row.
-pub struct SumAllColumnsSimpleDistributed;
+/// `substream_partial_sum(input)` — per-substream partial sum emitted at
+/// finalize; proves parallel streaming FINALIZE (Phase A4).
+///
+/// A streaming table-in-out *with* a finalize is still a per-substream
+/// operation under per-substream worker fan-out: `process` accumulates only
+/// THIS substream's rows (emitting nothing), and `finish` emits ONE row = this
+/// substream's partial sum. DuckDB fans the input across N substreams and
+/// unions their finalize outputs, so the caller re-aggregates with an outer
+/// `SELECT sum(...)` to get the global total — correct no matter how the rows
+/// were partitioned. State is keyed by the client-minted `substream_id` when
+/// present (stable across HTTP backends), else the substream's `execution_id`.
+/// This is NOT a global cross-substream combine — that is a
+/// `TableBufferingFunction` (see `sum_all_columns_simple_distributed`).
+pub struct SubstreamPartialSumFunction;
 
-const DIST_NS: &[u8] = b"tio_partials";
+const SS_NS: &[u8] = b"ss_partial";
 
-impl SumAllColumnsSimpleDistributed {
-    /// Numeric output schema: integers → int64, floats/decimals → float64.
-    fn output_schema(input: &arrow_schema::SchemaRef) -> arrow_schema::SchemaRef {
-        use arrow_schema::{DataType, Field, Schema};
-        let fields: Vec<Field> = input
-            .fields()
-            .iter()
-            .filter_map(|f| {
-                let t = f.data_type();
-                let out = if t.is_integer() {
-                    DataType::Int64
-                } else if matches!(t, DataType::Float16 | DataType::Float32 | DataType::Float64)
-                    || matches!(t, DataType::Decimal128(_, _) | DataType::Decimal256(_, _))
-                {
-                    DataType::Float64
-                } else {
-                    return None;
-                };
-                Some(Field::new(f.name(), out, true))
-            })
-            .collect();
-        Arc::new(Schema::new(fields))
-    }
-    fn sum_one(
-        field_type: &arrow_schema::DataType,
-        col: &arrow_array::ArrayRef,
-    ) -> Result<arrow_array::ArrayRef> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::{Float64Type, Int64Type};
-        use arrow_array::{Float64Array, Int64Array};
-        let cast = arrow_cast::cast(col, field_type)
-            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        match field_type {
-            arrow_schema::DataType::Int64 => {
-                let a = cast.as_primitive::<Int64Type>();
-                let s: i64 = (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i))
-                    .sum();
-                Ok(Arc::new(Int64Array::from(vec![s])))
-            }
-            _ => {
-                let a = cast.as_primitive::<Float64Type>();
-                let s: f64 = (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i))
-                    .sum();
-                Ok(Arc::new(Float64Array::from(vec![s])))
-            }
-        }
+impl SubstreamPartialSumFunction {
+    /// The storage scope for this substream's accumulated partials.
+    fn state_scope(params: &ProcessParams) -> Vec<u8> {
+        params
+            .substream_id
+            .clone()
+            .unwrap_or_else(|| params.execution_id.clone())
     }
 }
 
-impl TableInOutFunction for SumAllColumnsSimpleDistributed {
+impl TableInOutFunction for SubstreamPartialSumFunction {
     fn name(&self) -> &str {
-        "sum_all_columns_simple_distributed"
+        "substream_partial_sum"
     }
     fn metadata(&self) -> FunctionMetadata {
         FunctionMetadata {
-            description: "Distributed sum using simple callback API".to_string(),
-            categories: vec!["aggregation".into(), "numeric".into(), "distributed".into()],
+            description:
+                "Per-substream partial sum emitted at finalize (parallel streaming finalize)"
+                    .to_string(),
+            categories: vec!["aggregation".into(), "numeric".into()],
             ..Default::default()
         }
     }
@@ -132,11 +101,20 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
         vec![table_arg("data", 0)]
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        let input = params.input_schema.clone().ok_or_else(|| {
-            RpcError::value_error("sum_all_columns_simple_distributed requires input")
-        })?;
+        let input = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| RpcError::value_error("substream_partial_sum requires input"))?;
+        let field = input
+            .fields()
+            .first()
+            .ok_or_else(|| RpcError::value_error("substream_partial_sum requires a column"))?;
         Ok(BindResponse {
-            output_schema: Self::output_schema(&input),
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                field.name(),
+                arrow_schema::DataType::Int64,
+                true,
+            )])),
             opaque_data: Vec::new(),
         })
     }
@@ -144,59 +122,39 @@ impl TableInOutFunction for SumAllColumnsSimpleDistributed {
         true
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
-        let out = &params.output_schema;
-        let mut cols = Vec::with_capacity(out.fields().len());
-        for f in out.fields() {
-            let col = batch
-                .column_by_name(f.name())
-                .ok_or_else(|| RpcError::runtime_error(format!("missing column {}", f.name())))?;
-            cols.push(Self::sum_one(f.data_type(), col)?);
-        }
-        let partial = RecordBatch::try_new(out.clone(), cols)
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        let cast = arrow_cast::cast(batch.column(0), &arrow_schema::DataType::Int64)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let a = cast.as_primitive::<Int64Type>();
+        let s: i64 = (0..a.len())
+            .filter(|&i| a.is_valid(i))
+            .map(|i| a.value(i))
+            .sum();
         if let Some(store) = &params.storage {
             store.append(
-                &params.execution_id,
-                DIST_NS,
+                &Self::state_scope(params),
+                SS_NS,
                 b"",
-                vgi::ipc::write_batch(&partial)?,
+                s.to_le_bytes().to_vec(),
             );
         }
-        // Emit nothing during processing (one empty batch satisfies the exchange).
-        Ok(vec![RecordBatch::new_empty(out.clone())])
+        // Accumulate only; emit nothing during processing.
+        Ok(Vec::new())
     }
     fn finish(&self, params: &ProcessParams) -> Result<Vec<RecordBatch>> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::{Float64Type, Int64Type};
-        use arrow_array::{ArrayRef, Float64Array, Int64Array};
-        use arrow_schema::DataType;
-        let out = &params.output_schema;
-        let n = out.fields().len();
-        let mut int_acc = vec![0i64; n];
-        let mut flt_acc = vec![0.0f64; n];
+        // Sum THIS substream's accumulated partials (one per process call that
+        // handled this substream's batches); their sum is this substream's partial.
+        let mut total = 0i64;
         if let Some(store) = &params.storage {
-            for (_id, blob) in store.scan(&params.execution_id, DIST_NS, b"", -1, usize::MAX) {
-                let pb = vgi::ipc::read_batch(&blob)?;
-                for (i, f) in out.fields().iter().enumerate() {
-                    match f.data_type() {
-                        DataType::Int64 => {
-                            int_acc[i] += pb.column(i).as_primitive::<Int64Type>().value(0)
-                        }
-                        _ => flt_acc[i] += pb.column(i).as_primitive::<Float64Type>().value(0),
-                    }
+            for (_id, blob) in store.scan(&Self::state_scope(params), SS_NS, b"", -1, usize::MAX) {
+                if let Ok(arr) = <[u8; 8]>::try_from(blob.as_slice()) {
+                    total += i64::from_le_bytes(arr);
                 }
             }
         }
-        let cols: Vec<ArrayRef> = out
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| match f.data_type() {
-                DataType::Int64 => Arc::new(Int64Array::from(vec![int_acc[i]])) as ArrayRef,
-                _ => Arc::new(Float64Array::from(vec![flt_acc[i]])) as ArrayRef,
-            })
-            .collect();
-        let batch = RecordBatch::try_new(out.clone(), cols)
+        let col = Arc::new(arrow_array::Int64Array::from(vec![total])) as Arc<dyn Array>;
+        let batch = RecordBatch::try_new(params.output_schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![batch])
     }

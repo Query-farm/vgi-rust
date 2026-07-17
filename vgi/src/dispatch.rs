@@ -545,6 +545,7 @@ impl Dispatcher {
                 output_schema: output_schema.clone(),
                 input_schema: input_schema.clone(),
                 execution_id: execution_id.clone(),
+                substream_id: dto.substream_id.clone().map(|b| b.into()),
                 init_opaque_data: dto
                     .bind_opaque_data
                     .clone()
@@ -880,6 +881,7 @@ impl Dispatcher {
             settings: bind_call.settings.clone().map(|b| b.0).unwrap_or_default(),
             secrets: bind_call.secrets.clone().map(|b| b.0).unwrap_or_default(),
             execution_id: execution_id.to_vec(),
+            substream_id: dto.substream_id.clone().map(|b| b.0).unwrap_or_default(),
             init_opaque: dto
                 .bind_opaque_data
                 .clone()
@@ -929,6 +931,9 @@ impl Dispatcher {
             output_schema: output_schema.clone(),
             input_schema: input_schema.clone(),
             execution_id: blob.execution_id.clone(),
+            // Folded into the blob so a rehydrated HTTP tick keeps the client's
+            // per-substream identity (empty = the client sent none).
+            substream_id: Some(blob.substream_id.clone()).filter(|v| !v.is_empty()),
             init_opaque_data: blob.init_opaque.clone(),
             arguments: args,
             settings: settings.clone(),
@@ -2379,6 +2384,10 @@ pub struct ExchangeBlob {
     pub settings: Vec<u8>,
     pub secrets: Vec<u8>,
     pub execution_id: Vec<u8>,
+    /// Client-minted per-substream id (empty = none) — folded in so a resumed
+    /// HTTP tick keeps [`ProcessParams::substream_id`]. See
+    /// `InitRequest::substream_id`.
+    pub substream_id: Vec<u8>,
     pub init_opaque: Vec<u8>,
     pub pushdown_filters: Vec<u8>, // empty = none
     pub auto_apply: bool,
@@ -2455,7 +2464,16 @@ impl ExchangeState for TableInOutExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
-        for batch in self.func.process(&self.params, input)? {
+        let mut batches = self.func.process(&self.params, input)?;
+        // 1:1 lockstep: the client reads exactly ONE output batch per input
+        // batch, so an accumulate-only tick (process emitted nothing, e.g.
+        // substream_partial_sum) still answers with a 0-row batch — parity
+        // with the Python SDK's `empty_batch` padding. Without it the client
+        // blocks forever on ReadDataBatch.
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(out.schema()));
+        }
+        for batch in batches {
             let batch = match &self.filters {
                 Some(f) => f.apply(&batch)?,
                 None => batch,

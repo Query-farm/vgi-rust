@@ -31,6 +31,13 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_buffering(BufferInputFunction::new("hang_on_process").process_hang());
     w.register_buffering(BufferInputFunction::new("slow_cancellable_buffering").pushdown());
     w.register_buffering(SumAllColumnsFunction::new("sum_all_columns"));
+    // Migrated from a streaming TableInOutFunction (global finish over all
+    // states): a global cross-substream combine belongs on the buffered
+    // Sink+Combine+Source path, not the streaming per-substream map path
+    // (see substream_partial_sum for the per-substream finalize contract).
+    w.register_buffering(SumAllColumnsFunction::new(
+        "sum_all_columns_simple_distributed",
+    ));
     w.register_buffering(
         SumAllColumnsFunction::new("exception_finalize")
             .finalize_error("Intentional exception during finalize()"),
@@ -612,15 +619,29 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         let description = match self.name {
             "exception_finalize" => "Test function that raises exception during finalize",
             "exception_process" => "Test function that raises exception during process",
+            "sum_all_columns_simple_distributed" => {
+                "Distributed sum using the buffered (Sink+Combine+Source) model"
+            }
             _ => "Computes column-wise sums across all batches",
+        };
+        let categories = match self.name {
+            "sum_all_columns_simple_distributed" => {
+                vec!["aggregation".into(), "numeric".into(), "distributed".into()]
+            }
+            _ => vec!["aggregation".into(), "numeric".into()],
         };
         FunctionMetadata {
             description: description.to_string(),
-            categories: vec!["aggregation".into(), "numeric".into()],
+            categories,
             ..Default::default()
         }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
+        // The distributed variant declares only the table input (matching the
+        // canonical fixture surface pinned by function_registration.test).
+        if self.name == "sum_all_columns_simple_distributed" {
+            return vec![table_arg()];
+        }
         vec![
             table_arg(),
             ArgSpec::const_arg("logging", -1, "boolean", "Emit per-batch INFO logs"),
