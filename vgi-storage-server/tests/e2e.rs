@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use vgi::storage::http::{StorageOp, StorageRequest};
+use vgi::storage::http::{StorageOp, StorageRequest, WIRE};
 use vgi::storage::{FunctionStorage, HttpStorage};
 
 struct Server {
@@ -140,15 +140,13 @@ fn idempotent_retry_replays_queue_pop() {
             scope: b"qi".to_vec(),
         },
     };
-    let body = bincode::serialize(&req).unwrap();
+    let body = bincode::serde::encode_to_vec(&req, WIRE).unwrap();
     let pop_once = || -> Vec<u8> {
-        let resp = ureq::post(&url)
-            .set("content-type", "application/octet-stream")
-            .send_bytes(&body)
+        let mut resp = ureq::post(&url)
+            .header("content-type", "application/octet-stream")
+            .send(&body[..])
             .unwrap();
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).unwrap();
-        buf
+        resp.body_mut().read_to_vec().unwrap()
     };
     let a = pop_once();
     let b = pop_once();

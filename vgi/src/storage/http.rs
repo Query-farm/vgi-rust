@@ -84,6 +84,14 @@ pub enum StorageReply {
 /// Number of attempts before the client gives up (and panics).
 const MAX_ATTEMPTS: u32 = 5;
 
+/// Wire encoding for the storage RPC frame. `legacy()` is bincode 1's layout
+/// (fixint, little-endian) — pinned explicitly so bumping bincode never shifts
+/// the bytes on the wire and a client can still talk to an older server.
+pub const WIRE: bincode::config::Configuration<
+    bincode::config::LittleEndian,
+    bincode::config::Fixint,
+> = bincode::config::legacy();
+
 /// HTTP client backend. Talks bincode over `POST {url}/rpc`.
 pub struct HttpStorage {
     url: String,
@@ -105,10 +113,11 @@ impl HttpStorage {
     }
 
     pub fn new(url: impl Into<String>, token: Option<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .into();
         HttpStorage {
             url: url.into().trim_end_matches('/').to_string(),
             token,
@@ -140,7 +149,7 @@ impl HttpStorage {
             idempotency_key,
             op,
         };
-        let body = bincode::serialize(&req).expect("serialize storage request");
+        let body = bincode::serde::encode_to_vec(&req, WIRE).expect("serialize storage request");
         let endpoint = format!("{}/rpc", self.url);
 
         let mut last_err = String::new();
@@ -148,23 +157,27 @@ impl HttpStorage {
             let mut http = self
                 .agent
                 .post(&endpoint)
-                .set("content-type", "application/octet-stream");
+                .header("content-type", "application/octet-stream");
             if let Some(tok) = &self.token {
-                http = http.set("authorization", &format!("Bearer {tok}"));
+                http = http.header("authorization", &format!("Bearer {tok}"));
             }
-            match http.send_bytes(&body) {
-                Ok(resp) => {
-                    let mut buf = Vec::new();
-                    if let Err(e) = std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf) {
-                        last_err = format!("read body: {e}");
-                    } else {
-                        match bincode::deserialize::<StorageReply>(&buf) {
-                            Ok(reply) => return reply,
+            match http.send(&body[..]) {
+                // NB: `read_to_vec()` alone would cap the body at ureq's 10 MB
+                // default. Stored values (and `Entries` replies) are arbitrary
+                // user blobs with no such ceiling, and the ureq 2 reader this
+                // replaced was unbounded — so the limit is lifted explicitly
+                // rather than silently truncating large reads into a decode
+                // error. The endpoint is operator-configured, not untrusted.
+                Ok(mut resp) => match resp.body_mut().with_config().limit(u64::MAX).read_to_vec() {
+                    Err(e) => last_err = format!("read body: {e}"),
+                    Ok(buf) => {
+                        match bincode::serde::decode_from_slice::<StorageReply, _>(&buf, WIRE) {
+                            Ok((reply, _)) => return reply,
                             Err(e) => last_err = format!("decode reply: {e}"),
                         }
                     }
-                }
-                Err(ureq::Error::Status(code, _)) => {
+                },
+                Err(ureq::Error::StatusCode(code)) => {
                     // A definitive server-side rejection (auth, bad request)
                     // won't improve on retry.
                     panic!("vgi storage server returned HTTP {code}");

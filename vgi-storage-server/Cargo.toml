@@ -13,12 +13,12 @@ publish = false
 [dependencies]
 # Reuse the protocol types (storage::http) and the SQLite backend.
 vgi = { path = "../vgi", features = ["sqlite", "http-storage"] }
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
 bytes = "1"
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 
 [dev-dependencies]
-ureq = { version = "2", default-features = false }
+ureq = { version = "3", default-features = false }

@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
-use vgi::storage::http::{apply_op, StorageRequest};
+use vgi::storage::http::{apply_op, StorageRequest, WIRE};
 use vgi::storage::{FunctionStorage, SqliteStorage};
 
 /// Cap on the idempotency cache; cleared wholesale when exceeded (an idempotency
@@ -112,8 +112,8 @@ async fn rpc(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes
     if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
-    let req: StorageRequest = match bincode::deserialize(&body) {
-        Ok(r) => r,
+    let req: StorageRequest = match bincode::serde::decode_from_slice(&body, WIRE) {
+        Ok((r, _)) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode request: {e}")).into_response(),
     };
 
@@ -126,7 +126,7 @@ async fn rpc(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes
     }
 
     let reply = apply_op(&state.store as &dyn FunctionStorage, req.op);
-    let bytes = match bincode::serialize(&reply) {
+    let bytes = match bincode::serde::encode_to_vec(&reply, WIRE) {
         Ok(b) => b,
         Err(e) => {
             return (

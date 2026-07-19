@@ -11,7 +11,6 @@
 //! guard), which is the "maximum batch size returned over HTTP without
 //! externalization" boundary.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
@@ -228,18 +227,12 @@ fn exchange_body(token: &str) -> Vec<u8> {
 fn post(port: u16, path: &str, body: Vec<u8>) -> Vec<u8> {
     let url = format!("http://127.0.0.1:{port}/{path}");
     match ureq::post(&url)
-        .set("Content-Type", ARROW_CONTENT_TYPE)
-        .send_bytes(&body)
+        .header("Content-Type", ARROW_CONTENT_TYPE)
+        .send(&body[..])
     {
-        Ok(resp) => {
-            let mut buf = Vec::new();
-            resp.into_reader().read_to_end(&mut buf).unwrap();
-            buf
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let mut body = String::new();
-            resp.into_reader().read_to_string(&mut body).ok();
-            panic!("POST {path} -> {code}: {body}");
+        Ok(mut resp) => resp.body_mut().read_to_vec().unwrap(),
+        Err(ureq::Error::StatusCode(code)) => {
+            panic!("POST {path} -> {code}");
         }
         Err(e) => panic!("POST {path} failed: {e}"),
     }
