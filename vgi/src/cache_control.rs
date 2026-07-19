@@ -55,6 +55,8 @@ pub const CACHE_STALE_WHILE_REVALIDATE_KEY: &str = "vgi.cache.stale_while_revali
 pub const CACHE_STALE_IF_ERROR_KEY: &str = "vgi.cache.stale_if_error";
 /// 304-equivalent, set on a 0-row batch in reply to a conditional request.
 pub const CACHE_NOT_MODIFIED_KEY: &str = "vgi.cache.not_modified";
+/// Opt in to per-partition result caching (`SINGLE_VALUE_PARTITIONS` only).
+pub const CACHE_PARTITION_SCOPE_KEY: &str = "vgi.cache.partition_scope";
 
 // --- Request-side metadata keys (client -> worker) -------------------------
 
@@ -108,6 +110,12 @@ pub struct CacheControl {
     /// to assert the client's stored payload is still fresh (the client reuses
     /// it instead of re-streaming).
     pub not_modified: bool,
+    /// Opt in to per-partition caching. Only meaningful for a
+    /// `SINGLE_VALUE_PARTITIONS` table function; the client ALSO caches the
+    /// result split by partition value (one entry per distinct partition-value
+    /// tuple) so a later `=`/`IN`-filtered scan reuses per-partition entries.
+    /// Additive to the whole-scan cache.
+    pub partition_scope: bool,
 }
 
 impl Default for CacheControl {
@@ -123,6 +131,7 @@ impl Default for CacheControl {
             stale_while_revalidate: None,
             stale_if_error: None,
             not_modified: false,
+            partition_scope: false,
         }
     }
 }
@@ -195,6 +204,13 @@ impl CacheControl {
         self
     }
 
+    /// Opt in to per-partition caching (see [`CacheControl::partition_scope`]).
+    /// Only has an effect on a `SINGLE_VALUE_PARTITIONS` table function.
+    pub fn with_partition_scope(mut self) -> Self {
+        self.partition_scope = true;
+        self
+    }
+
     /// Render to the `vgi.cache.*` batch-metadata map.
     ///
     /// Booleans render as `"1"` and are omitted when false; unset optional
@@ -229,6 +245,9 @@ impl CacheControl {
         }
         if self.not_modified {
             md.insert(CACHE_NOT_MODIFIED_KEY.to_string(), "1".to_string());
+        }
+        if self.partition_scope {
+            md.insert(CACHE_PARTITION_SCOPE_KEY.to_string(), "1".to_string());
         }
         md
     }
@@ -311,6 +330,17 @@ mod tests {
             .with_not_modified()
             .to_metadata();
         assert_eq!(md[CACHE_NOT_MODIFIED_KEY], "1");
+    }
+
+    #[test]
+    fn partition_scope_renders_and_is_omitted_by_default() {
+        let md = CacheControl::ttl(300).to_metadata();
+        assert!(!md.contains_key(CACHE_PARTITION_SCOPE_KEY));
+
+        let md = CacheControl::ttl(300).with_partition_scope().to_metadata();
+        assert_eq!(md[CACHE_PARTITION_SCOPE_KEY], "1");
+        // Additive: the whole-scan freshness keys still ride along.
+        assert_eq!(md[CACHE_TTL_KEY], "300");
     }
 
     #[test]

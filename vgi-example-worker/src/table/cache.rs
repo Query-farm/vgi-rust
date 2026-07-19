@@ -60,6 +60,10 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(CacheTypesFunction);
     w.register_table(CacheFilteredFunction);
     w.register_table(CachePartitionedFunction);
+    w.register_table(CachePartitionScopeFunction);
+    w.register_table(CachePartitionParallelFunction);
+    w.register_table(CachePartitionMultiColFunction);
+    w.register_table(CachePartitionProjFunction);
     // `cache_multicol` backs only the `ex.data.cache_multicol` table — it stays
     // bindable for that scan but is not advertised as a SQL callable, matching
     // the Python fixture worker (which lists it under `tables`, not `functions`).
@@ -1470,6 +1474,437 @@ impl TableFunction for CachePartitionedFunction {
             rows_per_country: params.arguments.const_i64(0).unwrap_or(1),
             country_idx: 0,
             advertised: false,
+            meta: None,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-partition result cache (`vgi.cache.partition_scope`)
+// ---------------------------------------------------------------------------
+// A SINGLE_VALUE_PARTITIONS function that also advertises
+// `vgi.cache.partition_scope` gets its result cached BOTH whole-scan and split
+// by partition value, so a later `=`/`IN` scan on the partition column(s) is
+// served per-partition without reaching the worker.
+//
+// `filter_pushdown` + `auto_apply_filters` are what make that safe: the
+// predicate arrives as a real filter (so the client can enumerate the requested
+// set) and the framework prunes emitted batches to it — DuckDB does NOT
+// re-apply a pushed predicate above the scan, so a fall-through worker scan has
+// to be row-exact on its own.
+//
+// Mirrors vgi-python's `cache_partition_{scope,parallel,multicol,proj}`.
+
+/// Build the `{country, sales}` batch for partition `idx` of `countries`.
+/// `sales` starts at `idx * 1_000_000` so every partition's values are
+/// unmistakably its own.
+fn country_sales_batch(
+    schema: &SchemaRef,
+    country: Option<&str>,
+    idx: usize,
+    rows: i64,
+) -> Result<RecordBatch> {
+    let rows = rows.max(0);
+    let base = idx as i64 * 1_000_000;
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![country; rows as usize])) as ArrayRef,
+            Arc::new(Int64Array::from(range_vec(base, base + rows))) as ArrayRef,
+        ],
+    )
+    .map_err(|e| RpcError::runtime_error(e.to_string()))
+}
+
+/// `{country: string, sales: int64}` with `country` partition-annotated.
+fn country_sales_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        partition_field("country", DataType::Utf8),
+        Field::new("sales", DataType::Int64, true),
+    ]))
+}
+
+/// Cache-control every per-partition fixture advertises: a normal whole-scan TTL
+/// PLUS the per-partition opt-in.
+fn partition_scope_cc() -> HashMap<String, String> {
+    CacheControl::ttl(DEFAULT_TTL_SECONDS)
+        .with_partition_scope()
+        .to_metadata()
+}
+
+/// Partition metadata for a single-valued *string* partition column, computed
+/// from a synthetic 1-row batch rather than the emitted one. Needed when the
+/// partition column isn't in the emitted batch at all (projected away), where
+/// auto-extraction has nothing to read.
+fn explicit_country_pv(name: &str, value: Option<&str>) -> Result<HashMap<String, String>> {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![partition_field(name, DataType::Utf8)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![value])) as ArrayRef],
+    )
+    .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+    Ok(vgi::partition::partition_metadata(&schema, &batch)?.unwrap_or_default())
+}
+
+/// Shared metadata for the per-partition fixtures.
+fn partition_scope_meta(description: &str) -> FunctionMetadata {
+    FunctionMetadata {
+        partition_kind: Some(
+            vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS.to_string(),
+        ),
+        filter_pushdown: true,
+        auto_apply_filters: true,
+        ..cache_meta(description)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_partition_scope(rows_per_country) -> {country: string, sales: int64}
+// ---------------------------------------------------------------------------
+
+/// One single-country batch per tick over [`COUNTRIES`]. The partition-scope
+/// opt-in rides EVERY batch (not just the first, as the plain cache fixtures
+/// do): on a fall-through scan whose leading country is filtered away to 0
+/// rows, a first-batch-only advertisement would never be seen and the client
+/// would silently stop caching per partition.
+struct PartitionScopeProducer {
+    schema: SchemaRef,
+    rows_per_country: i64,
+    country_idx: usize,
+    meta: Option<HashMap<String, String>>,
+}
+impl TableProducer for PartitionScopeProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.country_idx >= COUNTRIES.len() {
+            return Ok(None);
+        }
+        let batch = country_sales_batch(
+            &self.schema,
+            Some(COUNTRIES[self.country_idx]),
+            self.country_idx,
+            self.rows_per_country,
+        )?;
+        let mut meta =
+            vgi::partition::partition_metadata(&self.schema, &batch)?.unwrap_or_default();
+        meta.extend(partition_scope_cc());
+        self.meta = Some(meta);
+        self.country_idx += 1;
+        Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+pub struct CachePartitionScopeFunction;
+impl TableFunction for CachePartitionScopeFunction {
+    fn name(&self) -> &str {
+        "cache_partition_scope"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        partition_scope_meta(
+            "Per-partition cacheable single-value-partitioned result (vgi.cache.partition_scope)",
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "rows_per_country",
+            0,
+            "int64",
+            "Rows per country partition",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        fixed_bind(country_sales_schema())
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(PartitionScopeProducer {
+            schema: params.output_schema.clone(),
+            rows_per_country: params.arguments.const_i64(0).unwrap_or(1),
+            country_idx: 0,
+            meta: None,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_partition_parallel(rows_per_country) -> {country: string, sales: int64}
+// ---------------------------------------------------------------------------
+
+/// Partitions for the parallel fixture. The trailing `None` is a genuine NULL
+/// partition (SINGLE_VALUE permits it), which exercises capture/serve of a NULL
+/// tuple — and the fact that `IS NULL` is correctly NOT enumerable, so it must
+/// fall through rather than partition-serve.
+const PSCOPE_COUNTRIES: [Option<&str>; 4] = [Some("AU"), Some("CA"), Some("US"), None];
+
+/// Work-queue fan-out: unlike the single-worker fixtures, a `threads=N` +
+/// `pool false` scan spreads these partitions over N workers, so the split at
+/// commit has to bucket batches drawn from MULTIPLE capture substreams.
+struct PartitionParallelProducer {
+    schema: SchemaRef,
+    storage: Arc<dyn vgi::storage::FunctionStorage>,
+    execution_id: Vec<u8>,
+    rows_per_country: i64,
+    meta: Option<HashMap<String, String>>,
+}
+impl TableProducer for PartitionParallelProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        // One queue item per partition; each pop yields that partition's whole batch.
+        let Some(item) = self.storage.queue_pop(&self.execution_id) else {
+            return Ok(None);
+        };
+        let idx = unpack_item(&item).0 as usize;
+        let country = *PSCOPE_COUNTRIES.get(idx).unwrap_or(&None);
+        let batch = country_sales_batch(&self.schema, country, idx, self.rows_per_country)?;
+        // Explicit pv keeps the NULL partition's scalar type pinned to the
+        // column's own type rather than inferring it from an all-NULL array.
+        let mut meta = explicit_country_pv("country", country)?;
+        meta.extend(partition_scope_cc());
+        self.meta = Some(meta);
+        Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+pub struct CachePartitionParallelFunction;
+impl TableFunction for CachePartitionParallelFunction {
+    fn name(&self) -> &str {
+        "cache_partition_parallel"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        partition_scope_meta(
+            "Per-partition cacheable; work-queue fan-out (parallel capture); one NULL partition",
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "rows_per_country",
+            0,
+            "int64",
+            "Rows per country partition",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        fixed_bind(country_sales_schema())
+    }
+    fn max_workers(&self, _params: &BindParams) -> i64 {
+        8
+    }
+    fn on_init(&self, params: &ProcessParams) -> Result<()> {
+        let store = params
+            .storage
+            .as_ref()
+            .ok_or_else(|| RpcError::runtime_error("cache_partition_parallel requires storage"))?;
+        // `start`/`end` are unused here — the partition index is the whole item.
+        let items: Vec<Vec<u8>> = (0..PSCOPE_COUNTRIES.len())
+            .map(|i| pack_item(i as i64, 0, 0))
+            .collect();
+        store.queue_push(&params.execution_id, &items);
+        Ok(())
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let storage = params
+            .storage
+            .clone()
+            .ok_or_else(|| RpcError::runtime_error("cache_partition_parallel requires storage"))?;
+        Ok(Box::new(PartitionParallelProducer {
+            schema: params.output_schema.clone(),
+            storage,
+            execution_id: params.execution_id.clone(),
+            rows_per_country: params.arguments.const_i64(0).unwrap_or(1),
+            meta: None,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_partition_multicol(rows_per_partition) -> {region, year, amount}
+// ---------------------------------------------------------------------------
+
+/// Two partition columns, so the client must enumerate the CROSS PRODUCT
+/// (`region IN (…) × year IN (…)`) and canonicalize a 2-column tuple. Years are
+/// deliberately NON-contiguous: DuckDB rewrites `year IN (2020, 2021)` into a
+/// BETWEEN range (which is not enumerable), so the gap keeps the pushed filter
+/// a real IN_FILTER and the cross-product path is actually exercised.
+const PSCOPE_REGIONS: [&str; 2] = ["EU", "US"];
+const PSCOPE_YEARS: [i64; 2] = [2020, 2022];
+
+/// `(region, year)` in region-major order, matching the Python fixture.
+fn pscope_ry(idx: usize) -> (&'static str, i64) {
+    (
+        PSCOPE_REGIONS[idx / PSCOPE_YEARS.len()],
+        PSCOPE_YEARS[idx % PSCOPE_YEARS.len()],
+    )
+}
+
+struct PartitionMultiColProducer {
+    schema: SchemaRef,
+    rows_per_partition: i64,
+    idx: usize,
+    meta: Option<HashMap<String, String>>,
+}
+impl TableProducer for PartitionMultiColProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        let total = PSCOPE_REGIONS.len() * PSCOPE_YEARS.len();
+        if self.idx >= total {
+            return Ok(None);
+        }
+        let (region, year) = pscope_ry(self.idx);
+        let rows = self.rows_per_partition.max(0);
+        let base = self.idx as i64 * 1000;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![region; rows as usize])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![year; rows as usize])) as ArrayRef,
+                Arc::new(Int64Array::from(range_vec(base, base + rows))) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let mut meta =
+            vgi::partition::partition_metadata(&self.schema, &batch)?.unwrap_or_default();
+        meta.extend(partition_scope_cc());
+        self.meta = Some(meta);
+        self.idx += 1;
+        Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+pub struct CachePartitionMultiColFunction;
+impl TableFunction for CachePartitionMultiColFunction {
+    fn name(&self) -> &str {
+        "cache_partition_multicol"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        partition_scope_meta(
+            "Per-partition cacheable over (region, year) SINGLE_VALUE partition columns",
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "rows_per_partition",
+            0,
+            "int64",
+            "Rows per (region, year) partition",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        fixed_bind(Arc::new(Schema::new(vec![
+            partition_field("region", DataType::Utf8),
+            partition_field("year", DataType::Int64),
+            Field::new("amount", DataType::Int64, true),
+        ])))
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(PartitionMultiColProducer {
+            schema: params.output_schema.clone(),
+            rows_per_partition: params.arguments.const_i64(0).unwrap_or(1),
+            idx: 0,
+            meta: None,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_partition_proj(rows_per_country) -> {country, sales, extra}
+// ---------------------------------------------------------------------------
+
+/// `projection_pushdown` makes the projection part of the cache key, so
+/// `SELECT country, sales` and `SELECT sales` key separately. `extra` exists
+/// purely as a column to project away while keeping `country` pushable.
+///
+/// The partition value is always supplied EXPLICITLY: when `country` is itself
+/// projected out, it is absent from the emitted batch and auto-extraction has
+/// nothing to read, yet the split must still bucket the rows correctly.
+const PSCOPE_PROJ_COUNTRIES: [&str; 2] = ["CA", "US"];
+
+struct PartitionProjProducer {
+    schema: SchemaRef,
+    rows_per_country: i64,
+    country_idx: usize,
+    meta: Option<HashMap<String, String>>,
+}
+impl TableProducer for PartitionProjProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.country_idx >= PSCOPE_PROJ_COUNTRIES.len() {
+            return Ok(None);
+        }
+        let country = PSCOPE_PROJ_COUNTRIES[self.country_idx];
+        let rows = self.rows_per_country.max(0);
+        let base = self.country_idx as i64 * 1_000_000;
+        // `output_schema` already reflects the pushed projection — emit exactly
+        // the columns it asks for, in its order.
+        let cols: Vec<ArrayRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| -> Result<ArrayRef> {
+                Ok(match f.name().as_str() {
+                    "country" => {
+                        Arc::new(StringArray::from(vec![country; rows as usize])) as ArrayRef
+                    }
+                    "sales" => Arc::new(Int64Array::from(range_vec(base, base + rows))) as ArrayRef,
+                    "extra" => Arc::new(Int64Array::from(range_vec(base + 500, base + 500 + rows)))
+                        as ArrayRef,
+                    other => {
+                        return Err(RpcError::runtime_error(format!(
+                            "cache_partition_proj: unknown column {other}"
+                        )))
+                    }
+                })
+            })
+            .collect::<Result<_>>()?;
+        let batch = RecordBatch::try_new(self.schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let mut meta = explicit_country_pv("country", Some(country))?;
+        meta.extend(partition_scope_cc());
+        self.meta = Some(meta);
+        self.country_idx += 1;
+        Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+pub struct CachePartitionProjFunction;
+impl TableFunction for CachePartitionProjFunction {
+    fn name(&self) -> &str {
+        "cache_partition_proj"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            projection_pushdown: true,
+            ..partition_scope_meta(
+                "Per-partition cacheable with projection pushdown + explicit partition_values",
+            )
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "rows_per_country",
+            0,
+            "int64",
+            "Rows per country partition",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        fixed_bind(Arc::new(Schema::new(vec![
+            partition_field("country", DataType::Utf8),
+            Field::new("sales", DataType::Int64, true),
+            Field::new("extra", DataType::Int64, true),
+        ])))
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(PartitionProjProducer {
+            schema: params.output_schema.clone(),
+            rows_per_country: params.arguments.const_i64(0).unwrap_or(1),
+            country_idx: 0,
             meta: None,
         }))
     }
