@@ -38,4 +38,13 @@ arrow-ord = { workspace = true }
 arrow-select = { workspace = true }
 arrow-row = { workspace = true }
 ctrlc = "3"
+sha2 = { version = "0.10" }
+
+# `sha2`'s `asm` feature is what routes bulk hashing onto the ARMv8 SHA-2
+# instructions (~3.8x on Apple Silicon) — but `sha2-asm` fails to build under
+# MSVC on Windows (its cc-rs step can't produce/link `sha512_x64.o`), so the
+# feature is enabled per-target rather than unconditionally. With resolver = "2"
+# a target-specific dependency's features are not unified into non-matching
+# targets, so Windows builds fall back to the portable pure-Rust backend.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

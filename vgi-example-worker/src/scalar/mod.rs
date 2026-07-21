@@ -13,6 +13,7 @@ use arrow_array::{
     StructArray,
 };
 use arrow_schema::DataType;
+use sha2::{Digest, Sha256};
 use util::*;
 use vgi::function::{
     ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
@@ -21,7 +22,6 @@ use vgi::function::{
 use vgi::numeric::{add_two, common_type_for_addition, double_first, promote_for_addition};
 use vgi::secrets::SecretLookup;
 use vgi_rpc::{Result, RpcError};
-use sha2::{Digest, Sha256};
 
 const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
 
