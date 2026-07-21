@@ -72,11 +72,6 @@ pub fn volatile_seed() -> u64 {
     n ^ t
 }
 
-/// Read a column as a `&dyn Array`.
-pub fn col<'a>(batch: &'a RecordBatch, i: usize) -> &'a dyn Array {
-    batch.column(i).as_ref()
-}
-
 /// Re-export.
 pub fn arc<T: Array + 'static>(a: T) -> ArrayRef {
     Arc::new(a)

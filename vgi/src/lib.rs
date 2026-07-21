@@ -19,7 +19,7 @@
 //! canonical Python implementation, so a Rust worker drops in behind the
 //! same `ATTACH … (TYPE vgi)`. It is built on the
 //! [`vgi-rpc`](https://docs.rs/vgi-rpc) crate (wire protocol, RPC server,
-//! transports), uses stock `arrow-rs` 59.x, and has an MSRV of 1.90.
+//! transports), uses stock `arrow-rs` 59.x, and has an MSRV of 1.97.
 //!
 //! # Your first worker
 //!

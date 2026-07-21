@@ -452,13 +452,11 @@ fn read_config(params: &ProcessParams) -> (i64, i64, String) {
     let mut label = "item".to_string();
     if let Some(arr) = params.settings.get("config") {
         if let Some(sa) = arr.as_any().downcast_ref::<arrow_array::StructArray>() {
-            if let Some(c) = sa
+            if let Some(Ok(c)) = sa
                 .column_by_name("start")
                 .map(|c| arrow_cast::cast(c, &DataType::Int64))
             {
-                if let Ok(c) = c {
-                    start = c.as_primitive::<Int64Type>().value(0);
-                }
+                start = c.as_primitive::<Int64Type>().value(0);
             }
             if let Some(Ok(c)) = sa
                 .column_by_name("step")

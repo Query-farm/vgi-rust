@@ -20,8 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain (MSRV 1.90)
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
 
@@ -62,8 +62,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain (MSRV 1.90)
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -79,8 +79,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain (MSRV 1.90)
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -112,8 +112,8 @@ jobs:
           sparse-checkout: |
             test/landing
 
-      - name: Install Rust toolchain (MSRV 1.90)
-        uses: dtolnay/rust-toolchain@1.90.0
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
 

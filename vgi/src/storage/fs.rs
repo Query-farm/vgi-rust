@@ -184,8 +184,7 @@ impl FunctionStorage for FsStorage {
         use std::io::Write;
         let dir = self.queue_dir(scope);
         let _ = std::fs::create_dir_all(&dir);
-        let mut id = self.max_id(&dir) + 1;
-        for item in items {
+        for (id, item) in (self.max_id(&dir) + 1..).zip(items) {
             let path = dir.join(format!("{id:020}.bin"));
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .write(true)
@@ -194,7 +193,6 @@ impl FunctionStorage for FsStorage {
             {
                 let _ = f.write_all(item);
             }
-            id += 1;
         }
     }
 

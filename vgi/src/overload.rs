@@ -147,10 +147,7 @@ fn score_candidate(
             continue;
         }
         if let Some(a) = args.arg(const_ord) {
-            match score_type(a.data_type(), spec) {
-                Some(s) => score += s,
-                None => return None,
-            }
+            score += score_type(a.data_type(), spec)?;
         }
         const_ord += 1;
     }
@@ -162,10 +159,7 @@ fn score_candidate(
         if vs.is_const && vs.position >= 0 {
             for pos in (vs.position as usize)..num_pos {
                 if let Some(a) = args.arg(pos) {
-                    match score_type(a.data_type(), vs) {
-                        Some(s) => score += s,
-                        None => return None,
-                    }
+                    score += score_type(a.data_type(), vs)?;
                 }
             }
         }

@@ -52,7 +52,7 @@ fn version_ids(version: i64) -> Vec<i64> {
 pub fn resolve_tt_version(at_unit: Option<&str>, at_value: Option<&str>) -> Result<i64> {
     let unit = match at_unit {
         None => return Ok(CURRENT_VERSION),
-        Some(u) if u.is_empty() => return Ok(CURRENT_VERSION),
+        Some("") => return Ok(CURRENT_VERSION),
         Some(u) => u.to_uppercase(),
     };
     match unit.as_str() {

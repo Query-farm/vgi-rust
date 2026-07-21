@@ -9,9 +9,9 @@ use arrow_schema::{DataType, Field, Schema};
 use vgi::arguments::Arguments;
 use vgi::catalog::{CatMacro, CatSchema, CatTable, CatView, CatalogModel, TimeTravelVersion};
 
-/// One time-travel version (schema + parameterized scan function `scan_fn(version)`
-/// + valid-from year). The single scan function returns the version-specific
-/// schema/rows based on its `version` const argument.
+/// One time-travel version: schema, parameterized scan function
+/// `scan_fn(version)`, and valid-from year. The single scan function returns the
+/// version-specific schema/rows based on its `version` const argument.
 fn ttv(version: i64, cols: Vec<Field>, scan_fn: &str, year: i32) -> TimeTravelVersion {
     TimeTravelVersion {
         version,

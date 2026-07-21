@@ -20,9 +20,12 @@ fn point_struct_type() -> DataType {
     ]))
 }
 
+/// Parallel (lat, lon) vectors for one point column; `None` marks a null point.
+type LatLonVecs = (Vec<Option<f64>>, Vec<Option<f64>>);
+
 /// Extract parallel (lat, lon) f64 vectors from a point column of any of the
 /// three supported shapes: struct{lat,lon}, list<f64>, fixed_size_list<f64,2>.
-fn lat_lon(arr: &dyn Array) -> Result<(Vec<Option<f64>>, Vec<Option<f64>>)> {
+fn lat_lon(arr: &dyn Array) -> Result<LatLonVecs> {
     let n = arr.len();
     match arr.data_type() {
         DataType::Struct(_) => {
@@ -171,7 +174,7 @@ impl ScalarFunction for GeoCentroid {
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let n_cols = batch.num_columns();
         let n_rows = batch.num_rows();
-        let mut cols: Vec<(Vec<Option<f64>>, Vec<Option<f64>>)> = Vec::with_capacity(n_cols);
+        let mut cols: Vec<LatLonVecs> = Vec::with_capacity(n_cols);
         for i in 0..n_cols {
             cols.push(lat_lon(batch.column(i).as_ref())?);
         }

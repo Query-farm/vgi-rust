@@ -24,7 +24,7 @@ This repo is the **Rust** worker SDK ([`vgi`](https://crates.io/crates/vgi)). It
 byte-for-byte wire-compatible with the canonical
 [Python](https://github.com/Query-farm/vgi-python) SDK, so a Rust worker
 drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
-[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 59.x, **MSRV 1.90**.
+[`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 59.x, **MSRV 1.97**.
 
 ## Why a worker instead of a C++ extension?
 

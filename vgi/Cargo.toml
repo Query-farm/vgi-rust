@@ -48,10 +48,11 @@ log = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"], optional = true }
 # SQLite storage backend (feature `sqlite`). `bundled` compiles a vendored
 # libsqlite3 so there is no system dependency; this is the one C-compiled dep.
-# HELD AT 0.39 ON PURPOSE: 0.40 requires libsqlite3-sys >=0.38.1, whose build
-# script uses `cfg_select!` — unstable until ~1.93, so it breaks the MSRV 1.90
-# gate. Bumping this is an MSRV decision, not a routine dep bump. The only
-# delta is the bundled SQLite (3.51.3 here vs 3.53.2).
+# Held at 0.39. This used to be an MSRV constraint — 0.40 needs
+# libsqlite3-sys >=0.38.1, whose build script uses `cfg_select!` (unstable until
+# ~1.93) — but the 1.97 MSRV no longer blocks it. The bump is now a routine dep
+# upgrade, deliberately left out of the MSRV change so the two move separately;
+# the only delta is the bundled SQLite (3.51.3 here vs 3.53.2).
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 # HTTP storage client (feature `http-storage`). `ureq` is a pure-sync blocking
 # client — safe to call from a worker served over stdio OR inside a tokio HTTP

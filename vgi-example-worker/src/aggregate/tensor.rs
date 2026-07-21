@@ -11,8 +11,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
 use arrow_array::{Array, ArrayRef, Int64Array, ListArray, RecordBatch, StructArray, UInt32Array};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -232,19 +230,21 @@ impl AggregateFunction for NestTensorFunction {
                     let mut shape = Vec::with_capacity(n_axes);
                     let mut idx_maps: Vec<HashMap<Vec<u8>, usize>> = Vec::with_capacity(n_axes);
                     let mut row_keys: Vec<Vec<Vec<u8>>> = Vec::with_capacity(n_axes);
-                    for a in 0..n_axes {
+                    for (a, coord_arrays) in axis_coord_arrays.iter_mut().enumerate() {
                         let field_arr = axes_col.column(a).clone();
                         let conv = arrow_row::RowConverter::new(vec![arrow_row::SortField::new(
                             field_arr.data_type().clone(),
                         )])
                         .map_err(cvt)?;
-                        let rows = conv.convert_columns(&[field_arr.clone()]).map_err(cvt)?;
+                        let rows = conv
+                            .convert_columns(std::slice::from_ref(&field_arr))
+                            .map_err(cvt)?;
                         let keys: Vec<Vec<u8>> =
                             (0..n_rows).map(|r| rows.row(r).as_ref().to_vec()).collect();
                         let mut first_row: HashMap<Vec<u8>, u32> = HashMap::new();
-                        for r in 0..n_rows {
+                        for (r, key) in keys.iter().enumerate() {
                             if field_arr.is_valid(r) {
-                                first_row.entry(keys[r].clone()).or_insert(r as u32);
+                                first_row.entry(key.clone()).or_insert(r as u32);
                             }
                         }
                         let mut distinct: Vec<Vec<u8>> = first_row.keys().cloned().collect();
@@ -259,7 +259,7 @@ impl AggregateFunction for NestTensorFunction {
                         let coord_arr =
                             arrow_select::take::take(&field_arr, &UInt32Array::from(rep), None)
                                 .map_err(cvt)?;
-                        axis_coord_arrays[a].push(coord_arr);
+                        coord_arrays.push(coord_arr);
                         idx_maps.push(idx_map);
                         row_keys.push(keys);
                     }

@@ -681,8 +681,7 @@ pub fn resolve_version_npm(
         let major: u32 = nums[0].parse().map_err(|_| unsupported())?;
         return sorted
             .iter()
-            .filter(|(t, _)| t.0 == major)
-            .next_back()
+            .rfind(|(t, _)| t.0 == major)
             .map(|(_, v)| v.to_string())
             .ok_or_else(unsupported);
     }
@@ -700,8 +699,7 @@ pub fn resolve_version_npm(
         if let Some(base) = parse_semver(spec.trim_start_matches(['^', '~'])) {
             return sorted
                 .iter()
-                .filter(|(t, _)| t.0 == base.0 && *t >= base && (prefix == '^' || t.1 == base.1))
-                .next_back()
+                .rfind(|(t, _)| t.0 == base.0 && *t >= base && (prefix == '^' || t.1 == base.1))
                 .map(|(_, v)| v.to_string())
                 .ok_or_else(unsupported);
         }

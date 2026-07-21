@@ -361,7 +361,7 @@ impl TableInOutFunction for RepeatInputsFunction {
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
         let n = params.arguments.const_i64(0).unwrap_or(1).max(1) as usize;
         let projected = project_batch(batch, &params.output_schema)?;
-        let repeated: Vec<&RecordBatch> = std::iter::repeat(&projected).take(n).collect();
+        let repeated: Vec<&RecordBatch> = std::iter::repeat_n(&projected, n).collect();
         let out = arrow_select::concat::concat_batches(&projected.schema(), repeated)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![out])
