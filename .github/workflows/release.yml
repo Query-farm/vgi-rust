@@ -33,7 +33,7 @@ on:
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -75,6 +75,29 @@ jobs:
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Create GitHub Release
+        # Publishing here is triggered by a *tag push*, unlike the SDK repos
+        # that publish in response to a published Release — so nothing ever
+        # created one, and this repo sat at 26 tags / 4 Releases with GitHub
+        # advertising a version far behind crates.io. Notes come from the
+        # annotated tag message, since this repo keeps no CHANGELOG.
+        # Idempotent: a re-run after a partial publish skips rather than fails.
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — skipping"
+            exit 0
+          fi
+          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > /tmp/notes.md
+          if ! grep -q '[^[:space:]]' /tmp/notes.md; then
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > /tmp/notes.md
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" --notes-file /tmp/notes.md --verify-tag
 
       - name: Summarise
         if: success()
