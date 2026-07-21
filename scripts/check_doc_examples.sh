@@ -45,6 +45,16 @@ if [ "${#names[@]}" -eq 0 ]; then
   echo "No \`\`\`rust example blocks found — nothing to check."; exit 0
 fi
 
+# Read the workspace's own vgi-rpc pin rather than hardcoding one here: a
+# version skew pulls two vgi-rpc copies into the example crate, so vgi_rpc's
+# error types stop matching vgi's trait bounds and every example fails to
+# compile. Derived, so a workspace bump can't silently break this lane.
+VGI_RPC_REQ="$(sed -n 's/^vgi-rpc = { version = "\([^"]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)"
+if [ -z "$VGI_RPC_REQ" ]; then
+  echo "could not read the vgi-rpc version from $REPO/Cargo.toml" >&2; exit 1
+fi
+echo "Using vgi-rpc $VGI_RPC_REQ (from the workspace Cargo.toml)"
+
 cat > "$WORK/Cargo.toml" <<EOF
 [package]
 name = "vgi-doc-examples"
@@ -54,9 +64,7 @@ publish = false
 
 [dependencies]
 vgi = { path = "$REPO/vgi" }
-# Must track vgi's vgi-rpc dep: a version skew pulls two vgi-rpc copies into
-# the example crate, so vgi_rpc error types stop matching vgi's trait bounds.
-vgi-rpc = "0.14"
+vgi-rpc = "$VGI_RPC_REQ"
 arrow-array = "59"
 arrow-schema = "59"
 
