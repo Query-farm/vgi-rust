@@ -38,3 +38,4 @@ arrow-ord = { workspace = true }
 arrow-select = { workspace = true }
 arrow-row = { workspace = true }
 ctrlc = "3"
+sha2 = { version = "0.10", features = ["asm"] }

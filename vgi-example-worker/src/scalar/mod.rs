@@ -21,12 +21,33 @@ use vgi::function::{
 use vgi::numeric::{add_two, common_type_for_addition, double_first, promote_for_addition};
 use vgi::secrets::SecretLookup;
 use vgi_rpc::{Result, RpcError};
+use sha2::{Digest, Sha256};
+
+const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
+
+#[inline]
+fn hex_of(bytes: &[u8]) -> String {
+    // Lookup-table hex — the previous `format!("{:02x}")` per byte cost ~1 µs/row
+    // (32 allocating format! calls), which swamped the hash itself. Matches the
+    // Go/Java fixtures' fast path.
+    let mut out = vec![0u8; bytes.len() * 2];
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX_LUT[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX_LUT[(b & 0x0f) as usize];
+    }
+    // Safety: HEX_LUT bytes are ASCII, so `out` is valid UTF-8.
+    unsafe { String::from_utf8_unchecked(out) }
+}
 
 /// Register all scalar fixtures.
 pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(DoubleFunction);
     w.register_scalar(AddValuesFunction);
     w.register_scalar(MultiplyFunction);
+    w.register_scalar(PassthruFunction);
+    w.register_scalar(CollatzStepsFunction);
+    w.register_scalar(Sha256HexFunction);
+    w.register_scalar(HashRoundsFunction);
     w.register_scalar(SumValuesFunction);
     w.register_scalar(ConcatValuesIntFunction);
     w.register_scalar(ConcatValuesStrFunction);
@@ -164,6 +185,131 @@ impl ScalarFunction for MultiplyFunction {
         let a = v.as_primitive::<arrow_array::types::Int64Type>();
         let out: Int64Array = (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i) * factor))
+            .collect();
+        result(params, arc(out))
+    }
+}
+
+/// `passthru(s)` — identity: return the input string unchanged. Zero compute,
+/// so a payload sweep over it measures pure round-trip wire cost per byte.
+pub struct PassthruFunction;
+impl ScalarFunction for PassthruFunction {
+    fn name(&self) -> &str {
+        "passthru"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret(
+            "Returns the input string unchanged (zero-compute wire probe)",
+            DataType::Utf8,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "varchar", "String value")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        result(params, batch.column(0).clone())
+    }
+}
+
+/// `collatz_steps(n)` — number of Collatz (3n+1) steps to reach 1. CPU-bound,
+/// data-dependent per-row loop (the compute-ladder anchor).
+pub struct CollatzStepsFunction;
+impl ScalarFunction for CollatzStepsFunction {
+    fn name(&self) -> &str {
+        "collatz_steps"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret("Number of Collatz (3n+1) steps to reach 1", DataType::Int64)
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "int64", "Positive integer")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let v = arrow_cast::cast(batch.column(0), &DataType::Int64)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let a = v.as_primitive::<arrow_array::types::Int64Type>();
+        let out: Int64Array = (0..a.len())
+            .map(|i| {
+                if a.is_null(i) {
+                    return None;
+                }
+                let mut n = a.value(i) as i128; // i128 guards the 3n+1 spikes
+                if n <= 0 {
+                    return Some(0);
+                }
+                let mut steps: i64 = 0;
+                while n != 1 {
+                    n = if n & 1 == 0 { n / 2 } else { 3 * n + 1 };
+                    steps += 1;
+                }
+                Some(steps)
+            })
+            .collect();
+        result(params, arc(out))
+    }
+}
+
+/// `sha256_hex(s)` — lowercase hex SHA-256 of the UTF-8 string. Fixed compute/byte.
+pub struct Sha256HexFunction;
+impl ScalarFunction for Sha256HexFunction {
+    fn name(&self) -> &str {
+        "sha256_hex"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret("Lowercase hex SHA-256 of the UTF-8 string", DataType::Utf8)
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "varchar", "String to hash")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let s = batch.column(0).as_string::<i32>();
+        let out: StringArray = (0..s.len())
+            .map(|i| {
+                (!s.is_null(i)).then(|| {
+                    let mut h = Sha256::new();
+                    h.update(s.value(i).as_bytes());
+                    hex_of(&h.finalize())
+                })
+            })
+            .collect();
+        result(params, arc(out))
+    }
+}
+
+/// `hash_rounds(s, rounds_const)` — apply SHA-256 `rounds` times (key-stretching).
+/// `rounds` is the const compute knob at fixed payload (the compute-sweep function).
+pub struct HashRoundsFunction;
+impl ScalarFunction for HashRoundsFunction {
+    fn name(&self) -> &str {
+        "hash_rounds"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret(
+            "Apply SHA-256 `rounds` times (key-stretching); rounds is a const compute knob",
+            DataType::Utf8,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::column("value", 0, "varchar", "String to stretch"),
+            ArgSpec::const_arg("rounds", 1, "int64", "Number of SHA-256 rounds"),
+        ]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let k = params.arguments.const_i64(1).unwrap_or(1).max(0) as usize;
+        let s = batch.column(0).as_string::<i32>();
+        let out: StringArray = (0..s.len())
+            .map(|i| {
+                (!s.is_null(i)).then(|| {
+                    let mut buf = s.value(i).as_bytes().to_vec();
+                    for _ in 0..k {
+                        let mut h = Sha256::new();
+                        h.update(&buf);
+                        buf = h.finalize().to_vec();
+                    }
+                    hex_of(&buf)
+                })
+            })
             .collect();
         result(params, arc(out))
     }
