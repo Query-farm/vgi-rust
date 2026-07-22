@@ -57,6 +57,8 @@ pub const CACHE_STALE_IF_ERROR_KEY: &str = "vgi.cache.stale_if_error";
 pub const CACHE_NOT_MODIFIED_KEY: &str = "vgi.cache.not_modified";
 /// Opt in to per-partition result caching (`SINGLE_VALUE_PARTITIONS` only).
 pub const CACHE_PARTITION_SCOPE_KEY: &str = "vgi.cache.partition_scope";
+/// Opt in to per-VALUE memoization for an exchange-mode MAP (default OFF).
+pub const CACHE_PER_VALUE_KEY: &str = "vgi.cache.per_value";
 
 // --- Request-side metadata keys (client -> worker) -------------------------
 
@@ -116,6 +118,18 @@ pub struct CacheControl {
     /// tuple) so a later `=`/`IN`-filtered scan reuses per-partition entries.
     /// Additive to the whole-scan cache.
     pub partition_scope: bool,
+    /// Opt in to per-VALUE memoization. Only meaningful for an exchange-mode
+    /// MAP (a scalar, or a blended table-in-out called via correlated
+    /// `LATERAL`); the client ALSO memoizes each distinct input tuple's output
+    /// so the same value serves without the worker on a later chunk or query.
+    ///
+    /// **Default off, and leave it off unless one call is genuinely
+    /// expensive.** A per-value serve costs a cache probe, a decode and an
+    /// assembly step per distinct value, which only pays back when that is
+    /// cheaper than calling you. For an arithmetic map it measures ~50x slower
+    /// than simply answering. Turn it on for model inference, geocoding, or a
+    /// rate-limited remote fetch.
+    pub per_value: bool,
 }
 
 impl Default for CacheControl {
@@ -132,6 +146,7 @@ impl Default for CacheControl {
             stale_if_error: None,
             not_modified: false,
             partition_scope: false,
+            per_value: false,
         }
     }
 }
@@ -211,6 +226,14 @@ impl CacheControl {
         self
     }
 
+    /// Opt in to per-VALUE memoization (see [`CacheControl::per_value`]). Only
+    /// worth setting when one call to this function is more expensive than a
+    /// cache probe plus a decode.
+    pub fn with_per_value(mut self) -> Self {
+        self.per_value = true;
+        self
+    }
+
     /// Render to the `vgi.cache.*` batch-metadata map.
     ///
     /// Booleans render as `"1"` and are omitted when false; unset optional
@@ -248,6 +271,9 @@ impl CacheControl {
         }
         if self.partition_scope {
             md.insert(CACHE_PARTITION_SCOPE_KEY.to_string(), "1".to_string());
+        }
+        if self.per_value {
+            md.insert(CACHE_PER_VALUE_KEY.to_string(), "1".to_string());
         }
         md
     }
