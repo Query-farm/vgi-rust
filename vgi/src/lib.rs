@@ -142,6 +142,7 @@ pub mod storage;
 pub mod table_function;
 pub mod table_in_out;
 pub mod transport;
+pub mod wasm_worker;
 pub mod wire;
 pub mod worker;
 
