@@ -76,7 +76,7 @@ mkdir -p "$STAGE/test/sql/integration"
        -not -name 'nested_type_combinations.test' \
        -not -name 'expression_filter.test' \
        -not -name 'bool_in_union.test' \
-       "${HTTP_SKIP[@]}" "${WIN_SKIP[@]}" | while read -r f; do
+       ${HTTP_SKIP[@]+"${HTTP_SKIP[@]}"} ${WIN_SKIP[@]+"${WIN_SKIP[@]}"} | while read -r f; do
     mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")"
     awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" > "$STAGE/test/sql/integration/$f"
   done )
