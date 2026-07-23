@@ -1,19 +1,21 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Same-name-in-two-schemas fixtures for the exchange and aggregate surfaces.
+//! Same-name-in-two-schemas fixtures for the exchange, aggregate and
+//! result-cache surfaces.
 //!
 //! Companion to [`crate::scalar::same_name`] (which collides a *scalar* name
 //! across `main` and `data`) and [`crate::twin_catalogs`] (which collides a
-//! name across two catalogs). This module covers the three remaining shapes,
+//! name across two catalogs). This module covers the four remaining shapes,
 //! each declared under one name in BOTH the `main` and `data` schemas of the
 //! `example` catalog:
 //!
 //! - `test_same_name_transform` — table-in-out (streaming exchange),
 //! - `test_same_name_buffered` — table-buffering (Sink + Source),
-//! - `test_same_name_agg` — aggregate.
+//! - `test_same_name_agg` — aggregate,
+//! - `test_same_name_cached` — cacheable table producer (result cache).
 //!
-//! Each of the three binds and *runs* through different machinery, which is why
-//! all three are needed:
+//! Each shape binds and *runs* through different machinery, which is why all
+//! are needed:
 //!
 //! - The exchange pair binds through `VgiTableInOutBind`, which builds its
 //!   bind-time connection directly rather than through
@@ -30,12 +32,22 @@
 //!   the reason protocol 1.2.0 puts `schema_name` on all of them. The tag is
 //!   stamped at finalize while accumulation happens in update, so a *partial*
 //!   mis-route (bind one implementation, update/finalize another) is visible.
+//! - The cacheable producer probes a *different layer* — the C++ result cache,
+//!   not dispatch. Its one row advertises `vgi.cache.ttl`, so the complete
+//!   result is memoized. The cache key was catalog + auth + function name with
+//!   no schema dimension, so the two implementations produced byte-identical
+//!   keys and one schema's memoized row cross-served the other. The tag makes
+//!   that visible: `example.data.test_same_name_cached()` would return a `main`
+//!   row. With the schema in the key each schema gets its own entry, so
+//!   `vgi_result_cache()` holds two rows for the one function name and each
+//!   returns its own tag.
 //!
 //! Every implementation tags its output with its own schema, so a mis-routed
 //! call reads as the wrong tag rather than a plausible answer. Ports
-//! vgi-python's `_test_fixtures/table_in_out_same_name.py` and
-//! `_test_fixtures/aggregate/same_name.py`; driven by
-//! `test/sql/integration/{table_in_out,aggregate}/same_name_schemas.test`.
+//! vgi-python's `_test_fixtures/table_in_out_same_name.py`,
+//! `_test_fixtures/aggregate/same_name.py` and
+//! `_test_fixtures/table/same_name_cached.py`; driven by
+//! `test/sql/integration/{table_in_out,aggregate,cache}/same_name_schemas.test`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,10 +58,13 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::aggregate::{AggregateBindParams, AggregateFunction};
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
-use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata};
+use vgi::cache_control::CacheControl;
+use vgi::function::{
+    ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
+};
 use vgi::ipc;
 use vgi::protocol::enums;
-use vgi::table_function::TableProducer;
+use vgi::table_function::{TableFunction, TableProducer};
 use vgi::table_in_out::{TableInOutFunction, TableInOutOutput};
 use vgi_rpc::{Result, RpcError};
 
@@ -61,6 +76,10 @@ const SCHEMAS: [&str; 2] = ["main", "data"];
 const TRANSFORM_NAME: &str = "test_same_name_transform";
 const BUFFERED_NAME: &str = "test_same_name_buffered";
 const AGG_NAME: &str = "test_same_name_agg";
+const CACHED_NAME: &str = "test_same_name_cached";
+
+/// Long enough that the cache TTL never lapses mid-test.
+const CACHE_TTL_SECONDS: i64 = 300;
 
 /// Storage namespace for the buffered pair's sink log.
 const NS: &[u8] = b"same_name_buf";
@@ -337,12 +356,93 @@ impl AggregateFunction for SameNameAgg {
     }
 }
 
-/// Declare all three pairs, each implementation into its own schema of
+// ---------------------------------------------------------------------------
+// Cacheable table-producer pair (result cache)
+// ---------------------------------------------------------------------------
+
+/// `test_same_name_cached()` — a one-row producer that advertises
+/// `vgi.cache.ttl` and tags its single row with the schema the implementation
+/// is declared in, so the result cache stores one entry per schema and a
+/// cross-serve reads as the wrong tag. See the module doc.
+pub struct SameNameCached {
+    schema: &'static str,
+}
+
+impl TableFunction for SameNameCached {
+    fn name(&self) -> &str {
+        CACHED_NAME
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: format!(
+                "Schema-disambiguation probe; the {}-schema cacheable producer",
+                self.schema
+            ),
+            categories: vec!["generator".into(), "cache".into(), "testing".into()],
+            examples: vec![FunctionExample {
+                sql: format!(
+                    "SELECT * FROM example.{}.test_same_name_cached()",
+                    self.schema
+                ),
+                description: format!("One cacheable row tagged '{}'", self.schema),
+                expected_output: Some(self.schema.to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        Vec::new()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: tag_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(CachedTagRow {
+            schema: params.output_schema.clone(),
+            tag: self.schema,
+            done: false,
+            meta: None,
+        }))
+    }
+}
+
+/// Emits the single schema-tagged row once, advertising a cache TTL on it.
+struct CachedTagRow {
+    schema: SchemaRef,
+    tag: &'static str,
+    done: bool,
+    meta: Option<HashMap<String, String>>,
+}
+
+impl TableProducer for CachedTagRow {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        self.meta = Some(CacheControl::ttl(CACHE_TTL_SECONDS).to_metadata());
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(StringArray::from(vec![self.tag])) as ArrayRef],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+
+/// Declare all four pairs, each implementation into its own schema of
 /// `example`. Only the primary catalog carries them.
 pub fn register(w: &mut vgi::Worker) {
     for schema in SCHEMAS {
         w.register_table_in_out_in(CATALOG, schema, SameNameTransform { schema });
         w.register_buffering_in(CATALOG, schema, SameNameBuffered { schema });
         w.register_aggregate_in(CATALOG, schema, SameNameAgg { schema });
+        w.register_table_in(CATALOG, schema, SameNameCached { schema });
     }
 }
