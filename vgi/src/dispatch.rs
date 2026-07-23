@@ -32,6 +32,71 @@ use crate::wire;
 const PROJ_REPRO_APP: &str = "projection_repro";
 const PROJ_REPRO_PREFIX: &str = "proj_repro";
 
+/// Which registry a function instance lives in. Part of the key of
+/// [`Dispatcher::scopes`], because the by-name registries are per kind and a
+/// name may exist in more than one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FnKind {
+    Scalar,
+    Table,
+    TableInOut,
+    Buffering,
+    Aggregate,
+}
+
+/// Where a function instance is *declared*: the VGI catalog that owns it and
+/// the schema within that catalog.
+///
+/// A function name is not a unique key — a worker may declare the same name in
+/// two schemas of one catalog, or (serving several catalogs from one process)
+/// in the same schema name of two different catalogs. The scope is what breaks
+/// the tie, and the bind request carries the caller's half of it: the schema on
+/// `BindRequest::schema_name` and the catalog inside `attach_opaque_data`.
+///
+/// Registering without a scope ([`Worker::register_scalar`](crate::Worker::register_scalar)
+/// and friends) leaves the function *unscoped*: advertised in every served
+/// catalog's `main` schema and reachable from any call, which is the historical
+/// behaviour and what nearly every worker wants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionScope {
+    /// The catalog name (as advertised by `catalog_catalogs`).
+    pub catalog: String,
+    /// The schema within that catalog.
+    pub schema: String,
+}
+
+impl FunctionScope {
+    /// Declare a function into `schema` of `catalog`.
+    pub fn new(catalog: impl Into<String>, schema: impl Into<String>) -> Self {
+        FunctionScope {
+            catalog: catalog.into(),
+            schema: schema.into(),
+        }
+    }
+
+    fn matches(&self, catalog: &str, schema: &str) -> bool {
+        self.catalog.eq_ignore_ascii_case(catalog) && self.schema.eq_ignore_ascii_case(schema)
+    }
+}
+
+/// The `(catalog, schema)` a call arrived through, as decoded from the bind
+/// request. `schema` is `None` when the caller named none (a COPY handler bind,
+/// or a scan whose function resolved outside the worker's schemas).
+#[derive(Clone, Copy)]
+pub(crate) struct CallScope<'a> {
+    catalog: &'a str,
+    schema: Option<&'a str>,
+}
+
+impl<'a> CallScope<'a> {
+    pub(crate) fn new(catalog: &'a str, schema: Option<&'a str>) -> Self {
+        CallScope {
+            catalog,
+            schema: schema.filter(|s| !s.is_empty()),
+        }
+    }
+}
+
 /// Shared dispatch state. Cloned (as `Arc`) into every RPC handler closure.
 pub struct Dispatcher {
     /// Catalog name → also the attach opaque-data plaintext.
@@ -65,6 +130,16 @@ pub struct Dispatcher {
     /// the only intended entry point — advertising the function too would create
     /// a redundant SQL callable. See [`Dispatcher::hide_function`].
     pub(crate) hidden_functions: std::collections::HashSet<String>,
+    /// Declaration scope per registered *instance*, parallel to the by-name
+    /// registry vectors: `scopes[&(kind, name)][i]` scopes the i-th overload
+    /// registered under `name`. `None` = unscoped (see [`FunctionScope`]).
+    ///
+    /// This is the schema-keyed index dispatch resolves through: a
+    /// schema-qualified bind matches an entry exactly, so one name declared in
+    /// two schemas reaches the implementation the caller named instead of
+    /// colliding as an overload. Overloads *within* one scope still resolve by
+    /// argument signature, unchanged.
+    pub(crate) scopes: HashMap<(FnKind, String), Vec<Option<FunctionScope>>>,
     /// Secret types registered by the worker (surfaced in `catalog_attach`).
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
@@ -98,6 +173,7 @@ impl Dispatcher {
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
             hidden_functions: std::collections::HashSet::new(),
+            scopes: HashMap::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -153,11 +229,29 @@ impl Dispatcher {
         self.copy_to_formats.push(f);
     }
 
-    pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
-        self.aggregates
-            .entry(f.name().to_string())
+    /// Record the declaration scope of the instance just pushed onto the
+    /// by-name registry vector for `(kind, name)`. Kept parallel to that vector,
+    /// so every `register_*` must call this exactly once per push.
+    fn note_scope(&mut self, kind: FnKind, name: &str, scope: Option<FunctionScope>) {
+        self.scopes
+            .entry((kind, name.to_string()))
             .or_default()
-            .push(f);
+            .push(scope);
+    }
+
+    pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
+        self.register_aggregate_scoped(f, None);
+    }
+
+    /// Register an aggregate declared in a specific catalog schema.
+    pub fn register_aggregate_scoped(
+        &mut self,
+        f: Arc<dyn AggregateFunction>,
+        scope: Option<FunctionScope>,
+    ) {
+        let name = f.name().to_string();
+        self.aggregates.entry(name.clone()).or_default().push(f);
+        self.note_scope(FnKind::Aggregate, &name, scope);
     }
 
     fn resolve_aggregate(&self, name: &str) -> Result<Arc<dyn AggregateFunction>> {
@@ -169,14 +263,34 @@ impl Dispatcher {
     }
 
     pub fn register_scalar(&mut self, f: Arc<dyn ScalarFunction>) {
-        self.scalars
-            .entry(f.name().to_string())
-            .or_default()
-            .push(f);
+        self.register_scalar_scoped(f, None);
+    }
+
+    /// Register a scalar declared in a specific catalog schema.
+    pub fn register_scalar_scoped(
+        &mut self,
+        f: Arc<dyn ScalarFunction>,
+        scope: Option<FunctionScope>,
+    ) {
+        let name = f.name().to_string();
+        self.scalars.entry(name.clone()).or_default().push(f);
+        self.note_scope(FnKind::Scalar, &name, scope);
     }
 
     pub fn register_table(&mut self, f: Arc<dyn TableFunction>) {
-        self.tables.entry(f.name().to_string()).or_default().push(f);
+        self.register_table_scoped(f, None);
+    }
+
+    /// Register a table (producer) function declared in a specific catalog
+    /// schema.
+    pub fn register_table_scoped(
+        &mut self,
+        f: Arc<dyn TableFunction>,
+        scope: Option<FunctionScope>,
+    ) {
+        let name = f.name().to_string();
+        self.tables.entry(name.clone()).or_default().push(f);
+        self.note_scope(FnKind::Table, &name, scope);
     }
 
     /// Hide `name` from `catalog_schema_contents_functions` without
@@ -192,7 +306,7 @@ impl Dispatcher {
     /// `scan_function_impl` without clobbering an explicit `register_table`.
     pub fn register_table_if_absent(&mut self, f: Arc<dyn TableFunction>) {
         if !self.tables.contains_key(f.name()) {
-            self.tables.entry(f.name().to_string()).or_default().push(f);
+            self.register_table_scoped(f, None);
         }
     }
 
@@ -230,10 +344,18 @@ impl Dispatcher {
                  positional column arg (its per-row input column); found none."
             );
         }
-        self.tableinouts
-            .entry(f.name().to_string())
-            .or_default()
-            .push(f);
+        self.register_table_in_out_scoped(f, None);
+    }
+
+    /// Register a table-in-out function declared in a specific catalog schema.
+    pub fn register_table_in_out_scoped(
+        &mut self,
+        f: Arc<dyn TableInOutFunction>,
+        scope: Option<FunctionScope>,
+    ) {
+        let name = f.name().to_string();
+        self.tableinouts.entry(name.clone()).or_default().push(f);
+        self.note_scope(FnKind::TableInOut, &name, scope);
     }
 
     fn resolve_table_in_out(
@@ -241,37 +363,55 @@ impl Dispatcher {
         name: &str,
         args: &crate::arguments::Arguments,
         input_schema: Option<&SchemaRef>,
+        call: CallScope<'_>,
     ) -> Result<Arc<dyn TableInOutFunction>> {
         let cands = self
             .tableinouts
             .get(name)
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+        let idxs = self.scoped_indices(FnKind::TableInOut, name, cands.len(), call)?;
         // Blended (input_from_args) overloads resolve by input-column count /
         // type against their declared positional args (which are the input
         // columns, absent from the wire args) — see `resolve_overload_blended`.
-        let idx = crate::overload::resolve_overload_blended(
-            cands.len(),
-            |i| cands[i].argument_specs(),
-            |i| cands[i].metadata().input_from_args,
+        let pick = crate::overload::resolve_overload_blended(
+            idxs.len(),
+            |i| cands[idxs[i]].argument_specs(),
+            |i| cands[idxs[i]].metadata().input_from_args,
             args,
             input_schema,
         )
         .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
-        Ok(cands[idx].clone())
+        Ok(cands[idxs[pick]].clone())
     }
 
     pub fn register_buffering(&mut self, f: Arc<dyn TableBufferingFunction>) {
-        self.buffering
-            .entry(f.name().to_string())
-            .or_default()
-            .push(f);
+        self.register_buffering_scoped(f, None);
     }
 
-    fn resolve_buffering(&self, name: &str) -> Result<Arc<dyn TableBufferingFunction>> {
-        self.buffering
+    /// Register a table-buffering function declared in a specific catalog
+    /// schema.
+    pub fn register_buffering_scoped(
+        &mut self,
+        f: Arc<dyn TableBufferingFunction>,
+        scope: Option<FunctionScope>,
+    ) {
+        let name = f.name().to_string();
+        self.buffering.entry(name.clone()).or_default().push(f);
+        self.note_scope(FnKind::Buffering, &name, scope);
+    }
+
+    fn resolve_buffering(
+        &self,
+        name: &str,
+        call: CallScope<'_>,
+    ) -> Result<Arc<dyn TableBufferingFunction>> {
+        let cands = self
+            .buffering
             .get(name)
-            .and_then(|v| v.first())
-            .cloned()
+            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+        let idxs = self.scoped_indices(FnKind::Buffering, name, cands.len(), call)?;
+        idxs.first()
+            .map(|&i| cands[i].clone())
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
     }
 
@@ -280,19 +420,21 @@ impl Dispatcher {
         name: &str,
         args: &crate::arguments::Arguments,
         input_schema: Option<&SchemaRef>,
+        call: CallScope<'_>,
     ) -> Result<Arc<dyn TableFunction>> {
         let cands = self
             .tables
             .get(name)
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
-        let idx = crate::overload::resolve_overload(
-            cands.len(),
-            |i| cands[i].argument_specs(),
+        let idxs = self.scoped_indices(FnKind::Table, name, cands.len(), call)?;
+        let pick = crate::overload::resolve_overload(
+            idxs.len(),
+            |i| cands[idxs[i]].argument_specs(),
             args,
             input_schema,
         )
         .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
-        Ok(cands[idx].clone())
+        Ok(cands[idxs[pick]].clone())
     }
 
     /// Mint a globally-unique execution id (process id + time + counter), so
@@ -317,25 +459,143 @@ impl Dispatcher {
         v
     }
 
+    /// Narrow the overloads registered under `name` to those the call's
+    /// `(catalog, schema)` may reach, *before* argument-signature scoring runs.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. **Exact** — the caller named a schema and some instance is declared in
+    ///    that `(catalog, schema)`. Only those are candidates, so one name in
+    ///    two schemas dispatches to the implementation the caller named.
+    /// 2. **Unscoped** — instances registered without a scope are reachable from
+    ///    anywhere. This is the historical shape: a worker that never declares
+    ///    schemas behaves exactly as before, and it also covers the calls that
+    ///    legitimately carry no schema (COPY handler binds, scans whose function
+    ///    resolved outside the worker's schemas).
+    /// 3. **Same catalog** — every remaining instance is scoped and none matched
+    ///    the schema; keep the ones the caller's catalog owns.
+    ///
+    /// If what is left spans more than one schema, the call is genuinely
+    /// ambiguous and the error names the schemas involved rather than reporting
+    /// an overload clash the caller cannot act on.
+    fn scoped_indices(
+        &self,
+        kind: FnKind,
+        name: &str,
+        len: usize,
+        call: CallScope<'_>,
+    ) -> Result<Vec<usize>> {
+        let Some(scopes) = self.scopes.get(&(kind, name.to_string())) else {
+            return Ok((0..len).collect());
+        };
+        let declared = |i: usize| scopes.get(i).and_then(|s| s.as_ref());
+        if let Some(schema) = call.schema {
+            let exact: Vec<usize> = (0..len)
+                .filter(|&i| declared(i).is_some_and(|s| s.matches(call.catalog, schema)))
+                .collect();
+            if !exact.is_empty() {
+                return Ok(exact);
+            }
+        }
+        let unscoped: Vec<usize> = (0..len).filter(|&i| declared(i).is_none()).collect();
+        if !unscoped.is_empty() {
+            return Ok(unscoped);
+        }
+        let same_catalog: Vec<usize> = (0..len)
+            .filter(|&i| declared(i).is_some_and(|s| s.catalog.eq_ignore_ascii_case(call.catalog)))
+            .collect();
+        let rest = if same_catalog.is_empty() {
+            (0..len).collect::<Vec<usize>>()
+        } else {
+            same_catalog
+        };
+        let mut owners: Vec<String> = rest
+            .iter()
+            .filter_map(|&i| declared(i).map(|s| format!("{}.{}", s.catalog, s.schema)))
+            .collect();
+        owners.sort();
+        owners.dedup();
+        if owners.len() > 1 {
+            return Err(RpcError::value_error(format!(
+                "Ambiguous function call '{name}': declared in more than one schema ({}) — \
+                 qualify the call with a schema to disambiguate",
+                owners.join(", ")
+            )));
+        }
+        Ok(rest)
+    }
+
+    /// Whether the `i`-th overload registered under `(kind, name)` is declared
+    /// in `(catalog, schema)`. An unscoped instance lives in the `main` schema
+    /// of whichever catalog is attached — the historical placement. Shared by
+    /// the `catalog_schema_contents_functions` RPC and the HTTP landing
+    /// contract, so the two never disagree about where a function lives.
+    pub(crate) fn declared_in(
+        &self,
+        kind: FnKind,
+        name: &str,
+        i: usize,
+        catalog: &str,
+        schema: &str,
+    ) -> bool {
+        match self
+            .scopes
+            .get(&(kind, name.to_string()))
+            .and_then(|v| v.get(i))
+            .and_then(|s| s.as_ref())
+        {
+            Some(scope) => scope.matches(catalog, schema),
+            None => schema == catalog::MAIN_SCHEMA,
+        }
+    }
+
     /// Resolve a scalar function by name with overload scoring.
     fn resolve_scalar(
         &self,
         name: &str,
         args: &crate::arguments::Arguments,
         input_schema: Option<&SchemaRef>,
+        call: CallScope<'_>,
     ) -> Result<Arc<dyn ScalarFunction>> {
         let cands = self
             .scalars
             .get(name)
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
-        let idx = crate::overload::resolve_overload(
-            cands.len(),
-            |i| cands[i].argument_specs(),
+        let idxs = self.scoped_indices(FnKind::Scalar, name, cands.len(), call)?;
+        let pick = crate::overload::resolve_overload(
+            idxs.len(),
+            |i| cands[idxs[i]].argument_specs(),
             args,
             input_schema,
         )
         .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
-        Ok(cands[idx].clone())
+        Ok(cands[idxs[pick]].clone())
+    }
+
+    /// The catalog a bind/init arrived through: the secondary catalog named by
+    /// `attach_opaque_data` when it carries the secondary marker, else this
+    /// worker's primary catalog. `attach_opaque_data` is the only thing that
+    /// distinguishes two catalogs served by one process, so it is the catalog
+    /// half of a [`CallScope`].
+    fn call_catalog(&self, attach: Option<&[u8]>) -> &str {
+        if let Some((name, _)) = attach.and_then(decode_secondary_opaque) {
+            if let Some(c) = self.secondary.iter().find(|c| c.name == name) {
+                return c.name.as_str();
+            }
+        }
+        if self.catalog.name.is_empty() {
+            &self.catalog_name
+        } else {
+            &self.catalog.name
+        }
+    }
+
+    /// The `(catalog, schema)` scope a `BindRequest` names.
+    fn bind_scope<'a>(&'a self, dto: &'a BindRequest) -> CallScope<'a> {
+        CallScope::new(
+            self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
+            dto.schema_name.as_deref(),
+        )
     }
 
     /// Build `BindParams` from a wire `BindRequest` + call context.
@@ -361,7 +621,7 @@ impl Dispatcher {
     // -- bind ---------------------------------------------------------------
 
     pub fn handle_bind(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
-        let inner = request_inner_batch(req)?;
+        let inner = backfill_bind_request(request_inner_batch(req)?)?;
         let dto: BindRequest = wire::from_batch(&inner)?;
         let mut params = self.bind_params(&dto, ctx)?;
         // The COPY ... FROM / ... TO contexts (when present) ride as out-of-band
@@ -370,10 +630,13 @@ impl Dispatcher {
         params.copy_from = read_copy_from(&inner)?;
         params.copy_to = read_copy_to(&inner)?;
         let ft = normalize_function_type(&dto.function_type.0).unwrap_or_default();
+        // (catalog, schema) the caller named — the key dispatch resolves through
+        // when a function name is declared in more than one schema.
+        let call = self.bind_scope(&dto);
 
         // Table buffering.
         if self.buffering.contains_key(&dto.function_name) {
-            let f = self.resolve_buffering(&dto.function_name)?;
+            let f = self.resolve_buffering(&dto.function_name, call)?;
             params.arguments.remap_positional(&f.argument_specs());
             crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
             // Two-phase secret bind: first pass requests the secret types; the
@@ -417,6 +680,7 @@ impl Dispatcher {
                 &dto.function_name,
                 &params.arguments,
                 params.input_schema.as_ref(),
+                call,
             )?;
             params.arguments.remap_positional(&f.argument_specs());
             crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
@@ -467,6 +731,7 @@ impl Dispatcher {
                 &dto.function_name,
                 &params.arguments,
                 params.input_schema.as_ref(),
+                call,
             )?;
             params.arguments.remap_positional(&f.argument_specs());
             crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
@@ -509,6 +774,7 @@ impl Dispatcher {
             &dto.function_name,
             &params.arguments,
             params.input_schema.as_ref(),
+            call,
         )?;
         params.arguments.remap_positional(&f.argument_specs());
 
@@ -552,7 +818,7 @@ impl Dispatcher {
     pub fn handle_init(&self, req: &Request, ctx: &CallContext) -> Result<StreamResult> {
         let dto: InitRequest = boxed(req)?;
         // bind_call is an IPC-serialized BindRequest.
-        let bind_call_batch = ipc::read_batch(&dto.bind_call.0)?;
+        let bind_call_batch = backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?;
         let bind_call: BindRequest = wire::from_batch(&bind_call_batch)?;
         // COPY ... FROM context (out-of-band struct column, absent for ordinary
         // scans) — threaded onto every ProcessParams built below.
@@ -576,6 +842,8 @@ impl Dispatcher {
             .map(|b| b.into())
             .unwrap_or_else(|| self.next_execution_id());
         let ft = normalize_function_type(&bind_call.function_type.0).unwrap_or_default();
+        // The embedded bind_call carries the same (catalog, schema) the bind did.
+        let call = self.bind_scope(&bind_call);
 
         let build_params =
             |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
@@ -618,7 +886,7 @@ impl Dispatcher {
 
         // Table buffering: sink (header-only) or finalize source (producer).
         if self.buffering.contains_key(&bind_call.function_name) {
-            let f = self.resolve_buffering(&bind_call.function_name)?;
+            let f = self.resolve_buffering(&bind_call.function_name, call)?;
             bp.arguments.remap_positional(&f.argument_specs());
             let phase = dto.phase.as_ref().map(|d| d.0.clone()).unwrap_or_default();
             let header = wire::to_batch(GlobalInitResponse {
@@ -731,6 +999,7 @@ impl Dispatcher {
                 &bind_call.function_name,
                 &bp.arguments,
                 input_schema.as_ref(),
+                call,
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let auto_apply = f.metadata().auto_apply_filters;
@@ -803,6 +1072,7 @@ impl Dispatcher {
                 &bind_call.function_name,
                 &bp.arguments,
                 input_schema.as_ref(),
+                call,
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let max_workers = f.max_workers(&bp);
@@ -866,6 +1136,7 @@ impl Dispatcher {
             &bind_call.function_name,
             &bp.arguments,
             input_schema.as_ref(),
+            call,
         )?;
         bp.arguments.remap_positional(&f.argument_specs());
         let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
@@ -937,6 +1208,15 @@ impl Dispatcher {
             inner_resume: Vec::new(),
             at_unit: bind_call.at_unit.clone().unwrap_or_default(),
             at_value: bind_call.at_value.clone().unwrap_or_default(),
+            catalog_name: self
+                .call_catalog(
+                    bind_call
+                        .attach_opaque_data
+                        .as_ref()
+                        .map(|b| b.0.as_slice()),
+                )
+                .to_string(),
+            schema_name: bind_call.schema_name.clone().unwrap_or_default(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -1005,8 +1285,11 @@ impl Dispatcher {
             if_none_match: None,
             if_modified_since: None,
         };
+        // Rehydrated ticks carry no attach_opaque_data; the scope folded into the
+        // blob is what keeps them on the function the original bind resolved.
+        let call = CallScope::new(&blob.catalog_name, Some(blob.schema_name.as_str()));
         if blob.kind == "table" {
-            let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref())?;
+            let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let params = make_params(args);
             let filters = if blob.auto_apply {
@@ -1037,7 +1320,8 @@ impl Dispatcher {
             )));
         }
         if blob.kind == "table_in_out" {
-            let f = self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref())?;
+            let f =
+                self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let params = make_params(args);
             let filters = if blob.auto_apply {
@@ -1060,7 +1344,7 @@ impl Dispatcher {
                 },
             )))
         } else {
-            let f = self.resolve_scalar(&blob.function_name, &args, input_schema.as_ref())?;
+            let f = self.resolve_scalar(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let params = make_params(args);
             Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
@@ -1365,15 +1649,39 @@ impl Dispatcher {
         // `kind_empty` and skips the bulk discovery RPC for empty kinds.
         let sch = cat.schema(name);
         let len = |n: usize| n as i64;
-        let (sf, af, tf) = if name == catalog::MAIN_SCHEMA {
-            (
-                len(self.scalars.len()),
-                len(self.aggregates.len()),
-                len(self.tables.len() + self.tableinouts.len() + self.buffering.len()),
-            )
-        } else {
-            (0, 0, 0)
+        // Counted per schema, not per catalog: a function explicitly declared in
+        // a non-`main` schema must make that schema's count non-zero, or the
+        // extension trusts the empty kind and never issues the discovery RPC
+        // (`VgiCatalogSet::ShouldBypassRpcLocked`) — the function would be
+        // invisible. Unscoped functions still count toward `main`.
+        let count = |kind: FnKind, names: Vec<(&String, usize)>| -> i64 {
+            names
+                .into_iter()
+                .map(|(fname, n)| {
+                    (0..n)
+                        .filter(|&i| self.declared_in(kind, fname, i, &cat.name, name))
+                        .count() as i64
+                })
+                .sum()
         };
+        let sf = count(
+            FnKind::Scalar,
+            self.scalars.iter().map(|(k, v)| (k, v.len())).collect(),
+        );
+        let af = count(
+            FnKind::Aggregate,
+            self.aggregates.iter().map(|(k, v)| (k, v.len())).collect(),
+        );
+        let tf = count(
+            FnKind::Table,
+            self.tables.iter().map(|(k, v)| (k, v.len())).collect(),
+        ) + count(
+            FnKind::TableInOut,
+            self.tableinouts.iter().map(|(k, v)| (k, v.len())).collect(),
+        ) + count(
+            FnKind::Buffering,
+            self.buffering.iter().map(|(k, v)| (k, v.len())).collect(),
+        );
         si.estimated_object_count = Some(vec![
             ("view".into(), len(sch.map(|s| s.views.len()).unwrap_or(0))),
             (
@@ -1518,7 +1826,8 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
-        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bind_call: BindRequest =
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
         let bp = self.bind_params(&bind_call, ctx)?;
         let card = self
             .tables
@@ -1539,7 +1848,8 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         use crate::protocol::dtos::{DynamicToStringRequest, DynamicToStringResponse};
         let dto: DynamicToStringRequest = boxed(req)?;
-        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bind_call: BindRequest =
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
         let pairs = self
             .tables
             .get(&bind_call.function_name)
@@ -1560,7 +1870,8 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
-        let bind_call: BindRequest = wire::from_batch(&ipc::read_batch(&dto.bind_call.0)?)?;
+        let bind_call: BindRequest =
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
         let bp = self.bind_params(&bind_call, ctx)?;
         let stats = self
             .tables
@@ -1707,15 +2018,25 @@ impl Dispatcher {
                 None => !all_sec_fns.contains(name),
             }
         };
+        // Per-instance schema placement: an explicitly scoped function is
+        // advertised only in its own catalog + schema, so one name declared in
+        // two schemas produces two distinct `duckdb_functions()` entries.
+        // Unscoped functions keep the historical placement — the `main` schema
+        // of whatever catalog is attached.
+        let in_schema = |kind: FnKind, name: &str, i: usize| {
+            self.declared_in(kind, name, i, &active.name, &schema_name)
+        };
         let mut infos = Vec::new();
-        if schema_name == catalog::MAIN_SCHEMA {
+        {
             let want = normalize_function_type(&type_filter);
             if want.as_deref() == Some("scalar") || want.is_none() {
                 let mut names: Vec<&String> = self.scalars.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
-                    for f in &self.scalars[name] {
-                        infos.push(catalog::scalar_function_info(f.as_ref())?);
+                    for (i, f) in self.scalars[name].iter().enumerate() {
+                        if in_schema(FnKind::Scalar, name, i) {
+                            infos.push(catalog::scalar_function_info(f.as_ref())?);
+                        }
                     }
                 }
             }
@@ -1725,23 +2046,29 @@ impl Dispatcher {
                 let mut names: Vec<&String> = self.tables.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
-                    for f in &self.tables[name] {
-                        infos.push(catalog::table_function_info(f.as_ref())?);
+                    for (i, f) in self.tables[name].iter().enumerate() {
+                        if in_schema(FnKind::Table, name, i) {
+                            infos.push(catalog::table_function_info(f.as_ref())?);
+                        }
                     }
                 }
                 let mut tio: Vec<&String> =
                     self.tableinouts.keys().filter(|n| visible(n)).collect();
                 tio.sort();
                 for name in tio {
-                    for f in &self.tableinouts[name] {
-                        infos.push(catalog::table_in_out_function_info(f.as_ref())?);
+                    for (i, f) in self.tableinouts[name].iter().enumerate() {
+                        if in_schema(FnKind::TableInOut, name, i) {
+                            infos.push(catalog::table_in_out_function_info(f.as_ref())?);
+                        }
                     }
                 }
                 let mut buf: Vec<&String> = self.buffering.keys().filter(|n| visible(n)).collect();
                 buf.sort();
                 for name in buf {
-                    for f in &self.buffering[name] {
-                        infos.push(catalog::buffering_function_info(f.as_ref())?);
+                    for (i, f) in self.buffering[name].iter().enumerate() {
+                        if in_schema(FnKind::Buffering, name, i) {
+                            infos.push(catalog::buffering_function_info(f.as_ref())?);
+                        }
                     }
                 }
             }
@@ -1749,8 +2076,10 @@ impl Dispatcher {
                 let mut agg: Vec<&String> = self.aggregates.keys().filter(|n| visible(n)).collect();
                 agg.sort();
                 for name in agg {
-                    for f in &self.aggregates[name] {
-                        infos.push(catalog::aggregate_function_info(f.as_ref())?);
+                    for (i, f) in self.aggregates[name].iter().enumerate() {
+                        if in_schema(FnKind::Aggregate, name, i) {
+                            infos.push(catalog::aggregate_function_info(f.as_ref())?);
+                        }
                     }
                 }
             }
@@ -1916,7 +2245,14 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
-        let f = self.resolve_buffering(&dto.function_name)?;
+        // The unary process/combine RPCs reference an already-bound execution
+        // and carry no schema, so they resolve by name within the attached
+        // catalog (mirroring vgi-python's `_resolve_function_by_name`).
+        let call = CallScope::new(
+            self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
+            None,
+        );
+        let f = self.resolve_buffering(&dto.function_name, call)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let output_schema =
             self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), Some(batch.schema()))?;
@@ -1963,7 +2299,11 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
-        let f = self.resolve_buffering(&dto.function_name)?;
+        let call = CallScope::new(
+            self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
+            None,
+        );
+        let f = self.resolve_buffering(&dto.function_name, call)?;
         let output_schema = self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), None)?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
@@ -2444,6 +2784,12 @@ pub struct ExchangeBlob {
     /// still sees the version it was scanning (empty = no AT clause).
     pub at_unit: String,
     pub at_value: String,
+    /// The `(catalog, schema)` the original bind named. An HTTP continuation
+    /// arrives with no `attach_opaque_data`, so without these a rehydrated tick
+    /// would resolve the bare name and could land on a same-named function in
+    /// another schema or another catalog served by the same process.
+    pub catalog_name: String,
+    pub schema_name: String,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.

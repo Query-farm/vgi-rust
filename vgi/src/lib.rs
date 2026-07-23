@@ -149,6 +149,7 @@ pub mod worker;
 #[cfg(test)]
 mod http_continuation_tests;
 
+pub use dispatch::FunctionScope;
 pub use function::{
     ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
     ScalarFunction,

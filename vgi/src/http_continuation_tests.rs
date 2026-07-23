@@ -183,6 +183,7 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        schema_name: None,
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
@@ -451,6 +452,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         resolved_secrets_provided,
         at_unit: None,
         at_value: None,
+        schema_name: None,
     };
     let inner = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let req_schema = Arc::new(Schema::new(vec![Field::new(

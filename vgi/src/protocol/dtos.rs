@@ -121,6 +121,14 @@ pub struct BindRequest {
     /// init. Additive nullable columns — the C++ always emits them.
     pub at_unit: Option<String>,
     pub at_value: Option<String>,
+    /// Catalog schema that owns the function being bound. The extension sets it
+    /// from the schema entry the function was registered into, so a name
+    /// declared in two schemas of one catalog resolves to the right
+    /// implementation. `None` (an empty string on the wire) when the caller has
+    /// no schema to name — COPY handler binds are advertised at catalog level,
+    /// and a scan whose function resolved to a built-in carries none either.
+    /// Additive nullable column; the C++ always emits it as of protocol 1.1.0.
+    pub schema_name: Option<String>,
     // NOTE: the `copy_from` / `copy_to` struct columns are intentionally NOT
     // derived fields here. The C++ extension only appends them to the
     // BindRequest schema for a COPY ... FROM / COPY ... TO scan (omitting them
@@ -128,6 +136,37 @@ pub struct BindRequest {
     // default-None semantics). The `VgiArrow` derive would reject the missing
     // column, so they are read out-of-band via [`read_copy_from`] /
     // [`read_copy_to`] from the request batch. See `dispatch.rs`.
+}
+
+/// Backfill the [`BindRequest`] columns a *newer* protocol revision added, so a
+/// request from an older client still decodes.
+///
+/// The derived decoder resolves fields by name and errors on a missing column,
+/// but the canonical Python `BindRequest` is a dataclass with defaults: a field
+/// the client omits simply takes its default. `schema_name` (protocol 1.1.0) is
+/// such a field — an extension built before it never emits the column. Append a
+/// null one so the by-name decode yields `None`, which resolution already treats
+/// as "the caller named no schema".
+pub fn backfill_bind_request(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
+    if batch.column_by_name("schema_name").is_some() {
+        return Ok(batch);
+    }
+    let rows = batch.num_rows();
+    let mut fields: Vec<arrow_schema::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    fields.push(arrow_schema::Field::new(
+        "schema_name",
+        arrow_schema::DataType::Utf8,
+        true,
+    ));
+    columns.push(Arc::new(arrow_array::StringArray::new_null(rows)));
+    arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map_err(|e| RpcError::type_error(format!("backfill BindRequest.schema_name: {e}")))
 }
 
 /// Read the optional `copy_from` nested-struct column from a (flat) BindRequest

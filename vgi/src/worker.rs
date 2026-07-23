@@ -12,7 +12,12 @@ use crate::function::ScalarFunction;
 use crate::protocol::register;
 
 /// VGI wire protocol version advertised to the C++ extension.
-pub const VGI_PROTOCOL_VERSION: &str = "1.0.0";
+///
+/// Enforced as an exact major+minor match at the dispatch boundary (carried in
+/// `vgi_rpc.protocol_version` custom metadata), so this must track
+/// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 adds `schema_name` to
+/// `BindRequest`.
+pub const VGI_PROTOCOL_VERSION: &str = "1.1.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 
@@ -79,13 +84,51 @@ impl Worker {
     }
 
     /// Register a scalar function.
+    ///
+    /// The function is *unscoped*: advertised in the `main` schema of every
+    /// catalog this worker serves, and reachable from any call. Use
+    /// [`register_scalar_in`](Self::register_scalar_in) to place it in a
+    /// specific catalog schema.
     pub fn register_scalar(&mut self, f: impl ScalarFunction + 'static) {
         self.disp.register_scalar(Arc::new(f));
+    }
+
+    /// Register a scalar function declared in `schema` of `catalog`.
+    ///
+    /// A function name is not a unique key: the same name may be declared in
+    /// two schemas of one catalog, or in two catalogs served by one worker
+    /// process. Declaring the owning schema makes the registration exact — the
+    /// function is advertised only in that schema, and a bind that names it
+    /// resolves there. See [`FunctionScope`](crate::FunctionScope).
+    pub fn register_scalar_in(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        f: impl ScalarFunction + 'static,
+    ) {
+        self.disp.register_scalar_scoped(
+            Arc::new(f),
+            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+        );
     }
 
     /// Register a table (producer) function.
     pub fn register_table(&mut self, f: impl crate::table_function::TableFunction + 'static) {
         self.disp.register_table(Arc::new(f));
+    }
+
+    /// Register a table (producer) function declared in `schema` of `catalog`.
+    /// See [`register_scalar_in`](Self::register_scalar_in).
+    pub fn register_table_in(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        f: impl crate::table_function::TableFunction + 'static,
+    ) {
+        self.disp.register_table_scoped(
+            Arc::new(f),
+            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+        );
     }
 
     /// Hide an already-registered function from the catalog's advertised
@@ -105,6 +148,20 @@ impl Worker {
         self.disp.register_table_in_out(Arc::new(f));
     }
 
+    /// Register a table-in-out function declared in `schema` of `catalog`.
+    /// See [`register_scalar_in`](Self::register_scalar_in).
+    pub fn register_table_in_out_in(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        f: impl crate::table_in_out::TableInOutFunction + 'static,
+    ) {
+        self.disp.register_table_in_out_scoped(
+            Arc::new(f),
+            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+        );
+    }
+
     /// Register a table-buffering function.
     pub fn register_buffering(
         &mut self,
@@ -113,9 +170,37 @@ impl Worker {
         self.disp.register_buffering(Arc::new(f));
     }
 
+    /// Register a table-buffering function declared in `schema` of `catalog`.
+    /// See [`register_scalar_in`](Self::register_scalar_in).
+    pub fn register_buffering_in(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        f: impl crate::buffering::TableBufferingFunction + 'static,
+    ) {
+        self.disp.register_buffering_scoped(
+            Arc::new(f),
+            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+        );
+    }
+
     /// Register an aggregate function.
     pub fn register_aggregate(&mut self, f: impl crate::aggregate::AggregateFunction + 'static) {
         self.disp.register_aggregate(Arc::new(f));
+    }
+
+    /// Register an aggregate function declared in `schema` of `catalog`.
+    /// See [`register_scalar_in`](Self::register_scalar_in).
+    pub fn register_aggregate_in(
+        &mut self,
+        catalog: &str,
+        schema: &str,
+        f: impl crate::aggregate::AggregateFunction + 'static,
+    ) {
+        self.disp.register_aggregate_scoped(
+            Arc::new(f),
+            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+        );
     }
 
     /// Register a custom `COPY ... FROM` format reader.

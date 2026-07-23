@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::catalog::{self, CatSchema, CatalogModel};
-use crate::dispatch::Dispatcher;
+use crate::dispatch::{Dispatcher, FnKind};
 use crate::protocol::dtos::{FunctionInfo, MacroInfo};
 
 /// This contract's version (independent of the VGI wire protocol version).
@@ -99,7 +99,7 @@ fn build_describe(
     let mut catalogs = Vec::new();
     // Primary catalog: functions are the worker-global registries minus any
     // names a secondary catalog owns (and minus the proj_repro-scoped set).
-    catalogs.push(build_catalog(&disp.catalog, &primary_function_infos(disp)));
+    catalogs.push(build_catalog(&disp.catalog, disp, None));
     // Secondary (MetaWorker-style) catalogs: each lists only its own functions.
     for (i, sec) in disp.secondary.iter().enumerate() {
         let owned = disp
@@ -107,7 +107,7 @@ fn build_describe(
             .get(i)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        catalogs.push(build_catalog(sec, &secondary_function_infos(disp, owned)));
+        catalogs.push(build_catalog(sec, disp, Some(owned)));
     }
 
     json!({
@@ -125,7 +125,12 @@ fn build_describe(
     })
 }
 
-fn build_catalog(model: &CatalogModel, functions: &[FunctionInfo]) -> Value {
+/// `owned` is `None` for the primary catalog (every registered name a secondary
+/// does not own) and `Some(names)` for a secondary (only the names it owns).
+/// Functions are placed per schema — see [`Dispatcher::declared_in`] — so the
+/// landing contract agrees with `catalog_schema_contents_functions` about which
+/// schema a function lives in.
+fn build_catalog(model: &CatalogModel, disp: &Dispatcher, owned: Option<&[String]>) -> Value {
     let version = model.default_data_version.as_deref();
     let schemas_slice = model.schemas_for(version);
 
@@ -144,11 +149,11 @@ fn build_catalog(model: &CatalogModel, functions: &[FunctionInfo]) -> Value {
         let sch = schemas_slice.iter().find(|s| &s.name == name);
         let tables = sch.map(schema_tables).unwrap_or_default();
         let views = sch.map(schema_views).unwrap_or_default();
-        let mut fns: Vec<Value> = if name == catalog::MAIN_SCHEMA {
-            functions.iter().map(function_json).collect()
-        } else {
-            Vec::new()
+        let infos = match owned {
+            None => primary_function_infos(disp, &model.name, name),
+            Some(names) => secondary_function_infos(disp, names, &model.name, name),
         };
+        let mut fns: Vec<Value> = infos.iter().map(function_json).collect();
         // Fold the schema's declarative macros into the same `functions` array:
         // a scalar macro is invoked exactly like a scalar function in SQL and a
         // table macro like a table function, so they share the landing page's
@@ -302,10 +307,10 @@ fn catalog_tags(model: &CatalogModel) -> Value {
 // Functions
 // ---------------------------------------------------------------------------
 
-/// Function infos for the primary catalog's `main` schema: every registered
-/// function whose name no secondary catalog owns (and which is not a
-/// proj_repro-scoped fixture), sorted by (type, name).
-fn primary_function_infos(disp: &Dispatcher) -> Vec<FunctionInfo> {
+/// Function infos the primary catalog places in `schema`: every registered
+/// function declared there whose name no secondary catalog owns (and which is
+/// not a proj_repro-scoped fixture), sorted by (type, name).
+fn primary_function_infos(disp: &Dispatcher, catalog: &str, schema: &str) -> Vec<FunctionInfo> {
     let all_sec: HashSet<&str> = disp
         .secondary_functions
         .iter()
@@ -316,19 +321,24 @@ fn primary_function_infos(disp: &Dispatcher) -> Vec<FunctionInfo> {
     let mut infos = Vec::new();
     for name in registry_names(disp) {
         if visible(&name) {
-            infos.extend(infos_for_name(disp, &name));
+            infos.extend(infos_for_name(disp, &name, catalog, schema));
         }
     }
     sort_infos(&mut infos);
     infos
 }
 
-/// Function infos for a secondary catalog's `main` schema: only the names it
+/// Function infos a secondary catalog places in `schema`: only the names it
 /// owns, sorted by (type, name).
-fn secondary_function_infos(disp: &Dispatcher, owned: &[String]) -> Vec<FunctionInfo> {
+fn secondary_function_infos(
+    disp: &Dispatcher,
+    owned: &[String],
+    catalog: &str,
+    schema: &str,
+) -> Vec<FunctionInfo> {
     let mut infos = Vec::new();
     for name in owned {
-        infos.extend(infos_for_name(disp, name));
+        infos.extend(infos_for_name(disp, name, catalog, schema));
     }
     sort_infos(&mut infos);
     infos
@@ -347,41 +357,53 @@ fn registry_names(disp: &Dispatcher) -> Vec<String> {
     v
 }
 
-/// All `FunctionInfo`s (overloads) registered under `name`, across registries.
-fn infos_for_name(disp: &Dispatcher, name: &str) -> Vec<FunctionInfo> {
+/// The `FunctionInfo`s (overloads) registered under `name` that are declared in
+/// `(catalog, schema)`, across registries.
+fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) -> Vec<FunctionInfo> {
     let mut out = Vec::new();
+    let here = |kind: FnKind, i: usize| disp.declared_in(kind, name, i, catalog, schema);
     if let Some(fs) = disp.scalars.get(name) {
-        for f in fs {
-            if let Ok(fi) = catalog::scalar_function_info(f.as_ref()) {
-                out.push(fi);
+        for (i, f) in fs.iter().enumerate() {
+            if here(FnKind::Scalar, i) {
+                if let Ok(fi) = catalog::scalar_function_info(f.as_ref()) {
+                    out.push(fi);
+                }
             }
         }
     }
     if let Some(fs) = disp.tables.get(name) {
-        for f in fs {
-            if let Ok(fi) = catalog::table_function_info(f.as_ref()) {
-                out.push(fi);
+        for (i, f) in fs.iter().enumerate() {
+            if here(FnKind::Table, i) {
+                if let Ok(fi) = catalog::table_function_info(f.as_ref()) {
+                    out.push(fi);
+                }
             }
         }
     }
     if let Some(fs) = disp.tableinouts.get(name) {
-        for f in fs {
-            if let Ok(fi) = catalog::table_in_out_function_info(f.as_ref()) {
-                out.push(fi);
+        for (i, f) in fs.iter().enumerate() {
+            if here(FnKind::TableInOut, i) {
+                if let Ok(fi) = catalog::table_in_out_function_info(f.as_ref()) {
+                    out.push(fi);
+                }
             }
         }
     }
     if let Some(fs) = disp.buffering.get(name) {
-        for f in fs {
-            if let Ok(fi) = catalog::buffering_function_info(f.as_ref()) {
-                out.push(fi);
+        for (i, f) in fs.iter().enumerate() {
+            if here(FnKind::Buffering, i) {
+                if let Ok(fi) = catalog::buffering_function_info(f.as_ref()) {
+                    out.push(fi);
+                }
             }
         }
     }
     if let Some(fs) = disp.aggregates.get(name) {
-        for f in fs {
-            if let Ok(fi) = catalog::aggregate_function_info(f.as_ref()) {
-                out.push(fi);
+        for (i, f) in fs.iter().enumerate() {
+            if here(FnKind::Aggregate, i) {
+                if let Ok(fi) = catalog::aggregate_function_info(f.as_ref()) {
+                    out.push(fi);
+                }
             }
         }
     }
