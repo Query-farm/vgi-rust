@@ -17,6 +17,7 @@ mod copy_to;
 #[cfg(feature = "coverage")]
 mod coverage;
 mod narrow_bind;
+mod same_name;
 mod scalar;
 mod table;
 mod table_in_out;
@@ -68,8 +69,11 @@ fn main() {
         narrow_bind::register(&mut worker);
         worker.register_secondary_catalog(narrow_bind::catalog(), narrow_bind::function_names());
         // One name in two schemas of `example` (main + data) — only the schema
-        // the caller names can tell the two implementations apart.
+        // the caller names can tell the two implementations apart. The scalar
+        // pair binds; the exchange / buffered / aggregate pairs also *run*
+        // through RPCs that re-resolve by name (protocol 1.2.0).
         scalar::same_name::register(&mut worker);
+        same_name::register(&mut worker);
         // ... and the same name in the `main` schema of two *catalogs*, where
         // only the attachment tells them apart.
         twin_catalogs::register(&mut worker);

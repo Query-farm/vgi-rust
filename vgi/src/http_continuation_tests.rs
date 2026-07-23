@@ -183,7 +183,10 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
-        schema_name: None,
+        // The extension names the owning schema on every bind (protocol 1.1.0);
+        // these functions are registered without an explicit home, so they live
+        // in the worker's own catalog under `main`.
+        schema_name: Some(crate::catalog::MAIN_SCHEMA.to_string()),
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
@@ -452,7 +455,10 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         resolved_secrets_provided,
         at_unit: None,
         at_value: None,
-        schema_name: None,
+        // The extension names the owning schema on every bind (protocol 1.1.0);
+        // these functions are registered without an explicit home, so they live
+        // in the worker's own catalog under `main`.
+        schema_name: Some(crate::catalog::MAIN_SCHEMA.to_string()),
     };
     let inner = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let req_schema = Arc::new(Schema::new(vec![Field::new(

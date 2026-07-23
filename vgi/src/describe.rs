@@ -366,11 +366,17 @@ fn registry_names(disp: &Dispatcher) -> Vec<String> {
 fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) -> Vec<FunctionInfo> {
     let mut out = Vec::new();
     let here = |kind: FnKind, i: usize| disp.declared_in(kind, name, i, catalog, schema);
+    // Report the schema the function is being listed in, not the placeholder
+    // `default_function_info` leaves behind.
+    let in_schema = |mut fi: FunctionInfo, s: &str| {
+        fi.schema_name = s.to_string();
+        fi
+    };
     if let Some(fs) = disp.scalars.get(name) {
         for (i, f) in fs.iter().enumerate() {
             if here(FnKind::Scalar, i) {
                 if let Ok(fi) = catalog::scalar_function_info(f.as_ref()) {
-                    out.push(fi);
+                    out.push(in_schema(fi, schema));
                 }
             }
         }
@@ -379,7 +385,7 @@ fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) ->
         for (i, f) in fs.iter().enumerate() {
             if here(FnKind::Table, i) {
                 if let Ok(fi) = catalog::table_function_info(f.as_ref()) {
-                    out.push(fi);
+                    out.push(in_schema(fi, schema));
                 }
             }
         }
@@ -388,7 +394,7 @@ fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) ->
         for (i, f) in fs.iter().enumerate() {
             if here(FnKind::TableInOut, i) {
                 if let Ok(fi) = catalog::table_in_out_function_info(f.as_ref()) {
-                    out.push(fi);
+                    out.push(in_schema(fi, schema));
                 }
             }
         }
@@ -397,7 +403,7 @@ fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) ->
         for (i, f) in fs.iter().enumerate() {
             if here(FnKind::Buffering, i) {
                 if let Ok(fi) = catalog::buffering_function_info(f.as_ref()) {
-                    out.push(fi);
+                    out.push(in_schema(fi, schema));
                 }
             }
         }
@@ -406,7 +412,7 @@ fn infos_for_name(disp: &Dispatcher, name: &str, catalog: &str, schema: &str) ->
         for (i, f) in fs.iter().enumerate() {
             if here(FnKind::Aggregate, i) {
                 if let Ok(fi) = catalog::aggregate_function_info(f.as_ref()) {
-                    out.push(fi);
+                    out.push(in_schema(fi, schema));
                 }
             }
         }

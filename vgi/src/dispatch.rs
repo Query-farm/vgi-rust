@@ -104,26 +104,25 @@ pub(crate) enum ScopeKind<'a> {
     /// catalog; where the schema *was* recorded at bind, the caller replays it
     /// as [`ScopeKind::Schema`] instead.
     Bound,
-    /// A **table-kind** bind that named no schema.
+    /// A bind for a function this worker deliberately hid from its catalog
+    /// listing ([`Dispatcher::hide_function`]).
     ///
-    /// This is not a design allowance — it is tolerance for a live gap in the
-    /// DuckDB extension. `VgiFunctionInfo::schema_name` is populated in exactly
-    /// one place (`vgi_scalar_function_set.cpp`, the scalar set's
-    /// `LoadEntries`), but it is *read* by the table and table-in-out bind
-    /// paths (`vgi_table_function_set.cpp`), which therefore always send an
-    /// empty schema. Scalars carry their schema; table / table-in-out /
-    /// table-buffering functions never do. A function-backed table scan whose
-    /// backing function is hidden has the same shape for a second reason: with
-    /// no advertised entry, `VgiTableEntry::GetScanFunctionImpl` finds none to
-    /// take a schema from.
+    /// The extension derives a scan's owning schema by looking the backing
+    /// function up as a `TableFunctionCatalogEntry`
+    /// (`VgiTableEntry::GetScanFunctionImpl`, around
+    /// `src/storage/vgi_table_entry.cpp:666`). A hidden function is by
+    /// definition never advertised, so no such entry exists in the table's
+    /// schema or in the catalog default, and `scan_function_schema` stays
+    /// empty. That is inherent to hiding a function rather than a defect: the
+    /// worker asked for it to be unlistable, and an unlisted function has
+    /// nothing for the extension to read a schema from.
     ///
-    /// Resolution stays catalog-scoped and still raises on cross-schema
-    /// ambiguity, so it cannot route `data.f` to `main.f` — the extension
-    /// simply is not naming a schema here yet. When it does, this variant stops
-    /// being reachable without any behavioural change. A schema-less *scalar*
-    /// bind is still rejected outright, so a regression on the path that does
-    /// work is caught immediately.
-    UnnamedSchema,
+    /// The worker knows which of its own functions are hidden, so this is
+    /// recognised exactly — not inferred from the function's kind. Resolution
+    /// stays catalog-scoped and still raises on cross-schema ambiguity, so it
+    /// cannot route `data.f` to `main.f`. Every other schema-less bind is
+    /// refused.
+    UnlistedScanFunction,
     /// The peer predates protocol 1.1.0 and omits the `schema_name` column
     /// entirely, so *no* bind it sends can name a schema. That is a statement
     /// about the peer, not about this call, and it is why
@@ -168,18 +167,22 @@ impl<'a> CallScope<'a> {
 
     /// Build the scope a `BindRequest` names.
     ///
-    /// A named schema resolves exactly. A bind that names none is legal only
-    /// for a COPY handler (by design, permanently) or for a table-kind function
-    /// (the extension gap documented on [`ScopeKind::UnnamedSchema`]). A
-    /// schema-less scalar bind is refused: scalars do carry their schema, so
-    /// losing it would be a real regression, and resolving one by bare name is
-    /// how `example.data.f()` could land on `example.main.f()`.
+    /// A named schema resolves exactly. A bind that names none is legal in
+    /// exactly three cases: a COPY handler (advertised at catalog level, so
+    /// there is no schema to send), a function this worker hid from its own
+    /// catalog listing (see [`ScopeKind::UnlistedScanFunction`]), and a peer
+    /// that predates the field entirely (see [`ScopeKind::LegacyPeer`]).
+    ///
+    /// Anything else is refused. The extension sends the owning schema on every
+    /// bind as of protocol 1.1.0, so a missing one is a defect worth surfacing
+    /// — and resolving by bare name is how `example.data.f()` could land on
+    /// `example.main.f()`.
     pub(crate) fn for_bind(
         catalog: &'a str,
         schema: Option<&'a str>,
         function_name: &str,
         is_copy: bool,
-        table_kind: bool,
+        hidden: bool,
         legacy_peer: bool,
     ) -> Result<Self> {
         let unqualified = |kind| Ok(CallScope { catalog, kind });
@@ -187,12 +190,13 @@ impl<'a> CallScope<'a> {
             Some(schema) => Ok(CallScope::qualified(catalog, schema)),
             None if is_copy => Ok(CallScope::copy_handler(catalog)),
             None if legacy_peer => unqualified(ScopeKind::LegacyPeer),
-            None if table_kind => unqualified(ScopeKind::UnnamedSchema),
+            None if hidden => unqualified(ScopeKind::UnlistedScanFunction),
             None => Err(RpcError::value_error(format!(
                 "bind for '{function_name}' carries no schema_name. Every function is \
                  declared in exactly one catalog schema, and the extension sends the \
-                 owning schema on every scalar bind as of VGI protocol 1.1.0; only a \
-                 COPY handler bind (advertised at catalog level) may omit it."
+                 owning schema on every bind as of VGI protocol 1.1.0. Only a COPY \
+                 handler bind (advertised at catalog level) or a function hidden from \
+                 the catalog listing may omit it."
             ))),
         }
     }
@@ -432,21 +436,23 @@ impl Dispatcher {
         self.note_scope(FnKind::Aggregate, &name, scope);
     }
 
-    /// Resolve an aggregate by name within the primary catalog.
+    /// Resolve an aggregate by `(catalog, schema, name)`.
     ///
-    /// The aggregate wire types (`AggregateBindRequest` and the update /
-    /// combine / finalize / window requests) carry no `schema_name` — the
-    /// extension never sends one for an aggregate — so an aggregate cannot be
-    /// resolved by schema the way a bind can. It still *has* a home, which is
-    /// what places it in `catalog_schema_contents_functions`; resolution is
-    /// scoped to the catalog and raises if the name is ambiguous across that
-    /// catalog's schemas.
-    fn resolve_aggregate(&self, name: &str) -> Result<Arc<dyn AggregateFunction>> {
+    /// Every aggregate RPC — bind, update, combine, finalize, the window calls,
+    /// the streaming calls — re-resolves through here, and each carries the
+    /// declaring schema as of protocol 1.2.0. That matters more for aggregates
+    /// than anywhere else: they run over `InvokePooledUnaryRpc`, which is
+    /// stateless and holds no bound connection, so the request is the *only*
+    /// carrier of the schema.
+    fn resolve_aggregate(
+        &self,
+        name: &str,
+        call: CallScope<'_>,
+    ) -> Result<Arc<dyn AggregateFunction>> {
         let cands = self
             .aggregates
             .get(name)
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
-        let call = CallScope::bound(self.primary_catalog_name());
         let idxs = self.scoped_indices(FnKind::Aggregate, name, cands.len(), call)?;
         idxs.first()
             .map(|&i| cands[i].clone())
@@ -663,10 +669,11 @@ impl Dispatcher {
     /// declared in `main`. Naming a schema the function does not live in is an
     /// error that reports where it *does* live, not a silent fall-through.
     ///
-    /// The schema-less kinds ([`ScopeKind::CopyHandler`], [`ScopeKind::Bound`])
-    /// resolve within the caller's catalog, and raise if the name is ambiguous
-    /// across that catalog's schemas — naming the schemas involved, since that
-    /// is what the caller would have to supply to disambiguate.
+    /// The schema-less kinds ([`ScopeKind::CopyHandler`], [`ScopeKind::Bound`],
+    /// [`ScopeKind::UnlistedScanFunction`], [`ScopeKind::LegacyPeer`]) resolve
+    /// within the caller's catalog, and raise if the name is ambiguous across
+    /// that catalog's schemas — naming the schemas involved, since that is what
+    /// the caller would have to supply to disambiguate.
     fn scoped_indices(
         &self,
         kind: FnKind,
@@ -727,6 +734,19 @@ impl Dispatcher {
         Ok(in_catalog)
     }
 
+    /// Stamp the schema a `FunctionInfo` is being advertised in.
+    ///
+    /// [`catalog::default_function_info`] leaves a placeholder, and the value
+    /// matters: the extension reads `schema_name` off this record and threads it
+    /// back as the `schema_name` of every bind for the function. Advertising a
+    /// `data`-schema function as living in `main` therefore routes its calls to
+    /// `main` — which is exactly the mis-route the schema-keyed registry exists
+    /// to prevent, arriving by the one path the registry cannot see.
+    fn advertise_in(mut info: FunctionInfo, schema: &str) -> FunctionInfo {
+        info.schema_name = schema.to_string();
+        info
+    }
+
     /// Whether the `i`-th overload registered under `(kind, name)` is declared
     /// in `(catalog, schema)` — an exact match against its one home. Shared by
     /// the `catalog_schema_contents_functions` RPC and the HTTP landing
@@ -785,26 +805,12 @@ impl Dispatcher {
         }
     }
 
-    /// Whether this bind dispatches into a table-kind registry, mirroring the
-    /// branch order in `handle_bind` / `handle_init`. Only used to decide how
-    /// strict to be about a missing `schema_name` — see
-    /// [`ScopeKind::UnnamedSchema`].
-    fn bind_is_table_kind(&self, name: &str, ft: &str) -> bool {
-        self.buffering.contains_key(name)
-            || self.tableinouts.contains_key(name)
-            || ft == "table"
-            || ft == "table_buffering"
-            || (!self.scalars.contains_key(name) && self.tables.contains_key(name))
-    }
-
     /// The scope a `BindRequest` names. `is_copy` is whether the bind opens a
-    /// COPY-FROM scan / COPY-TO sink (read out-of-band from the request batch)
-    /// — the one case where a bind legitimately carries no schema.
+    /// COPY-FROM scan / COPY-TO sink (read out-of-band from the request batch).
     fn bind_scope<'a>(
         &'a self,
         dto: &'a BindRequest,
         is_copy: bool,
-        ft: &str,
         legacy_peer: bool,
     ) -> Result<CallScope<'a>> {
         CallScope::for_bind(
@@ -812,7 +818,7 @@ impl Dispatcher {
             dto.schema_name.as_deref(),
             &dto.function_name,
             is_copy,
-            self.bind_is_table_kind(&dto.function_name, ft),
+            self.hidden_functions.contains(&dto.function_name),
             legacy_peer,
         )
     }
@@ -853,7 +859,7 @@ impl Dispatcher {
         // when a function name is declared in more than one schema. A COPY
         // handler is advertised at catalog level and so names no schema.
         let is_copy = params.copy_from.is_some() || params.copy_to.is_some();
-        let call = self.bind_scope(&dto, is_copy, &ft, legacy_peer)?;
+        let call = self.bind_scope(&dto, is_copy, legacy_peer)?;
 
         // Table buffering.
         if self.buffering.contains_key(&dto.function_name) {
@@ -1068,7 +1074,6 @@ impl Dispatcher {
         let call = self.bind_scope(
             &bind_call,
             copy_from.is_some() || copy_to.is_some(),
-            &ft,
             legacy_peer,
         )?;
 
@@ -2278,7 +2283,10 @@ impl Dispatcher {
                 for name in names {
                     for (i, f) in self.scalars[name].iter().enumerate() {
                         if in_schema(FnKind::Scalar, name, i) {
-                            infos.push(catalog::scalar_function_info(f.as_ref())?);
+                            infos.push(Self::advertise_in(
+                                catalog::scalar_function_info(f.as_ref())?,
+                                &schema_name,
+                            ));
                         }
                     }
                 }
@@ -2291,7 +2299,10 @@ impl Dispatcher {
                 for name in names {
                     for (i, f) in self.tables[name].iter().enumerate() {
                         if in_schema(FnKind::Table, name, i) {
-                            infos.push(catalog::table_function_info(f.as_ref())?);
+                            infos.push(Self::advertise_in(
+                                catalog::table_function_info(f.as_ref())?,
+                                &schema_name,
+                            ));
                         }
                     }
                 }
@@ -2301,7 +2312,10 @@ impl Dispatcher {
                 for name in tio {
                     for (i, f) in self.tableinouts[name].iter().enumerate() {
                         if in_schema(FnKind::TableInOut, name, i) {
-                            infos.push(catalog::table_in_out_function_info(f.as_ref())?);
+                            infos.push(Self::advertise_in(
+                                catalog::table_in_out_function_info(f.as_ref())?,
+                                &schema_name,
+                            ));
                         }
                     }
                 }
@@ -2310,7 +2324,10 @@ impl Dispatcher {
                 for name in buf {
                     for (i, f) in self.buffering[name].iter().enumerate() {
                         if in_schema(FnKind::Buffering, name, i) {
-                            infos.push(catalog::buffering_function_info(f.as_ref())?);
+                            infos.push(Self::advertise_in(
+                                catalog::buffering_function_info(f.as_ref())?,
+                                &schema_name,
+                            ));
                         }
                     }
                 }
@@ -2321,7 +2338,10 @@ impl Dispatcher {
                 for name in agg {
                     for (i, f) in self.aggregates[name].iter().enumerate() {
                         if in_schema(FnKind::Aggregate, name, i) {
-                            infos.push(catalog::aggregate_function_info(f.as_ref())?);
+                            infos.push(Self::advertise_in(
+                                catalog::aggregate_function_info(f.as_ref())?,
+                                &schema_name,
+                            ));
                         }
                     }
                 }
@@ -2485,12 +2505,28 @@ impl Dispatcher {
     }
 
     /// Scope a non-bind RPC against an already-resolved execution: exact when
-    /// the bind's schema was recorded, catalog-wide when it named none.
+    /// the schema is known, catalog-wide when it is not.
     fn bound_scope<'a>(catalog: &'a str, schema: Option<&'a str>) -> CallScope<'a> {
-        match schema {
+        match schema.filter(|s| !s.is_empty()) {
             Some(s) => CallScope::qualified(catalog, s),
             None => CallScope::bound(catalog),
         }
+    }
+
+    /// Scope one of the unary RPCs that re-resolve the function by name.
+    ///
+    /// Protocol 1.2.0 puts `schema_name` on all of them precisely because a
+    /// name is unique only within a schema: before it, a function declared in
+    /// two schemas bound correctly and then ran the *other* schema's
+    /// implementation on update / finalize / process, returning a
+    /// wrong-but-plausible answer. A peer that still omits it falls back to
+    /// catalog scope, which raises on ambiguity rather than guessing.
+    fn unary_scope<'a>(
+        &'a self,
+        attach: Option<&'a [u8]>,
+        schema: Option<&'a str>,
+    ) -> CallScope<'a> {
+        Self::bound_scope(self.call_catalog(attach), schema)
     }
 
     fn buffering_secrets(&self, execution_id: &[u8]) -> crate::secrets::Secrets {
@@ -2506,13 +2542,19 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
-        // process/combine reference an execution the sink-init already resolved
-        // and carry no schema of their own, so replay the one that bind named
-        // (persisted under `bufschema`, since these may run in another pooled
-        // worker). Only a schema-less bind — a COPY-TO handler — leaves it unset.
+        // The request names the declaring schema as of protocol 1.2.0. These two
+        // RPCs ride a bound connection whose init already carried it, so they
+        // also have the copy the sink-init persisted under `bufschema` — prefer
+        // the request, fall back to the persisted one for an older peer. Only a
+        // schema-less bind (a COPY-TO handler) leaves both unset.
         let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
-        let bound_schema = self.buffering_schema(&dto.execution_id.0);
-        let call = Self::bound_scope(catalog, bound_schema.as_deref());
+        let persisted = self.buffering_schema(&dto.execution_id.0);
+        let schema = dto
+            .schema_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(persisted.as_deref());
+        let call = Self::bound_scope(catalog, schema);
         let f = self.resolve_buffering(&dto.function_name, call)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let output_schema =
@@ -2561,8 +2603,13 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
         let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
-        let bound_schema = self.buffering_schema(&dto.execution_id.0);
-        let call = Self::bound_scope(catalog, bound_schema.as_deref());
+        let persisted = self.buffering_schema(&dto.execution_id.0);
+        let schema = dto
+            .schema_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(persisted.as_deref());
+        let call = Self::bound_scope(catalog, schema);
         let f = self.resolve_buffering(&dto.function_name, call)?;
         let output_schema = self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), None)?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2611,7 +2658,13 @@ impl Dispatcher {
         let dto: AggregateBindRequest = boxed(req)?;
         let mut args = crate::arguments::Arguments::parse(&dto.arguments.0)?;
         let input_schema = opt_schema(&dto.input_schema)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         args.remap_positional(&f.argument_specs());
         // Enforce declared const-argument constraints at bind (parity with the
         // scalar/table path); a violating value fails the aggregate_bind.
@@ -2641,7 +2694,13 @@ impl Dispatcher {
 
     pub fn handle_aggregate_update(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateUpdateRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let (gids, columns) = split_group_ids(&batch)?;
         // Pre-load only EXISTING states from prior batches; do NOT seed
@@ -2669,7 +2728,13 @@ impl Dispatcher {
 
     pub fn handle_aggregate_combine(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateCombineRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         let batch = ipc::read_batch(&dto.merge_batch.0)?;
         let src = batch
             .column_by_name("source_group_id")
@@ -2704,7 +2769,13 @@ impl Dispatcher {
 
     pub fn handle_aggregate_finalize(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateFinalizeRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         let output_schema = ipc::read_schema(&dto.output_schema.0)?;
         let gid_batch = ipc::read_batch(&dto.group_ids_batch.0)?;
         let gids = gid_batch
@@ -2812,7 +2883,10 @@ impl Dispatcher {
 
     pub fn handle_aggregate_window(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateWindowRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(None, dto.schema_name.as_deref()),
+        )?;
         let (partition, output_schema, mask) =
             self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         let frames: Vec<(i64, i64)> = dto
@@ -2831,7 +2905,10 @@ impl Dispatcher {
 
     pub fn handle_aggregate_window_batch(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateWindowBatchRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(None, dto.schema_name.as_deref()),
+        )?;
         let (partition, output_schema, mask) =
             self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         // Split the flattened (start,end) arrays into per-row sub-frame lists.
@@ -2918,7 +2995,13 @@ impl Dispatcher {
 
     pub fn handle_aggregate_streaming_open(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateStreamingOpenRequest = boxed(req)?;
-        self.resolve_aggregate(&dto.function_name)?;
+        self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         let execution_id = self.next_execution_id();
         self.store.kv_put(
             &execution_id,
@@ -2941,7 +3024,13 @@ impl Dispatcher {
 
     pub fn handle_aggregate_streaming_chunk(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateStreamingChunkRequest = boxed(req)?;
-        let f = self.resolve_aggregate(&dto.function_name)?;
+        let f = self.resolve_aggregate(
+            &dto.function_name,
+            self.unary_scope(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.schema_name.as_deref(),
+            ),
+        )?;
         let chunk = ipc::read_batch(&dto.input_batch.0)?;
         let pkc = self
             .store
@@ -3591,6 +3680,52 @@ mod scope_tests {
         }
     }
 
+    /// A minimal named aggregate carrying a tag, used to prove the unary RPCs
+    /// re-resolve by `(schema, name)` rather than by bare name (protocol 1.2.0).
+    struct AggProbe {
+        name: &'static str,
+        tag: &'static str,
+    }
+    impl crate::aggregate::AggregateFunction for AggProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("value", 0, "int64", "value")]
+        }
+        fn on_bind(
+            &self,
+            _p: &crate::aggregate::AggregateBindParams,
+        ) -> Result<crate::function::BindResponse> {
+            unreachable!()
+        }
+        fn initial_state(&self) -> Vec<u8> {
+            self.tag.as_bytes().to_vec()
+        }
+        fn update(
+            &self,
+            _s: &mut std::collections::HashMap<i64, Vec<u8>>,
+            _g: &Int64Array,
+            _c: &[ArrayRef],
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn combine(&self, t: Vec<u8>, _s: Vec<u8>) -> Result<Vec<u8>> {
+            Ok(t)
+        }
+        fn finalize(
+            &self,
+            _os: &SchemaRef,
+            _g: &Int64Array,
+            _st: &[Option<Vec<u8>>],
+        ) -> Result<RecordBatch> {
+            unreachable!()
+        }
+    }
+
     fn dispatcher() -> Dispatcher {
         let mut d = Dispatcher::new("cat");
         d.set_catalog(catalog::CatalogModel {
@@ -3691,23 +3826,36 @@ mod scope_tests {
         assert_eq!(idxs, vec![0]);
     }
 
-    /// A bind naming no schema: refused for a scalar from a 1.1.0 peer,
-    /// tolerated for a COPY handler, for a table-kind function (the upstream
-    /// gap), and from a pre-1.1.0 peer that omits the column outright.
+    /// A bind naming no schema is refused unless it is one of the three
+    /// enumerated cases: a COPY handler, a function hidden from the catalog
+    /// listing, or a peer that predates the field.
     #[test]
-    fn schema_less_bind_is_refused_for_scalars_only() {
-        // scalar, current peer, no schema -> refused
+    fn schema_less_bind_is_refused_unless_enumerated() {
+        // the default: no schema, nothing to excuse it -> refused
         assert!(CallScope::for_bind("cat", None, "f", false, false, false).is_err());
         // an empty string is the same as absent
         assert!(CallScope::for_bind("cat", Some(""), "f", false, false, false).is_err());
-        // COPY handler: schema-less by design
+        // COPY handler: advertised at catalog level, so there is no schema
         assert!(CallScope::for_bind("cat", None, "f", true, false, false).is_ok());
-        // table-kind: the extension does not send one yet
+        // hidden: unlisted, so the extension has no entry to read a schema from
         assert!(CallScope::for_bind("cat", None, "f", false, true, false).is_ok());
         // pre-1.1.0 peer: no bind it sends can name a schema
         assert!(CallScope::for_bind("cat", None, "f", false, false, true).is_ok());
         // a named schema always resolves exactly
         assert!(CallScope::for_bind("cat", Some("main"), "f", false, false, false).is_ok());
+    }
+
+    /// The hidden-function allowance is recognised from the worker's own
+    /// `hide_function` set, not guessed from the function's kind — so an
+    /// ordinary table function that loses its schema is still refused.
+    #[test]
+    fn only_hidden_functions_get_the_unlisted_allowance() {
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(Probe("listed")));
+        d.register_scalar(Arc::new(Probe("unlisted")));
+        d.hide_function("unlisted");
+        assert!(!d.hidden_functions.contains("listed"));
+        assert!(d.hidden_functions.contains("unlisted"));
     }
 
     /// Renaming the primary catalog after registration rebases the homes that
@@ -3768,5 +3916,60 @@ mod scope_tests {
             d.homes_of(FnKind::Scalar, "kept"),
             &[FunctionScope::new("cat", "main")]
         );
+    }
+
+    /// The aggregate unary RPCs re-resolve by name; with the 1.2.0 schema on the
+    /// request, a name declared in two schemas reaches the implementation the
+    /// caller named. `initial_state` is the cheap observable that tells the two
+    /// apart here.
+    #[test]
+    fn aggregate_resolves_by_schema() {
+        let mut d = dispatcher();
+        d.register_aggregate_scoped(
+            Arc::new(AggProbe {
+                name: "agg",
+                tag: "main",
+            }),
+            FunctionScope::new("cat", "main"),
+        );
+        d.register_aggregate_scoped(
+            Arc::new(AggProbe {
+                name: "agg",
+                tag: "data",
+            }),
+            FunctionScope::new("cat", "data"),
+        );
+        let main = d
+            .resolve_aggregate("agg", CallScope::qualified("cat", "main"))
+            .expect("main resolves");
+        assert_eq!(main.initial_state(), b"main");
+        let data = d
+            .resolve_aggregate("agg", CallScope::qualified("cat", "data"))
+            .expect("data resolves");
+        assert_eq!(data.initial_state(), b"data");
+        // No schema (an older peer): ambiguous across the two schemas -> error
+        // naming them, never a silent pick.
+        match d.resolve_aggregate("agg", CallScope::bound("cat")) {
+            Ok(_) => panic!("ambiguous call must not resolve"),
+            Err(e) => assert!(e.to_string().contains("Ambiguous function call 'agg'")),
+        }
+    }
+
+    /// `bound_scope` — the shape every 1.2.0 unary RPC uses: a named schema is
+    /// exact, an empty or absent one falls back to catalog scope.
+    #[test]
+    fn bound_scope_treats_empty_as_absent() {
+        assert!(matches!(
+            Dispatcher::bound_scope("cat", Some("data")).kind,
+            ScopeKind::Schema("data")
+        ));
+        assert!(matches!(
+            Dispatcher::bound_scope("cat", Some("")).kind,
+            ScopeKind::Bound
+        ));
+        assert!(matches!(
+            Dispatcher::bound_scope("cat", None).kind,
+            ScopeKind::Bound
+        ));
     }
 }

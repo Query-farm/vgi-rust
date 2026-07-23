@@ -15,9 +15,11 @@ use crate::protocol::register;
 ///
 /// Enforced as an exact major+minor match at the dispatch boundary (carried in
 /// `vgi_rpc.protocol_version` custom metadata), so this must track
-/// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 adds `schema_name` to
-/// `BindRequest`.
-pub const VGI_PROTOCOL_VERSION: &str = "1.1.0";
+/// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 added `schema_name` to
+/// `BindRequest`; 1.2.0 adds it to the 15 unary requests that re-resolve the
+/// function by name, so a name declared in two schemas cannot mis-route at
+/// runtime after binding correctly.
+pub const VGI_PROTOCOL_VERSION: &str = "1.2.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 

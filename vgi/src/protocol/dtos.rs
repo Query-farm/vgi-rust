@@ -338,6 +338,11 @@ pub struct AggregateWindowInitRequest {
     pub filter_mask: Option<Bytes>,
     pub frame_stats: Option<Bytes>,
     pub all_valid: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `aggregate_window` — evaluate one output row over its sub-frames.
@@ -349,6 +354,11 @@ pub struct AggregateWindowRequest {
     pub rid: i64,
     pub frame_starts: Vec<i64>,
     pub frame_ends: Vec<i64>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `aggregate_window_batch` — evaluate `count` consecutive output rows.
@@ -362,6 +372,11 @@ pub struct AggregateWindowBatchRequest {
     pub frames_per_row: Vec<i64>,
     pub frame_starts: Vec<i64>,
     pub frame_ends: Vec<i64>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `aggregate_window` / `aggregate_window_batch` result.
@@ -376,6 +391,11 @@ pub struct AggregateWindowDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
     pub partition_id: i64,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `table_function_dynamic_to_string` — post-execution profiling info.
@@ -406,6 +426,11 @@ pub struct AggregateStreamingOpenRequest {
     pub settings: Option<Bytes>,
     pub secrets: Option<Bytes>,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `aggregate_streaming_open` result — the session token.
@@ -421,6 +446,11 @@ pub struct AggregateStreamingChunkRequest {
     pub execution_id: Bytes,
     pub input_batch: Bytes,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `aggregate_streaming_chunk` result — a same-length output batch.
@@ -435,6 +465,11 @@ pub struct AggregateStreamingCloseRequest {
     pub function_name: String,
     pub execution_id: Bytes,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// One physical source backing a (possibly multi-branch) table scan.
@@ -790,6 +825,11 @@ pub struct TableBufferingProcessRequest {
     pub attach_opaque_data: Option<Bytes>,
     pub transaction_id: Option<Bytes>,
     pub batch_index: Option<i64>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `TableBufferingProcessResponse`.
@@ -806,6 +846,11 @@ pub struct TableBufferingCombineRequest {
     pub state_ids: Vec<Bytes>,
     pub attach_opaque_data: Option<Bytes>,
     pub transaction_id: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `TableBufferingCombineResponse`.
@@ -819,6 +864,11 @@ pub struct TableBufferingCombineResponse {
 pub struct TableBufferingDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +884,11 @@ pub struct AggregateBindRequest {
     pub settings: Option<Bytes>,
     pub secrets: Option<Bytes>,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `AggregateBindResponse`.
@@ -850,6 +905,11 @@ pub struct AggregateUpdateRequest {
     pub execution_id: Bytes,
     pub input_batch: Bytes,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `AggregateCombineRequest`.
@@ -859,6 +919,11 @@ pub struct AggregateCombineRequest {
     pub execution_id: Bytes,
     pub merge_batch: Bytes,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `AggregateFinalizeRequest`.
@@ -869,6 +934,11 @@ pub struct AggregateFinalizeRequest {
     pub group_ids_batch: Bytes,
     pub output_schema: Bytes,
     pub attach_opaque_data: Option<Bytes>,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 /// `AggregateFinalizeResponse`.
@@ -882,6 +952,11 @@ pub struct AggregateFinalizeResponse {
 pub struct AggregateDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
+    /// Catalog schema that declares the function. A name is unique only within
+    /// a schema, so this is what lets the worker resolve `(schema, name)` on an
+    /// RPC that re-resolves by name; `None` when the caller names no schema.
+    /// Added in protocol 1.2.0.
+    pub schema_name: Option<String>,
 }
 
 #[cfg(test)]

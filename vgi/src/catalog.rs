@@ -373,6 +373,12 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         comment: None,
         tags: Vec::new(),
         name: name.to_string(),
+        // Placeholder. The advertising site overwrites this with the schema the
+        // function is actually being listed in — see `Dispatcher::advertise_in`.
+        // It must be right: the extension parses `schema_name` straight off this
+        // record (`ParseFunctionInfo`) and threads it back as the bind's
+        // `schema_name`, so a wrong value here silently routes every call to
+        // whatever schema was claimed.
         schema_name: MAIN_SCHEMA.to_string(),
         function_type: enums::dict(function_type),
         arguments: Bytes::from(Vec::new()),
