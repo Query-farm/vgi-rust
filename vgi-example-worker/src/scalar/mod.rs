@@ -5,7 +5,8 @@
 mod cached;
 mod fmt;
 mod geo;
-mod util;
+pub mod same_name;
+pub mod util;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{

@@ -56,7 +56,6 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(CacheBenchFunction);
     w.register_table(CacheParallelFunction);
     w.register_table(CacheOrderedFunction);
-    w.register_table(CacheInterleavedFunction);
     w.register_table(CacheTypesFunction);
     w.register_table(CacheFilteredFunction);
     w.register_table(CachePartitionedFunction);
@@ -923,7 +922,7 @@ impl TableFunction for CacheBenchFunction {
 }
 
 // ---------------------------------------------------------------------------
-// Work-queue fan-out plumbing (cache_parallel / cache_ordered / cache_interleaved)
+// Work-queue fan-out plumbing (cache_parallel / cache_ordered)
 // ---------------------------------------------------------------------------
 
 /// A `(partition_id, start, end)` work item. `cache_parallel` ignores the id.
@@ -940,9 +939,8 @@ fn unpack_item(b: &[u8]) -> (i64, i64, i64) {
 }
 
 /// Push `[0, rows)` onto the execution's shared work queue as `chunk`-sized
-/// items. `reverse` enqueues them highest-first so arrival order ≠ batch_index
-/// order (the `cache_interleaved` scramble).
-fn push_chunks(params: &ProcessParams, rows: i64, chunk: i64, reverse: bool) -> Result<()> {
+/// items.
+fn push_chunks(params: &ProcessParams, rows: i64, chunk: i64) -> Result<()> {
     let store = params
         .storage
         .as_ref()
@@ -955,9 +953,6 @@ fn push_chunks(params: &ProcessParams, rows: i64, chunk: i64, reverse: bool) -> 
         items.push(pack_item(pid, start, (start + chunk).min(rows)));
         pid += 1;
         start += chunk;
-    }
-    if reverse {
-        items.reverse();
     }
     // Always push (even when empty) so the invocation is registered.
     store.queue_push(&params.execution_id, &items);
@@ -1082,7 +1077,7 @@ impl TableFunction for CacheParallelFunction {
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
         let rows = params.arguments.const_i64(0).unwrap_or(0).max(0);
         let chunk = ((rows + PARALLEL_MAX_CHUNKS - 1) / PARALLEL_MAX_CHUNKS).max(1);
-        push_chunks(params, rows, chunk, false)
+        push_chunks(params, rows, chunk)
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let batch_size = params.arguments.named_i64("batch_size").unwrap_or(24000);
@@ -1131,61 +1126,10 @@ impl TableFunction for CacheOrderedFunction {
     fn on_init(&self, params: &ProcessParams) -> Result<()> {
         let rows = params.arguments.named_i64("rows").unwrap_or(200_000).max(0);
         let chunk = params.arguments.named_i64("chunk_size").unwrap_or(1000);
-        push_chunks(params, rows, chunk, false)
+        push_chunks(params, rows, chunk)
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         queue_producer(params, 256, true)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// cache_interleaved(rows, chunk_size := 20000) -> {n: int64}
-// ---------------------------------------------------------------------------
-
-/// batch_index-tagged cacheable sequence emitted OUT OF ORDER. Chunks are
-/// enqueued in DESCENDING partition order, so the live scan returns rows in
-/// emission (descending-block) order while a cached serve flattens and
-/// stable-sorts by batch_index into strictly `0,1,…,rows-1`. The gap between the
-/// two proves the replay sort genuinely reorders real multi-batch output.
-pub struct CacheInterleavedFunction;
-impl TableFunction for CacheInterleavedFunction {
-    fn name(&self) -> &str {
-        "cache_interleaved"
-    }
-    fn metadata(&self) -> FunctionMetadata {
-        FunctionMetadata {
-            supports_batch_index: true,
-            ..cache_meta(
-                "Parallel batch_index-tagged cacheable sequence; cache serve reassembles order",
-            )
-        }
-    }
-    fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![
-            ArgSpec::const_arg("rows", 0, "int64", "Total number of rows to generate"),
-            ArgSpec::const_arg("chunk_size", -1, "int64", "Rows per partition"),
-        ]
-    }
-    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
-        fixed_bind(single_i64_schema("n"))
-    }
-    fn max_workers(&self, _params: &BindParams) -> i64 {
-        8
-    }
-    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
-        let rows = params.arguments.const_i64(0)?;
-        Some(TableCardinality {
-            estimate: Some(rows),
-            max: Some(rows),
-        })
-    }
-    fn on_init(&self, params: &ProcessParams) -> Result<()> {
-        let rows = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let chunk = params.arguments.named_i64("chunk_size").unwrap_or(20000);
-        push_chunks(params, rows, chunk, true)
-    }
-    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
-        queue_producer(params, 2048, true)
     }
 }
 

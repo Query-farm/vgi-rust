@@ -57,7 +57,7 @@ impl ScalarFunction for CachedDoubleScalarFunction {
         vec![ArgSpec::column("value", 0, "int64", "Value to double")]
     }
     fn cache_control(&self) -> Option<CacheControl> {
-        Some(CacheControl::ttl(CACHE_TTL))
+        Some(CacheControl::ttl(CACHE_TTL).with_per_value())
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let v = i64_col(batch.column(0))?;
@@ -97,7 +97,7 @@ impl ScalarFunction for CachedAddConstScalarFunction {
         ]
     }
     fn cache_control(&self) -> Option<CacheControl> {
-        Some(CacheControl::ttl(CACHE_TTL))
+        Some(CacheControl::ttl(CACHE_TTL).with_per_value())
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
         Ok(BindResponse::result(DataType::Int64))
@@ -138,7 +138,7 @@ impl ScalarFunction for CachedLabelScalarFunction {
         vec![ArgSpec::column("value", 0, "int64", "Value")]
     }
     fn cache_control(&self) -> Option<CacheControl> {
-        Some(CacheControl::ttl(CACHE_TTL))
+        Some(CacheControl::ttl(CACHE_TTL).with_per_value())
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let v = i64_col(batch.column(0))?;

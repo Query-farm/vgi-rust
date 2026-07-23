@@ -695,10 +695,10 @@ fn data_tables() -> Vec<CatTable> {
     // catalog-attached path (SELECT ... FROM ex.data.<name>) exercises the C++
     // result cache. See vgi-example-worker/src/table/cache.rs.
     //
-    // NB: cache_bench / cache_parallel / cache_interleaved / cache_types /
-    // cache_partitioned are intentionally NOT data tables — each takes a required
-    // positional arg a function-backed table can't supply at bind. Their tests use
-    // the direct `vgi_table_function(w, '<name>', [rows])` path instead.
+    // NB: cache_bench / cache_parallel / cache_types / cache_partitioned are
+    // intentionally NOT data tables — each takes a required positional arg a
+    // function-backed table can't supply at bind. Their tests call them as
+    // schema-qualified table functions on the attached catalog instead.
     let cache_table = |name: &str, cols: &[(&str, DataType)], comment: &str| -> CatTable {
         inline(CatTable::new(
             name,

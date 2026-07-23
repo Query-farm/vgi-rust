@@ -20,6 +20,7 @@ mod narrow_bind;
 mod scalar;
 mod table;
 mod table_in_out;
+mod twin_catalogs;
 
 use vgi::Worker;
 
@@ -66,6 +67,12 @@ fn main() {
         worker.register_secondary_catalog(accumulate::catalog(), accumulate::function_names());
         narrow_bind::register(&mut worker);
         worker.register_secondary_catalog(narrow_bind::catalog(), narrow_bind::function_names());
+        // One name in two schemas of `example` (main + data) — only the schema
+        // the caller names can tell the two implementations apart.
+        scalar::same_name::register(&mut worker);
+        // ... and the same name in the `main` schema of two *catalogs*, where
+        // only the attachment tells them apart.
+        twin_catalogs::register(&mut worker);
     }
     worker.set_catalog(catalog);
     worker.run();

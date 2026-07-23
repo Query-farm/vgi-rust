@@ -19,6 +19,7 @@ use vgi_rpc::{Result, RpcError};
 pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(CachedEchoFunction);
     w.register_table_in_out(CachedDoubleFunction);
+    w.register_table_in_out(CachedExplodeFunction);
     w.register_table_in_out(CachedRevalidatingEchoFunction);
     w.register_table_in_out(CachedRevalidatingDoubleFunction);
 }
@@ -151,7 +152,93 @@ impl TableInOutFunction for CachedDoubleFunction {
         out.emit_with(
             doubled_batch(params, batch)?,
             EmitOptions {
-                cache_control: Some(CacheControl::ttl(CACHE_TTL)),
+                cache_control: Some(CacheControl::ttl(CACHE_TTL).with_per_value()),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// `cached_explode(n)` — cacheable blended 1→N fan-out advertising
+/// `vgi.cache.per_value`.
+///
+/// Same shape as `blended_explode` (emit `0..n-1` per input row, with
+/// per-output-row provenance) but opts into the per-value memo tier, so it
+/// covers the cardinalities the 1:1 `cached_double` cannot reach: `n=0` is a
+/// NEGATIVE memo (a length-0 slot) and `n>1` a 1:N slot whose rows must survive
+/// the store's gather, the `[cached|fresh]` splice, and (on disk) the per-slot
+/// Arrow-IPC round trip. Deterministic (emits `range(n)`), so tests assert exact
+/// values and equivalence with per-value off.
+///
+/// A test choice, not production advice — memoizing a trivial fan-out is a net
+/// loss; the point is deterministic coverage of the 1:N and negative-memo paths.
+pub struct CachedExplodeFunction;
+impl TableInOutFunction for CachedExplodeFunction {
+    fn name(&self) -> &str {
+        "cached_explode"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta(
+            "Cacheable blended 1->N fan-out (per_value) — 1:0 / 1:1 / 1:N by input",
+            &["blended", "cache", "test"],
+            true,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column(
+            "n",
+            0,
+            "int64",
+            "Fan-out count: emit rows 0..n-1 for this input row",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        let cast = arrow_cast::cast(batch.column(0), &DataType::Int64)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let ns = cast.as_primitive::<Int64Type>();
+        let counts: Vec<i64> = (0..ns.len())
+            .map(|i| {
+                if ns.is_valid(i) {
+                    ns.value(i).max(0)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        // INTERLEAVE parents round-robin (round k emits value k for every parent
+        // with n>k), so within one chunk a given parent's output rows are
+        // NON-contiguous (parents [1,2,3] -> parent indices [0,1,2, 1,2, 2]).
+        // A per-value gather that assumed contiguous runs per parent would
+        // corrupt the result; this makes that failure visible.
+        let mut vals: Vec<i64> = Vec::new();
+        let mut parent_rows: Vec<i32> = Vec::new();
+        for k in 0..counts.iter().copied().max().unwrap_or(0) {
+            for (row_idx, &n) in counts.iter().enumerate() {
+                if n > k {
+                    vals.push(k);
+                    parent_rows.push(row_idx as i32);
+                }
+            }
+        }
+        let col = Arc::new(Int64Array::from(vals)) as ArrayRef;
+        let out_batch = RecordBatch::try_new(params.output_schema.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        out.emit_with(
+            out_batch,
+            EmitOptions {
+                parent_rows: Some(parent_rows),
+                cache_control: Some(CacheControl::ttl(CACHE_TTL).with_per_value()),
                 ..Default::default()
             },
         )
