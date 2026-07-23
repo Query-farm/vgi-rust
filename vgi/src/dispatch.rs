@@ -3377,7 +3377,11 @@ fn request_inner_batch(req: &Request) -> Result<RecordBatch> {
 }
 
 fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
-    let batch = request_inner_batch(req)?;
+    // The 15 unary requests that re-resolve by name gained a nullable
+    // `schema_name` column in protocol 1.2.0. Backfill it when a pre-1.2.0 peer
+    // omits it, so the request still decodes; a request type that never
+    // declared the field ignores the extra column (the derive reads by name).
+    let (batch, _) = crate::protocol::dtos::ensure_schema_name(request_inner_batch(req)?)?;
     if std::env::var("VGI_WIRE_DEBUG").is_ok() {
         eprintln!(
             "[vgi-wire] {} inner schema: {:?}",

@@ -154,6 +154,24 @@ pub struct BindRequest {
 pub fn backfill_bind_request(
     batch: arrow_array::RecordBatch,
 ) -> Result<(arrow_array::RecordBatch, bool)> {
+    ensure_schema_name(batch)
+}
+
+/// Append a null `schema_name` column when the request batch lacks one, so a
+/// request from a peer that predates the field still decodes (the `VgiArrow`
+/// derive resolves fields by name and errors on a missing column, while the
+/// canonical Python request dataclasses default it to `None`).
+///
+/// Every request that gained `schema_name` did so as an *additive nullable*
+/// column: `BindRequest` in protocol 1.1.0, the 15 unary requests that
+/// re-resolve by name in 1.2.0. A pre-1.1.0 peer omits it from `BindRequest`; a
+/// pre-1.2.0 peer omits it from the unary requests — the same shape, so one
+/// helper serves both. Returns whether the column had to be synthesised, which
+/// distinguishes a peer that predates the field (absent) from one that sent it
+/// null (present) — a statement about the peer, not about this call.
+pub fn ensure_schema_name(
+    batch: arrow_array::RecordBatch,
+) -> Result<(arrow_array::RecordBatch, bool)> {
     if batch.column_by_name("schema_name").is_some() {
         return Ok((batch, false));
     }
@@ -173,7 +191,7 @@ pub fn backfill_bind_request(
     columns.push(Arc::new(arrow_array::StringArray::new_null(rows)));
     let batch =
         arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-            .map_err(|e| RpcError::type_error(format!("backfill BindRequest.schema_name: {e}")))?;
+            .map_err(|e| RpcError::type_error(format!("backfill schema_name: {e}")))?;
     Ok((batch, true))
 }
 
