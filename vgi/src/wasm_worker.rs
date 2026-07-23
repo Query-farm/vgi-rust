@@ -9,7 +9,7 @@
 //! worker crate (the same reason the ring ops are a shared js-library, not
 //! vendored per worker).
 //!
-//! [`wasm_worker!`](crate::wasm_worker) generates the three canonical exports —
+//! [`wasm_worker!`](crate::wasm_worker!) generates the three canonical exports —
 //! `vgi_worker_init`, `vgi_worker_serve_sab_slot`, `vgi_worker_serve_pool` —
 //! wired to a builder you supply. The macro expands to nothing off `wasm32`, so
 //! a crate can invoke it unconditionally.
@@ -50,7 +50,7 @@
 
 /// Generate the canonical browser `worker:` entry points for a VGI worker.
 ///
-/// See the [module docs](crate::wasm_worker) for the fields and hook semantics.
+/// See the [module docs](mod@crate::wasm_worker) for the fields and hook semantics.
 /// `build` is required; `init` and `first_serve` are optional and must appear in
 /// the order shown (`init`, then `first_serve`, then `build`). Expands to
 /// nothing on non-`wasm32` targets.
