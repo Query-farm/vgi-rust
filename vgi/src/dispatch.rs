@@ -45,18 +45,21 @@ pub(crate) enum FnKind {
 }
 
 /// Where a function instance is *declared*: the VGI catalog that owns it and
-/// the schema within that catalog.
+/// the schema within that catalog. Every registered function has exactly one.
 ///
 /// A function name is not a unique key — a worker may declare the same name in
 /// two schemas of one catalog, or (serving several catalogs from one process)
-/// in the same schema name of two different catalogs. The scope is what breaks
+/// in the same schema name of two different catalogs. The home is what breaks
 /// the tie, and the bind request carries the caller's half of it: the schema on
 /// `BindRequest::schema_name` and the catalog inside `attach_opaque_data`.
 ///
-/// Registering without a scope ([`Worker::register_scalar`](crate::Worker::register_scalar)
-/// and friends) leaves the function *unscoped*: advertised in every served
-/// catalog's `main` schema and reachable from any call, which is the historical
-/// behaviour and what nearly every worker wants.
+/// There is deliberately no "unscoped" state. A function with no home would be
+/// advertised everywhere and would match any call, which makes
+/// `example.data.f()` and `example.main.f()` indistinguishable — the exact
+/// ambiguity this type exists to remove. Registering without naming a home
+/// ([`Worker::register_scalar`](crate::Worker::register_scalar) and friends)
+/// still yields one: the worker's own catalog and its default schema
+/// (`main`), which is where DuckDB registers such functions anyway.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionScope {
     /// The catalog name (as advertised by `catalog_catalogs`).
@@ -77,22 +80,120 @@ impl FunctionScope {
     fn matches(&self, catalog: &str, schema: &str) -> bool {
         self.catalog.eq_ignore_ascii_case(catalog) && self.schema.eq_ignore_ascii_case(schema)
     }
+
+    fn in_catalog(&self, catalog: &str) -> bool {
+        self.catalog.eq_ignore_ascii_case(catalog)
+    }
 }
 
-/// The `(catalog, schema)` a call arrived through, as decoded from the bind
-/// request. `schema` is `None` when the caller named none (a COPY handler bind,
-/// or a scan whose function resolved outside the worker's schemas).
+/// How a call names the function it wants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeKind<'a> {
+    /// The normal case: the caller named the owning schema, so resolution is an
+    /// exact `(catalog, schema, name)` match.
+    Schema(&'a str),
+    /// The one legitimate schema-less bind. A COPY handler is advertised at
+    /// *catalog* level (`catalog_copy_from_formats`), not inside a schema, so
+    /// the extension has no schema to send. Resolution falls back to the
+    /// catalog, and a name that is ambiguous across that catalog's schemas
+    /// still raises.
+    CopyHandler,
+    /// Not a bind: a unary RPC (`table_buffering_process` / `_combine`,
+    /// `aggregate_*`) referencing an execution some earlier bind already
+    /// resolved. The wire types carry no schema, so these resolve within the
+    /// catalog; where the schema *was* recorded at bind, the caller replays it
+    /// as [`ScopeKind::Schema`] instead.
+    Bound,
+    /// A **table-kind** bind that named no schema.
+    ///
+    /// This is not a design allowance — it is tolerance for a live gap in the
+    /// DuckDB extension. `VgiFunctionInfo::schema_name` is populated in exactly
+    /// one place (`vgi_scalar_function_set.cpp`, the scalar set's
+    /// `LoadEntries`), but it is *read* by the table and table-in-out bind
+    /// paths (`vgi_table_function_set.cpp`), which therefore always send an
+    /// empty schema. Scalars carry their schema; table / table-in-out /
+    /// table-buffering functions never do. A function-backed table scan whose
+    /// backing function is hidden has the same shape for a second reason: with
+    /// no advertised entry, `VgiTableEntry::GetScanFunctionImpl` finds none to
+    /// take a schema from.
+    ///
+    /// Resolution stays catalog-scoped and still raises on cross-schema
+    /// ambiguity, so it cannot route `data.f` to `main.f` — the extension
+    /// simply is not naming a schema here yet. When it does, this variant stops
+    /// being reachable without any behavioural change. A schema-less *scalar*
+    /// bind is still rejected outright, so a regression on the path that does
+    /// work is caught immediately.
+    UnnamedSchema,
+    /// The peer predates protocol 1.1.0 and omits the `schema_name` column
+    /// entirely, so *no* bind it sends can name a schema. That is a statement
+    /// about the peer, not about this call, and it is why
+    /// [`backfill_bind_request`] reports whether it had to synthesise the
+    /// column. Resolution is catalog-scoped and still raises on ambiguity; a
+    /// worker talking to such a peer simply cannot offer same-name-in-two-
+    /// schemas dispatch, which is exactly what protocol 1.1.0 is for.
+    LegacyPeer,
+}
+
+/// The `(catalog, how-it-was-named)` a call arrived through.
 #[derive(Clone, Copy)]
 pub(crate) struct CallScope<'a> {
     catalog: &'a str,
-    schema: Option<&'a str>,
+    kind: ScopeKind<'a>,
 }
 
 impl<'a> CallScope<'a> {
-    pub(crate) fn new(catalog: &'a str, schema: Option<&'a str>) -> Self {
+    /// A schema-qualified call — the normal path.
+    pub(crate) fn qualified(catalog: &'a str, schema: &'a str) -> Self {
         CallScope {
             catalog,
-            schema: schema.filter(|s| !s.is_empty()),
+            kind: ScopeKind::Schema(schema),
+        }
+    }
+
+    /// A COPY handler bind (advertised at catalog level, carries no schema).
+    pub(crate) fn copy_handler(catalog: &'a str) -> Self {
+        CallScope {
+            catalog,
+            kind: ScopeKind::CopyHandler,
+        }
+    }
+
+    /// A non-bind RPC against an already-resolved execution.
+    pub(crate) fn bound(catalog: &'a str) -> Self {
+        CallScope {
+            catalog,
+            kind: ScopeKind::Bound,
+        }
+    }
+
+    /// Build the scope a `BindRequest` names.
+    ///
+    /// A named schema resolves exactly. A bind that names none is legal only
+    /// for a COPY handler (by design, permanently) or for a table-kind function
+    /// (the extension gap documented on [`ScopeKind::UnnamedSchema`]). A
+    /// schema-less scalar bind is refused: scalars do carry their schema, so
+    /// losing it would be a real regression, and resolving one by bare name is
+    /// how `example.data.f()` could land on `example.main.f()`.
+    pub(crate) fn for_bind(
+        catalog: &'a str,
+        schema: Option<&'a str>,
+        function_name: &str,
+        is_copy: bool,
+        table_kind: bool,
+        legacy_peer: bool,
+    ) -> Result<Self> {
+        let unqualified = |kind| Ok(CallScope { catalog, kind });
+        match schema.filter(|s| !s.is_empty()) {
+            Some(schema) => Ok(CallScope::qualified(catalog, schema)),
+            None if is_copy => Ok(CallScope::copy_handler(catalog)),
+            None if legacy_peer => unqualified(ScopeKind::LegacyPeer),
+            None if table_kind => unqualified(ScopeKind::UnnamedSchema),
+            None => Err(RpcError::value_error(format!(
+                "bind for '{function_name}' carries no schema_name. Every function is \
+                 declared in exactly one catalog schema, and the extension sends the \
+                 owning schema on every scalar bind as of VGI protocol 1.1.0; only a \
+                 COPY handler bind (advertised at catalog level) may omit it."
+            ))),
         }
     }
 }
@@ -130,16 +231,17 @@ pub struct Dispatcher {
     /// the only intended entry point — advertising the function too would create
     /// a redundant SQL callable. See [`Dispatcher::hide_function`].
     pub(crate) hidden_functions: std::collections::HashSet<String>,
-    /// Declaration scope per registered *instance*, parallel to the by-name
-    /// registry vectors: `scopes[&(kind, name)][i]` scopes the i-th overload
-    /// registered under `name`. `None` = unscoped (see [`FunctionScope`]).
+    /// Declaration home per registered *instance*, parallel to the by-name
+    /// registry vectors: `scopes[&(kind, name)][i]` is where the i-th overload
+    /// registered under `name` lives. Every instance has one — see
+    /// [`FunctionScope`].
     ///
     /// This is the schema-keyed index dispatch resolves through: a
     /// schema-qualified bind matches an entry exactly, so one name declared in
     /// two schemas reaches the implementation the caller named instead of
-    /// colliding as an overload. Overloads *within* one scope still resolve by
+    /// colliding as an overload. Overloads *within* one home still resolve by
     /// argument signature, unchanged.
-    pub(crate) scopes: HashMap<(FnKind, String), Vec<Option<FunctionScope>>>,
+    pub(crate) scopes: HashMap<(FnKind, String), Vec<FunctionScope>>,
     /// Secret types registered by the worker (surfaced in `catalog_attach`).
     pub secret_types: Vec<catalog::SecretTypeSpec>,
     /// Custom settings registered by the worker.
@@ -184,6 +286,21 @@ impl Dispatcher {
     }
 
     pub fn set_catalog(&mut self, model: catalog::CatalogModel) {
+        // Functions are normally registered *before* the catalog is installed,
+        // so any that took the default home were homed under the name the
+        // dispatcher was constructed with. If the model renames the primary
+        // catalog, those homes would name a catalog that no longer exists and
+        // every one of those functions would become unreachable — rebase them.
+        let old_primary = self.primary_catalog_name().to_string();
+        if !model.name.is_empty() && !model.name.eq_ignore_ascii_case(&old_primary) {
+            for homes in self.scopes.values_mut() {
+                for home in homes.iter_mut() {
+                    if home.in_catalog(&old_primary) {
+                        home.catalog = model.name.clone();
+                    }
+                }
+            }
+        }
         self.catalog = model;
     }
 
@@ -195,6 +312,31 @@ impl Dispatcher {
         model: catalog::CatalogModel,
         functions: Vec<String>,
     ) {
+        // The functions a secondary owns live in *its* catalog, not the
+        // primary's. They are registered through the plain `register_*` entry
+        // points (the registries are worker-global), which homes them in the
+        // primary by default — so adopt them here, now that we know who owns
+        // them. Only default-homed instances move: one already declared into an
+        // explicit `(catalog, schema)` said where it lives and is left alone.
+        let default_home = self.default_home();
+        let adopted = FunctionScope::new(&model.name, catalog::MAIN_SCHEMA);
+        for name in &functions {
+            for kind in [
+                FnKind::Scalar,
+                FnKind::Table,
+                FnKind::TableInOut,
+                FnKind::Buffering,
+                FnKind::Aggregate,
+            ] {
+                if let Some(homes) = self.scopes.get_mut(&(kind, name.clone())) {
+                    for home in homes.iter_mut() {
+                        if *home == default_home {
+                            *home = adopted.clone();
+                        }
+                    }
+                }
+            }
+        }
         self.secondary.push(model);
         self.secondary_functions.push(functions);
     }
@@ -229,65 +371,108 @@ impl Dispatcher {
         self.copy_to_formats.push(f);
     }
 
-    /// Record the declaration scope of the instance just pushed onto the
-    /// by-name registry vector for `(kind, name)`. Kept parallel to that vector,
-    /// so every `register_*` must call this exactly once per push.
-    fn note_scope(&mut self, kind: FnKind, name: &str, scope: Option<FunctionScope>) {
+    /// Record the declaration home of the instance just pushed onto the by-name
+    /// registry vector for `(kind, name)`. Kept parallel to that vector, so
+    /// every `register_*` must call this exactly once per push.
+    fn note_scope(&mut self, kind: FnKind, name: &str, scope: FunctionScope) {
         self.scopes
             .entry((kind, name.to_string()))
             .or_default()
             .push(scope);
     }
 
+    /// The primary catalog's name. [`set_catalog`](Self::set_catalog) may
+    /// rename it after functions were registered, so this is the single place
+    /// that decides what the primary is called.
+    pub(crate) fn primary_catalog_name(&self) -> &str {
+        if self.catalog.name.is_empty() {
+            &self.catalog_name
+        } else {
+            &self.catalog.name
+        }
+    }
+
+    /// The name to match function homes against for `cat`.
+    ///
+    /// For a secondary that is just its model name, but the primary's model may
+    /// be absent entirely — a worker that only calls `register_scalar` and
+    /// `run()` never installs a catalog, leaving `CatalogModel::default()` with
+    /// an empty name. Homes are recorded against
+    /// [`primary_catalog_name`](Self::primary_catalog_name), so advertisement
+    /// has to ask the same question the same way.
+    pub(crate) fn catalog_identity<'a>(&'a self, cat: &'a catalog::CatalogModel) -> &'a str {
+        if std::ptr::eq(cat, &self.catalog) {
+            self.primary_catalog_name()
+        } else {
+            &cat.name
+        }
+    }
+
+    /// The home a registration that names none gets: this worker's own catalog,
+    /// in its default schema. Deterministic and singular — the point is that
+    /// there is no such thing as a function without a home, not that a home is
+    /// always spelled out at the call site.
+    fn default_home(&self) -> FunctionScope {
+        FunctionScope::new(self.primary_catalog_name(), catalog::MAIN_SCHEMA)
+    }
+
     pub fn register_aggregate(&mut self, f: Arc<dyn AggregateFunction>) {
-        self.register_aggregate_scoped(f, None);
+        let home = self.default_home();
+        self.register_aggregate_scoped(f, home);
     }
 
     /// Register an aggregate declared in a specific catalog schema.
     pub fn register_aggregate_scoped(
         &mut self,
         f: Arc<dyn AggregateFunction>,
-        scope: Option<FunctionScope>,
+        scope: FunctionScope,
     ) {
         let name = f.name().to_string();
         self.aggregates.entry(name.clone()).or_default().push(f);
         self.note_scope(FnKind::Aggregate, &name, scope);
     }
 
+    /// Resolve an aggregate by name within the primary catalog.
+    ///
+    /// The aggregate wire types (`AggregateBindRequest` and the update /
+    /// combine / finalize / window requests) carry no `schema_name` — the
+    /// extension never sends one for an aggregate — so an aggregate cannot be
+    /// resolved by schema the way a bind can. It still *has* a home, which is
+    /// what places it in `catalog_schema_contents_functions`; resolution is
+    /// scoped to the catalog and raises if the name is ambiguous across that
+    /// catalog's schemas.
     fn resolve_aggregate(&self, name: &str) -> Result<Arc<dyn AggregateFunction>> {
-        self.aggregates
+        let cands = self
+            .aggregates
             .get(name)
-            .and_then(|v| v.first())
-            .cloned()
+            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+        let call = CallScope::bound(self.primary_catalog_name());
+        let idxs = self.scoped_indices(FnKind::Aggregate, name, cands.len(), call)?;
+        idxs.first()
+            .map(|&i| cands[i].clone())
             .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
     }
 
     pub fn register_scalar(&mut self, f: Arc<dyn ScalarFunction>) {
-        self.register_scalar_scoped(f, None);
+        let home = self.default_home();
+        self.register_scalar_scoped(f, home);
     }
 
     /// Register a scalar declared in a specific catalog schema.
-    pub fn register_scalar_scoped(
-        &mut self,
-        f: Arc<dyn ScalarFunction>,
-        scope: Option<FunctionScope>,
-    ) {
+    pub fn register_scalar_scoped(&mut self, f: Arc<dyn ScalarFunction>, scope: FunctionScope) {
         let name = f.name().to_string();
         self.scalars.entry(name.clone()).or_default().push(f);
         self.note_scope(FnKind::Scalar, &name, scope);
     }
 
     pub fn register_table(&mut self, f: Arc<dyn TableFunction>) {
-        self.register_table_scoped(f, None);
+        let home = self.default_home();
+        self.register_table_scoped(f, home);
     }
 
     /// Register a table (producer) function declared in a specific catalog
     /// schema.
-    pub fn register_table_scoped(
-        &mut self,
-        f: Arc<dyn TableFunction>,
-        scope: Option<FunctionScope>,
-    ) {
+    pub fn register_table_scoped(&mut self, f: Arc<dyn TableFunction>, scope: FunctionScope) {
         let name = f.name().to_string();
         self.tables.entry(name.clone()).or_default().push(f);
         self.note_scope(FnKind::Table, &name, scope);
@@ -306,7 +491,8 @@ impl Dispatcher {
     /// `scan_function_impl` without clobbering an explicit `register_table`.
     pub fn register_table_if_absent(&mut self, f: Arc<dyn TableFunction>) {
         if !self.tables.contains_key(f.name()) {
-            self.register_table_scoped(f, None);
+            let home = self.default_home();
+            self.register_table_scoped(f, home);
         }
     }
 
@@ -344,14 +530,15 @@ impl Dispatcher {
                  positional column arg (its per-row input column); found none."
             );
         }
-        self.register_table_in_out_scoped(f, None);
+        let home = self.default_home();
+        self.register_table_in_out_scoped(f, home);
     }
 
     /// Register a table-in-out function declared in a specific catalog schema.
     pub fn register_table_in_out_scoped(
         &mut self,
         f: Arc<dyn TableInOutFunction>,
-        scope: Option<FunctionScope>,
+        scope: FunctionScope,
     ) {
         let name = f.name().to_string();
         self.tableinouts.entry(name.clone()).or_default().push(f);
@@ -385,7 +572,8 @@ impl Dispatcher {
     }
 
     pub fn register_buffering(&mut self, f: Arc<dyn TableBufferingFunction>) {
-        self.register_buffering_scoped(f, None);
+        let home = self.default_home();
+        self.register_buffering_scoped(f, home);
     }
 
     /// Register a table-buffering function declared in a specific catalog
@@ -393,7 +581,7 @@ impl Dispatcher {
     pub fn register_buffering_scoped(
         &mut self,
         f: Arc<dyn TableBufferingFunction>,
-        scope: Option<FunctionScope>,
+        scope: FunctionScope,
     ) {
         let name = f.name().to_string();
         self.buffering.entry(name.clone()).or_default().push(f);
@@ -459,25 +647,26 @@ impl Dispatcher {
         v
     }
 
-    /// Narrow the overloads registered under `name` to those the call's
-    /// `(catalog, schema)` may reach, *before* argument-signature scoring runs.
+    /// The homes of the overloads registered under `(kind, name)`.
+    fn homes_of(&self, kind: FnKind, name: &str) -> &[FunctionScope] {
+        self.scopes
+            .get(&(kind, name.to_string()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Narrow the overloads registered under `name` to those the call may
+    /// reach, *before* argument-signature scoring runs.
     ///
-    /// Resolution order:
+    /// A schema-qualified call is an **exact** `(catalog, schema, name)` match
+    /// and nothing else: a bind naming `data` never reaches an implementation
+    /// declared in `main`. Naming a schema the function does not live in is an
+    /// error that reports where it *does* live, not a silent fall-through.
     ///
-    /// 1. **Exact** — the caller named a schema and some instance is declared in
-    ///    that `(catalog, schema)`. Only those are candidates, so one name in
-    ///    two schemas dispatches to the implementation the caller named.
-    /// 2. **Unscoped** — instances registered without a scope are reachable from
-    ///    anywhere. This is the historical shape: a worker that never declares
-    ///    schemas behaves exactly as before, and it also covers the calls that
-    ///    legitimately carry no schema (COPY handler binds, scans whose function
-    ///    resolved outside the worker's schemas).
-    /// 3. **Same catalog** — every remaining instance is scoped and none matched
-    ///    the schema; keep the ones the caller's catalog owns.
-    ///
-    /// If what is left spans more than one schema, the call is genuinely
-    /// ambiguous and the error names the schemas involved rather than reporting
-    /// an overload clash the caller cannot act on.
+    /// The schema-less kinds ([`ScopeKind::CopyHandler`], [`ScopeKind::Bound`])
+    /// resolve within the caller's catalog, and raise if the name is ambiguous
+    /// across that catalog's schemas — naming the schemas involved, since that
+    /// is what the caller would have to supply to disambiguate.
     fn scoped_indices(
         &self,
         kind: FnKind,
@@ -485,49 +674,61 @@ impl Dispatcher {
         len: usize,
         call: CallScope<'_>,
     ) -> Result<Vec<usize>> {
-        let Some(scopes) = self.scopes.get(&(kind, name.to_string())) else {
-            return Ok((0..len).collect());
-        };
-        let declared = |i: usize| scopes.get(i).and_then(|s| s.as_ref());
-        if let Some(schema) = call.schema {
+        let homes = self.homes_of(kind, name);
+        // A registry entry with no parallel home is a wiring bug in a
+        // `register_*` (they must push both), not a caller error.
+        debug_assert_eq!(homes.len(), len, "home index out of step for {name}");
+        let home = |i: usize| homes.get(i);
+
+        if let ScopeKind::Schema(schema) = call.kind {
             let exact: Vec<usize> = (0..len)
-                .filter(|&i| declared(i).is_some_and(|s| s.matches(call.catalog, schema)))
+                .filter(|&i| home(i).is_some_and(|h| h.matches(call.catalog, schema)))
                 .collect();
             if !exact.is_empty() {
                 return Ok(exact);
             }
-        }
-        let unscoped: Vec<usize> = (0..len).filter(|&i| declared(i).is_none()).collect();
-        if !unscoped.is_empty() {
-            return Ok(unscoped);
-        }
-        let same_catalog: Vec<usize> = (0..len)
-            .filter(|&i| declared(i).is_some_and(|s| s.catalog.eq_ignore_ascii_case(call.catalog)))
-            .collect();
-        let rest = if same_catalog.is_empty() {
-            (0..len).collect::<Vec<usize>>()
-        } else {
-            same_catalog
-        };
-        let mut owners: Vec<String> = rest
-            .iter()
-            .filter_map(|&i| declared(i).map(|s| format!("{}.{}", s.catalog, s.schema)))
-            .collect();
-        owners.sort();
-        owners.dedup();
-        if owners.len() > 1 {
+            let mut elsewhere: Vec<String> = (0..len)
+                .filter_map(|i| home(i).map(|h| format!("{}.{}", h.catalog, h.schema)))
+                .collect();
+            elsewhere.sort();
+            elsewhere.dedup();
             return Err(RpcError::value_error(format!(
-                "Ambiguous function call '{name}': declared in more than one schema ({}) — \
-                 qualify the call with a schema to disambiguate",
-                owners.join(", ")
+                "Function '{name}' is not declared in schema '{}' of catalog '{}'. \
+                 It is declared in: {}",
+                schema,
+                call.catalog,
+                elsewhere.join(", ")
             )));
         }
-        Ok(rest)
+
+        let in_catalog: Vec<usize> = (0..len)
+            .filter(|&i| home(i).is_some_and(|h| h.in_catalog(call.catalog)))
+            .collect();
+        if in_catalog.is_empty() {
+            return Err(RpcError::value_error(format!(
+                "Function '{name}' is not declared in catalog '{}'",
+                call.catalog
+            )));
+        }
+        let mut schemas: Vec<&str> = in_catalog
+            .iter()
+            .filter_map(|&i| home(i).map(|h| h.schema.as_str()))
+            .collect();
+        schemas.sort_unstable();
+        schemas.dedup();
+        if schemas.len() > 1 {
+            return Err(RpcError::value_error(format!(
+                "Ambiguous function call '{name}': declared in more than one schema of \
+                 catalog '{}' ({}) — qualify the call with a schema to disambiguate",
+                call.catalog,
+                schemas.join(", ")
+            )));
+        }
+        Ok(in_catalog)
     }
 
     /// Whether the `i`-th overload registered under `(kind, name)` is declared
-    /// in `(catalog, schema)`. An unscoped instance lives in the `main` schema
-    /// of whichever catalog is attached — the historical placement. Shared by
+    /// in `(catalog, schema)` — an exact match against its one home. Shared by
     /// the `catalog_schema_contents_functions` RPC and the HTTP landing
     /// contract, so the two never disagree about where a function lives.
     pub(crate) fn declared_in(
@@ -538,15 +739,9 @@ impl Dispatcher {
         catalog: &str,
         schema: &str,
     ) -> bool {
-        match self
-            .scopes
-            .get(&(kind, name.to_string()))
-            .and_then(|v| v.get(i))
-            .and_then(|s| s.as_ref())
-        {
-            Some(scope) => scope.matches(catalog, schema),
-            None => schema == catalog::MAIN_SCHEMA,
-        }
+        self.homes_of(kind, name)
+            .get(i)
+            .is_some_and(|home| home.matches(catalog, schema))
     }
 
     /// Resolve a scalar function by name with overload scoring.
@@ -590,11 +785,35 @@ impl Dispatcher {
         }
     }
 
-    /// The `(catalog, schema)` scope a `BindRequest` names.
-    fn bind_scope<'a>(&'a self, dto: &'a BindRequest) -> CallScope<'a> {
-        CallScope::new(
+    /// Whether this bind dispatches into a table-kind registry, mirroring the
+    /// branch order in `handle_bind` / `handle_init`. Only used to decide how
+    /// strict to be about a missing `schema_name` — see
+    /// [`ScopeKind::UnnamedSchema`].
+    fn bind_is_table_kind(&self, name: &str, ft: &str) -> bool {
+        self.buffering.contains_key(name)
+            || self.tableinouts.contains_key(name)
+            || ft == "table"
+            || ft == "table_buffering"
+            || (!self.scalars.contains_key(name) && self.tables.contains_key(name))
+    }
+
+    /// The scope a `BindRequest` names. `is_copy` is whether the bind opens a
+    /// COPY-FROM scan / COPY-TO sink (read out-of-band from the request batch)
+    /// — the one case where a bind legitimately carries no schema.
+    fn bind_scope<'a>(
+        &'a self,
+        dto: &'a BindRequest,
+        is_copy: bool,
+        ft: &str,
+        legacy_peer: bool,
+    ) -> Result<CallScope<'a>> {
+        CallScope::for_bind(
             self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
             dto.schema_name.as_deref(),
+            &dto.function_name,
+            is_copy,
+            self.bind_is_table_kind(&dto.function_name, ft),
+            legacy_peer,
         )
     }
 
@@ -621,7 +840,7 @@ impl Dispatcher {
     // -- bind ---------------------------------------------------------------
 
     pub fn handle_bind(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
-        let inner = backfill_bind_request(request_inner_batch(req)?)?;
+        let (inner, legacy_peer) = backfill_bind_request(request_inner_batch(req)?)?;
         let dto: BindRequest = wire::from_batch(&inner)?;
         let mut params = self.bind_params(&dto, ctx)?;
         // The COPY ... FROM / ... TO contexts (when present) ride as out-of-band
@@ -631,8 +850,10 @@ impl Dispatcher {
         params.copy_to = read_copy_to(&inner)?;
         let ft = normalize_function_type(&dto.function_type.0).unwrap_or_default();
         // (catalog, schema) the caller named — the key dispatch resolves through
-        // when a function name is declared in more than one schema.
-        let call = self.bind_scope(&dto);
+        // when a function name is declared in more than one schema. A COPY
+        // handler is advertised at catalog level and so names no schema.
+        let is_copy = params.copy_from.is_some() || params.copy_to.is_some();
+        let call = self.bind_scope(&dto, is_copy, &ft, legacy_peer)?;
 
         // Table buffering.
         if self.buffering.contains_key(&dto.function_name) {
@@ -818,7 +1039,8 @@ impl Dispatcher {
     pub fn handle_init(&self, req: &Request, ctx: &CallContext) -> Result<StreamResult> {
         let dto: InitRequest = boxed(req)?;
         // bind_call is an IPC-serialized BindRequest.
-        let bind_call_batch = backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?;
+        let (bind_call_batch, legacy_peer) =
+            backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?;
         let bind_call: BindRequest = wire::from_batch(&bind_call_batch)?;
         // COPY ... FROM context (out-of-band struct column, absent for ordinary
         // scans) — threaded onto every ProcessParams built below.
@@ -843,7 +1065,12 @@ impl Dispatcher {
             .unwrap_or_else(|| self.next_execution_id());
         let ft = normalize_function_type(&bind_call.function_type.0).unwrap_or_default();
         // The embedded bind_call carries the same (catalog, schema) the bind did.
-        let call = self.bind_scope(&bind_call);
+        let call = self.bind_scope(
+            &bind_call,
+            copy_from.is_some() || copy_to.is_some(),
+            &ft,
+            legacy_peer,
+        )?;
 
         let build_params =
             |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
@@ -982,6 +1209,13 @@ impl Dispatcher {
                 .kv_put(&execution_id, b"bufargs", &bind_call.arguments.0);
             if let Some(a) = bind_call.attach_opaque_data.as_ref() {
                 self.store.kv_put(&execution_id, b"bufattach", &a.0);
+            }
+            // Replay the owning schema too. process/combine carry no bind_call,
+            // so without this they could only resolve the bare name — which is
+            // exactly the ambiguity the schema-keyed registry exists to remove.
+            if let Some(sn) = bind_call.schema_name.as_deref().filter(|s| !s.is_empty()) {
+                self.store
+                    .kv_put(&execution_id, b"bufschema", sn.as_bytes());
             }
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
@@ -1287,7 +1521,14 @@ impl Dispatcher {
         };
         // Rehydrated ticks carry no attach_opaque_data; the scope folded into the
         // blob is what keeps them on the function the original bind resolved.
-        let call = CallScope::new(&blob.catalog_name, Some(blob.schema_name.as_str()));
+        // An empty schema means the minting bind named none, which is only legal
+        // for a COPY handler — and a COPY-FROM producer drains fully, so it is
+        // never issued a continuation token in the first place.
+        let call = if blob.schema_name.is_empty() {
+            CallScope::copy_handler(&blob.catalog_name)
+        } else {
+            CallScope::qualified(&blob.catalog_name, &blob.schema_name)
+        };
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
@@ -1648,6 +1889,7 @@ impl Dispatcher {
         // Advertise per-kind object counts so the C++ extension caches
         // `kind_empty` and skips the bulk discovery RPC for empty kinds.
         let sch = cat.schema(name);
+        let cat_identity = self.catalog_identity(cat);
         let len = |n: usize| n as i64;
         // Counted per schema, not per catalog: a function explicitly declared in
         // a non-`main` schema must make that schema's count non-zero, or the
@@ -1659,7 +1901,7 @@ impl Dispatcher {
                 .into_iter()
                 .map(|(fname, n)| {
                     (0..n)
-                        .filter(|&i| self.declared_in(kind, fname, i, &cat.name, name))
+                        .filter(|&i| self.declared_in(kind, fname, i, cat_identity, name))
                         .count() as i64
                 })
                 .sum()
@@ -1827,7 +2069,7 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
         let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
         let bp = self.bind_params(&bind_call, ctx)?;
         let card = self
             .tables
@@ -1849,7 +2091,7 @@ impl Dispatcher {
         use crate::protocol::dtos::{DynamicToStringRequest, DynamicToStringResponse};
         let dto: DynamicToStringRequest = boxed(req)?;
         let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
         let pairs = self
             .tables
             .get(&bind_call.function_name)
@@ -1871,7 +2113,7 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
         let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?)?;
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
         let bp = self.bind_params(&bind_call, ctx)?;
         let stats = self
             .tables
@@ -2023,8 +2265,9 @@ impl Dispatcher {
         // two schemas produces two distinct `duckdb_functions()` entries.
         // Unscoped functions keep the historical placement — the `main` schema
         // of whatever catalog is attached.
+        let active_identity = self.catalog_identity(active);
         let in_schema = |kind: FnKind, name: &str, i: usize| {
-            self.declared_in(kind, name, i, &active.name, &schema_name)
+            self.declared_in(kind, name, i, active_identity, &schema_name)
         };
         let mut infos = Vec::new();
         {
@@ -2232,6 +2475,24 @@ impl Dispatcher {
     /// Replay the resolved secrets persisted by the sink-init (process / combine
     /// carry no bind_call). Empty when none were forwarded. This is what surfaces
     /// CREATE SECRET credentials on a COPY-TO writer's write()/close() params.
+    /// The owning schema the sink-init recorded for `execution_id`, if any.
+    /// Absent only when the bind itself named none (a COPY-TO handler).
+    fn buffering_schema(&self, execution_id: &[u8]) -> Option<String> {
+        self.store
+            .kv_get(execution_id, b"bufschema")
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Scope a non-bind RPC against an already-resolved execution: exact when
+    /// the bind's schema was recorded, catalog-wide when it named none.
+    fn bound_scope<'a>(catalog: &'a str, schema: Option<&'a str>) -> CallScope<'a> {
+        match schema {
+            Some(s) => CallScope::qualified(catalog, s),
+            None => CallScope::bound(catalog),
+        }
+    }
+
     fn buffering_secrets(&self, execution_id: &[u8]) -> crate::secrets::Secrets {
         self.store
             .kv_get(execution_id, b"bufsecrets")
@@ -2245,13 +2506,13 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
-        // The unary process/combine RPCs reference an already-bound execution
-        // and carry no schema, so they resolve by name within the attached
-        // catalog (mirroring vgi-python's `_resolve_function_by_name`).
-        let call = CallScope::new(
-            self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
-            None,
-        );
+        // process/combine reference an execution the sink-init already resolved
+        // and carry no schema of their own, so replay the one that bind named
+        // (persisted under `bufschema`, since these may run in another pooled
+        // worker). Only a schema-less bind — a COPY-TO handler — leaves it unset.
+        let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
+        let bound_schema = self.buffering_schema(&dto.execution_id.0);
+        let call = Self::bound_scope(catalog, bound_schema.as_deref());
         let f = self.resolve_buffering(&dto.function_name, call)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
         let output_schema =
@@ -2299,10 +2560,9 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
-        let call = CallScope::new(
-            self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice())),
-            None,
-        );
+        let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
+        let bound_schema = self.buffering_schema(&dto.execution_id.0);
+        let call = Self::bound_scope(catalog, bound_schema.as_deref());
         let f = self.resolve_buffering(&dto.function_name, call)?;
         let output_schema = self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), None)?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3305,5 +3565,208 @@ mod malformed_input_tests {
             assert_eq!(read_le_i64(&vec![0u8; n]), None);
         }
         assert_eq!(read_le_i64(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::function::{ArgSpec, FunctionMetadata};
+
+    /// A minimal named scalar; the body never runs — these tests only exercise
+    /// registry placement and resolution.
+    struct Probe(&'static str);
+    impl ScalarFunction for Probe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("value", 0, "int64", "value")]
+        }
+        fn process(&self, _p: &ProcessParams, b: &RecordBatch) -> Result<RecordBatch> {
+            Ok(b.clone())
+        }
+    }
+
+    fn dispatcher() -> Dispatcher {
+        let mut d = Dispatcher::new("cat");
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".to_string(),
+            ..Default::default()
+        });
+        d
+    }
+
+    /// Registering without naming a home still yields exactly one — the
+    /// worker's own catalog, in `main`. Nothing is homeless.
+    #[test]
+    fn default_registration_gets_one_home() {
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(Probe("f")));
+        assert_eq!(
+            d.homes_of(FnKind::Scalar, "f"),
+            &[FunctionScope::new("cat", "main")]
+        );
+        assert!(d.declared_in(FnKind::Scalar, "f", 0, "cat", "main"));
+        // Exact: it is NOT in another schema, nor in another catalog.
+        assert!(!d.declared_in(FnKind::Scalar, "f", 0, "cat", "data"));
+        assert!(!d.declared_in(FnKind::Scalar, "f", 0, "other", "main"));
+    }
+
+    /// A schema-qualified call reaches the implementation declared in that
+    /// schema, never the same-named one next door.
+    #[test]
+    fn qualified_call_is_exact() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "main"));
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "data"));
+        let main = d
+            .scoped_indices(FnKind::Scalar, "f", 2, CallScope::qualified("cat", "main"))
+            .expect("main resolves");
+        assert_eq!(main, vec![0]);
+        let data = d
+            .scoped_indices(FnKind::Scalar, "f", 2, CallScope::qualified("cat", "data"))
+            .expect("data resolves");
+        assert_eq!(data, vec![1]);
+    }
+
+    /// Naming a schema the function does not live in is an error that reports
+    /// where it *does* live — not a silent fall-through to another schema.
+    #[test]
+    fn schema_miss_errors_and_names_the_real_home() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "main"));
+        let err = d
+            .scoped_indices(FnKind::Scalar, "f", 1, CallScope::qualified("cat", "nope"))
+            .expect_err("a schema miss must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("not declared in schema 'nope'"), "{msg}");
+        assert!(msg.contains("cat.main"), "{msg}");
+    }
+
+    /// A call into a catalog that does not own the name fails rather than
+    /// reaching another catalog's implementation of it.
+    #[test]
+    fn other_catalog_cannot_reach_it() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("twin_a", "main"));
+        let err = d
+            .scoped_indices(
+                FnKind::Scalar,
+                "f",
+                1,
+                CallScope::qualified("twin_b", "main"),
+            )
+            .expect_err("a foreign catalog must not resolve");
+        assert!(err.to_string().contains("not declared in schema"));
+    }
+
+    /// A schema-less kind resolves within the catalog, but a name declared in
+    /// two schemas of that catalog is ambiguous — and the error names them.
+    #[test]
+    fn cross_schema_ambiguity_names_the_schemas() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "main"));
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "data"));
+        let err = d
+            .scoped_indices(FnKind::Scalar, "f", 2, CallScope::copy_handler("cat"))
+            .expect_err("ambiguous across schemas");
+        let msg = err.to_string();
+        assert!(msg.contains("Ambiguous function call 'f'"), "{msg}");
+        assert!(msg.contains("data"), "{msg}");
+        assert!(msg.contains("main"), "{msg}");
+    }
+
+    /// Unambiguous within the catalog: a schema-less kind still resolves.
+    #[test]
+    fn schema_less_resolves_when_unambiguous() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(Arc::new(Probe("f")), FunctionScope::new("cat", "data"));
+        let idxs = d
+            .scoped_indices(FnKind::Scalar, "f", 1, CallScope::bound("cat"))
+            .expect("single home resolves");
+        assert_eq!(idxs, vec![0]);
+    }
+
+    /// A bind naming no schema: refused for a scalar from a 1.1.0 peer,
+    /// tolerated for a COPY handler, for a table-kind function (the upstream
+    /// gap), and from a pre-1.1.0 peer that omits the column outright.
+    #[test]
+    fn schema_less_bind_is_refused_for_scalars_only() {
+        // scalar, current peer, no schema -> refused
+        assert!(CallScope::for_bind("cat", None, "f", false, false, false).is_err());
+        // an empty string is the same as absent
+        assert!(CallScope::for_bind("cat", Some(""), "f", false, false, false).is_err());
+        // COPY handler: schema-less by design
+        assert!(CallScope::for_bind("cat", None, "f", true, false, false).is_ok());
+        // table-kind: the extension does not send one yet
+        assert!(CallScope::for_bind("cat", None, "f", false, true, false).is_ok());
+        // pre-1.1.0 peer: no bind it sends can name a schema
+        assert!(CallScope::for_bind("cat", None, "f", false, false, true).is_ok());
+        // a named schema always resolves exactly
+        assert!(CallScope::for_bind("cat", Some("main"), "f", false, false, false).is_ok());
+    }
+
+    /// Renaming the primary catalog after registration rebases the homes that
+    /// were taken by default, so those functions stay reachable.
+    #[test]
+    fn set_catalog_rebases_default_homes() {
+        let mut d = Dispatcher::new("placeholder");
+        d.register_scalar(Arc::new(Probe("f")));
+        d.register_scalar_scoped(Arc::new(Probe("g")), FunctionScope::new("elsewhere", "s"));
+        d.set_catalog(catalog::CatalogModel {
+            name: "real".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            d.homes_of(FnKind::Scalar, "f"),
+            &[FunctionScope::new("real", "main")]
+        );
+        // An explicitly declared home is never rebased.
+        assert_eq!(
+            d.homes_of(FnKind::Scalar, "g"),
+            &[FunctionScope::new("elsewhere", "s")]
+        );
+    }
+
+    /// A worker that never installs a catalog still advertises its functions:
+    /// the primary's identity falls back to the name the dispatcher was built
+    /// with, which is what homes were recorded against.
+    #[test]
+    fn catalogless_worker_still_advertises_its_functions() {
+        let mut d = Dispatcher::new("plain");
+        d.register_scalar(Arc::new(Probe("f")));
+        // No set_catalog: `self.catalog` is the default, with an empty name.
+        assert_eq!(d.catalog.name, "");
+        let identity = d.catalog_identity(&d.catalog).to_string();
+        assert_eq!(identity, "plain");
+        assert!(d.declared_in(FnKind::Scalar, "f", 0, &identity, "main"));
+    }
+
+    /// A secondary catalog adopts the functions it declares it owns, so they
+    /// are advertised and resolved in *its* catalog rather than the primary's.
+    #[test]
+    fn secondary_catalog_adopts_its_functions() {
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(Probe("owned")));
+        d.register_scalar(Arc::new(Probe("kept")));
+        d.register_secondary_catalog(
+            catalog::CatalogModel {
+                name: "sec".to_string(),
+                ..Default::default()
+            },
+            vec!["owned".to_string()],
+        );
+        assert_eq!(
+            d.homes_of(FnKind::Scalar, "owned"),
+            &[FunctionScope::new("sec", "main")]
+        );
+        assert_eq!(
+            d.homes_of(FnKind::Scalar, "kept"),
+            &[FunctionScope::new("cat", "main")]
+        );
     }
 }

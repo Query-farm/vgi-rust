@@ -85,10 +85,10 @@ impl Worker {
 
     /// Register a scalar function.
     ///
-    /// The function is *unscoped*: advertised in the `main` schema of every
-    /// catalog this worker serves, and reachable from any call. Use
+    /// It is declared in this worker's own catalog, in the `main` schema —
+    /// every function has exactly one home. Use
     /// [`register_scalar_in`](Self::register_scalar_in) to place it in a
-    /// specific catalog schema.
+    /// different catalog schema.
     pub fn register_scalar(&mut self, f: impl ScalarFunction + 'static) {
         self.disp.register_scalar(Arc::new(f));
     }
@@ -97,9 +97,9 @@ impl Worker {
     ///
     /// A function name is not a unique key: the same name may be declared in
     /// two schemas of one catalog, or in two catalogs served by one worker
-    /// process. Declaring the owning schema makes the registration exact — the
-    /// function is advertised only in that schema, and a bind that names it
-    /// resolves there. See [`FunctionScope`](crate::FunctionScope).
+    /// process. The home is what tells them apart — the function is advertised
+    /// only in that schema, and only a bind naming that schema resolves to it.
+    /// See [`FunctionScope`](crate::FunctionScope).
     pub fn register_scalar_in(
         &mut self,
         catalog: &str,
@@ -108,7 +108,7 @@ impl Worker {
     ) {
         self.disp.register_scalar_scoped(
             Arc::new(f),
-            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+            crate::dispatch::FunctionScope::new(catalog, schema),
         );
     }
 
@@ -127,7 +127,7 @@ impl Worker {
     ) {
         self.disp.register_table_scoped(
             Arc::new(f),
-            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+            crate::dispatch::FunctionScope::new(catalog, schema),
         );
     }
 
@@ -158,7 +158,7 @@ impl Worker {
     ) {
         self.disp.register_table_in_out_scoped(
             Arc::new(f),
-            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+            crate::dispatch::FunctionScope::new(catalog, schema),
         );
     }
 
@@ -180,7 +180,7 @@ impl Worker {
     ) {
         self.disp.register_buffering_scoped(
             Arc::new(f),
-            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+            crate::dispatch::FunctionScope::new(catalog, schema),
         );
     }
 
@@ -199,7 +199,7 @@ impl Worker {
     ) {
         self.disp.register_aggregate_scoped(
             Arc::new(f),
-            Some(crate::dispatch::FunctionScope::new(catalog, schema)),
+            crate::dispatch::FunctionScope::new(catalog, schema),
         );
     }
 

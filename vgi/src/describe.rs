@@ -149,9 +149,13 @@ fn build_catalog(model: &CatalogModel, disp: &Dispatcher, owned: Option<&[String
         let sch = schemas_slice.iter().find(|s| &s.name == name);
         let tables = sch.map(schema_tables).unwrap_or_default();
         let views = sch.map(schema_views).unwrap_or_default();
+        // Match homes against the dispatcher's identity for this catalog, not
+        // the model name: a worker that never installs a catalog has an empty
+        // one, while its functions are homed under the worker's catalog name.
+        let identity = disp.catalog_identity(model);
         let infos = match owned {
-            None => primary_function_infos(disp, &model.name, name),
-            Some(names) => secondary_function_infos(disp, names, &model.name, name),
+            None => primary_function_infos(disp, identity, name),
+            Some(names) => secondary_function_infos(disp, names, identity, name),
         };
         let mut fns: Vec<Value> = infos.iter().map(function_json).collect();
         // Fold the schema's declarative macros into the same `functions` array:

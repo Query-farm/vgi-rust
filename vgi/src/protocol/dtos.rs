@@ -147,9 +147,15 @@ pub struct BindRequest {
 /// such a field — an extension built before it never emits the column. Append a
 /// null one so the by-name decode yields `None`, which resolution already treats
 /// as "the caller named no schema".
-pub fn backfill_bind_request(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
+/// Returns the batch alongside whether the column had to be synthesised —
+/// `true` means the peer predates 1.1.0 and omits the field entirely, which is
+/// a different situation from a 1.1.0 peer that sent the column as null. Only
+/// the latter is a statement about *this* bind.
+pub fn backfill_bind_request(
+    batch: arrow_array::RecordBatch,
+) -> Result<(arrow_array::RecordBatch, bool)> {
     if batch.column_by_name("schema_name").is_some() {
-        return Ok(batch);
+        return Ok((batch, false));
     }
     let rows = batch.num_rows();
     let mut fields: Vec<arrow_schema::Field> = batch
@@ -165,8 +171,47 @@ pub fn backfill_bind_request(batch: arrow_array::RecordBatch) -> Result<arrow_ar
         true,
     ));
     columns.push(Arc::new(arrow_array::StringArray::new_null(rows)));
-    arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-        .map_err(|e| RpcError::type_error(format!("backfill BindRequest.schema_name: {e}")))
+    let batch =
+        arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+            .map_err(|e| RpcError::type_error(format!("backfill BindRequest.schema_name: {e}")))?;
+    Ok((batch, true))
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use arrow_array::{Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn batch(with_schema_name: bool) -> RecordBatch {
+        let mut fields = vec![Field::new("function_name", DataType::Utf8, false)];
+        let mut cols: Vec<arrow_array::ArrayRef> = vec![Arc::new(StringArray::from(vec!["f"]))];
+        if with_schema_name {
+            fields.push(Field::new("schema_name", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from(vec![Some("data")])));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
+    }
+
+    /// A pre-1.1.0 peer omits the column: it is synthesised as null, and the
+    /// caller is told so — that is a statement about the peer, not the bind.
+    #[test]
+    fn absent_column_is_synthesised_and_reported() {
+        let (out, legacy) = backfill_bind_request(batch(false)).expect("backfill");
+        assert!(legacy, "an absent column means a pre-1.1.0 peer");
+        let col = out.column_by_name("schema_name").expect("column added");
+        assert_eq!(col.len(), 1);
+        assert!(col.is_null(0));
+    }
+
+    /// A 1.1.0 peer already sends the column; nothing is synthesised and the
+    /// batch is handed back untouched.
+    #[test]
+    fn present_column_is_left_alone() {
+        let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
+        assert!(!legacy);
+        assert_eq!(out.num_columns(), 2);
+    }
 }
 
 /// Read the optional `copy_from` nested-struct column from a (flat) BindRequest
