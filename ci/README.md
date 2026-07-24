@@ -47,6 +47,26 @@ Dropped at staging (covered by the locally-built `unittest` in the `vgi` repo):
   predicate's WKT differently under the prebuilt DuckDB/spatial build.
 - http lane only: `projection_pushdown_repro.test`, `dynamic_filter.test`.
 
+## Executed-case floor
+
+`haybarn-unittest` exits 0 whether one test skipped or every test did — a failed
+`require` / `require-env` is a **skip**, not an error. So "All tests passed" on
+its own is not evidence anything ran: a dead shared worker, an empty stage, or a
+mis-wired env var all read as green while the suite quietly tested nothing.
+`run_unittest` accumulates the executed count (staged cases minus skips) across
+every invocation, and the run fails if it collapses below a per-lane
+`MIN_EXECUTED` (stdio 250, launch 255, http 245, Windows-http 240 — floors ~15
+below the measured 269 / 270 / 262 / 256, leaving room for upstream growth).
+A collapse in that number is the tell of a suite-wide silent skip; it is a floor,
+not an equality, so **do not lower it to make a run pass** — find what stopped
+running. An empty stage (`No test cases matched`) fails outright.
+
+Only the floor is ported from vgi-typescript, not its per-reason skip allowlist:
+this port's three-OS matrix would need per-OS allowlists to maintain, and the
+floor alone catches the whole-suite collapses that are the real risk. The
+existing fatal-signal scan (a `fatal error condition` block a fork()ed child
+prints against the parent's counters, invisible to the exit code) stays.
+
 ## Worker coverage
 
 The `coverage` job (Linux only) measures **what the integration suite actually

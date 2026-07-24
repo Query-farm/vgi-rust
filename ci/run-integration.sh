@@ -229,6 +229,30 @@ rm -f "$STAGE/test/_warm.test"
 echo "Running suite (transport=$TRANSPORT) ..."
 rc=0
 
+# Executed-case floor — the collapse detector. haybarn-unittest exits 0 whether
+# one test skipped or every test did (a failed require/require-env is a SKIP, not
+# an error), so "All tests passed" alone is not evidence anything ran: a dead
+# shared worker, an empty stage, or a mis-wired env var all read as green while
+# the suite quietly tested nothing. run_unittest accumulates the executed count
+# (staged cases minus skips) into TOTAL_EXECUTED across every invocation; the
+# check at the end fails the lane if it collapses below MIN_EXECUTED. This is a
+# floor, not an equality — the upstream suite grows — so do NOT lower it to make
+# a run pass; find what stopped running. (Only the floor is ported from
+# vgi-typescript here, not its per-reason skip allowlist: this port's 3-OS matrix
+# would need per-OS allowlists to maintain, and the floor alone catches the
+# whole-suite collapses that are the real risk. The existing fatal-signal scan in
+# run_unittest stays.)
+#
+# Measured 2026-07-24 against Query-farm/vgi main: stdio 269, launch 270, http
+# 262 (Linux/macOS) / 256 (Windows, which runs the main catalog only). Floors sit
+# ~15 below, with a lower Windows-http value for its smaller staged set.
+TOTAL_EXECUTED=0
+case "$TRANSPORT" in
+  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-250}" ;;
+  launch) MIN_EXECUTED="${MIN_EXECUTED:-255}" ;;
+  http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-240}"; else MIN_EXECUTED="${MIN_EXECUTED:-245}"; fi ;;
+esac
+
 # run_unittest — invoke haybarn-unittest, streaming its output, and additionally
 # fail on a fatal-signal report that the process's own exit code cannot express.
 #
@@ -255,6 +279,25 @@ run_unittest() {
          "would otherwise have passed. This is invisible to the exit code by construction."
     unittest_rc=1
   fi
+  # Empty-stage guard: a runner that matched no tests still exits 0.
+  if grep -q 'No test cases matched\|No tests ran' "$log"; then
+    echo "::error::the runner matched no test cases — the glob or the staging is" \
+         "wrong (an empty stage still exits 0). transport=$TRANSPORT"
+    unittest_rc=1
+  fi
+  # Accumulate executed cases (staged total minus skips) for the floor check.
+  # total = the N in the last "[i/N] (..%):" progress line; skipped = the sum of
+  # the "Skipped tests for the following reasons:" block.
+  local total skipped
+  total="$(sed -n 's/^\[[0-9]*\/\([0-9]*\)\].*/\1/p' "$log" | tail -1)"
+  if [ -n "$total" ]; then
+    skipped="$(awk '
+      /^Skipped tests for the following reasons:/ { b = 1; next }
+      b && /^[[:space:]]*$/                       { b = 0; next }
+      b && match($0, /: [0-9]+[[:space:]]*$/)     { n += substr($0, RSTART + 2) }
+      END { print n + 0 }' "$log")"
+    TOTAL_EXECUTED=$(( TOTAL_EXECUTED + total - skipped ))
+  fi
   rm -f "$log"
   return "$unittest_rc"
 }
@@ -269,6 +312,19 @@ if [ "$TRANSPORT" = "http" ]; then
     run_unittest "test/sql/integration/bearer_auth/*" ) || rc=$?
 else
   run_unittest "test/sql/integration/*" || rc=$?
+fi
+
+# Executed-case floor — reached on every lane that runs the suite (the
+# Windows-launch lane exited earlier with nothing to run). A collapse below the
+# floor is the signature of a suite-wide silent skip.
+if [ "$TOTAL_EXECUTED" -lt "$MIN_EXECUTED" ]; then
+  echo "::error::only $TOTAL_EXECUTED test cases executed on the $TRANSPORT lane" \
+       "(windows=$WINDOWS), floor is MIN_EXECUTED=$MIN_EXECUTED. This is the" \
+       "signature of a suite-wide silent skip (a failed require is a SKIP, not an" \
+       "error). Do NOT lower the floor to make this pass — find what stopped running."
+  rc=1
+else
+  echo "Executed $TOTAL_EXECUTED test cases (floor $MIN_EXECUTED) on the $TRANSPORT lane (windows=$WINDOWS)."
 fi
 
 exit "$rc"
