@@ -861,8 +861,11 @@ impl Dispatcher {
         let is_copy = params.copy_from.is_some() || params.copy_to.is_some();
         let call = self.bind_scope(&dto, is_copy, legacy_peer)?;
 
-        // Table buffering.
-        if self.buffering.contains_key(&dto.function_name) {
+        // Table buffering. A bind carrying COPY-FROM context is always the read
+        // path, so it never resolves here: a format serving both directions
+        // registers its reader (table) and writer (buffering) under one shared
+        // handler name, and the buffering registry is consulted first.
+        if self.buffering.contains_key(&dto.function_name) && params.copy_from.is_none() {
             let f = self.resolve_buffering(&dto.function_name, call)?;
             params.arguments.remap_positional(&f.argument_specs());
             crate::function::validate_arg_constraints(&f.argument_specs(), &params.arguments)?;
@@ -1116,8 +1119,11 @@ impl Dispatcher {
                 if_modified_since: None,
             };
 
-        // Table buffering: sink (header-only) or finalize source (producer).
-        if self.buffering.contains_key(&bind_call.function_name) {
+        // Table buffering: sink (header-only) or finalize source (producer). As
+        // at bind, a COPY-FROM init is the read path and never resolves here —
+        // a both-direction format shares one handler name across the table
+        // (reader) and buffering (writer) registries.
+        if self.buffering.contains_key(&bind_call.function_name) && copy_from.is_none() {
             let f = self.resolve_buffering(&bind_call.function_name, call)?;
             bp.arguments.remap_positional(&f.argument_specs());
             let phase = dto.phase.as_ref().map(|d| d.0.clone()).unwrap_or_default();
@@ -2413,33 +2419,79 @@ impl Dispatcher {
     }
 
     /// `catalog_copy_from_formats` — advertise the worker's custom
-    /// `COPY ... FROM` formats. Catalog-level (not schema-scoped). Only the
-    /// primary catalog owns these formats; secondaries advertise none.
+    /// `COPY ... FROM` / `COPY ... TO` formats. Catalog-level (not
+    /// schema-scoped). Only the primary catalog owns these formats; secondaries
+    /// advertise none.
+    ///
+    /// A reader advertises `direction="from"` and a writer `direction="to"`. When
+    /// the *same* `format_name` is registered on both sides, the two are paired
+    /// into a single `direction="both"` entry — the extension registers one
+    /// DuckDB `CopyFunction` per format name and keeps the first registration, so
+    /// emitting two entries would silently drop the second direction. Pairing
+    /// requires the reader and writer to share a `handler_name` (the wire carries
+    /// one handler per format, and the extension hands it to both sides); the
+    /// advertised options are the union of the two directions' argument specs.
     pub fn handle_catalog_copy_from_formats(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let active = self.active_catalog(req);
         let items = if std::ptr::eq(active, &self.catalog) {
-            let mut infos: Vec<CopyFromFormatInfo> = self
-                .copy_from_formats
-                .iter()
-                .map(|f| -> Result<CopyFromFormatInfo> {
-                    let meta = f.metadata();
-                    let arg_schema = catalog::build_arg_schema(&f.argument_specs());
-                    Ok(CopyFromFormatInfo {
-                        comment: f.comment(),
-                        tags: meta.tags.clone(),
-                        format_name: f.format().to_string(),
-                        handler: f.handler_name().to_string(),
-                        options: Bytes::from(ipc::write_schema(&arg_schema)?),
-                        direction: "from".to_string(),
-                        ordered: false,
-                        description: meta.description.clone(),
-                    })
-                })
-                .collect::<Result<_>>()?;
-            // COPY ... TO writers advertise direction="to"; an ordered writer
-            // (sink_order_dependent) sets ordered=true so the extension installs
-            // a single-thread sink.
+            let mut infos: Vec<CopyFromFormatInfo> = Vec::new();
+            for f in &self.copy_from_formats {
+                let meta = f.metadata();
+                // A writer under the same format name folds into this entry.
+                let writer = self
+                    .copy_to_formats
+                    .iter()
+                    .find(|w| w.format() == f.format());
+                let mut specs = f.argument_specs();
+                let (direction, ordered) = match writer {
+                    Some(w) => {
+                        if w.handler_name() != f.handler_name() {
+                            return Err(RpcError::value_error(format!(
+                                "COPY format '{}' is registered for both directions but its \
+                                 reader and writer use different handler names ('{}' vs '{}'); a \
+                                 both-direction format carries one handler, so give \
+                                 CopyFromFunction::handler_name and CopyToFunction::handler_name \
+                                 the same value.",
+                                f.format(),
+                                f.handler_name(),
+                                w.handler_name()
+                            )));
+                        }
+                        // Union the option specs; the reader's win on a name
+                        // clash (the two directions should declare a shared
+                        // option identically).
+                        for spec in w.argument_specs() {
+                            if !specs.iter().any(|s| s.name == spec.name) {
+                                specs.push(spec);
+                            }
+                        }
+                        ("both", w.ordered())
+                    }
+                    None => ("from", false),
+                };
+                let arg_schema = catalog::build_arg_schema(&specs);
+                infos.push(CopyFromFormatInfo {
+                    comment: f.comment(),
+                    tags: meta.tags.clone(),
+                    format_name: f.format().to_string(),
+                    handler: f.handler_name().to_string(),
+                    options: Bytes::from(ipc::write_schema(&arg_schema)?),
+                    direction: direction.to_string(),
+                    ordered,
+                    description: meta.description.clone(),
+                });
+            }
+            // Writers with no same-named reader advertise direction="to" alone;
+            // an ordered writer (sink_order_dependent) sets ordered=true so the
+            // extension installs a single-thread sink.
             for f in &self.copy_to_formats {
+                if self
+                    .copy_from_formats
+                    .iter()
+                    .any(|r| r.format() == f.format())
+                {
+                    continue; // already folded into the "both" entry above
+                }
                 let meta = f.metadata();
                 let arg_schema = catalog::build_arg_schema(&f.argument_specs());
                 infos.push(CopyFromFormatInfo {
