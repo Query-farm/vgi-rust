@@ -553,6 +553,14 @@ pub struct CatalogAttachResult {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub supports_column_statistics: bool,
+    /// IPC-serialized `FunctionInfo` values the worker asks the client to
+    /// publish into its *global* (catalog-independent) namespace. Added in
+    /// protocol 1.3.0; positioned between `supports_column_statistics` and
+    /// `resolved_data_version` to match `CatalogAttachResultSchema()`.
+    pub global_functions: Vec<Bytes>,
+    /// Name prefix applied to every entry of `global_functions`. Added in
+    /// protocol 1.3.0.
+    pub global_function_prefix: String,
     pub resolved_data_version: Option<String>,
     pub resolved_implementation_version: Option<String>,
 }

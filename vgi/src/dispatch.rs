@@ -1664,6 +1664,8 @@ impl Dispatcher {
                 comment: sec.comment.clone(),
                 tags: sec.tags.clone(),
                 supports_column_statistics: false,
+                global_functions: Vec::new(),
+                global_function_prefix: String::new(),
                 resolved_data_version: sec.data_version_spec.clone(),
                 resolved_implementation_version: sec.implementation_version.clone(),
             };
@@ -1760,10 +1762,69 @@ impl Dispatcher {
                 .iter()
                 .flat_map(|s| &s.tables)
                 .any(|t| !t.statistics.is_empty()),
+            global_functions: self.global_function_infos()?,
+            global_function_prefix: self.catalog.global_function_prefix.clone(),
             resolved_data_version,
             resolved_implementation_version,
         };
         Ok(Some(wire::to_result_batch(result)?))
+    }
+
+    /// IPC-serialized `FunctionInfo` records for the primary catalog's
+    /// [`global_functions`](catalog::CatalogModel::global_functions) — the
+    /// protocol-1.3.0 `CatalogAttachResult.global_functions` column.
+    ///
+    /// Each named function must also be registered on this worker: a global
+    /// function stays schema-resident (bind dispatch is keyed on
+    /// `(schema_name, name)`), so the record is advertised in the schema the
+    /// function is declared in and the client republishes it under
+    /// `global_function_prefix`.
+    fn global_function_infos(&self) -> Result<Vec<Bytes>> {
+        if self.catalog.global_functions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let home = |kind: FnKind, name: &str| {
+            self.homes_of(kind, name)
+                .first()
+                .map(|h| h.schema.clone())
+                .unwrap_or_else(|| catalog::MAIN_SCHEMA.to_string())
+        };
+        let mut infos = Vec::new();
+        for name in &self.catalog.global_functions {
+            let info = if let Some(f) = self.scalars.get(name).and_then(|v| v.first()) {
+                Self::advertise_in(
+                    catalog::scalar_function_info(f.as_ref())?,
+                    &home(FnKind::Scalar, name),
+                )
+            } else if let Some(f) = self.tables.get(name).and_then(|v| v.first()) {
+                Self::advertise_in(
+                    catalog::table_function_info(f.as_ref())?,
+                    &home(FnKind::Table, name),
+                )
+            } else if let Some(f) = self.tableinouts.get(name).and_then(|v| v.first()) {
+                Self::advertise_in(
+                    catalog::table_in_out_function_info(f.as_ref())?,
+                    &home(FnKind::TableInOut, name),
+                )
+            } else if let Some(f) = self.buffering.get(name).and_then(|v| v.first()) {
+                Self::advertise_in(
+                    catalog::buffering_function_info(f.as_ref())?,
+                    &home(FnKind::Buffering, name),
+                )
+            } else if let Some(f) = self.aggregates.get(name).and_then(|v| v.first()) {
+                Self::advertise_in(
+                    catalog::aggregate_function_info(f.as_ref())?,
+                    &home(FnKind::Aggregate, name),
+                )
+            } else {
+                return Err(RpcError::value_error(format!(
+                    "catalog '{}' lists global function '{name}', which is not registered",
+                    self.catalog.name
+                )));
+            };
+            infos.push(info);
+        }
+        catalog::serialize_items(infos)
     }
 
     /// Validate the ATTACH-time version request against the catalog's declared

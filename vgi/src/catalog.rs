@@ -624,6 +624,18 @@ pub struct CatalogModel {
     /// When set, `catalog_attach` merges the user `options` over it and encodes
     /// the result into `attach_opaque_data` (`<16-byte id>\0<ipc>`).
     pub attach_options_default_batch: Option<Vec<u8>>,
+    /// Registered function names this catalog additionally asks the client to
+    /// publish into its *global* (catalog-independent) namespace, prefixed with
+    /// [`global_function_prefix`](Self::global_function_prefix). Advertised via
+    /// the protocol-1.3.0 `CatalogAttachResult.global_functions` column as
+    /// IPC-serialized `FunctionInfo` records. Each name must also be registered
+    /// on the worker — a global function stays schema-resident, because bind
+    /// dispatch is keyed on `(schema_name, name)`.
+    pub global_functions: Vec<String>,
+    /// Prefix applied to every [`global_functions`](Self::global_functions)
+    /// entry when the client publishes it (e.g. `vgi_example` →
+    /// `vgi_example_global_scalar`). Empty when the catalog publishes none.
+    pub global_function_prefix: String,
 }
 
 impl CatalogModel {

@@ -1128,6 +1128,8 @@ pub fn versioned() -> CatalogModel {
         attach_options_default_batch: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
+        global_functions: Vec::new(),
+        global_function_prefix: String::new(),
         comment: Some(
             "Example catalog demonstrating data_version_spec validation and cookie stickiness"
                 .to_string(),
@@ -1217,6 +1219,8 @@ pub fn versioned_tables() -> CatalogModel {
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
         version_schemas,
+        global_functions: Vec::new(),
+        global_function_prefix: String::new(),
         comment: Some(
             "Catalog whose visible tables depend on the resolved data version".to_string(),
         ),
@@ -1249,6 +1253,19 @@ pub fn build() -> CatalogModel {
         attach_options_default_batch: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
+        // Global-function registration probes, one per function type, so the
+        // client's system.main path is exercised for all four. Dedicated
+        // fixtures (see `global_functions.rs`) rather than existing ones: this
+        // catalog is a cross-language contract, so reusing e.g. `double` would
+        // force every other implementation to make the same semantic change to
+        // a function it already ships. Published as vgi_example_global_scalar,
+        // vgi_example_global_table, vgi_example_global_agg,
+        // vgi_example_global_buffered.
+        global_function_prefix: crate::global_functions::PREFIX.to_string(),
+        global_functions: crate::global_functions::NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         comment: Some("Example VGI catalog for testing".to_string()),
         tags: vec![
             ("source".to_string(), "vgi-fixture-worker".to_string()),

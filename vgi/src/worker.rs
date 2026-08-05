@@ -18,8 +18,10 @@ use crate::protocol::register;
 /// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 added `schema_name` to
 /// `BindRequest`; 1.2.0 adds it to the 15 unary requests that re-resolve the
 /// function by name, so a name declared in two schemas cannot mis-route at
-/// runtime after binding correctly.
-pub const VGI_PROTOCOL_VERSION: &str = "1.2.0";
+/// runtime after binding correctly. 1.3.0 adds `global_functions` and
+/// `global_function_prefix` to `CatalogAttachResult` — functions a worker asks
+/// the client to publish into its global namespace.
+pub const VGI_PROTOCOL_VERSION: &str = "1.3.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 

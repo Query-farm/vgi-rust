@@ -16,6 +16,7 @@ mod copy_from;
 mod copy_to;
 #[cfg(feature = "coverage")]
 mod coverage;
+mod global_functions;
 mod narrow_bind;
 mod same_name;
 mod scalar;
@@ -77,6 +78,12 @@ fn main() {
         // ... and the same name in the `main` schema of two *catalogs*, where
         // only the attachment tells them apart.
         twin_catalogs::register(&mut worker);
+        // Global-registration probes — one per function type. They are ordinary
+        // `main`-schema members of the example catalog (a global function must
+        // be schema-resident, since bind dispatch is keyed on (schema, name))
+        // AND are listed in the catalog's `global_functions` so the client is
+        // asked to publish them under `vgi_example_*`.
+        global_functions::register(&mut worker);
     }
     worker.set_catalog(catalog);
     worker.run();
