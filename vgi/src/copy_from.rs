@@ -15,6 +15,13 @@
 //! * the catalog advertises it via `catalog_copy_from_formats`, so the VGI
 //!   DuckDB extension registers a DuckDB `CopyFunction` for it.
 //!
+//! [`CopyFromFunction::read`] materializes every batch before the scan yields a
+//! row, which is the right shape for a source that fits in memory. A reader that
+//! can decode incrementally should implement
+//! [`CopyFromFunction::read_stream`] instead and hand back a producer: the scan
+//! path is identical (and unchanged on the wire — it already pulls one batch at
+//! a time), but peak memory is one batch rather than the whole source.
+//!
 //! The COPY statement's file path and the target table's schema arrive on the
 //! bind through [`crate::protocol::dtos::CopyFromContext`]
 //! (`params.copy_from`). The COPY options arrive as the function's normal
@@ -92,11 +99,37 @@ pub trait CopyFromFunction: Send + Sync {
     /// Parse `ctx.path` and return Arrow batches whose schema matches
     /// `ctx.expected_schema` exactly. The whole source is read here (single-shot
     /// — mirrors the Python reader). `out` is provided for `client_log` only.
+    ///
+    /// Implement [`read_stream`](Self::read_stream) instead when the source is
+    /// large enough that materializing every batch is the wrong shape.
     fn read(
         &self,
         ctx: &CopyFromReadContext,
         out: &mut OutputCollector,
     ) -> Result<Vec<RecordBatch>>;
+
+    /// Stream the source instead of materializing it: return a producer whose
+    /// `next_batch` is pulled until it yields `None`.
+    ///
+    /// [`read`](Self::read) must build every batch before DuckDB sees the first
+    /// row, so peak memory scales with the whole source. A producer is pulled
+    /// one batch at a time by the same scan path, so a reader that decodes
+    /// incrementally (an object-store range reader, a `File`, a socket) can hold
+    /// one batch instead of the entire file.
+    ///
+    /// **This changes nothing on the wire.** The COPY-FROM scan already streams:
+    /// dispatch pulls `next_batch` in a loop and emits each batch to the stream
+    /// as it arrives. This hook only lets a reader plug into that loop directly
+    /// rather than through a buffer, so a worker that implements it is
+    /// indistinguishable to the extension.
+    ///
+    /// Returning `None` (the default) uses [`read`](Self::read), so existing
+    /// implementations are unaffected. The returned producer must own its state
+    /// — `ctx` borrows from the call — so clone what it needs from
+    /// `ctx.params`, which is `Clone`.
+    fn read_stream(&self, _ctx: &CopyFromReadContext) -> Result<Option<Box<dyn TableProducer>>> {
+        Ok(None)
+    }
 }
 
 /// Adapter that exposes a [`CopyFromFunction`] as an ordinary producer-mode
@@ -155,23 +188,32 @@ impl TableFunction for CopyFromTable {
         Ok(Box::new(CopyFromProducer {
             inner: self.0.clone(),
             params: params.clone(),
-            done: false,
+            started: false,
+            stream: None,
             batches: Vec::new().into_iter(),
         }))
     }
 }
 
-/// Single-shot producer: the first `next_batch` reads the whole source via
-/// [`CopyFromFunction::read`] and drains the resulting batches.
+/// Drives a [`CopyFromFunction`] as a producer.
+///
+/// On the first pull it asks for a streaming producer
+/// ([`CopyFromFunction::read_stream`]) and delegates to it if there is one;
+/// otherwise it falls back to [`CopyFromFunction::read`] and drains the batches
+/// that call materialized. Either way the scan itself is unchanged — batches
+/// leave one at a time.
 struct CopyFromProducer {
     inner: Arc<dyn CopyFromFunction>,
     params: ProcessParams,
-    done: bool,
+    started: bool,
+    /// Set when the reader supplied a streaming producer.
+    stream: Option<Box<dyn TableProducer>>,
+    /// The buffered fallback's batches.
     batches: std::vec::IntoIter<RecordBatch>,
 }
 
 impl CopyFromProducer {
-    fn fill(&mut self, out: &mut OutputCollector) -> Result<()> {
+    fn start(&mut self, out: &mut OutputCollector) -> Result<()> {
         // `copy_from` presence is defended at bind/producer build.
         let cf =
             self.params.copy_from.clone().ok_or_else(|| {
@@ -184,18 +226,23 @@ impl CopyFromProducer {
             expected_schema: &expected_schema,
             params: &self.params,
         };
-        let batches = self.inner.read(&ctx, out)?;
-        self.batches = batches.into_iter();
-        self.done = true;
+        self.started = true;
+        match self.inner.read_stream(&ctx)? {
+            Some(producer) => self.stream = Some(producer),
+            None => self.batches = self.inner.read(&ctx, out)?.into_iter(),
+        }
         Ok(())
     }
 }
 
 impl TableProducer for CopyFromProducer {
     fn next_batch(&mut self, out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
-        if !self.done {
-            self.fill(out)?;
+        if !self.started {
+            self.start(out)?;
         }
-        Ok(self.batches.next())
+        match self.stream.as_mut() {
+            Some(producer) => producer.next_batch(out),
+            None => Ok(self.batches.next()),
+        }
     }
 }

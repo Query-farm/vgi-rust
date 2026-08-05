@@ -15,14 +15,14 @@
 //! - [`FsStorage`] — the original filesystem store (atomic-rename queue); the
 //!   zero-dependency fallback.
 //! - [`SqliteStorage`] — durable single-file SQLite (feature `sqlite`, default).
-//! - [`HttpStorage`] — a client to a remote storage service, so stateless
+//! - `HttpStorage` — a client to a remote storage service, so stateless
 //!   workers (e.g. several fly.io instances) share one durable store
 //!   (feature `http-storage`).
 //!
 //! The method surface is intentionally **infallible**: a backend that can't
 //! complete an operation logs and degrades (reads → empty, writes → dropped),
-//! matching the original filesystem store's best-effort contract. The remote
-//! [`HttpStorage`] retries internally and, on an unrecoverable error, panics —
+//! matching the original filesystem store's best-effort contract.
+//! The remote `HttpStorage` retries internally and, on an unrecoverable error, panics —
 //! which the RPC layer's panic isolation converts into a clean per-call error
 //! rather than taking down the worker. (Surfacing storage errors as `Result`
 //! to callers is a planned refinement.)
