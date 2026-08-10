@@ -37,11 +37,12 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     // --- catalog handshake ---
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "catalog_attach",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_catalog_attach(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
@@ -62,117 +63,131 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     // --- aggregates ---
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_bind",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, ctx| d.handle_aggregate_bind(req, ctx),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_update",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_update(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_combine",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_combine(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_finalize",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_finalize(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_destructor",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_destructor(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_window_init",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_window_init(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_window",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_window(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_window_batch",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_window_batch(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_window_destructor",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_window_destructor(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_streaming_open",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_streaming_open(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_streaming_chunk",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_streaming_chunk(req),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "aggregate_streaming_close",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_aggregate_streaming_close(req),
-        );
+        ));
     }
 
     // --- table buffering ---
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_buffering_process",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, ctx| d.handle_buffering_process(req, ctx),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_buffering_combine",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, ctx| d.handle_buffering_combine(req, ctx),
-        );
+        ));
     }
     {
         let d = disp.clone();
@@ -308,27 +323,30 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_function_statistics",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, ctx| d.handle_table_function_statistics(req, ctx),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_function_cardinality",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, ctx| d.handle_table_function_cardinality(req, ctx),
-        );
+        ));
     }
     {
         let d = disp.clone();
-        srv.register_unary(
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_function_dynamic_to_string",
+            wire::request_binary_schema(),
             wire::result_binary_schema(),
             move |req, _ctx| d.handle_table_function_dynamic_to_string(req),
-        );
+        ));
     }
 
     {

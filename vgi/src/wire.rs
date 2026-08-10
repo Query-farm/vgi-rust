@@ -78,6 +78,21 @@ pub fn result_binary_schema() -> SchemaRef {
     )]))
 }
 
+/// The wire params envelope every unary VGI method takes: a single `request`
+/// binary column holding an IPC-encoded inner batch.
+///
+/// This is what `__describe__` must advertise. A client that builds its request
+/// from the advertised schema (the TypeScript client does) sends a
+/// metadata-only batch against an empty advertised schema, and the handler then
+/// reports a missing `request` column.
+pub fn request_binary_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "request",
+        DataType::Binary,
+        true,
+    )]))
+}
+
 /// Serialize a response DTO into the wire `{result: binary}` envelope.
 pub fn to_result_batch<T: VgiArrow>(value: T) -> Result<RecordBatch> {
     let inner = to_batch(value)?;

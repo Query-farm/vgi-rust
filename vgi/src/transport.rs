@@ -192,7 +192,7 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
 pub fn serve_http(
     server: Arc<RpcServer>,
     authenticate: Option<vgi_rpc::Authenticate>,
-    describe_provider: Option<Arc<dyn vgi_rpc::http::DescribeProvider>>,
+    landing_info: Option<vgi_rpc::http::LandingInfo>,
 ) {
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();
@@ -221,10 +221,11 @@ pub fn serve_http(
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
         }
-        // Standardized landing surface: serve `describe.json` + lazy columns
-        // from the worker's catalog introspection.
-        if let Some(provider) = describe_provider {
-            builder = builder.describe_provider(provider);
+        // Standardized landing surface: the shared page plus the browser client
+        // build it reads the catalog with. Only the worker's identity is
+        // supplied here; the catalog is read over the protocol.
+        if let Some(info) = landing_info {
+            builder = builder.landing_info(info);
         }
         let state = builder.build();
         // Default to loopback + ephemeral port (the local test harness reads the

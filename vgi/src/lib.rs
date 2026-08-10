@@ -125,8 +125,6 @@ pub mod cache_control;
 pub mod catalog;
 pub mod copy_from;
 pub mod copy_to;
-#[cfg(feature = "transport-http")]
-pub mod describe;
 pub mod dispatch;
 pub mod function;
 pub mod ipc;

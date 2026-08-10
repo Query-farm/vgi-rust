@@ -338,10 +338,13 @@ impl Worker {
 
         #[cfg(feature = "transport-http")]
         if args.iter().any(|a| a == "--http") {
-            let provider: Arc<dyn vgi_rpc::http::DescribeProvider> = Arc::new(
-                crate::describe::VgiDescribeProvider::new(disp, worker_name, worker_doc),
-            );
-            crate::transport::serve_http(server, build_authenticate(), Some(provider));
+            let info = vgi_rpc::http::LandingInfo {
+                name: worker_name,
+                doc: worker_doc,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            let _ = &disp;
+            crate::transport::serve_http(server, build_authenticate(), Some(info));
             return;
         }
         // The dispatcher handle is only needed by the HTTP landing contract.
