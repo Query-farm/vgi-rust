@@ -135,13 +135,30 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
 
 /// Serialize one `AttachOptionSpec` (discovery record for an ATTACH option).
 /// Schema `{name:str, description:str, type:binary (IPC schema of a single
-/// `value` field), default_value:binary? (IPC 1-row batch of the default)}`.
+/// `value` field), default_value:binary? (IPC 1-row batch of the default),
+/// required:bool?}`.
+///
+/// `required` marks an option the caller must supply at ATTACH time, so a
+/// client can report that before attempting the attach rather than surfacing a
+/// failure that reads like an empty catalog. It is nullable and appended LAST:
+/// a peer that predates the column reads the batch by name and simply doesn't
+/// see it, and absent and explicit-null both mean "not required".
+///
+/// Passing `required = true` together with a `default` is an error — an option
+/// that falls back to a value is by definition satisfiable without the caller.
 pub fn serialize_attach_option_spec(
     name: &str,
     description: &str,
     arrow_type: &DataType,
     default: Option<&arrow_array::ArrayRef>,
+    required: bool,
 ) -> Result<Vec<u8>> {
+    if required && default.is_some() {
+        return Err(vgi_rpc::RpcError::runtime_error(format!(
+            "Attach option '{name}' is required but also declares a default; an option \
+             with a default is always satisfiable without the caller. Drop one."
+        )));
+    }
     use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
     let type_schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -162,12 +179,16 @@ pub fn serialize_attach_option_spec(
         Field::new("description", DataType::Utf8, false),
         Field::new("type", DataType::Binary, false),
         Field::new("default_value", DataType::Binary, true),
+        Field::new("required", DataType::Boolean, true),
     ]));
     let cols: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![name])),
         Arc::new(StringArray::from(vec![description])),
         Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])),
         Arc::new(BinaryArray::from(vec![default_bytes.as_deref()])),
+        // Written explicitly rather than left null so a reader sees `false`,
+        // not NULL, for an option that simply isn't required.
+        Arc::new(arrow_array::BooleanArray::from(vec![required])),
     ];
     let batch = RecordBatch::try_new(schema, cols)
         .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
@@ -1693,5 +1714,138 @@ mod tests {
         // ('x') is left to DuckDB's binder — validation must accept it.
         let t = ab_table(vec![vec!["a.x".to_string()]]);
         assert!(table_info("data", &t).is_ok());
+    }
+}
+
+/// Raised when `catalog_attach` omits options declared `required`.
+///
+/// Carries the option names so a caller can act on them without parsing the
+/// message. The message text mirrors Python's `MissingAttachOptionsError` —
+/// the extension's integration suite matches on it.
+#[derive(Debug, Clone)]
+pub struct MissingAttachOptions {
+    pub catalog_name: String,
+    pub missing: Vec<String>,
+}
+
+impl std::fmt::Display for MissingAttachOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quoted: Vec<String> = self.missing.iter().map(|n| format!("'{n}'")).collect();
+        let plural = if self.missing.len() > 1 { "s" } else { "" };
+        write!(
+            f,
+            "Catalog '{}' cannot be attached without the required option{} {}.",
+            self.catalog_name,
+            plural,
+            quoted.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MissingAttachOptions {}
+
+impl From<MissingAttachOptions> for vgi_rpc::RpcError {
+    fn from(e: MissingAttachOptions) -> Self {
+        vgi_rpc::RpcError::value_error(e.to_string())
+    }
+}
+
+/// Return an error when an option declared `required` has no corresponding
+/// entry in the supplied `catalog_attach` options.
+///
+/// `options_ipc` is the serialized options batch as received: each supplied
+/// option is a column of a single-row batch, so the column names are the keys.
+/// Names compare case-insensitively, mirroring DuckDB's handling of ATTACH
+/// option keys.
+pub fn validate_required_attach_options(
+    catalog_name: &str,
+    required_names: &[&str],
+    options_ipc: Option<&[u8]>,
+) -> std::result::Result<(), MissingAttachOptions> {
+    if required_names.is_empty() {
+        return Ok(());
+    }
+    let supplied: Vec<String> = match options_ipc {
+        Some(bytes) if !bytes.is_empty() => match ipc::read_batch(bytes) {
+            Ok(batch) => batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_lowercase())
+                .collect(),
+            // Unreadable options are not the same as absent ones; let the
+            // attach proceed and fail on its own terms rather than reporting a
+            // missing option that may well have been supplied.
+            Err(_) => return Ok(()),
+        },
+        _ => Vec::new(),
+    };
+    let missing: Vec<String> = required_names
+        .iter()
+        .filter(|n| !supplied.contains(&n.to_lowercase()))
+        .map(|n| (*n).to_string())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(MissingAttachOptions {
+            catalog_name: catalog_name.to_string(),
+            missing,
+        })
+    }
+}
+
+#[cfg(test)]
+mod attach_option_required_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+
+    fn options_batch(names: &[&str]) -> Vec<u8> {
+        let fields: Vec<Field> = names
+            .iter()
+            .map(|n| Field::new(*n, DataType::Utf8, true))
+            .collect();
+        let cols: Vec<ArrayRef> = names
+            .iter()
+            .map(|_| Arc::new(StringArray::from(vec!["x"])) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        ipc::write_batch(&batch).unwrap()
+    }
+
+    // An option that falls back to a value is always satisfiable without the
+    // caller, so declaring it required as well is a declaration bug.
+    #[test]
+    fn required_with_default_is_rejected() {
+        let default: ArrayRef = Arc::new(StringArray::from(vec!["us-east-1"]));
+        let err = serialize_attach_option_spec("region", "", &DataType::Utf8, Some(&default), true);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn required_column_is_written() {
+        let bytes = serialize_attach_option_spec("api_key", "API key", &DataType::Utf8, None, true)
+            .unwrap();
+        let batch = ipc::read_batch(&bytes).unwrap();
+        assert!(batch.schema().field_with_name("required").is_ok());
+    }
+
+    #[test]
+    fn missing_required_option_is_reported_by_name() {
+        let opts = options_batch(&["region"]);
+        let err = validate_required_attach_options("gated", &["api_key"], Some(&opts)).unwrap_err();
+        assert_eq!(err.missing, vec!["api_key".to_string()]);
+        assert!(err.to_string().contains("'api_key'"));
+    }
+
+    #[test]
+    fn supplied_required_option_passes_case_insensitively() {
+        let opts = options_batch(&["API_KEY"]);
+        assert!(validate_required_attach_options("gated", &["api_key"], Some(&opts)).is_ok());
+    }
+
+    #[test]
+    fn no_required_specs_accepts_absent_options() {
+        assert!(validate_required_attach_options("gated", &[], None).is_ok());
     }
 }

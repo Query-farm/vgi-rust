@@ -206,7 +206,7 @@ pub fn register(w: &mut vgi::Worker) {
 pub fn catalog() -> vgi::catalog::CatalogModel {
     let specs: Vec<Vec<u8>> = option_defs()
         .iter()
-        .map(|(n, d, t, a)| vgi::catalog::serialize_attach_option_spec(n, d, t, Some(a)).unwrap())
+        .map(|(n, d, t, a)| vgi::catalog::serialize_attach_option_spec(n, d, t, Some(a), false).unwrap())
         .collect();
     let default = default_batch()
         .ok()
