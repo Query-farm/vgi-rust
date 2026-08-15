@@ -148,6 +148,24 @@ pub mod worker;
 // downstream users and for `crate::`-relative paths inside this crate.
 pub use vgi_protocol::{cache_control, ipc, wire, VGI_PROTOCOL_NAME, VGI_PROTOCOL_VERSION};
 
+// The RPC layer, re-exported so a worker never has to name its version.
+//
+// Every trait method here returns `vgi_rpc::Result`, so implementing one used
+// to require a direct `vgi-rpc` dependency — and getting that version wrong is
+// not a warning, it is `RpcError` resolving to two different types and a trait
+// that cannot be implemented:
+//
+//     error[E0053]: method `process` has an incompatible type for trait
+//        = note: expected ... -> Result<_, vgi_rpc::errors::RpcError>
+//                  found ... -> Result<_, RpcError>
+//
+// 0.x minors are semver-incompatible, so Cargo will never unify them; the user
+// has to discover which version this crate happens to want. Re-exporting the
+// whole crate removes the question: `use vgi::vgi_rpc::{Result, RpcError};`
+// is always the right version by construction.
+pub use ::vgi_rpc;
+pub use ::vgi_rpc::{Result, RpcError};
+
 #[cfg(test)]
 mod http_continuation_tests;
 
