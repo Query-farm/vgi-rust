@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use vgi_protocol::ipc;
@@ -131,10 +132,6 @@ impl Arguments {
     /// An empty argument list encodes to empty bytes, which the worker reads as
     /// "no arguments" — see `Arguments::parse`.
     pub fn to_ipc(&self) -> Result<Bytes> {
-        if self.is_empty() {
-            return Ok(Bytes(Vec::new()));
-        }
-
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
@@ -148,14 +145,29 @@ impl Arguments {
         }
 
         let struct_fields = Fields::from(fields);
-        let args = StructArray::new(struct_fields.clone(), arrays, None);
+        // A no-argument call is still a real `Arguments`: `BindRequest.arguments`
+        // is NOT optional, so the worker always parses these bytes as an IPC
+        // stream. Sending nothing is therefore not "no arguments" — it is a
+        // truncated stream, and the Python reference worker dies on it with
+        // "Tried reading schema message, was null or length 0", taking the
+        // connection with it. The canonical empty encoding is a ONE-row batch
+        // over `args: struct<>` (248 bytes, per `Arguments().serialize_to_bytes()`).
+        let args: ArrayRef = if struct_fields.is_empty() {
+            Arc::new(StructArray::new_empty_fields(1, None))
+        } else {
+            Arc::new(StructArray::new(struct_fields.clone(), arrays, None))
+        };
         let schema = Arc::new(Schema::new(vec![Field::new(
             "args",
             DataType::Struct(struct_fields),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(args) as ArrayRef])
-            .map_err(|e| RpcError::runtime_error(format!("build arguments batch: {e}")))?;
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            vec![args],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .map_err(|e| RpcError::runtime_error(format!("build arguments batch: {e}")))?;
         Ok(Bytes(ipc::write_batch(&batch)?))
     }
 }
@@ -167,11 +179,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_arguments_encode_to_empty_bytes() {
-        // The worker reads empty bytes as "no arguments"; an empty *batch*
-        // would be a different thing (a struct with no fields), which Arrow
-        // will not even build.
-        assert!(Arguments::new().to_ipc().unwrap().0.is_empty());
+    fn empty_arguments_encode_to_a_valid_one_row_stream() {
+        // Not empty bytes: `BindRequest.arguments` is non-optional, so the
+        // worker always opens these bytes as an IPC stream. This mirrors
+        // Python's `Arguments().serialize_to_bytes()` — one row over
+        // `args: struct<>`.
+        let bytes = Arguments::new().to_ipc().unwrap().0;
+        assert!(!bytes.is_empty(), "a truncated stream kills the worker");
+
+        let batch = ipc::read_batch(&bytes).expect("parses as an IPC stream");
+        assert_eq!(batch.num_rows(), 1, "one row, like Python");
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "args");
+        match batch.schema().field(0).data_type() {
+            DataType::Struct(f) => assert!(f.is_empty(), "no argument fields"),
+            other => panic!("args should be a struct, got {other:?}"),
+        }
     }
 
     #[test]
