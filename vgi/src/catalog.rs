@@ -758,7 +758,7 @@ pub struct CatSchema {
     pub tables: Vec<CatTable>,
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct CatView {
     pub name: String,
     pub definition: String,
@@ -767,7 +767,7 @@ pub struct CatView {
     pub column_comments: Vec<(String, String)>,
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct CatMacro {
     pub name: String,
     pub parameters: Vec<String>,
@@ -836,6 +836,37 @@ pub struct CatTable {
     /// `register_table` call — mirroring the Go `CatalogTable.Function`
     /// ergonomics. Not serialized; only the `scan_function` name reaches the wire.
     pub scan_function_impl: Option<std::sync::Arc<dyn crate::table_function::TableFunction>>,
+}
+
+/// `columns` is the one field with no sensible zero — a table with no columns
+/// is not a table — so this fills it with an empty schema rather than blocking
+/// the `..Default::default()` spelling that `CatalogModel` and `CatSchema`
+/// already support. Set it.
+impl Default for CatTable {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            columns: std::sync::Arc::new(arrow_schema::Schema::empty()),
+            scan_function: String::new(),
+            scan_arguments: Vec::new(),
+            comment: None,
+            cardinality: None,
+            not_null: Vec::new(),
+            primary_key: Vec::new(),
+            unique: Vec::new(),
+            check: Vec::new(),
+            tags: Vec::new(),
+            foreign_keys: Vec::new(),
+            inline_scan: false,
+            branches: None,
+            required_extensions: Vec::new(),
+            statistics: Vec::new(),
+            time_travel: Vec::new(),
+            required_filters: Vec::new(),
+            supports_time_travel: false,
+            scan_function_impl: None,
+        }
+    }
 }
 
 /// One historical version of a time-travel table.

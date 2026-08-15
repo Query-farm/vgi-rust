@@ -1,0 +1,24 @@
+[package]
+name = "vgi-docs-examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+# Standalone workers embedded verbatim in the vgi-rust documentation. Distinct
+# from vgi-example-worker, which holds fixture functions for the C++ integration
+# suite and is not runnable on its own.
+#
+# Each binary is self-contained so a reader can copy one file into their own
+# crate. verify.sh runs them all against a real engine.
+
+[dependencies]
+vgi = { path = "../../vgi" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-select = { workspace = true }

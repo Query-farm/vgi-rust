@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vgi-protocol", "vgi-client", "vgi", "vgi-example-worker", "vgi-storage-server"]
+members = ["vgi-protocol", "vgi-client", "vgi", "vgi-example-worker", "vgi-storage-server", "examples/docs"]
 
 
 [workspace.package]
