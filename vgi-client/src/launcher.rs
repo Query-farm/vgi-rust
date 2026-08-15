@@ -41,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,14 @@ pub struct LaunchConfig {
     pub state_dir: Option<PathBuf>,
     /// How long to wait for the worker's discovery line.
     pub spawn_timeout: Duration,
+    /// Where the spawned worker's stderr goes. `None` means `/dev/null`.
+    ///
+    /// It cannot be inherited: the worker outlives this process by design, so
+    /// holding our stderr would keep the fd open for its whole idle timeout —
+    /// which hangs any parent waiting for our output to end, `cargo test`
+    /// included. The C++ launcher makes the same choice, with the same escape
+    /// valve.
+    pub stderr_path: Option<PathBuf>,
 }
 
 impl Default for LaunchConfig {
@@ -80,6 +88,7 @@ impl Default for LaunchConfig {
             idle_timeout: Duration::from_secs(300),
             state_dir: None,
             spawn_timeout: Duration::from_secs(60),
+            stderr_path: None,
         }
     }
 }
@@ -259,15 +268,29 @@ fn spawn_worker(argv: &[String], sock: &Path, config: &LaunchConfig) -> Result<(
         .split_first()
         .ok_or_else(|| RpcError::value_error("launch: has an empty argv"))?;
 
+    let stderr = match &config.stderr_path {
+        Some(path) => fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(Stdio::from)
+            .map_err(|e| {
+                RpcError::runtime_error(format!("open worker stderr {}: {e}", path.display()))
+            })?,
+        None => Stdio::null(),
+    };
+
     let mut child = Command::new(cmd)
         .args(args)
         .arg("--unix")
         .arg(sock)
         .arg("--idle-timeout")
         .arg(encode_idle_timeout(config.idle_timeout))
+        // stdin null so the worker cannot block on it; stderr never inherited
+        // (see `LaunchConfig::stderr_path`).
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| RpcError::runtime_error(format!("spawn launcher worker {cmd}: {e}")))?;
 
@@ -320,11 +343,11 @@ fn read_discovery_line(stdout: std::process::ChildStdout, timeout: Duration) -> 
                     seen += n;
                     if let Some(path) = line.trim_end().strip_prefix(DISCOVERY_PREFIX) {
                         let _ = tx.send(Ok(path.to_string()));
-                        // Keep draining so the worker never blocks on a full
-                        // pipe; the protocol says it should stay quiet, but a
-                        // chatty one must not deadlock us.
-                        let mut sink = Vec::new();
-                        let _ = reader.read_to_end(&mut sink);
+                        // Stop reading and drop the pipe. The protocol requires
+                        // exactly this: the worker must stay silent afterwards,
+                        // and a write to our closed read end SIGPIPEs it, which
+                        // is the intended kill. Draining instead would hold the
+                        // fd (and this thread) for the worker's whole life.
                         return;
                     }
                     if seen > MAX_PREAMBLE_BYTES {

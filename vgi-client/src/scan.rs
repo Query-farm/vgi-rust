@@ -71,6 +71,13 @@ pub struct BindSpec {
     pub schema_name: Option<String>,
     /// Call arguments.
     pub arguments: Arguments,
+    /// Pre-serialized call arguments, used in place of [`Self::arguments`].
+    ///
+    /// A catalog table's scan arguments arrive from the worker already IPC
+    /// encoded (`ScanFunctionResult::arguments`) and can hold types this
+    /// client's [`ArgValue`](crate::ArgValue) does not model. Re-encoding them
+    /// would be lossy, so they are forwarded byte-for-byte.
+    pub raw_arguments: Option<Bytes>,
     /// IPC-encoded settings, if the catalog declares any.
     pub settings: Option<Bytes>,
     /// Time travel for this bind.
@@ -85,9 +92,19 @@ impl BindSpec {
             function_type: FunctionType::Table,
             schema_name: None,
             arguments: Arguments::new(),
+            raw_arguments: None,
             settings: None,
             at: None,
         }
+    }
+
+    /// Use argument bytes the worker already encoded, verbatim.
+    ///
+    /// Takes precedence over [`Self::with_arguments`].
+    #[must_use]
+    pub fn with_raw_arguments(mut self, args: Bytes) -> Self {
+        self.raw_arguments = Some(args);
+        self
     }
 
     /// Set the owning schema.
@@ -378,7 +395,10 @@ impl VgiClient {
     pub fn bind(&mut self, cat: &AttachedCatalog, spec: &BindSpec) -> Result<BoundFunction> {
         let request = BindRequest {
             function_name: spec.function_name.clone(),
-            arguments: spec.arguments.to_ipc()?,
+            arguments: match &spec.raw_arguments {
+                Some(raw) => raw.clone(),
+                None => spec.arguments.to_ipc()?,
+            },
             function_type: DictString(spec.function_type.as_str().to_string()),
             input_schema: None,
             settings: spec.settings.clone(),

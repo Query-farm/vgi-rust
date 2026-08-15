@@ -93,5 +93,12 @@ pub use vgi_rpc::errors::{Result, RpcError};
 /// The wire types a caller receives.
 pub use vgi_protocol::protocol::dtos;
 
+/// The catalog DTOs a caller handles by name, lifted out of [`dtos`] so the
+/// common ones need no module path.
+pub use vgi_protocol::protocol::dtos::{ScanFunctionResult, TableInfo};
+
+/// An opaque wire blob — a worker handle, or arguments it already encoded.
+pub use vgi_rpc::Bytes;
+
 /// Cache directives a worker may advertise on its result.
 pub use vgi_protocol::cache_control::CacheControl;

@@ -46,4 +46,5 @@ sha2 = { version = "0.10", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+arrow-ipc = { workspace = true }
 vgi = { path = "../vgi" }

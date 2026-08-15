@@ -5,7 +5,8 @@
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     CatalogAttachRequest, CatalogAttachResult, CatalogInfo, CatalogTransactionBeginResult,
-    CatalogVersionResult, FunctionInfo, MacroInfo, SchemaInfo, TableInfo, ViewInfo,
+    CatalogVersionResult, FunctionInfo, MacroInfo, ScanFunctionResult, SchemaInfo, TableInfo,
+    ViewInfo,
 };
 use vgi_rpc::errors::Result;
 use vgi_rpc::{Bytes, DictString};
@@ -312,6 +313,43 @@ impl VgiClient {
             },
         )?;
         Ok(items.into_iter().next())
+    }
+
+    /// How to scan a catalog table: which function to bind, with what arguments.
+    ///
+    /// A VGI catalog table is not storage the client reads directly — it is a
+    /// *function call the worker chose*, so scanning one means binding that
+    /// function with the worker's own arguments. Those arguments arrive
+    /// already IPC-encoded and are forwarded verbatim
+    /// ([`BindSpec::with_raw_arguments`]) rather than decoded and rebuilt,
+    /// since they may carry types this client does not model.
+    ///
+    /// The worker may **inline** the answer on [`TableInfo::scan_function`] to
+    /// save a round trip, or leave it empty, in which case this fires
+    /// `catalog_table_scan_function_get`. Both are normal; inlining is an
+    /// optimisation, not a different kind of table.
+    pub fn table_scan_function(
+        &mut self,
+        cat: &AttachedCatalog,
+        table: &TableInfo,
+        at: Option<&At>,
+    ) -> Result<ScanFunctionResult> {
+        if !table.scan_function.0.is_empty() {
+            let batch = vgi_protocol::ipc::read_batch(&table.scan_function.0)?;
+            return vgi_protocol::wire::from_batch(&batch);
+        }
+        call(
+            self.transport_mut(),
+            "catalog_table_scan_function_get",
+            p::CatalogTableScanFunctionGetParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_name: table.schema_name.clone(),
+                name: table.name.clone(),
+                at_unit: at.map(|a| a.unit.clone()),
+                at_value: at.map(|a| a.value.clone()),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
     }
 
     /// Open a transaction, threading its handle onto later reads.

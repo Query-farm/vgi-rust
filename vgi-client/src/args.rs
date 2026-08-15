@@ -172,6 +172,112 @@ impl Arguments {
     }
 }
 
+impl Arguments {
+    /// Decode the arguments a worker attached to a catalog table's scan
+    /// function.
+    ///
+    /// # A different encoding from [`Arguments::to_ipc`]
+    ///
+    /// These are not round-tripped bind arguments. `ScanFunctionResult`
+    /// declares `positional_arguments` and `named_arguments`, and the wire form
+    /// is a **flat** batch whose columns *are* the arguments, read from row 0:
+    ///
+    /// * a column named `arg_<N>` is positional argument `N`
+    /// * any other column name is a named argument
+    ///
+    /// There is no `args` struct wrapper here, which is what
+    /// [`Arguments::to_ipc`] produces. Forwarding these bytes straight into
+    /// `BindRequest.arguments` therefore fails on the worker with
+    /// `Field "args" does not exist in schema` — they have to be decoded and
+    /// re-encoded. The DuckDB extension does the same (`DecodeScanArguments`).
+    ///
+    /// Empty bytes, or a batch with no rows, means "no arguments".
+    pub fn from_scan_arguments(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::new());
+        }
+        let batch = ipc::read_batch(bytes)?;
+        if batch.num_rows() == 0 {
+            return Ok(Self::new());
+        }
+
+        // Positional arguments are keyed by the index in their name, not by
+        // column order, so collect and sort rather than trusting the layout.
+        let mut positional: Vec<(usize, ArgValue)> = Vec::new();
+        let mut out = Self::new();
+        for (i, field) in batch.schema().fields().iter().enumerate() {
+            let value = ArgValue::from_array_row0(batch.column(i).as_ref(), field.name())?;
+            match field
+                .name()
+                .strip_prefix("arg_")
+                .and_then(|n| n.parse().ok())
+            {
+                // A ceiling, because the index sizes a vector and a worker
+                // could name a column `arg_9999999999`.
+                Some(idx) if idx < MAX_POSITIONAL_ARGS => positional.push((idx, value)),
+                Some(idx) => {
+                    return Err(RpcError::value_error(format!(
+                        "scan arguments name positional index {idx}, above the \
+                         {MAX_POSITIONAL_ARGS} ceiling"
+                    )))
+                }
+                None => out = out.named(field.name(), value),
+            }
+        }
+
+        positional.sort_by_key(|(i, _)| *i);
+        for (_, v) in positional {
+            out = out.positional(v);
+        }
+        Ok(out)
+    }
+}
+
+/// More positional arguments than any real function takes; a larger index in a
+/// worker-supplied column name is a protocol error, not an allocation request.
+const MAX_POSITIONAL_ARGS: usize = 1000;
+
+impl ArgValue {
+    /// Read row 0 of `array` as an argument value.
+    fn from_array_row0(array: &dyn arrow_array::Array, name: &str) -> Result<Self> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::*;
+
+        if array.is_empty() || array.is_null(0) {
+            return Ok(Self::Null(array.data_type().clone()));
+        }
+        Ok(match array.data_type() {
+            DataType::Boolean => Self::Bool(array.as_boolean().value(0)),
+            DataType::Int8 => Self::Int(array.as_primitive::<Int8Type>().value(0) as i64),
+            DataType::Int16 => Self::Int(array.as_primitive::<Int16Type>().value(0) as i64),
+            DataType::Int32 => Self::Int(array.as_primitive::<Int32Type>().value(0) as i64),
+            DataType::Int64 => Self::Int(array.as_primitive::<Int64Type>().value(0)),
+            DataType::UInt8 => Self::Int(array.as_primitive::<UInt8Type>().value(0) as i64),
+            DataType::UInt16 => Self::Int(array.as_primitive::<UInt16Type>().value(0) as i64),
+            DataType::UInt32 => Self::Int(array.as_primitive::<UInt32Type>().value(0) as i64),
+            DataType::UInt64 => {
+                let v = array.as_primitive::<UInt64Type>().value(0);
+                i64::try_from(v).map(Self::Int).map_err(|_| {
+                    RpcError::value_error(format!(
+                        "scan argument `{name}` ({v}) exceeds the signed 64-bit range"
+                    ))
+                })?
+            }
+            DataType::Float32 => Self::Float(array.as_primitive::<Float32Type>().value(0) as f64),
+            DataType::Float64 => Self::Float(array.as_primitive::<Float64Type>().value(0)),
+            DataType::Utf8 => Self::Text(array.as_string::<i32>().value(0).to_string()),
+            DataType::LargeUtf8 => Self::Text(array.as_string::<i64>().value(0).to_string()),
+            DataType::Utf8View => Self::Text(array.as_string_view().value(0).to_string()),
+            other => {
+                return Err(RpcError::value_error(format!(
+                    "scan argument `{name}` has type {other}, which this client \
+                     does not carry as a bind argument"
+                )))
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::Array;
