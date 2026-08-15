@@ -1003,6 +1003,15 @@ pub struct AggregateFinalizeResponse {
 pub struct AggregateDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
+    /// IPC batch of the group ids whose state should be released.
+    ///
+    /// Required, not optional: the worker's `AggregateDestructorRequest`
+    /// declares it as plain `bytes`, so a request that omits the column fails
+    /// schema validation outright — "Missing fields in
+    /// AggregateDestructorRequest RecordBatch: ['group_ids_batch']" — and takes
+    /// the connection down with it.
+    pub group_ids_batch: Bytes,
+    pub attach_opaque_data: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.

@@ -90,7 +90,7 @@ fn sums_one_group() {
     assert_eq!(out.num_rows(), 1);
     assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 6);
 
-    client.aggregate_destroy(&agg).expect("destroy");
+    client.aggregate_destroy(&cat, &agg, &[0]).expect("destroy");
 }
 
 #[test]
@@ -132,7 +132,9 @@ fn keeps_groups_apart() {
     assert_eq!(col.value(0), 6, "group 0 = 1+2+3");
     assert_eq!(col.value(1), 130, "group 1 = 10+20+100");
 
-    client.aggregate_destroy(&agg).expect("destroy");
+    client
+        .aggregate_destroy(&cat, &agg, &[0, 1])
+        .expect("destroy");
 }
 
 #[test]
@@ -167,7 +169,9 @@ fn finalize_answers_in_the_order_asked() {
         "results must line up with the requested group ids"
     );
 
-    client.aggregate_destroy(&agg).expect("destroy");
+    client
+        .aggregate_destroy(&cat, &agg, &[2, 0, 1])
+        .expect("destroy");
 }
 
 #[test]
@@ -194,7 +198,7 @@ fn a_batch_without_group_ids_is_refused_before_the_rpc() {
         "the error should name the missing column: {err}"
     );
 
-    client.aggregate_destroy(&agg).expect("destroy");
+    client.aggregate_destroy(&cat, &agg, &[0]).expect("destroy");
 }
 
 #[test]
@@ -237,8 +241,8 @@ fn two_executions_aggregate_independently() {
     assert_eq!(ra.column(0).as_primitive::<Int64Type>().value(0), 5);
     assert_eq!(rb.column(0).as_primitive::<Int64Type>().value(0), 50);
 
-    client.aggregate_destroy(&a).expect("destroy a");
-    client.aggregate_destroy(&b).expect("destroy b");
+    client.aggregate_destroy(&cat, &a, &[0]).expect("destroy a");
+    client.aggregate_destroy(&cat, &b, &[0]).expect("destroy b");
 }
 
 /// `vgi_window_sum(value)` — a windowed aggregate over a materialised partition.
@@ -283,7 +287,7 @@ fn evaluates_a_window_frame_over_a_shipped_partition() {
     assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 5);
 
     client.window_destroy(&part).expect("window_destroy");
-    client.aggregate_destroy(&agg).expect("destroy");
+    client.aggregate_destroy(&cat, &agg, &[0]).expect("destroy");
 }
 
 #[test]
@@ -316,7 +320,7 @@ fn evaluates_several_window_rows_in_one_call() {
     );
 
     client.window_destroy(&part).expect("window_destroy");
-    client.aggregate_destroy(&agg).expect("destroy");
+    client.aggregate_destroy(&cat, &agg, &[0]).expect("destroy");
 }
 
 #[test]
@@ -346,5 +350,5 @@ fn a_frame_count_that_disagrees_with_the_frame_list_is_refused() {
     );
 
     client.window_destroy(&part).expect("window_destroy");
-    client.aggregate_destroy(&agg).expect("destroy");
+    client.aggregate_destroy(&cat, &agg, &[0]).expect("destroy");
 }

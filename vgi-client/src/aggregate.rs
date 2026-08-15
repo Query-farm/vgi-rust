@@ -96,10 +96,25 @@ pub fn with_group_ids(group_ids: &[i64], values: &RecordBatch) -> Result<RecordB
 }
 
 /// A one-column batch of the group ids to finalize.
+/// The column name in a *group-ids* batch.
+///
+/// Deliberately NOT [`GROUP_COLUMN_NAME`]. Two different batches carry group
+/// ids and they spell the column differently:
+///
+/// * the **update** batch interleaves ids with the values, and marks the id
+///   column `__vgi_group_id` so it cannot collide with a user column;
+/// * a **group-ids** batch (finalize, destructor) carries nothing else, so it
+///   needs no such guard and the field is plain `group_id`.
+///
+/// The DuckDB extension builds both — `arrow::field("group_id", ...)` for the
+/// latter — and a worker reading the wrong one fails with
+/// `KeyError: 'Field "group_id" does not exist in schema'`.
+const GROUP_IDS_COLUMN_NAME: &str = "group_id";
+
 fn group_ids_batch(group_ids: &[i64]) -> Result<RecordBatch> {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
-            GROUP_COLUMN_NAME,
+            GROUP_IDS_COLUMN_NAME,
             DataType::Int64,
             false,
         )])),
@@ -236,15 +251,23 @@ impl VgiClient {
         Ok(batch)
     }
 
-    /// Release the worker's state for this execution.
+    /// Release the worker's state for the given groups.
     ///
-    /// Best-effort: a worker that never allocated anything answers happily.
-    /// Note the destructor carries no attach handle — the execution id alone
-    /// identifies what to free.
-    pub fn aggregate_destroy(&mut self, agg: &BoundAggregate) -> Result<()> {
+    /// Best-effort in spirit — a worker that never allocated anything answers
+    /// happily — but the request itself must be well formed: `group_ids_batch`
+    /// is a required field, and omitting it fails the worker's schema check and
+    /// kills the connection rather than being ignored.
+    pub fn aggregate_destroy(
+        &mut self,
+        cat: &AttachedCatalog,
+        agg: &BoundAggregate,
+        group_ids: &[i64],
+    ) -> Result<()> {
         let request = AggregateDestructorRequest {
             function_name: agg.function_name.clone(),
             execution_id: agg.execution_id.clone(),
+            group_ids_batch: Bytes(ipc::write_batch(&group_ids_batch(group_ids)?)?),
+            attach_opaque_data: Some(cat.handle().clone()),
             schema_name: agg.schema_name.clone(),
         };
         call_unit(
