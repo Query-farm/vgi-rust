@@ -10,6 +10,7 @@ use arrow_schema::Schema;
 use vgi_rpc::errors::Result;
 use vgi_rpc_client::RpcClient;
 
+use crate::location::VgiLocation;
 use crate::transport::{StreamTransport, VgiTransport};
 
 /// A connection to a VGI worker.
@@ -21,10 +22,72 @@ pub struct VgiClient {
     transport: Box<dyn VgiTransport>,
 }
 
+/// Apply the settings every VGI connection needs, whatever the transport.
+///
+/// Two of them, and both are contracts with the worker rather than tuning:
+///
+/// * **`protocol_version`** — a VGI worker rejects a request that does not
+///   declare `vgi_rpc.protocol_version`, matching major+minor exactly at the
+///   dispatch boundary. Omitting it is not a lenient default; the Python
+///   reference worker answers "the client did not send a
+///   vgi_rpc.protocol_version metadata key … or a non-VGI client connecting to
+///   a VGI worker" and drops the connection.
+/// * **`relax_nullability`** — the Python worker declares some response fields
+///   non-nullable and then legitimately sends nulls in them, so response
+///   schemas are promoted to fully-nullable on read.
+///
+/// Neither is optional in practice, which is why this is applied centrally
+/// rather than left to each `connect_*`: a new transport added later inherits
+/// both instead of rediscovering them.
+fn configure(client: RpcClient) -> RpcClient {
+    client
+        .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
+        .relax_nullability(true)
+}
+
 impl VgiClient {
     /// Build a client over any transport.
     pub fn new(transport: Box<dyn VgiTransport>) -> Self {
         Self { transport }
+    }
+
+    /// Connect to wherever a `LOCATION` string points.
+    ///
+    /// The one entry point that turns the extension's `LOCATION` spelling into
+    /// a connection, so a caller (or a test corpus) names a worker the same way
+    /// whichever client is reading the string. See [`VgiLocation`] for the
+    /// scheme table.
+    pub fn connect_location(location: &VgiLocation) -> Result<Self> {
+        match location {
+            VgiLocation::Subprocess(argv) => Self::connect_subprocess(argv),
+            VgiLocation::Tcp { host, port } => Self::connect_tcp(host, *port),
+            #[cfg(feature = "http")]
+            VgiLocation::Http(url) => Self::connect_http(url),
+            #[cfg(not(feature = "http"))]
+            VgiLocation::Http(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "http:// LOCATIONs need the `http` feature",
+            )),
+            #[cfg(feature = "unix")]
+            VgiLocation::Unix(path) => Self::connect_unix(path),
+            #[cfg(not(feature = "unix"))]
+            VgiLocation::Unix(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "unix:// LOCATIONs need the `unix` feature",
+            )),
+            #[cfg(feature = "launcher")]
+            VgiLocation::Launch(argv) => {
+                let sock = crate::launcher::ensure_worker(argv, &Default::default())?;
+                Self::connect_unix(sock)
+            }
+            #[cfg(not(feature = "launcher"))]
+            VgiLocation::Launch(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "launch: LOCATIONs need the `launcher` feature",
+            )),
+        }
+    }
+
+    /// Parse a `LOCATION` string and connect to it.
+    pub fn connect_to(location: &str) -> Result<Self> {
+        Self::connect_location(&VgiLocation::parse(location)?)
     }
 
     /// Spawn a worker as a child process and talk over its stdin/stdout.
@@ -33,13 +96,13 @@ impl VgiClient {
             .first()
             .map(|s| s.as_ref().to_string_lossy().into_owned())
             .unwrap_or_else(|| "subprocess".to_string());
-        let client = RpcClient::connect(cmd)?;
+        let client = configure(RpcClient::connect(cmd)?);
         Ok(Self::new(Box::new(StreamTransport::new(client, label))))
     }
 
     /// Connect to a worker listening on TCP.
     pub fn connect_tcp(host: &str, port: u16) -> Result<Self> {
-        let client = RpcClient::tcp_connect(host, port)?;
+        let client = configure(RpcClient::tcp_connect(host, port)?);
         Ok(Self::new(Box::new(StreamTransport::new(
             client,
             format!("tcp://{host}:{port}"),
@@ -50,7 +113,7 @@ impl VgiClient {
     #[cfg(feature = "unix")]
     pub fn connect_unix(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let label = format!("unix://{}", path.as_ref().display());
-        let client = RpcClient::unix_connect(path)?;
+        let client = configure(RpcClient::unix_connect(path)?);
         Ok(Self::new(Box::new(StreamTransport::new(client, label))))
     }
 
@@ -58,7 +121,9 @@ impl VgiClient {
     #[cfg(feature = "http")]
     pub fn connect_http(base_url: &str) -> Result<Self> {
         use crate::transport::HttpTransport;
-        let client = vgi_rpc_client::HttpClient::connect(base_url.to_string()).build()?;
+        let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
+            .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
+            .build()?;
         Ok(Self::new(Box::new(HttpTransport::new(
             client,
             base_url.to_string(),

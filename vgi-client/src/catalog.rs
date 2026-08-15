@@ -15,16 +15,29 @@ use crate::wire_call::{call, call_items, call_unit, envelope};
 
 /// Which kind of function to list from a schema.
 ///
-/// The wire carries this dictionary-encoded; these are the values the worker
-/// dispatches on.
+/// # Wire spelling
+///
+/// The `type` parameter of `catalog_schema_contents_functions` is Python's
+/// `SchemaObjectType`, and an enum crosses the wire as its **member name**, not
+/// its value — `vgi_rpc/rpc/_wire.py::_convert_for_arrow` is explicit about it
+/// ("Enum → .name") and the reader is `base[value]`, a name lookup that raises
+/// `KeyError` on anything else. So the spelling is `TABLE_FUNCTION`, never
+/// `table`.
+///
+/// The Rust reference worker accepts both — `normalize_function_type` in
+/// `vgi::dispatch` lowercases and strips a `_function` suffix — so a client that
+/// sends the short form works there and fails against the canonical Python
+/// worker. That leniency is why this was wrong for as long as it was.
+///
+/// # Why buffered and table-in-out are absent
+///
+/// They are not listing filters. `SchemaObjectType` has one `TABLE_FUNCTION`
+/// member covering all three shapes; which shape a given function is comes back
+/// on [`FunctionInfo::function_type`](crate::FunctionInfo) in the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
-    /// A producer table function.
+    /// Any table function — producer, buffered, or streaming table-in-out.
     Table,
-    /// A buffered table function (whole-input Sink+Source).
-    TableBuffering,
-    /// A streaming table-in-out function.
-    TableInOut,
     /// A scalar function.
     Scalar,
     /// An aggregate function.
@@ -32,14 +45,12 @@ pub enum FunctionKind {
 }
 
 impl FunctionKind {
-    /// The wire spelling.
+    /// The wire spelling: a `SchemaObjectType` member name.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Table => "table",
-            Self::TableBuffering => "table_buffering",
-            Self::TableInOut => "table_in_out",
-            Self::Scalar => "scalar",
-            Self::Aggregate => "aggregate",
+            Self::Table => "TABLE_FUNCTION",
+            Self::Scalar => "SCALAR_FUNCTION",
+            Self::Aggregate => "AGGREGATE_FUNCTION",
         }
     }
 
@@ -49,6 +60,8 @@ impl FunctionKind {
 }
 
 /// Which kind of macro to list from a schema.
+///
+/// Same `SchemaObjectType` member-name spelling as [`FunctionKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroKind {
     /// A scalar macro.
@@ -58,11 +71,11 @@ pub enum MacroKind {
 }
 
 impl MacroKind {
-    /// The wire spelling.
+    /// The wire spelling: a `SchemaObjectType` member name.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Scalar => "scalar",
-            Self::Table => "table",
+            Self::Scalar => "SCALAR_MACRO",
+            Self::Table => "TABLE_MACRO",
         }
     }
 

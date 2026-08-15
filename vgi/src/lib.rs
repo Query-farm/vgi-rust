@@ -146,7 +146,7 @@ pub mod worker;
 // depending on this worker framework. Re-exported at the original paths so
 // `vgi::ipc`, `vgi::wire` and `vgi::protocol::{dtos, enums}` keep working for
 // downstream users and for `crate::`-relative paths inside this crate.
-pub use vgi_protocol::{cache_control, ipc, wire};
+pub use vgi_protocol::{cache_control, ipc, wire, VGI_PROTOCOL_NAME, VGI_PROTOCOL_VERSION};
 
 #[cfg(test)]
 mod http_continuation_tests;

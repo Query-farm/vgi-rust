@@ -62,6 +62,10 @@ pub mod cache;
 pub mod catalog;
 pub mod client;
 pub mod exchange;
+#[cfg(feature = "launcher")]
+pub mod launcher;
+pub mod location;
+pub mod pool;
 pub mod scan;
 pub mod transport;
 pub mod wire_call;
@@ -72,6 +76,8 @@ pub use auth::{AuthReason, Unauthorized};
 pub use cache::{CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache};
 pub use catalog::{At, AttachOptions, AttachedCatalog, FunctionKind, MacroKind};
 pub use client::VgiClient;
+pub use location::VgiLocation;
+pub use pool::{PoolConfig, PoolStats, PooledClient, WorkerPool};
 pub use scan::{
     BindSpec, BoundFunction, FunctionType, NullOrder, OrderBy, Sample, Scan, ScanOptions,
     SortDirection,

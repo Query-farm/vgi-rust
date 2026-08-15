@@ -21,6 +21,8 @@ default = ["http", "oauth"]
 http = ["vgi-rpc-client/http"]
 # AF_UNIX transport — connect to a worker started out of band or by a launcher.
 unix = ["vgi-rpc-client/unix"]
+# The `launch:` transport: spawn and share one warm worker system-wide.
+launcher = ["unix", "dep:sha2", "dep:libc"]
 # POSIX shared-memory side-channel for large batches.
 shm = ["vgi-rpc-client/shm"]
 # OAuth: RFC 9728 discovery, device-code and refresh grants. Needs a sync HTTP
@@ -41,6 +43,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"], optiona
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { version = "0.10", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 vgi = { path = "../vgi" }

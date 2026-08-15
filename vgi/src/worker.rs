@@ -4,6 +4,7 @@
 //! RPC server, and drives transport selection from argv.
 
 use std::sync::Arc;
+use vgi_protocol::{VGI_PROTOCOL_NAME, VGI_PROTOCOL_VERSION};
 
 use vgi_rpc::RpcServer;
 
@@ -15,15 +16,6 @@ use crate::protocol::register;
 ///
 /// Enforced as an exact major+minor match at the dispatch boundary (carried in
 /// `vgi_rpc.protocol_version` custom metadata), so this must track
-/// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 added `schema_name` to
-/// `BindRequest`; 1.2.0 adds it to the 15 unary requests that re-resolve the
-/// function by name, so a name declared in two schemas cannot mis-route at
-/// runtime after binding correctly. 1.3.0 adds `global_functions` and
-/// `global_function_prefix` to `CatalogAttachResult` — functions a worker asks
-/// the client to publish into its global namespace.
-pub const VGI_PROTOCOL_VERSION: &str = "1.3.0";
-/// RPC protocol name; must match the Python `VgiProtocol`.
-pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 
 /// A VGI worker: the process DuckDB launches and talks to.
 ///

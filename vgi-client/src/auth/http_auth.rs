@@ -67,7 +67,8 @@ impl AuthenticatedHttpTransport {
     fn ensure_client(&mut self) -> Result<&mut HttpClient> {
         let token = self.auth.bearer_token();
         if self.client.is_none() || self.built_with != token {
-            let mut builder = HttpClient::connect(self.base_url.clone());
+            let mut builder = HttpClient::connect(self.base_url.clone())
+                .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION);
             if let Some(t) = &token {
                 builder = builder.header("Authorization", &format!("Bearer {t}"))?;
             }

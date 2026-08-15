@@ -114,12 +114,14 @@ fn walks_the_whole_discovery_surface() {
             .macros(&cat, &schema.name, MacroKind::Scalar)
             .expect("macros");
 
+        // Three kinds, not five: `SchemaObjectType` has a single
+        // `TABLE_FUNCTION` member covering producer, buffered and streaming
+        // table-in-out shapes. Which shape a function is comes back on
+        // `FunctionInfo::function_type`, not on the listing filter.
         for kind in [
             FunctionKind::Table,
             FunctionKind::Scalar,
             FunctionKind::Aggregate,
-            FunctionKind::TableInOut,
-            FunctionKind::TableBuffering,
         ] {
             total_functions += client
                 .functions(&cat, &schema.name, kind)
