@@ -239,7 +239,12 @@ const MAX_POSITIONAL_ARGS: usize = 1000;
 
 impl ArgValue {
     /// Read row 0 of `array` as an argument value.
-    fn from_array_row0(array: &dyn arrow_array::Array, name: &str) -> Result<Self> {
+    ///
+    /// Public because a **const** argument may reach a caller already expanded
+    /// into an array — an engine is free to materialise a literal across the
+    /// batch — and every row then holds the same constant, so row 0 is the
+    /// value the bind needs.
+    pub fn from_array_row0(array: &dyn arrow_array::Array, name: &str) -> Result<Self> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::*;
 

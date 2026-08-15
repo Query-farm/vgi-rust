@@ -56,6 +56,7 @@
 //! would be added.
 
 pub mod aggregate;
+pub mod arg_spec;
 pub mod args;
 pub mod auth;
 pub mod cache;
@@ -71,6 +72,7 @@ pub mod transport;
 pub mod wire_call;
 
 pub use aggregate::{with_group_ids, BoundAggregate, GROUP_COLUMN_NAME};
+pub use arg_spec::{ArgSpec, ArgSpecs};
 pub use args::{ArgValue, Arguments};
 pub use auth::{AuthReason, Unauthorized};
 pub use cache::{CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache};
