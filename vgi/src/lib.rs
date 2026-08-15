@@ -121,13 +121,12 @@
 pub mod aggregate;
 pub mod arguments;
 pub mod buffering;
-pub mod cache_control;
+
 pub mod catalog;
 pub mod copy_from;
 pub mod copy_to;
 pub mod dispatch;
 pub mod function;
-pub mod ipc;
 pub mod numeric;
 pub mod overload;
 pub mod partition;
@@ -141,8 +140,13 @@ pub mod table_function;
 pub mod table_in_out;
 pub mod transport;
 pub mod wasm_worker;
-pub mod wire;
 pub mod worker;
+
+// The wire protocol lives in `vgi-protocol` so a client can speak VGI without
+// depending on this worker framework. Re-exported at the original paths so
+// `vgi::ipc`, `vgi::wire` and `vgi::protocol::{dtos, enums}` keep working for
+// downstream users and for `crate::`-relative paths inside this crate.
+pub use vgi_protocol::{cache_control, ipc, wire};
 
 #[cfg(test)]
 mod http_continuation_tests;

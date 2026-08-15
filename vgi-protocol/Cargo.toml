@@ -1,0 +1,26 @@
+[package]
+name = "vgi-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "VGI wire protocol types: Arrow-backed DTOs, enum payloads, and IPC helpers shared by VGI workers and clients"
+readme = "README.md"
+keywords = ["vgi", "arrow", "rpc", "protocol", "duckdb"]
+categories = ["database", "api-bindings"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+# Deliberately dependency-light and feature-free. This crate sits below both the
+# worker framework (`vgi`) and any client, so it must not pull the HTTP stack,
+# tokio, or a storage backend — and it must stay wasm-buildable. The `vgi-rpc`
+# workspace dependency already carries `default-features = false`.
+[dependencies]
+vgi-rpc = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }

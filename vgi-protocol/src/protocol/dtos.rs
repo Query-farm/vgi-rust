@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use vgi_rpc::{Bytes, DictString, LargeBytes, Result, RpcError, VgiArrow};
+use vgi_rpc::{Bytes, DictString, LargeBytes, Result, RpcError, UtcTimestamp, VgiArrow};
 
 /// `map<utf8, utf8>` payload (Python-canonical `keys`/`values` child names).
 pub type StrMap = Vec<(String, String)>;
@@ -637,6 +637,31 @@ pub struct CatalogSchemaContentsFunctionsParams {
     pub transaction_opaque_data: Option<Bytes>,
 }
 
+/// One entry of `CatalogInfo.releases` — a published version of the catalog.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CatalogRelease {
+    pub version: String,
+    pub released_at: UtcTimestamp,
+    pub summary: String,
+    pub notes_url: Option<String>,
+}
+
+/// One catalog a worker advertises through `catalog_catalogs`.
+///
+/// The worker side builds this by hand in `vgi::catalog::serialize_catalog_info`;
+/// this struct is the reader a *client* needs, and the parity test in
+/// `tests/catalog_info_parity.rs` pins the two together against the generated
+/// schema.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct CatalogInfo {
+    pub name: String,
+    pub implementation_version: Option<String>,
+    pub data_version_spec: Option<String>,
+    pub attach_option_specs: Vec<Bytes>,
+    pub releases: Vec<CatalogRelease>,
+    pub source_url: Option<String>,
+}
+
 /// Shared flat result for every `catalog_*_get` / `_contents_*` method:
 /// `items` is a list of IPC-serialized item structs.
 #[derive(Debug, Clone, VgiArrow)]
@@ -819,9 +844,9 @@ pub struct CopyFromFormatInfo {
     /// Intrinsic documentation from the handler's metadata description.
     pub description: String,
     /// COPY ... TO only — when true the writer requires rows in source order, so
-    /// the extension installs a single-thread sink. Set from a
-    /// [`CopyToFunction::ordered`](crate::copy_to::CopyToFunction::ordered)
-    /// (`Meta.sink_order_dependent` in the Python model). Always `false` for
+    /// the extension installs a single-thread sink. Set from a worker's
+    /// `CopyToFunction::ordered` (`vgi` crate; `Meta.sink_order_dependent` in
+    /// the Python model). Always `false` for
     /// COPY-FROM readers. Field order (after `description`) matches the canonical
     /// wire schema the C++ extension validates positionally.
     pub ordered: bool,

@@ -29,6 +29,7 @@ transport-http = ["dep:tokio", "vgi-rpc/http"]
 
 [dependencies]
 vgi-rpc = { workspace = true }
+vgi-protocol = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }

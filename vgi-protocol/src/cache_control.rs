@@ -13,7 +13,7 @@
 //! extension, which reads them by string. [`CacheControl::to_metadata`] renders
 //! a set of these fields to the `HashMap<String, String>` of `vgi.cache.*` keys
 //! that rides on batch `custom_metadata` — the map a
-//! [`TableProducer::last_metadata`](crate::table_function::TableProducer::last_metadata)
+//! `TableProducer::last_metadata` (in the `vgi` worker crate)
 //! returns.
 //!
 //! Booleans render as `"1"` (present) and are omitted when false; timestamps are
@@ -21,13 +21,24 @@
 //!
 //! # Examples
 //!
-//! ```
-//! use vgi::cache_control::CacheControl;
+//! A worker advertises directives; a client reads them back. Both directions
+//! live here because both sides of the wire need the same vocabulary.
 //!
-//! // Advertise a 5-minute freshness lifetime on the first emitted batch.
+//! ```
+//! use vgi_protocol::cache_control::CacheControl;
+//!
+//! // Worker side: advertise a 5-minute lifetime on the first emitted batch.
 //! let md = CacheControl::ttl(300).to_metadata();
 //! assert_eq!(md.get("vgi.cache.ttl").map(String::as_str), Some("300"));
 //! assert_eq!(md.get("vgi.cache.scope").map(String::as_str), Some("catalog"));
+//!
+//! // Client side: read them back off the batch metadata.
+//! let parsed = CacheControl::from_metadata(&md).expect("directives present");
+//! assert_eq!(parsed.ttl_seconds, Some(300));
+//! assert!(parsed.is_cacheable());
+//!
+//! // A batch with no `vgi.cache.*` key is not asking to be cached.
+//! assert!(CacheControl::from_metadata(&Default::default()).is_none());
 //! ```
 
 use std::collections::HashMap;
@@ -64,7 +75,7 @@ pub const CACHE_PER_VALUE_KEY: &str = "vgi.cache.per_value";
 
 /// The client's stored ETag, sent on a conditional revalidation request.
 /// Surfaced to a producer via
-/// [`TableProducer::on_conditional_request`](crate::table_function::TableProducer::on_conditional_request).
+/// `TableProducer::on_conditional_request` (in the `vgi` worker crate).
 pub const CACHE_IF_NONE_MATCH_KEY: &str = "vgi.cache.if_none_match";
 /// The client's stored Last-Modified, sent on a conditional revalidation
 /// request. Companion to [`CACHE_IF_NONE_MATCH_KEY`].
@@ -234,6 +245,59 @@ impl CacheControl {
         self
     }
 
+    /// Read directives back off a batch's `vgi.cache.*` metadata.
+    ///
+    /// The inverse of [`CacheControl::to_metadata`], and the half a **client**
+    /// needs: a worker states its caching policy on the first data batch, and
+    /// the client decides what to do with the result on that basis.
+    ///
+    /// Returns `None` when the map carries no `vgi.cache.*` key at all, which
+    /// is the common case — a worker that says nothing is not asking for
+    /// anything to be cached. A malformed value (a `ttl` that is not an
+    /// integer, say) is ignored rather than fatal: cache directives are advice,
+    /// and refusing to scan because of a bad hint would be the wrong trade.
+    pub fn from_metadata(md: &HashMap<String, String>) -> Option<Self> {
+        let any = md.keys().any(|k| k.starts_with("vgi.cache."));
+        if !any {
+            return None;
+        }
+        let flag = |key: &str| -> bool {
+            md.get(key)
+                .map(|v| matches!(v.as_str(), "1" | "true" | "True"))
+                .unwrap_or(false)
+        };
+        let int = |key: &str| -> Option<i64> { md.get(key).and_then(|v| v.parse::<i64>().ok()) };
+        let text = |key: &str| -> Option<String> { md.get(key).filter(|v| !v.is_empty()).cloned() };
+
+        Some(Self {
+            ttl_seconds: int(CACHE_TTL_KEY).map(|v| v.max(0)),
+            expires: text(CACHE_EXPIRES_KEY),
+            scope: md
+                .get(CACHE_SCOPE_KEY)
+                .filter(|v| !v.is_empty())
+                .cloned()
+                .unwrap_or_else(|| CACHE_SCOPE_CATALOG.to_string()),
+            no_store: flag(CACHE_NO_STORE_KEY),
+            etag: text(CACHE_ETAG_KEY),
+            last_modified: text(CACHE_LAST_MODIFIED_KEY),
+            revalidatable: flag(CACHE_REVALIDATABLE_KEY),
+            stale_while_revalidate: int(CACHE_STALE_WHILE_REVALIDATE_KEY),
+            stale_if_error: int(CACHE_STALE_IF_ERROR_KEY),
+            not_modified: flag(CACHE_NOT_MODIFIED_KEY),
+            partition_scope: flag(CACHE_PARTITION_SCOPE_KEY),
+            per_value: flag(CACHE_PER_VALUE_KEY),
+        })
+    }
+
+    /// Whether this result may be stored at all.
+    ///
+    /// `no_store` overrides everything; otherwise a freshness key (`ttl` or
+    /// `expires`) is the opt-in. A worker that sets neither is not asking to be
+    /// cached.
+    pub fn is_cacheable(&self) -> bool {
+        !self.no_store && (self.ttl_seconds.is_some() || self.expires.is_some())
+    }
+
     /// Render to the `vgi.cache.*` batch-metadata map.
     ///
     /// Booleans render as `"1"` and are omitted when false; unset optional
@@ -281,7 +345,7 @@ impl CacheControl {
 
 /// The validators a client sends when revalidating a stale-but-revalidatable
 /// cached result. Handed to
-/// [`TableProducer::on_conditional_request`](crate::table_function::TableProducer::on_conditional_request)
+/// `TableProducer::on_conditional_request` (in the `vgi` worker crate)
 /// before the producer's first batch; both fields are `None` on a normal call.
 ///
 /// A producer that advertised [`CacheControl::with_revalidatable`] compares

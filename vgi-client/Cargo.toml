@@ -1,0 +1,46 @@
+[package]
+name = "vgi-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Client for the VGI protocol — attach a remote catalog, discover its contents, and call its functions over Arrow IPC"
+readme = "README.md"
+keywords = ["vgi", "arrow", "rpc", "client", "duckdb"]
+categories = ["database", "api-bindings"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["http", "oauth"]
+# HTTP transport (reqwest-blocking under the hood, via vgi-rpc-client).
+http = ["vgi-rpc-client/http"]
+# AF_UNIX transport — connect to a worker started out of band or by a launcher.
+unix = ["vgi-rpc-client/unix"]
+# POSIX shared-memory side-channel for large batches.
+shm = ["vgi-rpc-client/shm"]
+# OAuth: RFC 9728 discovery, device-code and refresh grants. Needs a sync HTTP
+# client of its own because discovery talks to the identity provider, not to
+# the VGI worker.
+oauth = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:sha2", "http"]
+
+[dependencies]
+vgi-protocol = { workspace = true }
+vgi-rpc = { workspace = true }
+vgi-rpc-client = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+# `ureq` is pure-sync with no runtime of its own, so it is safe to call from
+# inside a `spawn_blocking` closure — unlike `reqwest::blocking`, which panics
+# when it detects an ambient async runtime.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+vgi = { path = "../vgi" }

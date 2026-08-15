@@ -2,10 +2,14 @@
 
 //! VGI wire protocol: DTOs, enum payloads, and RPC method registration.
 //!
-//! The C++ DuckDB extension is the client; these types and methods must be
-//! byte-compatible with the canonical Python `vgi/protocol.py`. Field names,
-//! Arrow types, and nullability all follow that canonical wire schema.
+//! The DTOs and enums themselves now live in the direction-agnostic
+//! [`vgi-protocol`](https://docs.rs/vgi-protocol) crate — a client speaks the
+//! same types, so they must not depend on this worker framework. They are
+//! re-exported here at their original paths.
+//!
+//! [`register`] stays worker-side: it wires those types onto an `RpcServer` and
+//! is meaningless to a client.
 
-pub mod dtos;
-pub mod enums;
+pub use vgi_protocol::protocol::{dtos, enums};
+
 pub mod register;

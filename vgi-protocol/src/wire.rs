@@ -126,89 +126,19 @@ pub fn empty_result_batch() -> Result<RecordBatch> {
         .map_err(|e| RpcError::runtime_error(format!("build empty envelope: {e}")))
 }
 
-/// Advertised params schemas for the unary methods that take flat params
-/// (as opposed to the single wrapped `request` column).
+/// Advertised params schema for an RPC method.
 ///
 /// `__describe__` has to state these: a client that builds its request from the
 /// advertised schema — the TypeScript client does — otherwise sends a
-/// metadata-only batch and every handler reports a missing column. Field lists
-/// mirror the generated protocol schemas shared with the C++ extension and the
-/// Go worker.
+/// metadata-only batch and every handler reports a missing column.
+///
+/// The table is generated from the canonical Python `VgiProtocol`
+/// ([`crate::generated::protocol_schemas`]), so it covers every method rather
+/// than the hand-maintained subset this used to carry. Methods whose params are
+/// the single wrapped `request` column resolve to that envelope through the
+/// generated table; an entirely unknown method — a peer speaking a newer
+/// protocol — falls back to the envelope too, which is the safe assumption.
 pub fn params_schema_for(method: &str) -> SchemaRef {
-    match method {
-        "catalog_copy_from_formats" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schema_contents_functions" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schema_contents_macros" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schema_contents_tables" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schema_contents_views" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schema_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_schemas" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_table_column_statistics_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_table_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("at_unit", DataType::Utf8, true),
-            Field::new("at_value", DataType::Utf8, true),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_table_scan_branches_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("at_unit", DataType::Utf8, true),
-            Field::new("at_value", DataType::Utf8, true),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_table_scan_function_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("at_unit", DataType::Utf8, true),
-            Field::new("at_value", DataType::Utf8, true),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_transaction_begin" => Arc::new(Schema::new(vec![Field::new(
-            "attach_opaque_data",
-            DataType::Binary,
-            false,
-        )])),
-        "catalog_version" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        // Everything else carries the wrapped `request` envelope.
-        _ => request_binary_schema(),
-    }
+    crate::generated::protocol_schemas::params_schema_for(method)
+        .unwrap_or_else(request_binary_schema)
 }
