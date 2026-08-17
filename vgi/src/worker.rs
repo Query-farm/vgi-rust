@@ -12,11 +12,6 @@ use crate::dispatch::Dispatcher;
 use crate::function::ScalarFunction;
 use crate::protocol::register;
 
-/// VGI wire protocol version advertised to the C++ extension.
-///
-/// Enforced as an exact major+minor match at the dispatch boundary (carried in
-/// `vgi_rpc.protocol_version` custom metadata), so this must track
-
 /// A VGI worker: the process DuckDB launches and talks to.
 ///
 /// Build one with [`Worker::new`], register one or more functions

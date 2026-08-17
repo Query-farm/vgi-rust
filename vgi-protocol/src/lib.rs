@@ -32,6 +32,10 @@
 //! - [`wire`] — `to_batch` / `from_batch` plus [`wire::params_schema_for`]
 //! - [`ipc`] — Arrow IPC stream read/write helpers
 
+/// VGI wire protocol version advertised to the C++ extension.
+///
+/// Enforced as an exact major+minor match at the dispatch boundary (carried in
+/// `vgi_rpc.protocol_version` custom metadata), so this must track
 /// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 added `schema_name` to
 /// `BindRequest`; 1.2.0 adds it to the 15 unary requests that re-resolve the
 /// function by name, so a name declared in two schemas cannot mis-route at
