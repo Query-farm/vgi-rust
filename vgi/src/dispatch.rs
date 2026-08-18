@@ -11,7 +11,8 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use vgi_rpc::{
-    Bytes, CallContext, ExchangeState, OutputCollector, Request, Result, RpcError, StreamResult,
+    Bytes, CallContext, ExchangeState, LargeBytes, OutputCollector, Request, Result, RpcError,
+    StreamResult,
     VgiArrow,
 };
 
@@ -1080,6 +1081,34 @@ impl Dispatcher {
             legacy_peer,
         )?;
 
+        // Verify and strip the split envelopes BEFORE any user code runs, so an
+        // unverified token never reaches a function. A bad token means the caller
+        // is asking for work this worker did not hand out, which is exactly what
+        // the envelope exists to refuse — so failure here is fatal to the init.
+        let split_payloads: Option<Vec<Vec<u8>>> = match dto.split_tokens.as_ref() {
+            None => None,
+            Some(tokens) => {
+                let expected = self.split_bind_fingerprint(&bind_call);
+                let mut out = Vec::with_capacity(tokens.len());
+                for token in tokens {
+                    out.push(
+                        crate::split_token::open_split_token(
+                            &token.0,
+                            self.split_signing_key(),
+                            None,
+                            Some(&expected),
+                            None,
+                        )
+                        .map_err(|e| {
+                            RpcError::runtime_error(format!("[{}] {e}", e.kind()))
+                        })?,
+                    );
+                }
+                Some(out)
+            }
+        };
+        let split_payload_slice: &[Vec<u8>] = split_payloads.as_deref().unwrap_or(&[]);
+
         let build_params =
             |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
                 output_schema: output_schema.clone(),
@@ -1117,6 +1146,7 @@ impl Dispatcher {
                 // request — set per exchange tick (see TableInOutExchangeState).
                 if_none_match: None,
                 if_modified_since: None,
+                split_payloads: split_payloads.clone(),
             };
 
         // Table buffering: sink (header-only) or finalize source (producer). As
@@ -1294,6 +1324,7 @@ impl Dispatcher {
                 &dto,
                 &execution_id,
                 auto_apply,
+                split_payload_slice,
             )?;
             let in_schema = input_schema.unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
             let state = TableInOutExchangeState {
@@ -1345,6 +1376,13 @@ impl Dispatcher {
             // `SELECT pushed_filters ... WHERE n != 5`), while DuckDB has
             // pre-narrowed the output via projection pushdown.
             let project_to = Some(output_schema.clone());
+            // A split init is neither primary nor secondary: it carries an
+            // execution_id like a secondary, but unlike one it MUST run user
+            // code — the payloads name the work. Called before producer() so a
+            // function can act on the claim before building its state.
+            if params.split_payloads.is_some() {
+                f.on_split(&params)?;
+            }
             let producer = f.producer(&params)?;
             // Always carry the rebuild blob so any resumable producer can yield a
             // continuation token over HTTP (one batch per response, like the
@@ -1360,6 +1398,7 @@ impl Dispatcher {
                 &dto,
                 &execution_id,
                 auto_apply,
+                split_payload_slice,
             )?);
             let header = wire::to_batch(GlobalInitResponse {
                 execution_id: Bytes::from(execution_id),
@@ -1401,6 +1440,7 @@ impl Dispatcher {
             &dto,
             &execution_id,
             false,
+            split_payload_slice,
         )?;
         let state = ScalarExchangeState {
             func: f,
@@ -1425,6 +1465,7 @@ impl Dispatcher {
         dto: &InitRequest,
         execution_id: &[u8],
         auto_apply: bool,
+        split_payloads: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let blob = ExchangeBlob {
             kind: kind.to_string(),
@@ -1439,6 +1480,7 @@ impl Dispatcher {
             secrets: bind_call.secrets.clone().map(|b| b.0).unwrap_or_default(),
             execution_id: execution_id.to_vec(),
             substream_id: dto.substream_id.clone().map(|b| b.0).unwrap_or_default(),
+            split_payloads: split_payloads.to_vec(),
             init_opaque: dto
                 .bind_opaque_data
                 .clone()
@@ -1500,6 +1542,11 @@ impl Dispatcher {
             // Folded into the blob so a rehydrated HTTP tick keeps the client's
             // per-substream identity (empty = the client sent none).
             substream_id: Some(blob.substream_id.clone()).filter(|v| !v.is_empty()),
+            split_payloads: if blob.split_payloads.is_empty() {
+                None
+            } else {
+                Some(blob.split_payloads.clone())
+            },
             init_opaque_data: blob.init_opaque.clone(),
             arguments: args,
             settings: settings.clone(),
@@ -2153,6 +2200,153 @@ impl Dispatcher {
             max: Some(card.and_then(|c| c.max).unwrap_or(-1)),
         };
         Ok(Some(wire::to_result_batch(resp)?))
+    }
+
+    // --- splits --------------------------------------------------------
+
+    /// The signing key split tokens are sealed with, or `None` when this worker
+    /// holds none.
+    ///
+    /// `None` is the DuckDB-primary case (subprocess and unix), where the trust
+    /// boundary is the uid rather than a key. Note the consequence stated in the
+    /// transport docs: a same-uid multi-tenant deployment (every Postgres backend
+    /// as one uid against a shared launcher socket) can forge tokens, and must
+    /// use keyed HTTP instead.
+    fn split_signing_key(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// The 16-byte bind binding check.
+    ///
+    /// Minted AND verified by this same worker, so it needs self-consistency
+    /// only — it does not have to agree with any client, which is why the
+    /// cross-SDK byte fixtures do not cover it.
+    fn split_bind_fingerprint(&self, bind_call: &BindRequest) -> [u8; 16] {
+        crate::split_token::bind_fingerprint(
+            bind_call.schema_name.as_deref().unwrap_or(""),
+            &bind_call.function_name,
+            &bind_call.arguments.0,
+            bind_call
+                .settings
+                .as_ref()
+                .map(|b| b.0.as_ref())
+                .unwrap_or(&[]),
+            // projection_ids is not a BindRequest field (it rides InitRequest),
+            // so it feeds in empty — matching the reference implementation,
+            // which reads it off the bind call and likewise finds nothing.
+            &[],
+        )
+    }
+
+    /// Divide a table-function scan into named, redeemable splits.
+    ///
+    /// A function that does not override `on_plan` gets the framework default: a
+    /// SINGLE empty-payload split, which is what "not split-capable" means — the
+    /// whole scan is one unit of work. That keeps every existing worker serving
+    /// unchanged under protocol 1.4.0, so splits stay opt-in rather than
+    /// something every worker must now implement.
+    pub fn handle_table_function_plan(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
+        use crate::protocol::dtos::{PlanResponse, ScanSplit, TableFunctionPlanRequest};
+
+        // A client sends only the sizing inputs it has; backfill the rest as
+        // nulls so the by-name decode yields None rather than failing.
+        let dto: TableFunctionPlanRequest = wire::from_batch(
+            &crate::protocol::dtos::backfill_plan_request(request_inner_batch(req)?)?,
+        )?;
+        let bind_call: BindRequest =
+            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
+        let bp = self.bind_params(&bind_call, ctx)?;
+
+        let outcome = self
+            .tables
+            .get(&bind_call.function_name)
+            .and_then(|v| v.first())
+            .map(|f| f.on_plan(&bp, &dto))
+            .transpose()?
+            .flatten();
+
+        let Some(outcome) = outcome else {
+            let one = wire::to_batch(ScanSplit {
+                payload: LargeBytes::from(Vec::new()),
+                token: LargeBytes::from(Vec::new()),
+                estimated_rows: None,
+                rows_exact: false,
+                estimated_bytes: None,
+                partition_bounds: None,
+                column_statistics: None,
+                location_ids: None,
+                start_position: None,
+                end_position: None,
+            })?;
+            return Ok(Some(wire::to_result_batch(PlanResponse {
+                splits: vec![Bytes::from(ipc::write_batch(&one)?)],
+                next_cursors: Vec::new(),
+                execution_id: None,
+                init_opaque_data: Bytes::from(Vec::new()),
+                max_workers: None,
+                estimated_total_splits: None,
+                estimated_total_rows: None,
+                estimated_total_bytes: None,
+                catalog_version: None,
+                scope: "catalog".to_string(),
+                locations: None,
+                partitioning: Vec::new(),
+                sort_order: Vec::new(),
+                cache_max_age_seconds: None,
+                start_position: Bytes::from(Vec::new()),
+                end_position: Bytes::from(Vec::new()),
+            })?));
+        };
+
+        // The framework stamps every token: an author cannot forget the
+        // consistency anchor, cannot mis-bind the fingerprint, and never writes
+        // crypto — and the envelope stays a private implementation detail.
+        let fingerprint = self.split_bind_fingerprint(&bind_call);
+        let anchor = crate::split_token::split_anchor(outcome.catalog_version.unwrap_or(0));
+        let key = self.split_signing_key();
+
+        let mut splits = Vec::with_capacity(outcome.splits.len());
+        for s in &outcome.splits {
+            let token =
+                crate::split_token::build_split_token(&s.payload, &fingerprint, &anchor, key, None)
+                    .map_err(|e| RpcError::runtime_error(format!("[{}] {e}", e.kind())))?;
+            let batch = wire::to_batch(ScanSplit {
+                payload: LargeBytes::from(s.payload.clone()),
+                token: LargeBytes::from(token),
+                estimated_rows: s.estimated_rows,
+                rows_exact: s.rows_exact,
+                estimated_bytes: s.estimated_bytes,
+                partition_bounds: s.partition_bounds.clone().map(LargeBytes::from),
+                column_statistics: s.column_statistics.clone().map(LargeBytes::from),
+                location_ids: s.location_ids.clone(),
+                start_position: s.start_position.clone().map(LargeBytes::from),
+                end_position: s.end_position.clone().map(LargeBytes::from),
+            })?;
+            splits.push(Bytes::from(ipc::write_batch(&batch)?));
+        }
+
+        Ok(Some(wire::to_result_batch(PlanResponse {
+            splits,
+            next_cursors: outcome.next_cursors.iter().cloned().map(Bytes::from).collect(),
+            execution_id: None,
+            init_opaque_data: Bytes::from(Vec::new()),
+            max_workers: outcome.max_workers,
+            estimated_total_splits: outcome.estimated_total_splits,
+            estimated_total_rows: outcome.estimated_total_rows,
+            estimated_total_bytes: outcome.estimated_total_bytes,
+            catalog_version: outcome.catalog_version,
+            scope: outcome.scope.clone().unwrap_or_else(|| "catalog".to_string()),
+            locations: None,
+            partitioning: Vec::new(),
+            sort_order: Vec::new(),
+            cache_max_age_seconds: outcome.cache_max_age_seconds,
+            start_position: Bytes::from(Vec::new()),
+            end_position: Bytes::from(Vec::new()),
+        })?))
     }
 
     /// Post-execution profiling info (EXPLAIN ANALYZE Extra Info).
@@ -3252,6 +3446,19 @@ pub struct ExchangeBlob {
     /// another schema or another catalog served by the same process.
     pub catalog_name: String,
     pub schema_name: String,
+    /// The VERIFIED split payloads (envelope already stripped), folded in so a
+    /// rehydrated HTTP tick still knows which work it claimed.
+    ///
+    /// Load-bearing over HTTP: a producer is rebuilt from its params on every
+    /// continuation, so a split producer that seeded its ranges from
+    /// `split_payloads` at init would rebuild EMPTY without this and silently
+    /// return no rows. Empty vec = not a split init.
+    ///
+    /// Storing the stripped payloads rather than the tokens is safe because the
+    /// blob is itself AEAD-sealed into the continuation token; re-verifying
+    /// per continuation would only re-check bytes this worker already sealed.
+    #[serde(default)]
+    pub split_payloads: Vec<Vec<u8>>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -3495,6 +3702,13 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
     // omits it, so the request still decodes; a request type that never
     // declared the field ignores the extra column (the derive reads by name).
     let (batch, _) = crate::protocol::dtos::ensure_schema_name(request_inner_batch(req)?)?;
+    // `init` also gained additive nullable columns in 1.4.0, one of which
+    // (`row_limit`) the DuckDB extension never sends at all.
+    let batch = if req.method == "init" {
+        crate::protocol::dtos::backfill_init_request(batch)?
+    } else {
+        batch
+    };
     if std::env::var("VGI_WIRE_DEBUG").is_ok() {
         eprintln!(
             "[vgi-wire] {} inner schema: {:?}",

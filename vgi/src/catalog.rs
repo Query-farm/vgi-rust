@@ -417,6 +417,10 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         order_preservation: None,
         max_workers: 0,
         supports_batch_index: false,
+        supports_splits: false,
+        filters_exactly_applied: false,
+        supports_positions: false,
+        split_token_ttl_seconds: None,
         partition_kind: enums::dict(enums::partition_kind::NOT_PARTITIONED),
         order_dependent: enums::dict(enums::order_dependence::NOT_ORDER_DEPENDENT),
         distinct_dependent: enums::dict(enums::distinct_dependence::NOT_DISTINCT_DEPENDENT),
@@ -450,6 +454,10 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
         fi.sampling_pushdown = Some(true);
     }
     fi.supports_batch_index = meta.supports_batch_index;
+    fi.supports_splits = meta.supports_splits;
+    fi.filters_exactly_applied = meta.filters_exactly_applied;
+    fi.supports_positions = meta.supports_positions;
+    fi.split_token_ttl_seconds = meta.split_token_ttl_seconds;
     if let Some(pk) = &meta.partition_kind {
         fi.partition_kind = enums::dict(pk);
     }

@@ -207,6 +207,8 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
         tablesample_percentage: None,
         tablesample_seed: None,
         finalize_state_id: None,
+        split_tokens: None,
+        row_limit: None,
     };
     let inner = ipc::write_batch(&wire::to_batch(init).unwrap()).unwrap();
     let req_schema = Arc::new(Schema::new(vec![Field::new(

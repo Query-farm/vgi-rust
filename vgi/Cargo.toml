@@ -29,6 +29,9 @@ transport-http = ["dep:tokio", "vgi-rpc/http"]
 
 [dependencies]
 vgi-rpc = { workspace = true }
+# Split-token bind fingerprint (see src/split_token.rs). Already in the lock
+# file via a transitive dependency, so this adds no new crate to the build.
+sha2 = "0.10"
 vgi-protocol = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

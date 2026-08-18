@@ -195,6 +195,107 @@ pub fn ensure_schema_name(
     Ok((batch, true))
 }
 
+/// Append null columns for the optional [`TableFunctionPlanRequest`] fields a
+/// client omitted, so the by-name decode yields `None` for each.
+///
+/// The derived decoder resolves fields by name and errors on a missing column,
+/// while the canonical Python request is a dataclass with defaults — a field the
+/// client omits simply takes its default. That gap is unavoidable here rather
+/// than incidental: a client sends only the sizing inputs it actually has, and
+/// the DuckDB extension deliberately sends seven of twenty columns (it has no
+/// basis to invent a byte target, and `TableFunctionInitInput` carries no row
+/// limit at all). Without this, the primary client would fail to decode.
+pub fn backfill_plan_request(
+    batch: arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch> {
+    use arrow_schema::DataType;
+
+    ensure_nullable_columns(batch, &[
+        ("bind_opaque_data", DataType::Binary),
+        ("projection_ids", DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )))),
+        ("pushdown_filters", DataType::LargeBinary),
+        ("join_keys", DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::LargeBinary,
+            true,
+        )))),
+        ("row_limit", DataType::Int64),
+        ("target_split_bytes", DataType::Int64),
+        ("min_splits", DataType::Int64),
+        ("max_splits_per_response", DataType::Int64),
+        ("cursor", DataType::Binary),
+        ("refined_filters", DataType::LargeBinary),
+        ("filters_complete", DataType::Boolean),
+        ("start_position", DataType::Binary),
+        ("end_position", DataType::Binary),
+        ("order_by_column_name", DataType::Utf8),
+        ("order_by_direction", DataType::Utf8),
+        ("order_by_null_order", DataType::Utf8),
+        ("order_by_limit", DataType::Int64),
+        ("tablesample_percentage", DataType::Float64),
+        ("tablesample_seed", DataType::Int64),
+    ])
+}
+
+/// Backfill an `init` request's additive nullable columns.
+///
+/// `row_limit` (protocol 1.4.0) is not sent by the DuckDB extension at all —
+/// `TableFunctionInitInput` carries no limit — so this is the ordinary case, not
+/// an old-peer fallback.
+pub fn backfill_init_request(
+    batch: arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch> {
+    use arrow_schema::DataType;
+    ensure_nullable_columns(
+        batch,
+        &[
+            (
+                "split_tokens",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::LargeBinary,
+                    true,
+                ))),
+            ),
+            ("row_limit", DataType::Int64),
+        ],
+    )
+}
+
+/// Append a null column for each named field the batch lacks, so a by-name
+/// decode yields `None` rather than failing on a peer that omitted it.
+pub fn ensure_nullable_columns(
+    batch: arrow_array::RecordBatch,
+    optional: &[(&str, arrow_schema::DataType)],
+) -> Result<arrow_array::RecordBatch> {
+    let rows = batch.num_rows();
+    let mut fields: Vec<arrow_schema::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    let mut appended = false;
+    for (name, ty) in optional {
+        if batch.column_by_name(name).is_some() {
+            continue;
+        }
+        appended = true;
+        fields.push(arrow_schema::Field::new(*name, ty.clone(), true));
+        columns.push(arrow_array::new_null_array(ty, rows));
+    }
+    if !appended {
+        return Ok(batch);
+    }
+    arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map_err(|e| RpcError::type_error(format!("backfill plan request: {e}")))
+}
+
 #[cfg(test)]
 mod backfill_tests {
     use super::*;
@@ -306,6 +407,144 @@ pub struct InitRequest {
     pub tablesample_percentage: Option<f64>,
     pub tablesample_seed: Option<i64>,
     pub finalize_state_id: Option<Bytes>,
+    /// The framework-stamped split envelopes this init redeems.
+    ///
+    /// A LIST, though DuckDB always sends exactly one: DataFusion's
+    /// `partition_count()` IS its concurrency, so it bin-packs at planning time
+    /// and must read a whole group per partition — without the list that is N
+    /// sequential inits per partition. A worker handed several concatenates
+    /// them into one stream in the order given.
+    pub split_tokens: Option<Vec<LargeBytes>>,
+    /// A plain fetch limit, distinct from `order_by_limit` (which is a field OF
+    /// the Top-N hint). Always `None` from DuckDB — `TableFunctionInitInput`
+    /// carries no limit; DataFusion supplies it via `TableProvider::scan`.
+    pub row_limit: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// table_function_plan
+// ---------------------------------------------------------------------------
+
+/// `TableFunctionPlanRequest` — carried IPC-serialized inside the `request`
+/// binary column of `table_function_plan`.
+///
+/// Every field but `bind_call` is optional, and deliberately so: a client sends
+/// only the sizing inputs it actually has. The DuckDB extension, for instance,
+/// sends seven columns — it has no basis to invent a byte target it did not set,
+/// and `TableFunctionInitInput` carries no row limit at all — so a decoder that
+/// required the full field list would reject the primary client outright.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct TableFunctionPlanRequest {
+    pub bind_call: Bytes,
+    pub bind_opaque_data: Option<Bytes>,
+    /// Pushdown as it reached the scan. A plan is built from STATIC filters
+    /// only — join-key values land after planning, so they prune WITHIN a split
+    /// rather than deciding the split set.
+    pub projection_ids: Option<Vec<i64>>,
+    pub pushdown_filters: Option<LargeBytes>,
+    pub join_keys: Option<Vec<LargeBytes>>,
+    pub row_limit: Option<i64>,
+    /// The primary sizing lever: every engine is byte-driven.
+    pub target_split_bytes: Option<i64>,
+    /// The parallelism FLOOR — a small but expensive table still needs one
+    /// reader per thread, which a byte target alone would not give it.
+    pub min_splits: Option<i64>,
+    /// A PAGINATION cap, not a sizing hint. Conflating the two produces wrongly
+    /// sized splits.
+    pub max_splits_per_response: Option<i64>,
+    /// A place in the ENUMERATION of splits — NOT a place in the data (that is
+    /// `start_position`). A cursor lives for one plan call; a position is
+    /// checkpointed and must survive restarts, upgrades and key rotation.
+    pub cursor: Option<Bytes>,
+    /// Narrows FUTURE splits only; splits already emitted under a looser filter
+    /// stay valid. `filters_complete = Some(false)` says more narrowing may
+    /// arrive, so a worker may hold splits back.
+    pub refined_filters: Option<LargeBytes>,
+    pub filters_complete: Option<bool>,
+    /// The range in the DATA. A null `end_position` means "as of now": the
+    /// worker resolves the frontier and reports it back.
+    pub start_position: Option<Bytes>,
+    pub end_position: Option<Bytes>,
+    pub order_by_column_name: Option<String>,
+    pub order_by_direction: Option<DictString>,
+    pub order_by_null_order: Option<DictString>,
+    pub order_by_limit: Option<i64>,
+    pub tablesample_percentage: Option<f64>,
+    pub tablesample_seed: Option<i64>,
+}
+
+/// `PlanResponse` — the reply to `table_function_plan`.
+///
+/// An EMPTY `splits` list is legal and means "no work": a fully-pruned scan
+/// reaches it, and the client must produce an empty result, not an error.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct PlanResponse {
+    /// Each entry is an IPC-serialized [`ScanSplit`].
+    pub splits: Vec<Bytes>,
+    /// A list so a client can enumerate a large plan in PARALLEL — sound only
+    /// under a contract the worker must honour: the cursors in one response MUST
+    /// partition the remaining enumeration disjointly and exhaustively. The
+    /// client dedups by token regardless, because violating it produces
+    /// duplicate ROWS, the exact failure class splits exist to prevent.
+    pub next_cursors: Vec<Bytes>,
+    pub execution_id: Option<Bytes>,
+    pub init_opaque_data: Bytes,
+    /// NORMATIVE on redemption, not advisory.
+    pub max_workers: Option<i64>,
+    pub estimated_total_splits: Option<i64>,
+    pub estimated_total_rows: Option<i64>,
+    pub estimated_total_bytes: Option<i64>,
+    /// The counter that MOVES within an attach, so it is what a plan is pinned
+    /// to and what a stale token is detected against. `resolved_data_version` is
+    /// fixed at attach and would say nothing.
+    pub catalog_version: Option<i64>,
+    /// Which anchor the tokens bind to: `catalog` or `transaction`.
+    pub scope: String,
+    /// A hoisted host list; splits index into it, which keeps a large plan off
+    /// the coordinator heap.
+    pub locations: Option<Vec<String>>,
+    /// Serialized partition transforms. NOT derivable from a split's partition
+    /// values: `country=US` does not say whether partitions are
+    /// `identity(country)` or `bucket(16, user_id)`. Report nothing here unless
+    /// every split really is single-valued.
+    pub partitioning: Vec<Bytes>,
+    /// Ordering WITHIN each split, never a global claim across splits. An engine
+    /// that bin-packs several splits into one partition must declare no ordering
+    /// at all — concatenating K non-contiguous sorted runs is not sorted.
+    pub sort_order: Vec<Bytes>,
+    pub cache_max_age_seconds: Option<i64>,
+    pub start_position: Bytes,
+    /// The data frontier resolved at plan time — checkpoint it and pass it back
+    /// as the next `start_position`.
+    pub end_position: Bytes,
+}
+
+/// `ScanSplit` — one named, independently redeemable unit of scan work.
+///
+/// A split NAMES work rather than describing it: "these three files at version
+/// 47" survives a retry, "rows 0-999 of whatever this returns now" does not.
+/// A worker sets `payload` only; the framework stamps `token` from it.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct ScanSplit {
+    pub payload: LargeBytes,
+    /// The framework-stamped (and, where a key exists, sealed) envelope. The
+    /// client sends THIS back, never the raw payload.
+    pub token: LargeBytes,
+    pub estimated_rows: Option<i64>,
+    /// True if `estimated_rows` is exact — unlocks COUNT(*) from statistics.
+    pub rows_exact: bool,
+    /// Load-bearing for engines that bin-pack (DataFusion weight, Trino
+    /// SplitWeight). `None` degrades them to round-robin by count; DuckDB claims
+    /// greedily and needs no cost model at all.
+    pub estimated_bytes: Option<i64>,
+    /// 2-row (min, max) batch in the existing `vgi_partition_values` encoding.
+    pub partition_bounds: Option<LargeBytes>,
+    pub column_statistics: Option<LargeBytes>,
+    pub location_ids: Option<Vec<i64>>,
+    pub start_position: Option<LargeBytes>,
+    /// `None` means UNBOUNDED — a shard read forever. A bounded engine (Spark
+    /// micro-batch) must refuse those rather than hang.
+    pub end_position: Option<LargeBytes>,
 }
 
 /// `GlobalInitResponse` — the streaming header for `init`.
@@ -803,6 +1042,17 @@ pub struct FunctionInfo {
     pub order_preservation: Option<DictString>,
     pub max_workers: i32,
     pub supports_batch_index: bool,
+    /// Opts this table function into the split path: the scan divides into
+    /// named, independently redeemable units (see `TableFunction::on_plan`).
+    pub supports_splits: bool,
+    /// The worker applies every pushed filter EXACTLY, so the engine may drop
+    /// its own copy rather than re-filtering.
+    pub filters_exactly_applied: bool,
+    /// Addressable positions in the data, for incremental / streaming reads.
+    pub supports_positions: bool,
+    /// `None` means UNBOUNDED, not "expires immediately" — a client must not
+    /// assume a TTL exists, or long-running streams are foreclosed.
+    pub split_token_ttl_seconds: Option<i64>,
     pub partition_kind: DictString,
     pub order_dependent: DictString,
     pub distinct_dependent: DictString,

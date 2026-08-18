@@ -134,6 +134,7 @@ pub mod protocol;
 pub mod pushdown;
 pub mod secrets;
 pub mod settings;
+pub mod split_token;
 pub mod statistics;
 pub mod storage;
 pub mod table_function;

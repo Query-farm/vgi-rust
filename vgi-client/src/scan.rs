@@ -186,6 +186,10 @@ impl BoundFunction {
             tablesample_percentage: opts.sample.map(|s| s.percentage),
             tablesample_seed: opts.sample.and_then(|s| s.seed),
             finalize_state_id,
+            // Split tokens ride the per-redemption init built by the split
+            // path, not this shared one — a plain scan claims no splits.
+            split_tokens: opts.split_tokens.clone(),
+            row_limit: opts.row_limit,
         }
     }
 
@@ -287,6 +291,18 @@ pub struct ScanOptions {
     pub execution_id: Option<Bytes>,
     /// A client-minted per-substream identity, for the exchange shapes.
     pub substream_id: Option<Bytes>,
+    /// The split envelopes this connection redeems, from a prior `plan()`.
+    ///
+    /// A LIST because an engine whose partition count IS its concurrency (
+    /// DataFusion) bin-packs at planning time and reads a whole group per
+    /// partition; without the list that is N sequential inits per partition.
+    /// `None` on the ordinary primary/secondary path.
+    pub split_tokens: Option<Vec<LargeBytes>>,
+    /// A plain fetch limit, distinct from `order_by.limit` (a field OF the Top-N
+    /// hint). Push the FULL limit into every split: over-production is legal and
+    /// the engine re-applies above the coalesce, whereas dividing by N
+    /// under-produces under skew.
+    pub row_limit: Option<i64>,
 }
 
 /// An open producer stream.

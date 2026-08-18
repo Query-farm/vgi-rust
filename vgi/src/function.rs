@@ -402,6 +402,28 @@ pub struct FunctionMetadata {
     /// Worker-side: auto-apply pushed-down filters to emitted batches.
     pub auto_apply_filters: bool,
     pub supports_batch_index: bool,
+    /// Declares that this table function divides its scan into named,
+    /// independently redeemable splits (see [`TableFunction::on_plan`]).
+    ///
+    /// A distributed engine reads this to decide whether it can retry a task: a
+    /// split NAMES its work, so re-running one reads exactly the same rows.
+    /// Without it, the division lives behind an opaque worker-side queue and a
+    /// retry reads neither what it read before nor what it missed.
+    pub supports_splits: bool,
+    /// Declares that the worker applies every pushed filter EXACTLY, so the
+    /// engine may drop its own copy rather than re-filtering. Wrong answers if
+    /// declared falsely — leave it false unless certain.
+    pub filters_exactly_applied: bool,
+    /// Declares addressable positions in the data, for incremental and
+    /// streaming reads. The engine owns the checkpoint; this declares only that
+    /// positions are meaningful to externalize.
+    pub supports_positions: bool,
+    /// How long a split token stays redeemable. `None` means UNBOUNDED, not
+    /// "expires immediately" — a client must not assume a TTL exists, or
+    /// long-running streams are foreclosed. A client rejects a plan whose TTL is
+    /// below its own planning-to-task-start horizon, which on a busy cluster is
+    /// hours rather than seconds.
+    pub split_token_ttl_seconds: Option<i64>,
     pub partition_kind: Option<String>,
     pub order_preservation: Option<String>,
     /// Table-buffering ordering knobs (surfaced in `FunctionInfo`).
@@ -455,6 +477,10 @@ impl Default for FunctionMetadata {
             sampling_pushdown: false,
             auto_apply_filters: false,
             supports_batch_index: false,
+            supports_splits: false,
+            filters_exactly_applied: false,
+            supports_positions: false,
+            split_token_ttl_seconds: None,
             partition_kind: None,
             order_preservation: None,
             sink_order_dependent: false,
@@ -584,6 +610,15 @@ pub struct ProcessParams {
     pub if_none_match: Option<String>,
     /// Companion Last-Modified validator; see [`if_none_match`](Self::if_none_match).
     pub if_modified_since: Option<String>,
+    /// The VERIFIED payloads of the splits this init claimed — the worker's own
+    /// bytes, with the token envelope already opened and stripped, so unverified
+    /// bytes never reach a function.
+    ///
+    /// `None` means this is not a split init at all, which is worth
+    /// distinguishing from an empty vec: `None` is "the client did not plan" (a
+    /// split-only function should fail loudly rather than answer the same query
+    /// differently), empty is a claim of no work.
+    pub split_payloads: Option<Vec<Vec<u8>>>,
 }
 
 /// A scalar VGI function: one output row per input row.

@@ -363,6 +363,15 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     {
         let d = disp.clone();
         srv.register(vgi_rpc::MethodInfo::unary(
+            "table_function_plan",
+            wire::params_schema_for("table_function_plan"),
+            wire::result_binary_schema(),
+            move |req, ctx| d.handle_table_function_plan(req, ctx),
+        ));
+    }
+    {
+        let d = disp.clone();
+        srv.register(vgi_rpc::MethodInfo::unary(
             "table_function_dynamic_to_string",
             wire::params_schema_for("table_function_dynamic_to_string"),
             wire::result_binary_schema(),

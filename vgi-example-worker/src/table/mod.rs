@@ -13,6 +13,7 @@ mod proj_repro;
 mod rff;
 mod settings_fixtures;
 mod static_scan;
+pub mod splits;
 pub mod tt_pushdown;
 mod typed_probe;
 mod versioned_scan;
@@ -44,6 +45,7 @@ pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     batch_index::register(w);
     cache::register(w);
     partition::register(w);
+    splits::register(w);
     order_modes::register(w);
     static_scan::register(w);
     versioned_scan::register(w);

@@ -176,6 +176,48 @@ pub trait TableFunction: Send + Sync {
     fn cardinality(&self, _params: &BindParams) -> Option<TableCardinality> {
         None
     }
+
+    /// Divide this scan into named, independently redeemable splits.
+    ///
+    /// Returning `None` (the default) means this function is not split-capable:
+    /// the whole scan is one unit of work, and the client falls back to
+    /// primary/secondary init. Override together with [`TableFunction::on_split`]
+    /// and `FunctionMetadata::supports_splits`.
+    ///
+    /// A split *names* work rather than describing it. "These three files at
+    /// version 47" survives a retry; "rows 0-999 of whatever this returns now"
+    /// does not — and a distributed engine WILL retry, so the difference is
+    /// correctness, not tidiness. The same split may also be redeemed more than
+    /// once (recursive CTEs, re-collected DataFrames, task retry) and may be
+    /// abandoned mid-stream (LIMIT, TopK, an empty join build side); neither is
+    /// an error.
+    ///
+    /// Set only `payload` on each split. The framework stamps the consistency
+    /// anchor, the bind fingerprint and (where a key exists) the seal, so an
+    /// author cannot forget the anchor or mis-bind the fingerprint.
+    ///
+    /// Size splits into comparable units of work and honour
+    /// `request.target_split_bytes`: a claiming client treats them as
+    /// interchangeable because it cannot see per-split cost, so wildly uneven
+    /// splits leave its makespan bounded by the largest one.
+    fn on_plan(
+        &self,
+        _params: &BindParams,
+        _request: &crate::protocol::dtos::TableFunctionPlanRequest,
+    ) -> Result<Option<crate::split_token::PlanOutcome>> {
+        Ok(None)
+    }
+
+    /// Called on a split init, with the verified payloads on
+    /// `params.split_payloads`.
+    ///
+    /// Any state carried from planning to reading must live in cross-process
+    /// storage keyed by `execution_id`: the process that plans is, in the
+    /// general case, not the process that reads — and under a distributed engine
+    /// it is not even the same host.
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
     /// Optional per-column optimizer statistics for this call.
     fn statistics(&self, _params: &BindParams) -> Option<Vec<crate::statistics::CatColStat>> {
         None
