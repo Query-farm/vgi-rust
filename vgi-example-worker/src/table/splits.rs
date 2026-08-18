@@ -45,6 +45,9 @@ pub fn register(w: &mut vgi::Worker) {
         "One split ~100x the others: exercises greedy claiming under skew",
         Shape::Skewed,
     ));
+    w.register_table(SplitFailAt);
+    w.register_table(SplitEndlessCursor);
+    w.register_table(SplitEchoFilters);
     w.register_table(SplitScan::new(
         "split_many",
         "Far more splits than threads: exercises greedy claiming and re-init",
@@ -289,5 +292,389 @@ impl TableProducer for SplitProducer {
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
         }
         Ok(None)
+    }
+}
+
+
+// --- fixtures that exercise the CLIENT's split machinery -------------------
+
+/// Fails on a chosen split, in either of the two places that matter.
+///
+/// They are genuinely different failure paths, not variations:
+///
+/// * `fail_in_init` fails while REDEEMING the token, before any row is produced.
+///   The client must not return that connection to the pool — the init request
+///   is on the wire with no answer, so a later checkout would read this split's
+///   init response as its own stream header: silent cross-query corruption on
+///   the pool-enabled default.
+/// * Otherwise it fails MID-STREAM, after emitting rows, so the capture is
+///   genuinely partial when it dies. A partial result committed as complete is
+///   the failure class the never-partial gate exists to prevent.
+struct SplitFailAt;
+
+fn encode_fail(ordinal: i64, r: Range) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&ordinal.to_le_bytes());
+    out.extend_from_slice(&r.lo.to_le_bytes());
+    out.extend_from_slice(&r.hi.to_le_bytes());
+    out
+}
+
+fn decode_fail(payload: &[u8]) -> Result<(i64, Range)> {
+    if payload.len() != 24 {
+        return Err(RpcError::runtime_error(format!(
+            "fail payload must be 24 bytes, got {}",
+            payload.len()
+        )));
+    }
+    Ok((
+        i64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        Range {
+            lo: i64::from_le_bytes(payload[8..16].try_into().unwrap()),
+            hi: i64::from_le_bytes(payload[16..24].try_into().unwrap()),
+        },
+    ))
+}
+
+impl TableFunction for SplitFailAt {
+    fn name(&self) -> &str {
+        "split_fail_at"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Fails on a chosen split, at init or mid-stream".to_string(),
+            supports_splits: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("n", -1, "int64", "Number of rows to produce").with_ge(0.0),
+            ArgSpec::const_arg("splits", -1, "int64", "How many splits to divide the scan into")
+                .with_ge(0.0)
+                .with_default(4),
+            ArgSpec::const_arg("fail_at", -1, "int64", "Split ordinal to fail on; -1 never fails")
+                .with_default(-1),
+            ArgSpec::const_arg(
+                "fail_in_init",
+                -1,
+                "bool",
+                "Fail during the split's init rather than mid-stream",
+            )
+            .with_default(false),
+        ]
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(ranges.len() as i64),
+            splits: ranges
+                .iter()
+                .enumerate()
+                .map(|(i, r)| PlannedSplit {
+                    payload: encode_fail(i as i64, *r),
+                    estimated_rows: Some(r.hi - r.lo),
+                    rows_exact: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    /// Where the init-time failure lands, so the client's connection-poisoning
+    /// path is exercised rather than the mid-stream one.
+    fn on_split(&self, params: &ProcessParams) -> Result<()> {
+        if !params
+            .arguments
+            .named_bool("fail_in_init")
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let fail_at = params.arguments.named_i64("fail_at").unwrap_or(-1);
+        for payload in params.split_payloads.as_deref().unwrap_or(&[]) {
+            let (ordinal, _) = decode_fail(payload)?;
+            if ordinal == fail_at {
+                return Err(RpcError::runtime_error(format!(
+                    "split {ordinal} refuses to initialize (fixture)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_fail_at is split-only but was initialized with no split tokens",
+            ));
+        };
+        let mut ranges = Vec::with_capacity(payloads.len());
+        let mut ordinals = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let (ordinal, r) = decode_fail(payload)?;
+            ranges.push(r);
+            ordinals.push(ordinal);
+        }
+        let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
+        Ok(Box::new(FailProducer {
+            schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            ranges,
+            ordinals,
+            idx: 0,
+            cur,
+            fail_at: params.arguments.named_i64("fail_at").unwrap_or(-1),
+        }))
+    }
+}
+
+struct FailProducer {
+    schema: SchemaRef,
+    ranges: Vec<Range>,
+    ordinals: Vec<i64>,
+    idx: usize,
+    cur: i64,
+    fail_at: i64,
+}
+
+impl TableProducer for FailProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        while self.idx < self.ranges.len() {
+            let r = self.ranges[self.idx];
+            if self.cur >= r.hi {
+                self.idx += 1;
+                if self.idx < self.ranges.len() {
+                    self.cur = self.ranges[self.idx].lo;
+                }
+                continue;
+            }
+            // Fail AFTER at least one row of this split has gone out, so the
+            // never-partial gate is tested against a genuinely partial capture
+            // rather than an empty one.
+            if self.fail_at >= 0 && self.ordinals[self.idx] == self.fail_at && self.cur > r.lo {
+                return Err(RpcError::runtime_error(format!(
+                    "split {} failed mid-stream (fixture)",
+                    self.fail_at
+                )));
+            }
+            let size = (r.hi - self.cur).min(8);
+            let start = self.cur;
+            self.cur += size;
+            let arr: ArrayRef =
+                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            return RecordBatch::try_new(self.schema.clone(), vec![arr])
+                .map(Some)
+                .map_err(|e| RpcError::runtime_error(e.to_string()));
+        }
+        Ok(None)
+    }
+}
+
+/// Paginates forever: every plan page returns a cursor and never exhausts it.
+///
+/// A worker can hang a client this way by accident as easily as on purpose, and
+/// the failure mode is the bad one: a client that stopped early would scan a
+/// PARTIAL enumeration and report it as the whole answer. The client must hit
+/// its page cap and throw an error naming it — never truncate and proceed.
+struct SplitEndlessCursor;
+
+impl TableFunction for SplitEndlessCursor {
+    fn name(&self) -> &str {
+        "split_endless_cursor"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Paginates forever: the client must hit its page cap".to_string(),
+            supports_splits: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("n", -1, "int64", "Ignored").with_ge(0.0),
+            ArgSpec::const_arg("splits", -1, "int64", "Ignored")
+                .with_ge(0.0)
+                .with_default(1),
+        ]
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        _params: &BindParams,
+        request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let page = request.cursor.as_ref().map(|c| c.0.len()).unwrap_or(0);
+        Ok(Some(PlanOutcome {
+            splits: vec![PlannedSplit {
+                payload: encode(Range { lo: 0, hi: 1 }),
+                ..Default::default()
+            }],
+            next_cursors: vec![vec![b'x'; page + 1]],
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, _params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(SplitProducer {
+            schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            ranges: vec![Range { lo: 0, hi: 1 }],
+            idx: 0,
+            cur: 0,
+        }))
+    }
+}
+
+/// Reports, per split, what pushdown the PLAN call actually received.
+///
+/// A row-count assertion cannot catch a pushdown regression — the rows are the
+/// same either way — so this fixture makes the pushdown itself the data. What it
+/// reports is recorded at PLAN time and baked into each split's payload, which is
+/// the claim under test: filters and projection must reach `plan()`, not merely
+/// reach the per-split `init()` afterwards.
+struct SplitEchoFilters;
+
+fn echo_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("split_ordinal", DataType::Int64, false),
+        Field::new("saw_filters", DataType::Boolean, false),
+        Field::new("n_projection", DataType::Int64, false),
+    ]))
+}
+
+impl TableFunction for SplitEchoFilters {
+    fn name(&self) -> &str {
+        "split_echo_filters"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Reports the pushdown each split's plan() call saw".to_string(),
+            supports_splits: true,
+            // filter_pushdown declares that this worker APPLIES the filter, so
+            // DuckDB stops re-checking it above the scan. Declaring it while
+            // only reporting the filter would be the "wrong answers if declared
+            // falsely" hazard in miniature. auto_apply_filters makes it true.
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("splits", -1, "int64", "How many splits to report")
+            .with_ge(1.0)
+            .with_default(3)]
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: echo_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let splits = arg_i64(params, "splits", 3);
+        let saw = i64::from(request.pushdown_filters.is_some());
+        let nproj = request.projection_ids.as_ref().map(|v| v.len()).unwrap_or(0) as i64;
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(splits),
+            splits: (0..splits)
+                .map(|i| {
+                    let mut payload = Vec::with_capacity(24);
+                    payload.extend_from_slice(&i.to_le_bytes());
+                    payload.extend_from_slice(&saw.to_le_bytes());
+                    payload.extend_from_slice(&nproj.to_le_bytes());
+                    PlannedSplit {
+                        payload,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_echo_filters is split-only but was initialized with no split tokens",
+            ));
+        };
+        let mut rows = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            if payload.len() != 24 {
+                return Err(RpcError::runtime_error(format!(
+                    "echo payload must be 24 bytes, got {}",
+                    payload.len()
+                )));
+            }
+            rows.push((
+                i64::from_le_bytes(payload[0..8].try_into().unwrap()),
+                i64::from_le_bytes(payload[8..16].try_into().unwrap()) != 0,
+                i64::from_le_bytes(payload[16..24].try_into().unwrap()),
+            ));
+        }
+        Ok(Box::new(EchoProducer { rows, done: false }))
+    }
+}
+
+struct EchoProducer {
+    rows: Vec<(i64, bool, i64)>,
+    done: bool,
+}
+
+impl TableProducer for EchoProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done || self.rows.is_empty() {
+            return Ok(None);
+        }
+        self.done = true;
+        let ordinals: ArrayRef =
+            Arc::new(Int64Array::from(self.rows.iter().map(|r| r.0).collect::<Vec<i64>>()));
+        let saw: ArrayRef = Arc::new(arrow_array::BooleanArray::from(
+            self.rows.iter().map(|r| r.1).collect::<Vec<bool>>(),
+        ));
+        let nproj: ArrayRef =
+            Arc::new(Int64Array::from(self.rows.iter().map(|r| r.2).collect::<Vec<i64>>()));
+        RecordBatch::try_new(echo_schema(), vec![ordinals, saw, nproj])
+            .map(Some)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
 }
