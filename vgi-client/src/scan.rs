@@ -20,7 +20,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
-use vgi_protocol::protocol::dtos::{BindRequest, BindResponse, GlobalInitResponse, InitRequest};
+use vgi_protocol::protocol::dtos::{
+    BindRequest, BindResponse, GlobalInitResponse, InitRequest, PlanResponse, ScanSplit,
+    TableFunctionPlanRequest,
+};
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString, LargeBytes};
@@ -478,5 +481,181 @@ impl VgiClient {
             request: envelope(request)?,
         })?;
         Scan::open(self.transport_mut(), &params, schema)
+    }
+}
+
+/// One named, independently redeemable unit of scan work, as the client sees it.
+///
+/// The `token` is what a redemption sends back — never `payload`, which is the
+/// worker's own bytes sealed inside the envelope and unverifiable on its own.
+#[derive(Debug, Clone)]
+pub struct ScanSplitInfo {
+    /// The framework-stamped envelope to send back on the redeeming init.
+    pub token: Vec<u8>,
+    /// Row estimate for this split, or `None` if the worker did not say.
+    pub estimated_rows: Option<i64>,
+    /// True when `estimated_rows` is exact — unlocks COUNT(*) from statistics.
+    pub rows_exact: bool,
+    /// Bin-packing weight for an engine whose partition count is fixed at
+    /// planning time. `None` degrades such an engine to round-robin by count;
+    /// a greedily-claiming engine needs no cost model at all.
+    pub estimated_bytes: Option<i64>,
+    /// `None` means UNBOUNDED — a shard read forever. An engine whose tasks must
+    /// terminate has to refuse those rather than hang on one.
+    pub end_position: Option<Vec<u8>>,
+}
+
+/// The result of dividing a scan into splits.
+#[derive(Debug, Clone, Default)]
+pub struct ScanPlan {
+    /// One entry per unit of work. EMPTY is legal and means "no work" — a
+    /// fully-pruned scan reaches it, and a caller must produce an empty result
+    /// rather than an error. An engine that maps partitions to splits must still
+    /// clamp to at least one (empty) partition.
+    pub splits: Vec<ScanSplitInfo>,
+    /// NORMATIVE cap on how many splits may be redeemed concurrently, not
+    /// advisory. An engine whose partition count IS its concurrency must enforce
+    /// it at planning time rather than relying on the worker to push back.
+    pub max_workers: Option<i64>,
+    /// Estimate of the total split count, for a caller sizing before enumeration finishes.
+    pub estimated_total_splits: Option<i64>,
+    /// Whole-scan row estimate, for cost-based planning.
+    pub estimated_total_rows: Option<i64>,
+    /// Whole-scan byte estimate, for cost-based planning.
+    pub estimated_total_bytes: Option<i64>,
+    /// The catalog counter this plan is pinned to.
+    pub catalog_version: Option<i64>,
+    /// `catalog` or `transaction`. A transaction-scoped plan is not cacheable
+    /// and is not redeemable after commit or rollback.
+    pub scope: String,
+}
+
+/// Sizing inputs for [`VgiClient::plan`].
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// Indices into the bind output schema the scan will actually emit.
+    pub projection: Option<Vec<i64>>,
+    /// Serialized static filters, in the extension's filter encoding.
+    pub pushdown_filters: Option<Vec<u8>>,
+    /// The primary sizing lever: every engine is byte-driven.
+    pub target_split_bytes: Option<i64>,
+    /// The parallelism FLOOR. A small but expensive table still needs one reader
+    /// per thread, which a byte target alone would never give it.
+    pub min_splits: Option<i64>,
+    /// A plain fetch limit. Push the FULL limit into every split rather than
+    /// dividing it: over-production is legal and the engine re-applies above the
+    /// coalesce, whereas dividing by N under-produces under skew.
+    pub row_limit: Option<i64>,
+}
+
+impl VgiClient {
+    /// Divide a bound scan into named, independently redeemable splits.
+    ///
+    /// Paginated: the worker may return a cursor, and this follows it until the
+    /// enumeration is exhausted. Bounded by a page cap, because a worker that
+    /// paginates forever would otherwise hang the caller — and the tempting
+    /// mitigation is the wrong one. Stopping early and scanning what arrived
+    /// would turn a hang into a SILENT SUBSET: a correct-looking answer missing
+    /// rows, which is the failure class splits exist to prevent. So a breach is
+    /// an error, never a truncation.
+    ///
+    /// Duplicate tokens are dropped. A worker returning overlapping cursors is
+    /// a contract violation with no enforcement, and its symptom would be
+    /// duplicate ROWS — arriving through the very mechanism meant to speed
+    /// enumeration up. Deduping is cheap next to a plan RPC and turns a silent
+    /// correctness bug into a droppable duplicate.
+    pub fn plan(&mut self, bound: &BoundFunction, opts: &PlanOptions) -> Result<ScanPlan> {
+        use std::collections::HashSet;
+
+        /// Generous on purpose: the cap exists to turn a hang into a legible
+        /// error, not to second-guess a worker's split count.
+        const MAX_PAGES: usize = 1024;
+
+        let mut plan = ScanPlan {
+            scope: "catalog".to_string(),
+            ..Default::default()
+        };
+        let mut cursor: Option<Bytes> = None;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut pages = 0usize;
+
+        loop {
+            if pages >= MAX_PAGES {
+                return Err(RpcError::runtime_error(format!(
+                    "worker exceeded the scan-planning page cap ({MAX_PAGES} pages) without \
+                     exhausting its cursor; refusing to scan a partial split enumeration"
+                )));
+            }
+            pages += 1;
+
+            let request = TableFunctionPlanRequest {
+                bind_call: bound.bind_call.clone(),
+                bind_opaque_data: Some(bound.response.opaque_data.clone()),
+                projection_ids: opts.projection.clone(),
+                pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
+                join_keys: None,
+                row_limit: opts.row_limit,
+                target_split_bytes: opts.target_split_bytes,
+                min_splits: opts.min_splits,
+                max_splits_per_response: None,
+                cursor: cursor.clone(),
+                refined_filters: None,
+                filters_complete: Some(true),
+                start_position: None,
+                end_position: None,
+                order_by_column_name: None,
+                order_by_direction: None,
+                order_by_null_order: None,
+                order_by_limit: None,
+                tablesample_percentage: None,
+                tablesample_seed: None,
+            };
+
+            let response: PlanResponse = call(
+                self.transport_mut(),
+                "table_function_plan",
+                p::TableFunctionPlanParams {
+                    request: envelope(request)?,
+                },
+            )?;
+
+            for blob in &response.splits {
+                let split: ScanSplit = wire::from_batch(&ipc::read_batch(&blob.0)?)?;
+                if !seen.insert(split.token.0.clone()) {
+                    continue;
+                }
+                plan.splits.push(ScanSplitInfo {
+                    token: split.token.0.clone(),
+                    estimated_rows: split.estimated_rows,
+                    rows_exact: split.rows_exact,
+                    estimated_bytes: split.estimated_bytes,
+                    end_position: split.end_position.map(|b| b.0),
+                });
+            }
+
+            plan.max_workers = plan.max_workers.or(response.max_workers);
+            plan.estimated_total_splits = plan
+                .estimated_total_splits
+                .or(response.estimated_total_splits);
+            plan.estimated_total_rows = plan.estimated_total_rows.or(response.estimated_total_rows);
+            plan.estimated_total_bytes =
+                plan.estimated_total_bytes.or(response.estimated_total_bytes);
+            plan.catalog_version = plan.catalog_version.or(response.catalog_version);
+            if !response.scope.is_empty() {
+                plan.scope = response.scope.clone();
+            }
+
+            // Only the FIRST cursor is followed. Parallel enumeration is sound
+            // only if the cursors partition the remaining work disjointly, and
+            // that is a worker obligation with no enforcement — so this client
+            // takes the serial path, which every worker supports, rather than
+            // trusting a contract it cannot check.
+            match response.next_cursors.first() {
+                Some(next) if !next.0.is_empty() => cursor = Some(next.clone()),
+                _ => break,
+            }
+        }
+
+        Ok(plan)
     }
 }

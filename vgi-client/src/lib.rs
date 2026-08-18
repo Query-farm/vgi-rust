@@ -81,8 +81,8 @@ pub use client::VgiClient;
 pub use location::VgiLocation;
 pub use pool::{PoolConfig, PoolStats, PooledClient, WorkerPool};
 pub use scan::{
-    BindSpec, BoundFunction, FunctionType, NullOrder, OrderBy, Sample, Scan, ScanOptions,
-    SortDirection,
+    BindSpec, BoundFunction, FunctionType, NullOrder, OrderBy, PlanOptions, Sample, Scan,
+    ScanOptions, ScanPlan, ScanSplitInfo, SortDirection,
 };
 pub use transport::{ExchangeStream, ProducerStream, StreamTransport, VgiTransport};
 
@@ -100,7 +100,7 @@ pub use vgi_protocol::protocol::dtos;
 pub use vgi_protocol::protocol::dtos::{ScanFunctionResult, TableInfo};
 
 /// An opaque wire blob — a worker handle, or arguments it already encoded.
-pub use vgi_rpc::Bytes;
+pub use vgi_rpc::{Bytes, LargeBytes};
 
 /// Cache directives a worker may advertise on its result.
 pub use vgi_protocol::cache_control::CacheControl;
