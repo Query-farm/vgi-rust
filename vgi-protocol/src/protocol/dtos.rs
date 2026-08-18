@@ -541,10 +541,10 @@ pub struct ScanSplit {
     pub partition_bounds: Option<LargeBytes>,
     pub column_statistics: Option<LargeBytes>,
     pub location_ids: Option<Vec<i64>>,
-    pub start_position: Option<LargeBytes>,
+    pub start_position: Option<Bytes>,
     /// `None` means UNBOUNDED — a shard read forever. A bounded engine (Spark
     /// micro-batch) must refuse those rather than hang.
-    pub end_position: Option<LargeBytes>,
+    pub end_position: Option<Bytes>,
 }
 
 /// `GlobalInitResponse` — the streaming header for `init`.
