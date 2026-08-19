@@ -11,8 +11,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use vgi_rpc::{
-    Bytes, CallContext, ExchangeState, LargeBytes, OutputCollector, Request, Result, RpcError,
-    StreamResult,
+    Bytes, CallContext, ExchangeState, OutputCollector, Request, Result, RpcError, StreamResult,
     VgiArrow,
 };
 
@@ -2271,8 +2270,8 @@ impl Dispatcher {
 
         let Some(outcome) = outcome else {
             let one = wire::to_batch(ScanSplit {
-                payload: LargeBytes::from(Vec::new()),
-                token: LargeBytes::from(Vec::new()),
+                payload: Bytes::from(Vec::new()),
+                token: Bytes::from(Vec::new()),
                 estimated_rows: None,
                 rows_exact: false,
                 estimated_bytes: None,
@@ -2315,16 +2314,16 @@ impl Dispatcher {
                 crate::split_token::build_split_token(&s.payload, &fingerprint, &anchor, key, None)
                     .map_err(|e| RpcError::runtime_error(format!("[{}] {e}", e.kind())))?;
             let batch = wire::to_batch(ScanSplit {
-                payload: LargeBytes::from(s.payload.clone()),
-                token: LargeBytes::from(token),
+                payload: Bytes::from(s.payload.clone()),
+                token: Bytes::from(token),
                 estimated_rows: s.estimated_rows,
                 rows_exact: s.rows_exact,
                 estimated_bytes: s.estimated_bytes,
-                partition_bounds: s.partition_bounds.clone().map(LargeBytes::from),
-                column_statistics: s.column_statistics.clone().map(LargeBytes::from),
+                partition_bounds: s.partition_bounds.clone().map(Bytes::from),
+                column_statistics: s.column_statistics.clone().map(Bytes::from),
                 location_ids: s.location_ids.clone(),
-                start_position: s.start_position.clone().map(LargeBytes::from),
-                end_position: s.end_position.clone().map(LargeBytes::from),
+                start_position: s.start_position.clone().map(Bytes::from),
+                end_position: s.end_position.clone().map(Bytes::from),
             })?;
             splits.push(Bytes::from(ipc::write_batch(&batch)?));
         }

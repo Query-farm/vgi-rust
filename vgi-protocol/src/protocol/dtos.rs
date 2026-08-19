@@ -526,10 +526,10 @@ pub struct PlanResponse {
 /// A worker sets `payload` only; the framework stamps `token` from it.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanSplit {
-    pub payload: LargeBytes,
+    pub payload: Bytes,
     /// The framework-stamped (and, where a key exists, sealed) envelope. The
     /// client sends THIS back, never the raw payload.
-    pub token: LargeBytes,
+    pub token: Bytes,
     pub estimated_rows: Option<i64>,
     /// True if `estimated_rows` is exact — unlocks COUNT(*) from statistics.
     pub rows_exact: bool,
@@ -538,8 +538,8 @@ pub struct ScanSplit {
     /// greedily and needs no cost model at all.
     pub estimated_bytes: Option<i64>,
     /// 2-row (min, max) batch in the existing `vgi_partition_values` encoding.
-    pub partition_bounds: Option<LargeBytes>,
-    pub column_statistics: Option<LargeBytes>,
+    pub partition_bounds: Option<Bytes>,
+    pub column_statistics: Option<Bytes>,
     pub location_ids: Option<Vec<i64>>,
     pub start_position: Option<Bytes>,
     /// `None` means UNBOUNDED — a shard read forever. A bounded engine (Spark
