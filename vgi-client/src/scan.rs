@@ -500,7 +500,12 @@ pub struct ScanSplitInfo {
     /// planning time. `None` degrades such an engine to round-robin by count;
     /// a greedily-claiming engine needs no cost model at all.
     pub estimated_bytes: Option<i64>,
-    /// `None` means UNBOUNDED — a shard read forever. An engine whose tasks must
+    /// Where this split's range in the DATA begins. Its presence is what makes
+    /// an unbounded split recognizable: `end_position: None` alone cannot say,
+    /// because it is also the default for every ordinary batch split.
+    pub start_position: Option<Vec<u8>>,
+    /// The upper bound of this split's range. `None` alongside a `start_position`
+    /// means UNBOUNDED — a shard read forever — and an engine whose tasks must
     /// terminate has to refuse those rather than hang on one.
     pub end_position: Option<Vec<u8>>,
 }
@@ -629,20 +634,26 @@ impl VgiClient {
                     estimated_rows: split.estimated_rows,
                     rows_exact: split.rows_exact,
                     estimated_bytes: split.estimated_bytes,
+                    start_position: split.start_position.map(|b| b.0),
                     end_position: split.end_position.map(|b| b.0),
                 });
             }
 
-            plan.max_workers = plan.max_workers.or(response.max_workers);
-            plan.estimated_total_splits = plan
-                .estimated_total_splits
-                .or(response.estimated_total_splits);
-            plan.estimated_total_rows = plan.estimated_total_rows.or(response.estimated_total_rows);
-            plan.estimated_total_bytes =
-                plan.estimated_total_bytes.or(response.estimated_total_bytes);
-            plan.catalog_version = plan.catalog_version.or(response.catalog_version);
-            if !response.scope.is_empty() {
-                plan.scope = response.scope.clone();
+            // Plan-level facts come from the FIRST page, keyed on the page
+            // counter — one rule for all of them. `scope` used to be
+            // last-non-empty-wins, and since it defaults to "catalog" it is never
+            // empty: a page-1 "transaction" scope was overwritten by every
+            // subsequent page's default, recording a transaction-scoped plan
+            // (not cacheable, not redeemable after commit) as catalog-scoped.
+            if pages == 1 {
+                plan.max_workers = response.max_workers;
+                plan.estimated_total_splits = response.estimated_total_splits;
+                plan.estimated_total_rows = response.estimated_total_rows;
+                plan.estimated_total_bytes = response.estimated_total_bytes;
+                plan.catalog_version = response.catalog_version;
+                if !response.scope.is_empty() {
+                    plan.scope = response.scope.clone();
+                }
             }
 
             // Only the FIRST cursor is followed. Parallel enumeration is sound
