@@ -82,7 +82,7 @@ pub fn classify_status(status: u16) -> StatusClass {
     match status {
         200..=299 => StatusClass::Success,
         429 => StatusClass::Throttled,
-        502 | 503 | 504 => StatusClass::Transient,
+        502..=504 => StatusClass::Transient,
         _ => StatusClass::Fatal,
     }
 }
@@ -249,7 +249,9 @@ impl RetryPolicy {
     pub fn delay(&self, attempt: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
         let window = self.window(attempt).as_secs_f64();
         let jittered = Duration::from_secs_f64(window * jitter.clamp(0.0, 1.0));
-        retry_after.unwrap_or(Duration::ZERO).saturating_add(jittered)
+        retry_after
+            .unwrap_or(Duration::ZERO)
+            .saturating_add(jittered)
     }
 
     /// Decide what to do after an attempt that ended in `class`.
@@ -302,7 +304,13 @@ impl RetryPolicy {
                 Err(e) => e,
             };
             let (class, retry_after) = classify_error(&err);
-            match self.decide(class, attempt, start.elapsed(), retry_after, jitter_fraction()) {
+            match self.decide(
+                class,
+                attempt,
+                start.elapsed(),
+                retry_after,
+                jitter_fraction(),
+            ) {
                 RetryDecision::Retry(d) => std::thread::sleep(d),
                 // A fatal failure is returned as the peer stated it: wrapping it
                 // in retry vocabulary would bury the real cause under an
@@ -355,13 +363,19 @@ pub fn classify_error(err: &RpcError) -> (StatusClass, Option<Duration>) {
     // credential is good", which is exactly a retryable condition and is
     // deliberately not a rejection.
     if err.is_auth_unavailable() {
-        let after = err.retry_after_seconds.map(|s| Duration::from_secs(s.into()));
+        let after = err
+            .retry_after_seconds
+            .map(|s| Duration::from_secs(s.into()));
         return (StatusClass::Transient, after);
     }
     if let Some(status) = status_in_message(&err.message) {
         let class = classify_status(status);
         if class.is_retryable() {
-            return (class, err.retry_after_seconds.map(|s| Duration::from_secs(s.into())));
+            return (
+                class,
+                err.retry_after_seconds
+                    .map(|s| Duration::from_secs(s.into())),
+            );
         }
         return (StatusClass::Fatal, None);
     }
@@ -430,6 +444,79 @@ pub fn method_is_retryable(method: &str) -> bool {
         || method.starts_with("catalog_table_")
 }
 
+// ---------------------------------------------------------------------------
+
+/// A [`VgiTransport`] that applies a [`RetryPolicy`] to the calls it can.
+///
+/// Wrapped around the HTTP transports only. A byte-stream worker (subprocess,
+/// AF_UNIX, TCP) has no status codes and no rate limiter in front of it, so
+/// there is nothing here for it to classify.
+///
+/// # What is retried, and what is left alone
+///
+/// Unary calls whose method is on [`method_is_retryable`]'s allowlist. That
+/// covers the two calls a distributed engine makes most and cares about most —
+/// `bind` and `table_function_plan`, the latter being split enumeration, which
+/// is exactly where an over-fanning engine meets the cap.
+///
+/// The stream opens (`init`) are forwarded with a single attempt, and the
+/// reason is a borrow, not a judgement: the session they return borrows the
+/// client for as long as the caller holds it, so a loop that re-opened after a
+/// failure would be re-borrowing across iterations — rejected before Polonius.
+/// A caller that owns its client retries those itself through
+/// [`RetryPolicy::run`], which is why the policy is a value and not private
+/// state.
+pub struct RetryTransport {
+    inner: Box<dyn VgiTransport>,
+    policy: RetryPolicy,
+}
+
+impl RetryTransport {
+    /// Wrap `inner`, applying `policy` to the calls that can carry it.
+    pub fn new(inner: Box<dyn VgiTransport>, policy: RetryPolicy) -> Self {
+        Self { inner, policy }
+    }
+
+    /// The policy in force, for a caller driving its own retries around the
+    /// stream opens this cannot cover.
+    pub fn policy(&self) -> &RetryPolicy {
+        &self.policy
+    }
+}
+
+impl VgiTransport for RetryTransport {
+    fn call_unary(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+        if !method_is_retryable(method) {
+            return self.inner.call_unary(method, params);
+        }
+        let policy = self.policy;
+        let inner = &mut self.inner;
+        policy.run(method, || inner.call_unary(method, params))
+    }
+
+    fn open_producer<'a>(
+        &'a mut self,
+        method: &str,
+        params: &RecordBatch,
+        has_header: bool,
+    ) -> Result<Box<dyn ProducerStream + 'a>> {
+        self.inner.open_producer(method, params, has_header)
+    }
+
+    fn open_exchange<'a>(
+        &'a mut self,
+        method: &str,
+        params: &RecordBatch,
+        has_header: bool,
+    ) -> Result<Box<dyn ExchangeStream + 'a>> {
+        self.inner.open_exchange(method, params, has_header)
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,7 +540,10 @@ mod tests {
     fn retry_after_reads_both_forms() {
         let now = UNIX_EPOCH + Duration::from_secs(784_111_777);
         assert_eq!(parse_retry_after("2", now), Some(Duration::from_secs(2)));
-        assert_eq!(parse_retry_after("  30 ", now), Some(Duration::from_secs(30)));
+        assert_eq!(
+            parse_retry_after("  30 ", now),
+            Some(Duration::from_secs(30))
+        );
         assert_eq!(parse_retry_after("0", now), Some(Duration::ZERO));
 
         // 1994-11-06 08:49:37 GMT is 784_111_777 — the RFC's own example.
@@ -474,7 +564,14 @@ mod tests {
     #[test]
     fn unparseable_retry_after_falls_back_rather_than_failing() {
         let now = SystemTime::now();
-        for v in ["", "   ", "soon", "-5", "1.5", "Mon, 32 Xxx 1994 08:49:37 GMT"] {
+        for v in [
+            "",
+            "   ",
+            "soon",
+            "-5",
+            "1.5",
+            "Mon, 32 Xxx 1994 08:49:37 GMT",
+        ] {
             assert_eq!(parse_retry_after(v, now), None, "{v:?}");
         }
     }
@@ -693,78 +790,5 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(e.error_type, "ValueError");
         assert_eq!(e.message, "no such function");
-    }
-}
-
-// ---------------------------------------------------------------------------
-
-/// A [`VgiTransport`] that applies a [`RetryPolicy`] to the calls it can.
-///
-/// Wrapped around the HTTP transports only. A byte-stream worker (subprocess,
-/// AF_UNIX, TCP) has no status codes and no rate limiter in front of it, so
-/// there is nothing here for it to classify.
-///
-/// # What is retried, and what is left alone
-///
-/// Unary calls whose method is on [`method_is_retryable`]'s allowlist. That
-/// covers the two calls a distributed engine makes most and cares about most —
-/// `bind` and `table_function_plan`, the latter being split enumeration, which
-/// is exactly where an over-fanning engine meets the cap.
-///
-/// The stream opens (`init`) are forwarded with a single attempt, and the
-/// reason is a borrow, not a judgement: the session they return borrows the
-/// client for as long as the caller holds it, so a loop that re-opened after a
-/// failure would be re-borrowing across iterations — rejected before Polonius.
-/// A caller that owns its client retries those itself through
-/// [`RetryPolicy::run`], which is why the policy is a value and not private
-/// state.
-pub struct RetryTransport {
-    inner: Box<dyn VgiTransport>,
-    policy: RetryPolicy,
-}
-
-impl RetryTransport {
-    /// Wrap `inner`, applying `policy` to the calls that can carry it.
-    pub fn new(inner: Box<dyn VgiTransport>, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
-    }
-
-    /// The policy in force, for a caller driving its own retries around the
-    /// stream opens this cannot cover.
-    pub fn policy(&self) -> &RetryPolicy {
-        &self.policy
-    }
-}
-
-impl VgiTransport for RetryTransport {
-    fn call_unary(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
-        if !method_is_retryable(method) {
-            return self.inner.call_unary(method, params);
-        }
-        let policy = self.policy;
-        let inner = &mut self.inner;
-        policy.run(method, || inner.call_unary(method, params))
-    }
-
-    fn open_producer<'a>(
-        &'a mut self,
-        method: &str,
-        params: &RecordBatch,
-        has_header: bool,
-    ) -> Result<Box<dyn ProducerStream + 'a>> {
-        self.inner.open_producer(method, params, has_header)
-    }
-
-    fn open_exchange<'a>(
-        &'a mut self,
-        method: &str,
-        params: &RecordBatch,
-        has_header: bool,
-    ) -> Result<Box<dyn ExchangeStream + 'a>> {
-        self.inner.open_exchange(method, params, has_header)
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
     }
 }

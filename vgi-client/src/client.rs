@@ -96,34 +96,6 @@ fn format_worker_log(msg: &vgi_rpc_client::LogMessage) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vgi_rpc_client::{LogLevel, LogMessage};
-
-    #[test]
-    fn worker_levels_map_across_and_exception_stays_loud() {
-        assert_eq!(worker_log_level(LogLevel::Trace), log::Level::Trace);
-        assert_eq!(worker_log_level(LogLevel::Debug), log::Level::Debug);
-        assert_eq!(worker_log_level(LogLevel::Info), log::Level::Info);
-        assert_eq!(worker_log_level(LogLevel::Warn), log::Level::Warn);
-        assert_eq!(worker_log_level(LogLevel::Error), log::Level::Error);
-        // An EXCEPTION reaching a log sink at all means a peer mislabelled it —
-        // the transport turns a real one into a failed call — so it must not
-        // land below Error, where a default filter would hide it.
-        assert_eq!(worker_log_level(LogLevel::Exception), log::Level::Error);
-    }
-
-    #[test]
-    fn extras_travel_with_the_message() {
-        let bare = LogMessage::new(LogLevel::Info, "pruned 3 splits");
-        assert_eq!(format_worker_log(&bare), "pruned 3 splits");
-
-        let rich = LogMessage::new(LogLevel::Info, "pruned").with_extra("splits", "3");
-        assert_eq!(format_worker_log(&rich), r#"pruned {"splits":"3"}"#);
-    }
-}
-
 impl VgiClient {
     /// Build a client over any transport.
     pub fn new(transport: Box<dyn VgiTransport>) -> Self {
@@ -267,5 +239,33 @@ impl VgiClient {
             &RecordBatchOptions::new().with_row_count(Some(1)),
         )
         .map_err(|e| vgi_rpc::errors::RpcError::runtime_error(format!("empty params batch: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vgi_rpc_client::{LogLevel, LogMessage};
+
+    #[test]
+    fn worker_levels_map_across_and_exception_stays_loud() {
+        assert_eq!(worker_log_level(LogLevel::Trace), log::Level::Trace);
+        assert_eq!(worker_log_level(LogLevel::Debug), log::Level::Debug);
+        assert_eq!(worker_log_level(LogLevel::Info), log::Level::Info);
+        assert_eq!(worker_log_level(LogLevel::Warn), log::Level::Warn);
+        assert_eq!(worker_log_level(LogLevel::Error), log::Level::Error);
+        // An EXCEPTION reaching a log sink at all means a peer mislabelled it —
+        // the transport turns a real one into a failed call — so it must not
+        // land below Error, where a default filter would hide it.
+        assert_eq!(worker_log_level(LogLevel::Exception), log::Level::Error);
+    }
+
+    #[test]
+    fn extras_travel_with_the_message() {
+        let bare = LogMessage::new(LogLevel::Info, "pruned 3 splits");
+        assert_eq!(format_worker_log(&bare), "pruned 3 splits");
+
+        let rich = LogMessage::new(LogLevel::Info, "pruned").with_extra("splits", "3");
+        assert_eq!(format_worker_log(&rich), r#"pruned {"splits":"3"}"#);
     }
 }
