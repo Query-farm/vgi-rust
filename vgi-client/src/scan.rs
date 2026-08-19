@@ -175,7 +175,7 @@ impl BoundFunction {
             bind_call: self.bind_call.clone(),
             output_schema: self.response.output_schema.clone(),
             bind_opaque_data: Some(self.response.opaque_data.clone()),
-            projection_ids: opts.projection.clone(),
+            projection_ids: opts.wire_projection(),
             pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
             join_keys: opts
                 .join_keys
@@ -287,6 +287,20 @@ pub struct Sample {
 pub struct ScanOptions {
     /// Indices into the bind output schema to actually emit.
     pub projection: Option<Vec<i64>>,
+    /// Indices into the bind output schema that [`Self::pushdown_filters`]
+    /// references but [`Self::projection`] does not ask for.
+    ///
+    /// A pushed filter is keyed by its column's position in the PROJECTED set,
+    /// while an engine is free to push a predicate on a column the query never
+    /// selects — `SELECT a FROM t WHERE b > 1` is the whole case. Left alone,
+    /// the filter's key names some other column and a worker that honours it
+    /// filters on the wrong data. So the init asks for the UNION, projection
+    /// first, and the extra columns are dropped from each batch before it
+    /// reaches the caller: [`Scan::schema`] still reports the projection alone.
+    ///
+    /// Ignored when `projection` is `None`, because every column is being
+    /// emitted already.
+    pub filter_columns: Option<Vec<i64>>,
     /// Serialized filter pushdown, in the extension's filter encoding.
     pub pushdown_filters: Option<Vec<u8>>,
     /// Serialized join-key sets pushed as an IN filter.
@@ -317,12 +331,57 @@ pub struct ScanOptions {
     pub row_limit: Option<i64>,
 }
 
+/// The projection to put on the wire: the requested columns, then any
+/// filter-only column, in first-reference order.
+///
+/// Order is load-bearing twice over. The requested columns come FIRST so
+/// trimming a batch back to what the caller asked for is a prefix slice — get
+/// that wrong and one column's values are read out of another's slot, which
+/// nothing downstream can catch because both are the right length and often the
+/// right type. And a filter's key is its column's position in THIS list, which
+/// is what [`ScanOptions::wire_index_of`] computes.
+///
+/// `None` projection means "emit everything", so there is nothing to add: the
+/// filter's columns are already there, and turning `None` into a list would
+/// NARROW the scan to them.
+fn union_projection(
+    projection: Option<&Vec<i64>>,
+    filter_columns: Option<&Vec<i64>>,
+) -> Option<Vec<i64>> {
+    let mut out = projection?.clone();
+    for c in filter_columns.into_iter().flatten() {
+        if !out.contains(c) {
+            out.push(*c);
+        }
+    }
+    Some(out)
+}
+
+impl ScanOptions {
+    /// The projection this scan puts on the wire. See [`union_projection`].
+    pub fn wire_projection(&self) -> Option<Vec<i64>> {
+        union_projection(self.projection.as_ref(), self.filter_columns.as_ref())
+    }
+
+    /// Where `column` (an index into the bind output schema) lands in the
+    /// projected set — the index a pushed filter must be keyed by.
+    ///
+    /// `None` when the scan projects everything, in which case a filter keeps
+    /// the bind-schema index it already has.
+    pub fn wire_index_of(&self, column: i64) -> Option<usize> {
+        self.wire_projection()?.iter().position(|c| *c == column)
+    }
+}
+
 /// An open producer stream.
 pub struct Scan<'a> {
     stream: Box<dyn ProducerStream + 'a>,
     header: GlobalInitResponse,
     function: String,
     schema: SchemaRef,
+    /// What the worker was asked to emit: the projection plus any filter-only
+    /// column. Equal to `schema` unless those were added.
+    emitted_schema: SchemaRef,
     last_cache_control: Option<CacheControl>,
     finished: bool,
 }
@@ -344,10 +403,27 @@ impl<'a> Scan<'a> {
             stream,
             header,
             function: function.into(),
+            emitted_schema: Arc::clone(&schema),
             schema,
             last_cache_control: None,
             finished: false,
         })
+    }
+
+    /// Open a scan whose worker emits more columns than the caller asked for,
+    /// the extras being filter-only columns that are trimmed on the way out.
+    pub(crate) fn open_projected(
+        transport: &'a mut dyn crate::transport::VgiTransport,
+        params: &RecordBatch,
+        function: impl Into<String>,
+        schema: SchemaRef,
+        emitted_schema: SchemaRef,
+    ) -> Result<Scan<'a>> {
+        let mut scan = Scan::open(transport, params, function, emitted_schema)?;
+        // `open` points both at what the worker emits; narrow the caller-facing
+        // one, which is the whole point of the trim.
+        scan.schema = schema;
+        Ok(scan)
     }
 }
 
@@ -399,11 +475,30 @@ impl Scan<'_> {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    check_batch_schema(&self.function, &self.schema, &batch)?;
-                    return Ok(Some(batch));
+                    check_batch_schema(&self.function, &self.emitted_schema, &batch)?;
+                    return Ok(Some(self.trim_to_projection(batch)?));
                 }
             }
         }
+    }
+
+    /// Drop the filter-only columns a batch carries.
+    ///
+    /// A prefix slice, and only because [`union_projection`] put the requested
+    /// columns first. Cheap — the columns are `Arc`s, so this rebuilds a batch
+    /// header and clones no data.
+    fn trim_to_projection(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let keep = self.schema.fields().len();
+        if keep == batch.num_columns() {
+            return Ok(batch);
+        }
+        let idx: Vec<usize> = (0..keep).collect();
+        batch.project(&idx).map_err(|e| {
+            RpcError::runtime_error(format!(
+                "function `{}`: could not drop the filter-only columns from a batch: {e}",
+                self.function
+            ))
+        })
     }
 
     /// Collect every remaining batch.
@@ -420,6 +515,25 @@ impl Scan<'_> {
         self.finished = true;
         self.stream.cancel()
     }
+}
+
+/// Narrow `schema` to `ids`, or hand it back whole when there is no projection.
+fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> {
+    let Some(ids) = ids else {
+        return Ok(Arc::clone(schema));
+    };
+    let idx = ids
+        .iter()
+        .map(|i| {
+            usize::try_from(*i)
+                .map_err(|_| RpcError::type_error(format!("negative projection index {i}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(schema.project(&idx).map_err(|e| {
+        RpcError::type_error(format!(
+            "projection is not valid for the bind output schema: {e}"
+        ))
+    })?))
 }
 
 /// Refuse a batch whose schema is not the one the scan declared.
@@ -512,36 +626,21 @@ impl VgiClient {
 
     /// Open a scan over a bound function.
     pub fn scan<'a>(&'a mut self, bound: &BoundFunction, opts: &ScanOptions) -> Result<Scan<'a>> {
-        // Projection narrows the emitted columns, so the caller's view of the
-        // schema must narrow with it.
-        let schema = match &opts.projection {
-            None => Arc::clone(bound.output_schema()),
-            Some(ids) => {
-                let idx = ids
-                    .iter()
-                    .map(|i| {
-                        usize::try_from(*i).map_err(|_| {
-                            RpcError::type_error(format!("negative projection index {i}"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Arc::new(bound.output_schema().project(&idx).map_err(|e| {
-                    RpcError::type_error(format!(
-                        "projection is not valid for the bind output schema: {e}"
-                    ))
-                })?)
-            }
-        };
+        // Two schemas, and the difference between them is the filter-only
+        // columns: the worker emits the union, the caller sees the projection.
+        let schema = project_schema(bound.output_schema(), opts.projection.as_deref())?;
+        let emitted = project_schema(bound.output_schema(), opts.wire_projection().as_deref())?;
 
         let request = bound.init_request(opts, None, None);
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
-        Scan::open(
+        Scan::open_projected(
             self.transport_mut(),
             &params,
             bound.function_name(),
             schema,
+            emitted,
         )
     }
 }
@@ -602,6 +701,10 @@ pub struct ScanPlan {
 pub struct PlanOptions {
     /// Indices into the bind output schema the scan will actually emit.
     pub projection: Option<Vec<i64>>,
+    /// Filter-only columns, exactly as on [`ScanOptions::filter_columns`]. A
+    /// plan carries the same filters as the scan it sizes, so it must key them
+    /// against the same projected set or the worker prunes on the wrong column.
+    pub filter_columns: Option<Vec<i64>>,
     /// Serialized static filters, in the extension's filter encoding.
     pub pushdown_filters: Option<Vec<u8>>,
     /// The primary sizing lever: every engine is byte-driven.
@@ -613,6 +716,13 @@ pub struct PlanOptions {
     /// dividing it: over-production is legal and the engine re-applies above the
     /// coalesce, whereas dividing by N under-produces under skew.
     pub row_limit: Option<i64>,
+}
+
+impl PlanOptions {
+    /// The projection this plan puts on the wire. See [`union_projection`].
+    pub fn wire_projection(&self) -> Option<Vec<i64>> {
+        union_projection(self.projection.as_ref(), self.filter_columns.as_ref())
+    }
 }
 
 impl VgiClient {
@@ -658,7 +768,7 @@ impl VgiClient {
             let request = TableFunctionPlanRequest {
                 bind_call: bound.bind_call.clone(),
                 bind_opaque_data: Some(bound.response.opaque_data.clone()),
-                projection_ids: opts.projection.clone(),
+                projection_ids: opts.wire_projection(),
                 pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
                 join_keys: None,
                 row_limit: opts.row_limit,
@@ -736,6 +846,7 @@ impl VgiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::cast::AsArray;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
@@ -751,8 +862,11 @@ mod tests {
     #[test]
     fn a_conforming_batch_passes() {
         let s = schema(&[("n", DataType::Int64)]);
-        let b = RecordBatch::try_new(Arc::new(s.clone()), vec![Arc::new(Int64Array::from(vec![1]))])
-            .unwrap();
+        let b = RecordBatch::try_new(
+            Arc::new(s.clone()),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
         assert!(check_batch_schema("f", &s, &b).is_ok());
     }
 
@@ -776,9 +890,8 @@ mod tests {
     fn a_renamed_column_is_refused() {
         let declared = schema(&[("n", DataType::Int64)]);
         let emitted = schema(&[("m", DataType::Int64)]);
-        let b =
-            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+        let b = RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
         assert!(check_batch_schema("f", &declared, &b).is_err());
     }
 
@@ -786,9 +899,8 @@ mod tests {
     fn a_column_count_mismatch_is_refused() {
         let declared = schema(&[("n", DataType::Int64), ("s", DataType::Utf8)]);
         let emitted = schema(&[("n", DataType::Int64)]);
-        let b =
-            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+        let b = RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
         let e = check_batch_schema("f", &declared, &b).unwrap_err();
         assert!(e.message.contains("1 column(s)"), "{}", e.message);
         assert!(e.message.contains("resolved 2"), "{}", e.message);
@@ -801,9 +913,197 @@ mod tests {
         // fail correct scans.
         let declared = Schema::new(vec![Field::new("n", DataType::Int64, false)]);
         let emitted = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
-        let b =
-            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap();
+        let b = RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
         assert!(check_batch_schema("f", &declared, &b).is_ok());
+    }
+
+    // --- projection ∪ filter columns ------------------------------------
+
+    /// A canned producer stream: one header, then the batches, then EOS.
+    struct StubStream {
+        header: RecordBatch,
+        batches: std::collections::VecDeque<RecordBatch>,
+    }
+
+    impl ProducerStream for StubStream {
+        fn header(&self) -> Option<&RecordBatch> {
+            Some(&self.header)
+        }
+        fn tick(&mut self) -> Result<Option<(RecordBatch, vgi_rpc::wire::Metadata)>> {
+            Ok(self
+                .batches
+                .pop_front()
+                .map(|b| (b, vgi_rpc::wire::Metadata::default())))
+        }
+        fn cancel(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A transport that answers `init` from a script and records what it was
+    /// asked for, so a test can assert on the request as well as the answer.
+    struct StubTransport {
+        batches: Vec<RecordBatch>,
+        seen: Arc<std::sync::Mutex<Option<InitRequest>>>,
+    }
+
+    impl crate::transport::VgiTransport for StubTransport {
+        fn call_unary(&mut self, method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            Err(RpcError::runtime_error(format!("unexpected call {method}")))
+        }
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            let p: p::InitParams = wire::from_batch(params)?;
+            let request: InitRequest = wire::from_batch(&ipc::read_batch(&p.request.0)?)?;
+            *self.seen.lock().unwrap() = Some(request);
+            let header = wire::to_batch(GlobalInitResponse {
+                execution_id: Bytes(b"stub".to_vec()),
+                max_workers: 1,
+                opaque_data: None,
+            })?;
+            Ok(Box::new(StubStream {
+                header,
+                batches: self.batches.clone().into(),
+            }))
+        }
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn crate::transport::ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("no exchange here"))
+        }
+        fn label(&self) -> &str {
+            "stub"
+        }
+    }
+
+    /// The bind schema the stub scans stand on: `a`, `b`, `c`.
+    fn bound_stub() -> BoundFunction {
+        let out: SchemaRef = Arc::new(schema(&[
+            ("a", DataType::Int64),
+            ("b", DataType::Int64),
+            ("c", DataType::Utf8),
+        ]));
+        BoundFunction::from_parts(
+            "stub_fn",
+            Bytes(Vec::new()),
+            vgi_protocol::protocol::dtos::BindResponse {
+                output_schema: Bytes(ipc::write_schema(&out).unwrap()),
+                opaque_data: Bytes(Vec::new()),
+                lookup_secret_types: Vec::new(),
+                lookup_scopes: Vec::new(),
+                lookup_names: Vec::new(),
+            },
+            out,
+        )
+    }
+
+    #[test]
+    fn filter_only_columns_are_appended_after_the_projection() {
+        let opts = ScanOptions {
+            projection: Some(vec![2]),
+            filter_columns: Some(vec![0, 2]),
+            ..ScanOptions::default()
+        };
+        // `2` is already projected, so it is not requested twice; `0` lands
+        // after the projection, never before it.
+        assert_eq!(opts.wire_projection(), Some(vec![2, 0]));
+        assert_eq!(opts.wire_index_of(2), Some(0));
+        assert_eq!(opts.wire_index_of(0), Some(1));
+        assert_eq!(opts.wire_index_of(1), None);
+    }
+
+    #[test]
+    fn an_unprojected_scan_is_left_alone() {
+        // Emitting everything already includes the filter's columns; building a
+        // list here would NARROW the scan to them.
+        let opts = ScanOptions {
+            projection: None,
+            filter_columns: Some(vec![0]),
+            ..ScanOptions::default()
+        };
+        assert_eq!(opts.wire_projection(), None);
+        assert_eq!(opts.wire_index_of(0), None);
+    }
+
+    #[test]
+    fn a_filter_only_column_is_requested_and_then_trimmed_off() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        // The worker answers in the order it was asked: `c`, then `a`.
+        let emitted: SchemaRef = Arc::new(schema(&[("c", DataType::Utf8), ("a", DataType::Int64)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&emitted),
+            vec![
+                Arc::new(StringArray::from(vec!["kept"])),
+                Arc::new(Int64Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+        let mut client = crate::VgiClient::new(Box::new(StubTransport {
+            batches: vec![batch],
+            seen: Arc::clone(&seen),
+        }));
+
+        let bound = bound_stub();
+        let opts = ScanOptions {
+            projection: Some(vec![2]),
+            filter_columns: Some(vec![0]),
+            ..ScanOptions::default()
+        };
+        let mut scan = client.scan(&bound, &opts).expect("scan");
+
+        // The init asked for the union, projection first.
+        let request = seen.lock().unwrap().clone().expect("init request");
+        assert_eq!(request.projection_ids, Some(vec![2, 0]));
+
+        // The caller's schema is the projection alone: the filter column is
+        // this client's business, not the engine's.
+        assert_eq!(scan.schema().fields().len(), 1);
+        assert_eq!(scan.schema().field(0).name(), "c");
+
+        let out = scan.next_batch().expect("batch").expect("one batch");
+        assert_eq!(out.num_columns(), 1);
+        // The VALUE, not just the type: an order slip that put `a` first would
+        // trim `c` away and leave the filter column in its slot — and had both
+        // columns been Int64, nothing but the value would have caught it.
+        assert_eq!(
+            out.column(0).as_string::<i32>().value(0),
+            "kept",
+            "trimming kept the wrong column"
+        );
+    }
+
+    #[test]
+    fn a_plain_projection_still_emits_exactly_what_it_asked_for() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let emitted: SchemaRef = Arc::new(schema(&[("c", DataType::Utf8)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&emitted),
+            vec![Arc::new(StringArray::from(vec!["only"]))],
+        )
+        .unwrap();
+        let mut client = crate::VgiClient::new(Box::new(StubTransport {
+            batches: vec![batch],
+            seen: Arc::clone(&seen),
+        }));
+
+        let bound = bound_stub();
+        let opts = ScanOptions {
+            projection: Some(vec![2]),
+            ..ScanOptions::default()
+        };
+        let mut scan = client.scan(&bound, &opts).expect("scan");
+        let request = seen.lock().unwrap().clone().expect("init request");
+        assert_eq!(request.projection_ids, Some(vec![2]));
+        let out = scan.next_batch().expect("batch").expect("one batch");
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.column(0).as_string::<i32>().value(0), "only");
     }
 }

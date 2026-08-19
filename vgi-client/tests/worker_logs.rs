@@ -83,9 +83,7 @@ fn worker_log_batches_reach_the_log_facade() {
         "the worker's opening log never arrived: {lines:?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|(_, m)| m.contains("Generation complete")),
+        lines.iter().any(|(_, m)| m.contains("Generation complete")),
         "the worker's closing log never arrived: {lines:?}"
     );
 }
