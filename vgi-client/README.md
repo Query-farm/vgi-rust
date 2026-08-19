@@ -80,6 +80,13 @@ clients (Python and Java). Bridge from async with `spawn_blocking`; the
 `UnaryTransport` trait is where a native async driver would be added without
 disturbing the protocol layer.
 
+`spawn_blocking` is not a style preference on the HTTP transport, which is
+`reqwest::blocking` underneath. Measured (`tests/http_under_tokio.rs`): inside
+`spawn_blocking` a whole HTTP scan runs clean, while constructing the client
+directly on a tokio worker thread panics before the first request — *"Cannot
+drop a runtime in a context where blocking is not allowed"*. Same reason the
+OAuth path uses `ureq`.
+
 ## Status
 
 Catalog attach and discovery are implemented and covered end to end against a

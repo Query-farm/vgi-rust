@@ -52,3 +52,6 @@ libc = { version = "0.2", optional = true }
 [dev-dependencies]
 arrow-ipc = { workspace = true }
 vgi = { path = "../vgi" }
+# Only to prove the blocking HTTP path survives an ambient async runtime, which
+# is how every async consumer reaches this client.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
