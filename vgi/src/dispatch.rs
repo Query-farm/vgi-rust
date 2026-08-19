@@ -1088,6 +1088,7 @@ impl Dispatcher {
             None => None,
             Some(tokens) => {
                 let expected = self.split_bind_fingerprint(&bind_call);
+                let live_anchor = self.split_live_anchor();
                 let mut out = Vec::with_capacity(tokens.len());
                 for token in tokens {
                     out.push(
@@ -1096,7 +1097,12 @@ impl Dispatcher {
                             self.split_signing_key(),
                             None,
                             Some(&expected),
-                            None,
+                            // Checked, not skipped. Passing None here meant a plan
+                            // that outlived its snapshot was redeemed happily, so
+                            // SPLIT_SNAPSHOT_EXPIRED could never be raised by this
+                            // SDK — the one error whose whole purpose is telling an
+                            // operator the query is re-runnable.
+                            Some(&live_anchor),
                         )
                         .map_err(|e| {
                             RpcError::runtime_error(format!("[{}] {e}", e.kind()))
@@ -1965,8 +1971,24 @@ impl Dispatcher {
 
     pub fn handle_catalog_version(&self, _req: &Request) -> Result<Option<RecordBatch>> {
         Ok(Some(wire::to_result_batch(CatalogVersionResult {
-            version: 1,
+            version: Self::CATALOG_VERSION,
         })?))
+    }
+
+    /// The catalog version this worker reports, and the consistency anchor every
+    /// split token is stamped with and checked against.
+    ///
+    /// Read from ONE place by all three call sites on purpose. Minting from a
+    /// different value than redemption compares against is not a subtle bug: it
+    /// refuses every split token, and the documented response to
+    /// `SPLIT_SNAPSHOT_EXPIRED` is "re-run the query", which re-plans, mints the
+    /// same mismatch and fails again. A livelock returning no rows, blaming the
+    /// data for moving when it has not.
+    const CATALOG_VERSION: i64 = 1;
+
+    /// The live anchor a split token must still name.
+    fn split_live_anchor(&self) -> Vec<u8> {
+        crate::split_token::split_anchor(Self::CATALOG_VERSION)
     }
 
     pub fn handle_transaction_begin(&self, _req: &Request) -> Result<Option<RecordBatch>> {
@@ -2305,7 +2327,15 @@ impl Dispatcher {
         // consistency anchor, cannot mis-bind the fingerprint, and never writes
         // crypto — and the envelope stays a private implementation detail.
         let fingerprint = self.split_bind_fingerprint(&bind_call);
-        let anchor = crate::split_token::split_anchor(outcome.catalog_version.unwrap_or(0));
+        // A worker that names its version is taken at its word — it knows which
+        // snapshot it planned against. One that leaves it unset gets the LIVE
+        // version, never 0: minting 0 while redemption compares against the live
+        // counter refuses every token, and is invisible on a catalog whose
+        // version happens to be 0.
+        let anchor = match outcome.catalog_version {
+            Some(v) => crate::split_token::split_anchor(v),
+            None => self.split_live_anchor(),
+        };
         let key = self.split_signing_key();
 
         let mut splits = Vec::with_capacity(outcome.splits.len());

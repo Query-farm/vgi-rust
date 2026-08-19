@@ -863,6 +863,33 @@ fn data_tables() -> Vec<CatTable> {
         ],
     ));
     tables.push(mb(
+        "multi_branch_split",
+        "Multi-branch: split_sequence(30 over 6 splits) + sequence(20) —          used by splits/multi_branch.test",
+        vec![
+            // The split-capable arm. Its plan call happens at THIS arm's own
+            // InitGlobal, independently of the plain arm beside it — the two
+            // parallelism axes (branches divide a table across functions, splits
+            // divide one function's scan across readers) compose without either
+            // planning on the other's behalf.
+            vgi::catalog::CatBranch {
+                function_name: "split_sequence".to_string(),
+                scan_arguments: Arguments::serialize_scan_args_named(
+                    &[],
+                    &[
+                        ("n", std::sync::Arc::new(Int64Array::from(vec![30])) as ArrayRef),
+                        ("splits", std::sync::Arc::new(Int64Array::from(vec![6])) as ArrayRef),
+                    ],
+                )
+                .unwrap_or_default(),
+                branch_filter: None,
+                writable: false,
+                ..Default::default()
+            },
+            // The ordinary arm, which never sees a plan call at all.
+            seq(20),
+        ],
+    ));
+    tables.push(mb(
         "multi_branch_empty",
         "Multi-branch: empty branches list — used by multi_branch_empty_branches.test",
         vec![],

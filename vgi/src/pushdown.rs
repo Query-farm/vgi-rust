@@ -276,11 +276,24 @@ impl PushdownFilters {
                         .and_then(|r| self.values.get(r))
                         .and_then(val_i64);
                     if let Some(v) = v {
+                        // EXCLUSIVE comparisons are tightened by one rather
+                        // than folded in with their inclusive twins.
+                        //
+                        // ColumnBounds carries no inclusive flag (unlike Python's,
+                        // which this type claims to mirror), so lumping "gt" with
+                        // "ge" reported `n < 30` as `max = 30` — an inclusive bound
+                        // asserting row 30 MAY be present when the filter excludes
+                        // it. Bounds are integer-coerced already, so `< v` is
+                        // exactly `<= v - 1` and the tightening is lossless.
                         match spec.op.as_deref().unwrap_or("eq") {
-                            "gt" | "ge" | "gteq" | ">" | ">=" => {
+                            "ge" | "gteq" | ">=" => lo = Some(lo.map_or(v, |l| l.min(v))),
+                            "gt" | ">" => {
+                                let v = v.saturating_add(1);
                                 lo = Some(lo.map_or(v, |l| l.min(v)))
                             }
-                            "lt" | "le" | "lteq" | "<" | "<=" => {
+                            "le" | "lteq" | "<=" => hi = Some(hi.map_or(v, |h| h.max(v))),
+                            "lt" | "<" => {
+                                let v = v.saturating_sub(1);
                                 hi = Some(hi.map_or(v, |h| h.max(v)))
                             }
                             _ => {

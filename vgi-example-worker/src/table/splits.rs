@@ -48,6 +48,13 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(SplitFailAt);
     w.register_table(SplitEndlessCursor);
     w.register_table(SplitEchoFilters);
+    w.register_table(SplitPaginated);
+    w.register_table(SplitStalePlan);
+    w.register_table(SplitShortTtl);
+    w.register_table(SplitBatchIndex);
+    w.register_table(SplitCacheable);
+    w.register_table(SplitPartitioned);
+    w.register_table(SplitDynamicFilter);
     w.register_table(SplitScan::new(
         "split_many",
         "Far more splits than threads: exercises greedy claiming and re-init",
@@ -110,6 +117,49 @@ fn even_ranges(n: i64, k: i64) -> Vec<Range> {
         lo = hi;
     }
     out
+}
+
+/// The one-column schema every sequence-shaped split fixture returns.
+fn seq_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+}
+
+/// The two named arguments the shared SQL suite binds by name across SDKs.
+fn split_args() -> Vec<ArgSpec> {
+    vec![
+        ArgSpec::const_arg("n", -1, "int64", "Number of rows to produce").with_ge(0.0),
+        ArgSpec::const_arg("splits", -1, "int64", "How many splits to divide the scan into")
+            .with_ge(0.0)
+            .with_default(4),
+    ]
+}
+
+/// Decode this reader's claimed ranges and walk them, the shape every
+/// sequence-shaped fixture shares.
+///
+/// Absent payloads mean the client stopped planning (`vgi_split_scans` off). A
+/// split-only function has no way to know what to read then, and failing is the
+/// point: quietly returning zero rows would be A DIFFERENT ANSWER to the same
+/// query, which is worse than an error.
+fn seq_producer(name: &str, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+    let Some(payloads) = params.split_payloads.as_ref() else {
+        return Err(RpcError::runtime_error(format!(
+            "{name} is split-only but was initialized with no split tokens; \
+             vgi_split_scans is probably off, and this function has no \
+             primary/secondary path to fall back to"
+        )));
+    };
+    let ranges = payloads
+        .iter()
+        .map(|p| decode(p))
+        .collect::<Result<Vec<_>>>()?;
+    let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
+    Ok(Box::new(SplitProducer {
+        schema: seq_schema(),
+        ranges,
+        idx: 0,
+        cur,
+    }))
 }
 
 struct SplitScan {
@@ -676,5 +726,911 @@ impl TableProducer for EchoProducer {
         RecordBatch::try_new(echo_schema(), vec![ordinals, saw, nproj])
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
+
+// --- fixtures that exercise the CLIENT's split machinery, part 2 -----------
+//
+// Everything below is a twin of a vgi-python fixture of the same name. The
+// shared SQL suite runs unchanged against every SDK's worker, so a wire
+// disagreement between two SDKs shows up as the same named test failing under
+// one of them — which only works if the fixtures agree on behaviour, not merely
+// on name.
+
+/// Enumerates its plan over several pages, each disjoint from the last.
+///
+/// Pagination is how a worker keeps one plan response bounded when a scan has
+/// very many splits. What has to hold is that the pages compose: each split
+/// appears exactly once across the whole enumeration, and the client keeps
+/// asking until a page arrives with no cursor.
+///
+/// Disjointness is the worker's obligation and is NOT checked by any client —
+/// a dedup was tried and removed, because it needed a copy of every token, it
+/// compared token bytes and so could never fire on a keyed worker, and the most
+/// a client can do with a duplicate is refuse anyway. This fixture is the
+/// well-behaved side of that contract.
+struct SplitPaginated;
+
+const PER_PAGE: usize = 4;
+
+impl TableFunction for SplitPaginated {
+    fn name(&self) -> &str {
+        "split_paginated"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Plan enumerated over several disjoint pages".to_string(),
+            supports_splits: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: seq_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let n = arg_i64(params, "n", 0);
+        let splits = arg_i64(params, "splits", 4);
+        let ranges = even_ranges(n, splits);
+
+        // The cursor is the worker's own bytes; this one carries the page index
+        // as an LE u64, which is enough because the range list is regenerable
+        // from the bind arguments alone.
+        let cursor: &[u8] = request.cursor.as_ref().map(|c| c.0.as_slice()).unwrap_or(&[]);
+        let page = if cursor.len() == 8 {
+            u64::from_le_bytes(cursor.try_into().unwrap()) as usize
+        } else {
+            0
+        };
+
+        let lo = page * PER_PAGE;
+        let window: Vec<Range> = ranges.iter().skip(lo).take(PER_PAGE).copied().collect();
+        let done = lo + PER_PAGE >= ranges.len();
+        Ok(Some(PlanOutcome {
+            splits: window
+                .iter()
+                .map(|r| PlannedSplit {
+                    payload: encode(*r),
+                    estimated_rows: Some(r.hi - r.lo),
+                    rows_exact: true,
+                    ..Default::default()
+                })
+                .collect(),
+            next_cursors: if done {
+                Vec::new()
+            } else {
+                vec![((page + 1) as u64).to_le_bytes().to_vec()]
+            },
+            estimated_total_rows: if done { Some(n) } else { None },
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        seq_producer("split_paginated", params)
+    }
+}
+
+/// Pins its plan to a catalog version that has moved on.
+///
+/// The only way a bad split token is reachable through SQL, and deliberately so:
+/// the framework owns the envelope, so a worker cannot mint a token with a wrong
+/// fingerprint or a cleared seal even on purpose. What it CAN do is plan against
+/// a snapshot that is no longer current — which is exactly the situation
+/// `SPLIT_SNAPSHOT_EXPIRED` names, a plan outliving the version it was pinned to.
+///
+/// The refusal must stay distinguishable from `SPLIT_TOKEN_INVALID`, because only
+/// this one means "re-run the query": re-planning mints a valid token, whereas
+/// re-running a wrongly-bound one just reproduces it.
+struct SplitStalePlan;
+
+impl TableFunction for SplitStalePlan {
+    fn name(&self) -> &str {
+        "split_stale_plan"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Plans against a catalog version that is not the live one".to_string(),
+            supports_splits: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: seq_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            splits: ranges
+                .iter()
+                .map(|r| PlannedSplit {
+                    payload: encode(*r),
+                    ..Default::default()
+                })
+                .collect(),
+            // Any value the live catalog will not report. The fixture catalog's
+            // version is small, so a large constant is reliably "not current"
+            // without depending on what that version happens to be.
+            catalog_version: Some(987_654_321),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        seq_producer("split_stale_plan", params)
+    }
+}
+
+/// Declares a split-token lifetime shorter than any client's scheduling horizon.
+///
+/// An expired token is a failed query, not a degradation: nothing re-plans when
+/// one expires, because a distributed engine retries the serialized task it was
+/// handed and has no path back to the planner. So the only useful moment to
+/// notice a too-short lifetime is BEFORE the plan is issued — a legible refusal
+/// naming the shortfall, instead of a scan that dies partway with the work
+/// already scheduled.
+///
+/// One second is unusable everywhere: even DuckDB, whose horizon is the shortest
+/// of any engine because it plans at execution start, can take longer than that
+/// to reach a split.
+struct SplitShortTtl;
+
+impl TableFunction for SplitShortTtl {
+    fn name(&self) -> &str {
+        "split_short_ttl"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Declares a 1s split-token TTL, below any client horizon".to_string(),
+            supports_splits: true,
+            split_token_ttl_seconds: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: seq_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            splits: ranges
+                .iter()
+                .map(|r| PlannedSplit {
+                    payload: encode(*r),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        seq_producer("split_short_ttl", params)
+    }
+}
+
+/// Split-capable AND `supports_batch_index`, which together are a contract.
+///
+/// A batch index must be globally monotonic per reader, and greedy per-split
+/// claiming re-initializes the same connection for each split — so every split
+/// starts a fresh stream, and a worker that restarted its numbering per split
+/// would hand one reader a DECREASING index. Nothing in the transport prevents
+/// that; the client throws when it happens, which is right but only useful if
+/// the contract is written down and exercised.
+///
+/// What makes it work is that the client's `fetch_add` hands each reader strictly
+/// ASCENDING split indices, so a worker deriving its index from the split's
+/// position in a globally-ordered space is monotonic per reader by construction.
+/// That is the whole reason claiming is greedy rather than grouped — and it is
+/// NOT something multi-token init provides, since a group's tokens carry no
+/// ordering of their own.
+///
+/// Each split owns a slice of the index space (`ordinal * STRIDE`), so indices
+/// ascend across split boundaries as well as within them. The stride bounds how
+/// many batches one split may emit before colliding with the next, and
+/// `VGI_BATCH_INDEX_CAP` bounds the product — so choosing a stride is really
+/// choosing `cap / n_splits`.
+struct SplitBatchIndex;
+
+const STRIDE: i64 = 1_000;
+
+/// `(ordinal, lo, hi)` — the ordinal is what the index space keys on.
+fn encode_ordinal(ordinal: i64, r: Range) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&ordinal.to_le_bytes());
+    out.extend_from_slice(&r.lo.to_le_bytes());
+    out.extend_from_slice(&r.hi.to_le_bytes());
+    out
+}
+
+fn decode_ordinal(payload: &[u8]) -> Result<(i64, Range)> {
+    if payload.len() != 24 {
+        return Err(RpcError::runtime_error(format!(
+            "batch-index split payload must be 24 bytes, got {}",
+            payload.len()
+        )));
+    }
+    Ok((
+        i64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        Range {
+            lo: i64::from_le_bytes(payload[8..16].try_into().unwrap()),
+            hi: i64::from_le_bytes(payload[16..24].try_into().unwrap()),
+        },
+    ))
+}
+
+impl TableFunction for SplitBatchIndex {
+    fn name(&self) -> &str {
+        "split_batch_index"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Split-capable with per-split batch_index space".to_string(),
+            supports_splits: true,
+            supports_batch_index: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: seq_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(ranges.len() as i64),
+            splits: ranges
+                .iter()
+                .enumerate()
+                .map(|(i, r)| PlannedSplit {
+                    payload: encode_ordinal(i as i64, *r),
+                    estimated_rows: Some(r.hi - r.lo),
+                    rows_exact: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_batch_index is split-only but was initialized with no split tokens",
+            ));
+        };
+        let claims = payloads
+            .iter()
+            .map(|p| decode_ordinal(p))
+            .collect::<Result<Vec<_>>>()?;
+        let cur = claims.first().map(|(_, r)| r.lo).unwrap_or(0);
+        Ok(Box::new(BatchIndexProducer {
+            schema: seq_schema(),
+            claims,
+            idx: 0,
+            cur,
+            emitted_in_split: 0,
+            last_index: 0,
+        }))
+    }
+}
+
+struct BatchIndexProducer {
+    schema: SchemaRef,
+    claims: Vec<(i64, Range)>,
+    idx: usize,
+    cur: i64,
+    emitted_in_split: i64,
+    last_index: i64,
+}
+
+impl TableProducer for BatchIndexProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        const MAX_BATCH: i64 = 64;
+        while self.idx < self.claims.len() {
+            let (ordinal, r) = self.claims[self.idx];
+            if self.cur >= r.hi {
+                self.idx += 1;
+                self.emitted_in_split = 0;
+                if self.idx < self.claims.len() {
+                    self.cur = self.claims[self.idx].1.lo;
+                }
+                continue;
+            }
+            let size = (r.hi - self.cur).min(MAX_BATCH);
+            let start = self.cur;
+            self.cur += size;
+            // The index space this split owns. Ascending claims make this
+            // monotonic per reader across split boundaries too.
+            self.last_index = ordinal * STRIDE + self.emitted_in_split;
+            self.emitted_in_split += 1;
+            let arr: ArrayRef =
+                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            return RecordBatch::try_new(self.schema.clone(), vec![arr])
+                .map(Some)
+                .map_err(|e| RpcError::runtime_error(e.to_string()));
+        }
+        Ok(None)
+    }
+
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        Some(std::collections::HashMap::from([(
+            "vgi_batch_index".to_string(),
+            self.last_index.to_string(),
+        )]))
+    }
+}
+
+/// A split scan whose result is cacheable, so never-partial becomes assertable.
+///
+/// The result cache knows nothing about splits, deliberately: its key describes
+/// the QUERY — identity, filters, projection, catalog version — while splits are
+/// how the rows were produced. A split scan and a non-split scan of the same
+/// query return the same rows and so share an entry, either able to serve what
+/// the other populated.
+///
+/// What that makes testable is the never-partial gate. A scan abandoned partway —
+/// by a LIMIT satisfied early, or by an error — leaves splits claimed but unread,
+/// and committing what was captured would store a SUBSET under a key claiming to
+/// be the whole answer. Every later identical query would then return missing
+/// rows with no error at all.
+///
+/// Cache control rides the FIRST batch, and under splits every reader sees a
+/// first batch of its own — so all of them advertise the same freshness. A result
+/// is one entry with one lifetime; a per-split TTL would be decided by whichever
+/// reader happened to arrive first.
+struct SplitCacheable;
+
+impl TableFunction for SplitCacheable {
+    fn name(&self) -> &str {
+        "split_cacheable"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Split-capable and cacheable, for the never-partial gate".to_string(),
+            supports_splits: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: seq_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(ranges.len() as i64),
+            splits: ranges
+                .iter()
+                .map(|r| PlannedSplit {
+                    payload: encode(*r),
+                    estimated_rows: Some(r.hi - r.lo),
+                    rows_exact: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_cacheable is split-only but was initialized with no split tokens",
+            ));
+        };
+        let ranges = payloads
+            .iter()
+            .map(|p| decode(p))
+            .collect::<Result<Vec<_>>>()?;
+        let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
+        Ok(Box::new(CacheableProducer {
+            schema: seq_schema(),
+            ranges,
+            idx: 0,
+            cur,
+            first: true,
+            advertised: false,
+        }))
+    }
+}
+
+struct CacheableProducer {
+    schema: SchemaRef,
+    ranges: Vec<Range>,
+    idx: usize,
+    cur: i64,
+    first: bool,
+    advertised: bool,
+}
+
+impl TableProducer for CacheableProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        const MAX_BATCH: i64 = 16;
+        while self.idx < self.ranges.len() {
+            let r = self.ranges[self.idx];
+            if self.cur >= r.hi {
+                self.idx += 1;
+                if self.idx < self.ranges.len() {
+                    self.cur = self.ranges[self.idx].lo;
+                }
+                continue;
+            }
+            let size = (r.hi - self.cur).min(MAX_BATCH);
+            let start = self.cur;
+            self.cur += size;
+            self.advertised = self.first;
+            self.first = false;
+            let arr: ArrayRef =
+                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            return RecordBatch::try_new(self.schema.clone(), vec![arr])
+                .map(Some)
+                .map_err(|e| RpcError::runtime_error(e.to_string()));
+        }
+        Ok(None)
+    }
+
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        // Only the first batch of this reader's stream carries it — the client
+        // latches freshness there, and every reader advertises the same value.
+        self.advertised.then(|| {
+            std::collections::HashMap::from([("vgi.cache.ttl".to_string(), "300".to_string())])
+        })
+    }
+}
+
+/// One split per partition — the shape a partitioned table naturally takes.
+///
+/// A partition and a split are different things that usually coincide: a
+/// partition is a property of the DATA (every row here shares a value), a split
+/// is a unit of WORK. A worker that already stores data per partition has its
+/// split boundaries handed to it, so this is the common case rather than a
+/// contrived one.
+///
+/// What needs asserting is that the two survive each other. Splits are claimed
+/// greedily, in an order nobody chose, by readers that each end up holding
+/// several — so the association between a batch and the partition value it
+/// carries has to hold through re-init on a reused connection and across the
+/// boundary where one reader moves from one partition to the next. Losing it
+/// does not raise: it produces a GROUP BY that silently mixes partitions.
+struct SplitPartitioned;
+
+const COUNTRIES: [&str; 4] = ["US", "DE", "JP", "BR"];
+
+impl SplitPartitioned {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            vgi::partition::partition_field("country", DataType::Utf8),
+            Field::new("sales", DataType::Int64, false),
+        ]))
+    }
+}
+
+impl TableFunction for SplitPartitioned {
+    fn name(&self) -> &str {
+        "split_partitioned"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "One split per partition, with partition values on each batch".to_string(),
+            supports_splits: true,
+            partition_kind: Some(
+                vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS.to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "rows_per_country",
+            -1,
+            "int64",
+            "Rows in each partition",
+        )
+        .with_ge(0.0)
+        .with_default(5)]
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Self::schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        _params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        // The payload names the partition by INDEX, so a redemption reads the
+        // same partition however many times it runs and in whichever process.
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(COUNTRIES.len() as i64),
+            splits: (0..COUNTRIES.len() as i64)
+                .map(|i| PlannedSplit {
+                    payload: i.to_le_bytes().to_vec(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_partitioned is split-only but was initialized with no split tokens",
+            ));
+        };
+        let mut idxs = Vec::with_capacity(payloads.len());
+        for p in payloads {
+            if p.len() != 8 {
+                return Err(RpcError::runtime_error(format!(
+                    "partition split payload must be 8 bytes, got {}",
+                    p.len()
+                )));
+            }
+            idxs.push(i64::from_le_bytes(p[..8].try_into().unwrap()));
+        }
+        Ok(Box::new(PartitionedProducer {
+            schema: Self::schema(),
+            rows: params
+                .arguments
+                .named_i64("rows_per_country")
+                .unwrap_or(5),
+            idxs,
+            at: 0,
+            last: None,
+        }))
+    }
+}
+
+struct PartitionedProducer {
+    schema: SchemaRef,
+    rows: i64,
+    idxs: Vec<i64>,
+    at: usize,
+    last: Option<RecordBatch>,
+}
+
+impl TableProducer for PartitionedProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        // A partition with zero rows is STEPPED OVER, never reported as
+        // end-of-stream — the same rule every split fixture follows, and here it
+        // is reachable through `rows_per_country := 0`.
+        while self.at < self.idxs.len() {
+            let ci = self.idxs[self.at] as usize;
+            self.at += 1;
+            if self.rows <= 0 || ci >= COUNTRIES.len() {
+                continue;
+            }
+            // Each partition's values are offset by its own index, so swapping
+            // two splits' labels MOVES the per-partition sums. With identical
+            // values everywhere a mislabelled partition would be invisible.
+            let base = (ci as i64) * 100;
+            let country: ArrayRef = Arc::new(arrow_array::StringArray::from(
+                vec![COUNTRIES[ci]; self.rows as usize],
+            ));
+            let sales: ArrayRef = Arc::new(Int64Array::from(
+                (1..=self.rows).map(|i| base + i).collect::<Vec<i64>>(),
+            ));
+            let batch = RecordBatch::try_new(self.schema.clone(), vec![country, sales])
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+            self.last = Some(batch.clone());
+            return Ok(Some(batch));
+        }
+        self.last = None;
+        Ok(None)
+    }
+
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        // SINGLE_VALUE: min == max within the batch, which is what lets the
+        // client read row 0 as the exact partition key.
+        let batch = self.last.as_ref()?;
+        vgi::partition::partition_metadata(&self.schema, batch).ok().flatten()
+    }
+}
+
+/// Echoes the DYNAMIC filter each tick carried, per split.
+///
+/// A plan is built from STATIC filters only — join-key values are not known when
+/// the plan RPC fires, so they cannot prune the split SET. They arrive later, per
+/// tick, and prune WITHIN each split. Both halves have to keep working once a
+/// reader re-initializes the same connection per split: the tick filter state is
+/// a property of the connection, and a split that lost it would silently stop
+/// pruning.
+///
+/// "Silently" is the operative word, and it is why this reports the filter as
+/// DATA rather than leaving the test to infer it from row counts. A scan that
+/// stopped receiving dynamic filters returns exactly the same rows — DuckDB
+/// re-checks the predicate above the scan — just after shipping more of them. No
+/// assertion about the result set can tell the difference.
+struct SplitDynamicFilter;
+
+impl SplitDynamicFilter {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("pushed_filters", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl TableFunction for SplitDynamicFilter {
+    fn name(&self) -> &str {
+        "split_dynamic_filter"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Echoes the dynamic filter each tick carried, per split".to_string(),
+            supports_splits: true,
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            projection_pushdown: true,
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        split_args()
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Self::schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+
+    /// Report the row count, which decides which side of a join this lands on.
+    ///
+    /// Without it DuckDB assumes a default (large) cardinality and puts this scan
+    /// on the BUILD side of a hash join — where no join-key IN filter is pushed
+    /// into it, because the filter goes to the probe side. The scan then reads
+    /// everything and DuckDB filters above it: right answers, no pushdown, and
+    /// nothing in the result to say so. Nothing about splits causes that; it is
+    /// the ordinary consequence of a table function declining to estimate itself.
+    fn cardinality(&self, params: &BindParams) -> Option<vgi::table_function::TableCardinality> {
+        let n = arg_i64(params, "n", 0);
+        Some(vgi::table_function::TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
+    }
+
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        Ok(Some(PlanOutcome {
+            estimated_total_splits: Some(ranges.len() as i64),
+            splits: ranges
+                .iter()
+                .map(|r| PlannedSplit {
+                    payload: encode(*r),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+        Ok(())
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "split_dynamic_filter is split-only but was initialized with no split tokens",
+            ));
+        };
+        let ranges = payloads
+            .iter()
+            .map(|p| decode(p))
+            .collect::<Result<Vec<_>>>()?;
+        let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
+        let rendered = params
+            .pushdown_filters
+            .as_ref()
+            .and_then(|b| {
+                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
+            })
+            .map(|pf| render_filters(&pf))
+            .unwrap_or_else(|| "(none)".to_string());
+        Ok(Box::new(DynFilterProducer {
+            schema: Self::schema(),
+            ranges,
+            idx: 0,
+            cur,
+            rendered,
+        }))
+    }
+}
+
+/// The CANONICAL cross-SDK rendering of a pushed-down filter set.
+///
+/// Every SDK must produce this byte-for-byte, because the shared SQL suite
+/// asserts on the string. A language's own debug formatting cannot be used —
+/// `repr(PushdownFilters)` is Python-shaped and no other SDK can reproduce it —
+/// so this renders from `get_column_bounds`, which every SDK mirrors: for each
+/// filtered column in sorted order, `col>=min` and/or `col<=max`, joined by `,`.
+/// Values are included deliberately: without them a tightening Top-N filter and
+/// a loose one render identically, and the test could not tell them apart.
+fn render_filters(pf: &vgi::pushdown::PushdownFilters) -> String {
+    // Recursive: a compound predicate arrives as `And([Constant, Constant])`, so
+    // collecting only top-level columns rendered `(none)` for exactly the
+    // multi-clause filters worth asserting on.
+    fn collect(f: &vgi::pushdown::Filter, out: &mut Vec<String>) {
+        use vgi::pushdown::Filter as F;
+        match f {
+            F::Constant { column_name, .. }
+            | F::In { column_name }
+            | F::JoinKeys { column_name }
+            | F::IsNull { column_name }
+            | F::IsNotNull { column_name }
+            | F::Other { column_name, .. } => out.push(column_name.clone()),
+            F::And(children) | F::Or(children) => {
+                for c in children {
+                    collect(c, out);
+                }
+            }
+            F::Struct { column_name, .. } => out.push(column_name.clone()),
+        }
+    }
+    let mut cols: Vec<String> = Vec::new();
+    for f in pf.filters().iter() {
+        collect(f, &mut cols);
+    }
+    cols.sort();
+    cols.dedup();
+    let mut parts = Vec::new();
+    for c in cols {
+        if let Some(b) = pf.get_column_bounds(&c) {
+            if let Some(min) = b.min {
+                parts.push(format!("{c}>={min}"));
+            }
+            if let Some(max) = b.max {
+                parts.push(format!("{c}<={max}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        "(none)".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
+struct DynFilterProducer {
+    schema: SchemaRef,
+    ranges: Vec<Range>,
+    idx: usize,
+    cur: i64,
+    rendered: String,
+}
+
+impl TableProducer for DynFilterProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        const MAX_BATCH: i64 = 4;
+        while self.idx < self.ranges.len() {
+            let r = self.ranges[self.idx];
+            if self.cur >= r.hi {
+                self.idx += 1;
+                if self.idx < self.ranges.len() {
+                    self.cur = self.ranges[self.idx].lo;
+                }
+                continue;
+            }
+            let size = (r.hi - self.cur).min(MAX_BATCH);
+            let start = self.cur;
+            self.cur += size;
+            let n: ArrayRef =
+                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            let f: ArrayRef = Arc::new(arrow_array::StringArray::from(
+                vec![self.rendered.as_str(); size as usize],
+            ));
+            return RecordBatch::try_new(self.schema.clone(), vec![n, f])
+                .map(Some)
+                .map_err(|e| RpcError::runtime_error(e.to_string()));
+        }
+        Ok(None)
     }
 }
