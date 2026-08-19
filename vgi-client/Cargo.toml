@@ -36,6 +36,10 @@ vgi-rpc = { workspace = true }
 vgi-rpc-client = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+# The `log` facade, not `tracing`: it is what the rest of this workspace and
+# DataFusion already emit through, and a `tracing` subscriber picks `log`
+# records up while the reverse needs extra wiring.
+log = { workspace = true }
 # `ureq` is pure-sync with no runtime of its own, so it is safe to call from
 # inside a `spawn_blocking` closure — unlike `reqwest::blocking`, which panics
 # when it detects an ambient async runtime.

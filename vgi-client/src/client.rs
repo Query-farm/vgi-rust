@@ -43,6 +43,85 @@ fn configure(client: RpcClient) -> RpcClient {
     client
         .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
         .relax_nullability(true)
+        .on_log(worker_log_sink())
+}
+
+/// Where a worker's in-band log batches go.
+///
+/// A worker reports progress, pruning decisions and warnings by emitting
+/// zero-row batches carrying `vgi_rpc.log_level` alongside its data — the only
+/// diagnostic channel it has on a transport where stderr is either the RPC pipe
+/// itself or on another machine. Without a sink installed the transport
+/// classifies each one and then drops it, so everything a worker author wrote
+/// to explain a slow or empty scan vanished between the worker and the caller.
+///
+/// EXCEPTION level never arrives here, and that is deliberate rather than
+/// incidental: the transport turns an EXCEPTION batch into an `Err` before any
+/// sink is consulted, so a worker failure is a failed call and not a line in a
+/// log nobody read. The mapping below exists for a peer that mislabels one, and
+/// it is loud for the same reason.
+pub(crate) fn worker_log_sink() -> vgi_rpc_client::OnLog {
+    Box::new(|msg: vgi_rpc_client::LogMessage| {
+        log::log!(
+            target: "vgi::worker",
+            worker_log_level(msg.level),
+            "{}",
+            format_worker_log(&msg)
+        );
+    })
+}
+
+/// A worker level as a `log` level.
+fn worker_log_level(level: vgi_rpc_client::LogLevel) -> log::Level {
+    use vgi_rpc_client::LogLevel;
+    match level {
+        LogLevel::Trace => log::Level::Trace,
+        LogLevel::Debug => log::Level::Debug,
+        LogLevel::Info => log::Level::Info,
+        LogLevel::Warn => log::Level::Warn,
+        LogLevel::Error | LogLevel::Exception => log::Level::Error,
+    }
+}
+
+/// Render one worker log line.
+///
+/// The extras are the structured half of the message (row counts, split ids,
+/// timings), so they travel with it rather than being dropped for want of a
+/// structured sink.
+fn format_worker_log(msg: &vgi_rpc_client::LogMessage) -> String {
+    if msg.extras.is_empty() {
+        msg.message.clone()
+    } else {
+        format!("{} {}", msg.message, msg.extras_json())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vgi_rpc_client::{LogLevel, LogMessage};
+
+    #[test]
+    fn worker_levels_map_across_and_exception_stays_loud() {
+        assert_eq!(worker_log_level(LogLevel::Trace), log::Level::Trace);
+        assert_eq!(worker_log_level(LogLevel::Debug), log::Level::Debug);
+        assert_eq!(worker_log_level(LogLevel::Info), log::Level::Info);
+        assert_eq!(worker_log_level(LogLevel::Warn), log::Level::Warn);
+        assert_eq!(worker_log_level(LogLevel::Error), log::Level::Error);
+        // An EXCEPTION reaching a log sink at all means a peer mislabelled it —
+        // the transport turns a real one into a failed call — so it must not
+        // land below Error, where a default filter would hide it.
+        assert_eq!(worker_log_level(LogLevel::Exception), log::Level::Error);
+    }
+
+    #[test]
+    fn extras_travel_with_the_message() {
+        let bare = LogMessage::new(LogLevel::Info, "pruned 3 splits");
+        assert_eq!(format_worker_log(&bare), "pruned 3 splits");
+
+        let rich = LogMessage::new(LogLevel::Info, "pruned").with_extra("splits", "3");
+        assert_eq!(format_worker_log(&rich), r#"pruned {"splits":"3"}"#);
+    }
 }
 
 impl VgiClient {
@@ -138,6 +217,7 @@ impl VgiClient {
         use crate::transport::HttpTransport;
         let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
+            .on_log(worker_log_sink())
             .build()?;
         let http = Box::new(HttpTransport::new(client, base_url.to_string()));
         Ok(Self::new(Box::new(crate::retry::RetryTransport::new(
