@@ -47,6 +47,32 @@ about I/O.
   and are shared with the worker framework, so Rust has exactly one definition of
   the protocol.
 
+## Back-pressure (429 / Retry-After)
+
+`max_workers` is a normative cap on redemption concurrency, and over HTTP a
+server enforces it with `429` + `Retry-After`. `VgiClient::connect_http` wraps
+the transport in a `RetryTransport`, which applies a `RetryPolicy` — bounded by
+both an attempt count and a total-time budget, honouring `Retry-After` in both
+its delta-seconds and HTTP-date forms, and adding **full jitter** so N split
+readers released by one planner do not re-form the herd the cap exists to break
+up. A breached cap fails with an error naming the endpoint and the attempts;
+enumeration is never silently truncated.
+
+Two limits are worth knowing:
+
+- **Status fidelity.** `vgi-rpc-client` does not report the HTTP status of a
+  data call to its caller — it inspects `415`/`413`/`401` and hands every other
+  body to the Arrow decoder, so an unhandled `429` surfaces as `empty IPC
+  stream (no schema)`. `retry::classify_error` therefore reads the statuses that
+  *do* survive (the external-location fetch and upload-URL PUT format `HTTP
+  <status>` into their messages, and a transient auth failure carries a parsed
+  `Retry-After`) and treats anything unplaceable as fatal. Classifying every
+  data-path status needs the transport crate to surface it.
+- **Stream opens.** `init` returns a session that borrows the client, so it
+  cannot be retried inside the transport (the retry loop would re-borrow across
+  iterations). A caller that owns its client retries it with
+  `RetryPolicy::run`.
+
 ## Blocking
 
 Every call blocks, matching the underlying transport client and both other VGI

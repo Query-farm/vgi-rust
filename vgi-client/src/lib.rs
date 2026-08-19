@@ -67,6 +67,7 @@ pub mod exchange;
 pub mod launcher;
 pub mod location;
 pub mod pool;
+pub mod retry;
 pub mod scan;
 pub mod transport;
 pub mod wire_call;
@@ -80,6 +81,10 @@ pub use catalog::{At, AttachOptions, AttachedCatalog, FunctionKind, MacroKind};
 pub use client::VgiClient;
 pub use location::VgiLocation;
 pub use pool::{PoolConfig, PoolStats, PooledClient, WorkerPool};
+pub use retry::{
+    classify_status, parse_retry_after, RetryDecision, RetryPolicy, RetryTransport, StatusClass,
+    StopReason,
+};
 pub use scan::{
     BindSpec, BoundFunction, FunctionType, NullOrder, OrderBy, PlanOptions, Sample, Scan,
     ScanOptions, ScanPlan, ScanSplitInfo, SortDirection,

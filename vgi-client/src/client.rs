@@ -118,15 +118,30 @@ impl VgiClient {
     }
 
     /// Connect to a worker serving VGI over HTTP.
+    ///
+    /// Wrapped in a [`RetryTransport`](crate::retry::RetryTransport): HTTP is
+    /// the only transport that can answer `429` + `Retry-After`, which is how
+    /// the protocol's `max_workers` cap is enforced against an engine that
+    /// over-fans. Nothing else in the stack reads that status, so an unwrapped
+    /// HTTP client meets a cap with a decode error instead of a wait.
     #[cfg(feature = "http")]
     pub fn connect_http(base_url: &str) -> Result<Self> {
+        Self::connect_http_with_retry(base_url, crate::retry::RetryPolicy::default())
+    }
+
+    /// As [`Self::connect_http`], with an explicit retry policy.
+    #[cfg(feature = "http")]
+    pub fn connect_http_with_retry(
+        base_url: &str,
+        policy: crate::retry::RetryPolicy,
+    ) -> Result<Self> {
         use crate::transport::HttpTransport;
         let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .build()?;
-        Ok(Self::new(Box::new(HttpTransport::new(
-            client,
-            base_url.to_string(),
+        let http = Box::new(HttpTransport::new(client, base_url.to_string()));
+        Ok(Self::new(Box::new(crate::retry::RetryTransport::new(
+            http, policy,
         ))))
     }
 
@@ -140,8 +155,14 @@ impl VgiClient {
         base_url: &str,
         auth: std::sync::Arc<dyn crate::auth::CatalogAuth>,
     ) -> Self {
-        Self::new(Box::new(crate::auth::AuthenticatedHttpTransport::new(
-            base_url, auth,
+        let inner = Box::new(crate::auth::AuthenticatedHttpTransport::new(base_url, auth));
+        // Retry sits OUTSIDE the 401 recovery, not inside it: a 401 is fatal to
+        // the retry classifier and passes straight through to the credential
+        // refresh, while a 429 that the refresh would have no answer for is
+        // absorbed here.
+        Self::new(Box::new(crate::retry::RetryTransport::new(
+            inner,
+            crate::retry::RetryPolicy::default(),
         )))
     }
 
