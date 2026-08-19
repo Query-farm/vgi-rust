@@ -484,8 +484,11 @@ pub struct PlanResponse {
     /// A list so a client can enumerate a large plan in PARALLEL — sound only
     /// under a contract the worker must honour: the cursors in one response MUST
     /// partition the remaining enumeration disjointly and exhaustively. The
-    /// client dedups by token regardless, because violating it produces
-    /// duplicate ROWS, the exact failure class splits exist to prevent.
+    /// No client checks this. A dedup was tried and removed: it needed a set
+    /// holding a copy of every token (hundreds of MB on a large plan, paid by every
+    /// scan), it compared token bytes so it could never work on a keyed worker where
+    /// each mint uses a fresh nonce, and the most a client can do with a duplicate is
+    /// refuse anyway. Violating this returns DUPLICATE ROWS, silently.
     pub next_cursors: Vec<Bytes>,
     pub execution_id: Option<Bytes>,
     pub init_opaque_data: Bytes,
