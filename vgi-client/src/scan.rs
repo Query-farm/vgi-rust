@@ -132,6 +132,7 @@ impl BindSpec {
 /// per-bind state.
 #[derive(Debug, Clone)]
 pub struct BoundFunction {
+    function_name: String,
     bind_call: Bytes,
     response: BindResponse,
     output_schema: SchemaRef,
@@ -139,15 +140,23 @@ pub struct BoundFunction {
 
 impl BoundFunction {
     pub(crate) fn from_parts(
+        function_name: impl Into<String>,
         bind_call: Bytes,
         response: BindResponse,
         output_schema: SchemaRef,
     ) -> Self {
         Self {
+            function_name: function_name.into(),
             bind_call,
             response,
             output_schema,
         }
+    }
+
+    /// The function this bind resolved, for error messages that have to say
+    /// which of a query's several scans went wrong.
+    pub fn function_name(&self) -> &str {
+        &self.function_name
     }
 
     /// The IPC bytes of the bind output schema, as the worker sent them.
@@ -312,6 +321,7 @@ pub struct ScanOptions {
 pub struct Scan<'a> {
     stream: Box<dyn ProducerStream + 'a>,
     header: GlobalInitResponse,
+    function: String,
     schema: SchemaRef,
     last_cache_control: Option<CacheControl>,
     finished: bool,
@@ -322,6 +332,7 @@ impl<'a> Scan<'a> {
     pub(crate) fn open(
         transport: &'a mut dyn crate::transport::VgiTransport,
         params: &RecordBatch,
+        function: impl Into<String>,
         schema: SchemaRef,
     ) -> Result<Scan<'a>> {
         let stream = transport.open_producer("init", params, true)?;
@@ -332,6 +343,7 @@ impl<'a> Scan<'a> {
         Ok(Scan {
             stream,
             header,
+            function: function.into(),
             schema,
             last_cache_control: None,
             finished: false,
@@ -387,6 +399,7 @@ impl Scan<'_> {
                     if batch.num_rows() == 0 {
                         continue;
                     }
+                    check_batch_schema(&self.function, &self.schema, &batch)?;
                     return Ok(Some(batch));
                 }
             }
@@ -407,6 +420,49 @@ impl Scan<'_> {
         self.finished = true;
         self.stream.cancel()
     }
+}
+
+/// Refuse a batch whose schema is not the one the scan declared.
+///
+/// A scan's schema is resolved once, at bind, and every consumer downstream
+/// takes it as a promise: DataFusion hands it to the physical plan and then
+/// `concat_batches` the stream against it, so one non-conforming batch surfaces
+/// as an Arrow error deep inside an operator, naming neither the worker, the
+/// function, nor which column drifted. Checking here converts that into a
+/// failure at its source, on the batch that caused it.
+///
+/// Names and types only. Nullability and field metadata are deliberately not
+/// compared: response schemas are read with `relax_nullability`, which promotes
+/// them, so a nullability difference here would be this client's own doing
+/// rather than the worker's — and rejecting on it would fail scans that are
+/// perfectly correct.
+fn check_batch_schema(
+    function: &str,
+    expected: &arrow_schema::Schema,
+    batch: &RecordBatch,
+) -> Result<()> {
+    let got = batch.schema();
+    if got.fields().len() != expected.fields().len() {
+        return Err(RpcError::type_error(format!(
+            "function `{function}` emitted a batch with {} column(s) but its bind resolved {}: \
+             every batch must match the schema the scan declared",
+            got.fields().len(),
+            expected.fields().len()
+        )));
+    }
+    for (i, (want, have)) in expected.fields().iter().zip(got.fields()).enumerate() {
+        if want.name() != have.name() || want.data_type() != have.data_type() {
+            return Err(RpcError::type_error(format!(
+                "function `{function}` emitted a batch that does not match the schema its bind \
+                 resolved: column {i} arrived as `{}: {}` but the schema declares `{}: {}`",
+                have.name(),
+                have.data_type(),
+                want.name(),
+                want.data_type()
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl VgiClient {
@@ -447,6 +503,7 @@ impl VgiClient {
         })?;
 
         Ok(BoundFunction {
+            function_name: spec.function_name.clone(),
             bind_call,
             response,
             output_schema,
@@ -480,7 +537,12 @@ impl VgiClient {
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
-        Scan::open(self.transport_mut(), &params, schema)
+        Scan::open(
+            self.transport_mut(),
+            &params,
+            bound.function_name(),
+            schema,
+        )
     }
 }
 
@@ -668,5 +730,80 @@ impl VgiClient {
         }
 
         Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn schema(fields: &[(&str, DataType)]) -> Schema {
+        Schema::new(
+            fields
+                .iter()
+                .map(|(n, t)| Field::new(*n, t.clone(), true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn a_conforming_batch_passes() {
+        let s = schema(&[("n", DataType::Int64)]);
+        let b = RecordBatch::try_new(Arc::new(s.clone()), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
+        assert!(check_batch_schema("f", &s, &b).is_ok());
+    }
+
+    #[test]
+    fn a_drifted_type_names_the_function_the_column_and_both_types() {
+        let declared = schema(&[("n", DataType::Int64)]);
+        let emitted = schema(&[("n", DataType::Utf8)]);
+        let b = RecordBatch::try_new(
+            Arc::new(emitted),
+            vec![Arc::new(StringArray::from(vec!["1"]))],
+        )
+        .unwrap();
+        let e = check_batch_schema("rowid_sequence", &declared, &b).unwrap_err();
+        assert!(e.message.contains("rowid_sequence"), "{}", e.message);
+        assert!(e.message.contains("column 0"), "{}", e.message);
+        assert!(e.message.contains("Utf8"), "{}", e.message);
+        assert!(e.message.contains("Int64"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_renamed_column_is_refused() {
+        let declared = schema(&[("n", DataType::Int64)]);
+        let emitted = schema(&[("m", DataType::Int64)]);
+        let b =
+            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        assert!(check_batch_schema("f", &declared, &b).is_err());
+    }
+
+    #[test]
+    fn a_column_count_mismatch_is_refused() {
+        let declared = schema(&[("n", DataType::Int64), ("s", DataType::Utf8)]);
+        let emitted = schema(&[("n", DataType::Int64)]);
+        let b =
+            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        let e = check_batch_schema("f", &declared, &b).unwrap_err();
+        assert!(e.message.contains("1 column(s)"), "{}", e.message);
+        assert!(e.message.contains("resolved 2"), "{}", e.message);
+    }
+
+    #[test]
+    fn nullability_alone_is_not_drift() {
+        // The transport promotes response schemas to fully-nullable, so a
+        // difference here is this client's own doing; rejecting on it would
+        // fail correct scans.
+        let declared = Schema::new(vec![Field::new("n", DataType::Int64, false)]);
+        let emitted = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+        let b =
+            RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        assert!(check_batch_schema("f", &declared, &b).is_ok());
     }
 }

@@ -196,6 +196,7 @@ impl VgiClient {
             RpcError::type_error(format!("bind returned an unreadable output schema: {e}"))
         })?;
         Ok(BoundFunction::from_parts(
+            spec.function_name.clone(),
             bind_call,
             response,
             output_schema,
@@ -350,7 +351,12 @@ impl VgiClient {
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
-        Scan::open(self.transport_mut(), &params, bound.output_schema().clone())
+        Scan::open(
+            self.transport_mut(),
+            &params,
+            bound.function_name(),
+            bound.output_schema().clone(),
+        )
     }
 }
 
