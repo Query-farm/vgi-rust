@@ -729,38 +729,64 @@ impl VgiClient {
     /// Divide a bound scan into named, independently redeemable splits.
     ///
     /// Paginated: the worker may return a cursor, and this follows it until the
-    /// enumeration is exhausted. Bounded by a page cap, because a worker that
-    /// paginates forever would otherwise hang the caller — and the tempting
-    /// mitigation is the wrong one. Stopping early and scanning what arrived
-    /// would turn a hang into a SILENT SUBSET: a correct-looking answer missing
-    /// rows, which is the failure class splits exist to prevent. So a breach is
-    /// an error, never a truncation.
+    /// enumeration is exhausted. Three caps bound that — pages, accumulated
+    /// splits, and wall clock — because a worker that paginates forever, or
+    /// paginates faster than it converges, would otherwise hang the caller
+    /// while the vector grows.
     ///
-    /// Duplicate tokens are dropped. A worker returning overlapping cursors is
-    /// a contract violation with no enforcement, and its symptom would be
-    /// duplicate ROWS — arriving through the very mechanism meant to speed
-    /// enumeration up. Deduping is cheap next to a plan RPC and turns a silent
-    /// correctness bug into a droppable duplicate.
+    /// Each cap ERRORS. Stopping early and scanning what arrived is the
+    /// tempting mitigation and it is the wrong one: it turns a hang into a
+    /// SILENT SUBSET — a correct-looking answer missing rows, which is exactly
+    /// the failure class splits exist to prevent — so a breach names the cap it
+    /// broke and refuses. The time cap is here rather than an interrupt flag
+    /// because this client has no cancellation channel to poll; the DuckDB
+    /// extension polls its query's `interrupted` instead and is otherwise
+    /// identical.
+    ///
+    /// Duplicate tokens are NOT dropped. Keeping the enumeration disjoint is
+    /// the worker's obligation, and a client-side dedup could not discharge it:
+    /// it costs a set holding a copy of every token on every scan, it compares
+    /// token bytes and so never fires against a keyed worker (which seals each
+    /// mint under a fresh nonce), and the most a client could do with a
+    /// duplicate is refuse anyway. Should a stable split identity ever reach
+    /// the wire, enforcing it becomes cheap and uniform and is worth
+    /// revisiting.
     pub fn plan(&mut self, bound: &BoundFunction, opts: &PlanOptions) -> Result<ScanPlan> {
-        use std::collections::HashSet;
-
         /// Generous on purpose: the cap exists to turn a hang into a legible
-        /// error, not to second-guess a worker's split count.
+        /// error, not to second-guess a worker's split count. Bounds PAGES, so
+        /// the reachable split count is this times the worker's page size.
         const MAX_PAGES: usize = 1024;
+        /// The one cap on what is actually held in memory, since a page count
+        /// says nothing about page size. Matches the DuckDB extension's.
+        const MAX_SPLITS: usize = 1_048_576;
+        /// A worker that keeps returning small pages breaches neither of the
+        /// other caps quickly, so planning also has to end in bounded time.
+        const MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let started = std::time::Instant::now();
 
         let mut plan = ScanPlan {
             scope: "catalog".to_string(),
             ..Default::default()
         };
         let mut cursor: Option<Bytes> = None;
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut pages = 0usize;
 
         loop {
             if pages >= MAX_PAGES {
                 return Err(RpcError::runtime_error(format!(
-                    "worker exceeded the scan-planning page cap ({MAX_PAGES} pages) without \
-                     exhausting its cursor; refusing to scan a partial split enumeration"
+                    "function `{}`: worker exceeded the scan-planning page cap ({MAX_PAGES} \
+                     pages) without exhausting its cursor; refusing to scan a partial split \
+                     enumeration",
+                    bound.function_name()
+                )));
+            }
+            if started.elapsed() >= MAX_ELAPSED {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: scan planning ran past its {}s budget after {pages} page(s) \
+                     without exhausting its cursor; refusing to scan a partial split enumeration",
+                    bound.function_name(),
+                    MAX_ELAPSED.as_secs()
                 )));
             }
             pages += 1;
@@ -798,9 +824,6 @@ impl VgiClient {
 
             for blob in &response.splits {
                 let split: ScanSplit = wire::from_batch(&ipc::read_batch(&blob.0)?)?;
-                if !seen.insert(split.token.0.clone()) {
-                    continue;
-                }
                 plan.splits.push(ScanSplitInfo {
                     token: split.token.0.clone(),
                     estimated_rows: split.estimated_rows,
@@ -809,6 +832,13 @@ impl VgiClient {
                     start_position: split.start_position.map(|b| b.0),
                     end_position: split.end_position.map(|b| b.0),
                 });
+            }
+            if plan.splits.len() > MAX_SPLITS {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: worker returned more than {MAX_SPLITS} splits for one scan; \
+                     refusing to buffer an unbounded split vector",
+                    bound.function_name()
+                )));
             }
 
             // Plan-level facts come from the FIRST page, keyed on the page
@@ -1105,5 +1135,105 @@ mod tests {
         let out = scan.next_batch().expect("batch").expect("one batch");
         assert_eq!(out.num_columns(), 1);
         assert_eq!(out.column(0).as_string::<i32>().value(0), "only");
+    }
+
+    // --- bounded split enumeration ---------------------------------------
+
+    /// A worker that always hands back another cursor, and never a last page.
+    struct EndlessPlanTransport {
+        pages: std::cell::Cell<usize>,
+        splits_per_page: usize,
+    }
+
+    impl EndlessPlanTransport {
+        fn plan_response(&self) -> Result<RecordBatch> {
+            use arrow_array::BinaryArray;
+            let split = wire::to_batch(vgi_protocol::protocol::dtos::ScanSplit {
+                payload: Bytes(b"p".to_vec()),
+                token: Bytes(b"t".to_vec()),
+                estimated_rows: None,
+                rows_exact: false,
+                estimated_bytes: None,
+                partition_bounds: None,
+                column_statistics: None,
+                location_ids: None,
+                start_position: None,
+                end_position: None,
+            })?;
+            let split = Bytes(ipc::write_batch(&split)?);
+            let response = vgi_protocol::protocol::dtos::PlanResponse {
+                splits: vec![split; self.splits_per_page],
+                // Never exhausted: the failure this test is about.
+                next_cursors: vec![Bytes(b"more".to_vec())],
+                execution_id: None,
+                init_opaque_data: Bytes(Vec::new()),
+                max_workers: Some(4),
+                estimated_total_splits: None,
+                estimated_total_rows: None,
+                estimated_total_bytes: None,
+                catalog_version: None,
+                scope: "catalog".to_string(),
+                locations: None,
+                partitioning: Vec::new(),
+                sort_order: Vec::new(),
+                cache_max_age_seconds: None,
+                start_position: Bytes(Vec::new()),
+                end_position: Bytes(Vec::new()),
+            };
+            let inner = ipc::write_batch(&wire::to_batch(response)?)?;
+            let field = Field::new("result", DataType::Binary, false);
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field])),
+                vec![Arc::new(BinaryArray::from(vec![inner.as_slice()]))],
+            )
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+        }
+    }
+
+    impl crate::transport::VgiTransport for EndlessPlanTransport {
+        fn call_unary(&mut self, method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            assert_eq!(method, "table_function_plan");
+            self.pages.set(self.pages.get() + 1);
+            self.plan_response()
+        }
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("no scan here"))
+        }
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn crate::transport::ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("no exchange here"))
+        }
+        fn label(&self) -> &str {
+            "endless"
+        }
+    }
+
+    #[test]
+    fn an_unexhausted_cursor_breaches_the_page_cap_and_says_so() {
+        let mut client = crate::VgiClient::new(Box::new(EndlessPlanTransport {
+            pages: std::cell::Cell::new(0),
+            splits_per_page: 1,
+        }));
+        let e = client
+            .plan(&bound_stub(), &PlanOptions::default())
+            .unwrap_err();
+        // Naming the cap is the point: it is the difference between "raise it"
+        // and "fix the worker".
+        assert!(e.message.contains("page cap (1024"), "{}", e.message);
+        assert!(e.message.contains("stub_fn"), "{}", e.message);
+        assert!(
+            e.message.contains("partial split enumeration"),
+            "{}",
+            e.message
+        );
     }
 }
