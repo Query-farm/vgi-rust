@@ -2314,7 +2314,11 @@ impl Dispatcher {
                 crate::split_token::build_split_token(&s.payload, &fingerprint, &anchor, key, None)
                     .map_err(|e| RpcError::runtime_error(format!("[{}] {e}", e.kind())))?;
             let batch = wire::to_batch(ScanSplit {
-                payload: Bytes::from(s.payload.clone()),
+                // Cleared, not forwarded. The payload is sealed INTO the token, and
+                // shipping the plaintext in the field beside the ciphertext made the
+                // seal decorative. No client reads it — the C++ side pulls `token`
+                // alone — and redemption recovers it from inside the envelope.
+                payload: Bytes::from(Vec::new()),
                 token: Bytes::from(token),
                 estimated_rows: s.estimated_rows,
                 rows_exact: s.rows_exact,
