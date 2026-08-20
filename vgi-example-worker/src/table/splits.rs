@@ -128,9 +128,14 @@ fn seq_schema() -> SchemaRef {
 fn split_args() -> Vec<ArgSpec> {
     vec![
         ArgSpec::const_arg("n", -1, "int64", "Number of rows to produce").with_ge(0.0),
-        ArgSpec::const_arg("splits", -1, "int64", "How many splits to divide the scan into")
-            .with_ge(0.0)
-            .with_default(4),
+        ArgSpec::const_arg(
+            "splits",
+            -1,
+            "int64",
+            "How many splits to divide the scan into",
+        )
+        .with_ge(0.0)
+        .with_default(4),
     ]
 }
 
@@ -194,10 +199,14 @@ impl SplitScan {
                 // The first split takes ~99% of the rows; the rest divide the tail.
                 let head = n * 99 / 100;
                 let mut out = vec![Range { lo: 0, hi: head }];
-                out.extend(even_ranges(n - head, splits - 1).into_iter().map(|r| Range {
-                    lo: head + r.lo,
-                    hi: head + r.hi,
-                }));
+                out.extend(
+                    even_ranges(n - head, splits - 1)
+                        .into_iter()
+                        .map(|r| Range {
+                            lo: head + r.lo,
+                            hi: head + r.hi,
+                        }),
+                );
                 out
             }
             Shape::Many => even_ranges(n, if splits <= 0 { 1000 } else { splits }),
@@ -229,9 +238,14 @@ impl TableFunction for SplitScan {
         // `split_sequence(n := 10, splits := 4)` binds identically across SDKs.
         vec![
             ArgSpec::const_arg("n", -1, "int64", "Number of rows to produce").with_ge(0.0),
-            ArgSpec::const_arg("splits", -1, "int64", "How many splits to divide the scan into")
-                .with_ge(0.0)
-                .with_default(4),
+            ArgSpec::const_arg(
+                "splits",
+                -1,
+                "int64",
+                "How many splits to divide the scan into",
+            )
+            .with_ge(0.0)
+            .with_default(4),
         ]
     }
 
@@ -316,10 +330,7 @@ struct SplitProducer {
 }
 
 impl TableProducer for SplitProducer {
-    fn next_batch(
-        &mut self,
-        _out: &mut vgi_rpc::OutputCollector,
-    ) -> Result<Option<RecordBatch>> {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         const MAX_BATCH: i64 = 1024;
         // A zero-row range is STEPPED OVER, never reported as end-of-stream:
         // returning None here would truncate the reader's remaining claims.
@@ -335,8 +346,9 @@ impl TableProducer for SplitProducer {
             let size = (r.hi - self.cur).min(MAX_BATCH);
             let start = self.cur;
             self.cur += size;
-            let arr: ArrayRef =
-                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            let arr: ArrayRef = Arc::new(Int64Array::from(
+                (start..start + size).collect::<Vec<i64>>(),
+            ));
             return RecordBatch::try_new(self.schema.clone(), vec![arr])
                 .map(Some)
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
@@ -344,7 +356,6 @@ impl TableProducer for SplitProducer {
         Ok(None)
     }
 }
-
 
 // --- fixtures that exercise the CLIENT's split machinery -------------------
 
@@ -402,11 +413,21 @@ impl TableFunction for SplitFailAt {
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![
             ArgSpec::const_arg("n", -1, "int64", "Number of rows to produce").with_ge(0.0),
-            ArgSpec::const_arg("splits", -1, "int64", "How many splits to divide the scan into")
-                .with_ge(0.0)
-                .with_default(4),
-            ArgSpec::const_arg("fail_at", -1, "int64", "Split ordinal to fail on; -1 never fails")
-                .with_default(-1),
+            ArgSpec::const_arg(
+                "splits",
+                -1,
+                "int64",
+                "How many splits to divide the scan into",
+            )
+            .with_ge(0.0)
+            .with_default(4),
+            ArgSpec::const_arg(
+                "fail_at",
+                -1,
+                "int64",
+                "Split ordinal to fail on; -1 never fails",
+            )
+            .with_default(-1),
             ArgSpec::const_arg(
                 "fail_in_init",
                 -1,
@@ -449,11 +470,7 @@ impl TableFunction for SplitFailAt {
     /// Where the init-time failure lands, so the client's connection-poisoning
     /// path is exercised rather than the mid-stream one.
     fn on_split(&self, params: &ProcessParams) -> Result<()> {
-        if !params
-            .arguments
-            .named_bool("fail_in_init")
-            .unwrap_or(false)
-        {
+        if !params.arguments.named_bool("fail_in_init").unwrap_or(false) {
             return Ok(());
         }
         let fail_at = params.arguments.named_i64("fail_at").unwrap_or(-1);
@@ -525,8 +542,9 @@ impl TableProducer for FailProducer {
             let size = (r.hi - self.cur).min(8);
             let start = self.cur;
             self.cur += size;
-            let arr: ArrayRef =
-                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            let arr: ArrayRef = Arc::new(Int64Array::from(
+                (start..start + size).collect::<Vec<i64>>(),
+            ));
             return RecordBatch::try_new(self.schema.clone(), vec![arr])
                 .map(Some)
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
@@ -639,9 +657,11 @@ impl TableFunction for SplitEchoFilters {
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg("splits", -1, "int64", "How many splits to report")
-            .with_ge(1.0)
-            .with_default(3)]
+        vec![
+            ArgSpec::const_arg("splits", -1, "int64", "How many splits to report")
+                .with_ge(1.0)
+                .with_default(3),
+        ]
     }
 
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
@@ -658,7 +678,11 @@ impl TableFunction for SplitEchoFilters {
     ) -> Result<Option<PlanOutcome>> {
         let splits = arg_i64(params, "splits", 3);
         let saw = i64::from(request.pushdown_filters.is_some());
-        let nproj = request.projection_ids.as_ref().map(|v| v.len()).unwrap_or(0) as i64;
+        let nproj = request
+            .projection_ids
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0) as i64;
         Ok(Some(PlanOutcome {
             estimated_total_splits: Some(splits),
             splits: (0..splits)
@@ -716,13 +740,15 @@ impl TableProducer for EchoProducer {
             return Ok(None);
         }
         self.done = true;
-        let ordinals: ArrayRef =
-            Arc::new(Int64Array::from(self.rows.iter().map(|r| r.0).collect::<Vec<i64>>()));
+        let ordinals: ArrayRef = Arc::new(Int64Array::from(
+            self.rows.iter().map(|r| r.0).collect::<Vec<i64>>(),
+        ));
         let saw: ArrayRef = Arc::new(arrow_array::BooleanArray::from(
             self.rows.iter().map(|r| r.1).collect::<Vec<bool>>(),
         ));
-        let nproj: ArrayRef =
-            Arc::new(Int64Array::from(self.rows.iter().map(|r| r.2).collect::<Vec<i64>>()));
+        let nproj: ArrayRef = Arc::new(Int64Array::from(
+            self.rows.iter().map(|r| r.2).collect::<Vec<i64>>(),
+        ));
         RecordBatch::try_new(echo_schema(), vec![ordinals, saw, nproj])
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
@@ -789,7 +815,11 @@ impl TableFunction for SplitPaginated {
         // The cursor is the worker's own bytes; this one carries the page index
         // as an LE u64, which is enough because the range list is regenerable
         // from the bind arguments alone.
-        let cursor: &[u8] = request.cursor.as_ref().map(|c| c.0.as_slice()).unwrap_or(&[]);
+        let cursor: &[u8] = request
+            .cursor
+            .as_ref()
+            .map(|c| c.0.as_slice())
+            .unwrap_or(&[]);
         let page = if cursor.len() == 8 {
             u64::from_le_bytes(cursor.try_into().unwrap()) as usize
         } else {
@@ -1114,8 +1144,9 @@ impl TableProducer for BatchIndexProducer {
             // monotonic per reader across split boundaries too.
             self.last_index = ordinal * STRIDE + self.emitted_in_split;
             self.emitted_in_split += 1;
-            let arr: ArrayRef =
-                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            let arr: ArrayRef = Arc::new(Int64Array::from(
+                (start..start + size).collect::<Vec<i64>>(),
+            ));
             return RecordBatch::try_new(self.schema.clone(), vec![arr])
                 .map(Some)
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
@@ -1248,8 +1279,9 @@ impl TableProducer for CacheableProducer {
             self.cur += size;
             self.advertised = self.first;
             self.first = false;
-            let arr: ArrayRef =
-                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
+            let arr: ArrayRef = Arc::new(Int64Array::from(
+                (start..start + size).collect::<Vec<i64>>(),
+            ));
             return RecordBatch::try_new(self.schema.clone(), vec![arr])
                 .map(Some)
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
@@ -1310,14 +1342,11 @@ impl TableFunction for SplitPartitioned {
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        vec![ArgSpec::const_arg(
-            "rows_per_country",
-            -1,
-            "int64",
-            "Rows in each partition",
-        )
-        .with_ge(0.0)
-        .with_default(5)]
+        vec![
+            ArgSpec::const_arg("rows_per_country", -1, "int64", "Rows in each partition")
+                .with_ge(0.0)
+                .with_default(5),
+        ]
     }
 
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
@@ -1368,10 +1397,7 @@ impl TableFunction for SplitPartitioned {
         }
         Ok(Box::new(PartitionedProducer {
             schema: Self::schema(),
-            rows: params
-                .arguments
-                .named_i64("rows_per_country")
-                .unwrap_or(5),
+            rows: params.arguments.named_i64("rows_per_country").unwrap_or(5),
             idxs,
             at: 0,
             last: None,
@@ -1402,9 +1428,11 @@ impl TableProducer for PartitionedProducer {
             // two splits' labels MOVES the per-partition sums. With identical
             // values everywhere a mislabelled partition would be invisible.
             let base = (ci as i64) * 100;
-            let country: ArrayRef = Arc::new(arrow_array::StringArray::from(
-                vec![COUNTRIES[ci]; self.rows as usize],
-            ));
+            let country: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![
+                COUNTRIES[ci];
+                self.rows
+                    as usize
+            ]));
             let sales: ArrayRef = Arc::new(Int64Array::from(
                 (1..=self.rows).map(|i| base + i).collect::<Vec<i64>>(),
             ));
@@ -1421,7 +1449,9 @@ impl TableProducer for PartitionedProducer {
         // SINGLE_VALUE: min == max within the batch, which is what lets the
         // client read row 0 as the exact partition key.
         let batch = self.last.as_ref()?;
-        vgi::partition::partition_metadata(&self.schema, batch).ok().flatten()
+        vgi::partition::partition_metadata(&self.schema, batch)
+            .ok()
+            .flatten()
     }
 }
 
@@ -1622,11 +1652,13 @@ impl TableProducer for DynFilterProducer {
             let size = (r.hi - self.cur).min(MAX_BATCH);
             let start = self.cur;
             self.cur += size;
-            let n: ArrayRef =
-                Arc::new(Int64Array::from((start..start + size).collect::<Vec<i64>>()));
-            let f: ArrayRef = Arc::new(arrow_array::StringArray::from(
-                vec![self.rendered.as_str(); size as usize],
+            let n: ArrayRef = Arc::new(Int64Array::from(
+                (start..start + size).collect::<Vec<i64>>(),
             ));
+            let f: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![
+                self.rendered.as_str();
+                size as usize
+            ]));
             return RecordBatch::try_new(self.schema.clone(), vec![n, f])
                 .map(Some)
                 .map_err(|e| RpcError::runtime_error(e.to_string()));

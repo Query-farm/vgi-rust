@@ -205,40 +205,47 @@ pub fn ensure_schema_name(
 /// the DuckDB extension deliberately sends seven of twenty columns (it has no
 /// basis to invent a byte target, and `TableFunctionInitInput` carries no row
 /// limit at all). Without this, the primary client would fail to decode.
-pub fn backfill_plan_request(
-    batch: arrow_array::RecordBatch,
-) -> Result<arrow_array::RecordBatch> {
+pub fn backfill_plan_request(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
     use arrow_schema::DataType;
 
-    ensure_nullable_columns(batch, &[
-        ("bind_opaque_data", DataType::Binary),
-        ("projection_ids", DataType::List(Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::Int64,
-            true,
-        )))),
-        ("pushdown_filters", DataType::LargeBinary),
-        ("join_keys", DataType::List(Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::LargeBinary,
-            true,
-        )))),
-        ("row_limit", DataType::Int64),
-        ("target_split_bytes", DataType::Int64),
-        ("min_splits", DataType::Int64),
-        ("max_splits_per_response", DataType::Int64),
-        ("cursor", DataType::Binary),
-        ("refined_filters", DataType::LargeBinary),
-        ("filters_complete", DataType::Boolean),
-        ("start_position", DataType::Binary),
-        ("end_position", DataType::Binary),
-        ("order_by_column_name", DataType::Utf8),
-        ("order_by_direction", DataType::Utf8),
-        ("order_by_null_order", DataType::Utf8),
-        ("order_by_limit", DataType::Int64),
-        ("tablesample_percentage", DataType::Float64),
-        ("tablesample_seed", DataType::Int64),
-    ])
+    ensure_nullable_columns(
+        batch,
+        &[
+            ("bind_opaque_data", DataType::Binary),
+            (
+                "projection_ids",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                ))),
+            ),
+            ("pushdown_filters", DataType::LargeBinary),
+            (
+                "join_keys",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::LargeBinary,
+                    true,
+                ))),
+            ),
+            ("row_limit", DataType::Int64),
+            ("target_split_bytes", DataType::Int64),
+            ("min_splits", DataType::Int64),
+            ("max_splits_per_response", DataType::Int64),
+            ("cursor", DataType::Binary),
+            ("refined_filters", DataType::LargeBinary),
+            ("filters_complete", DataType::Boolean),
+            ("start_position", DataType::Binary),
+            ("end_position", DataType::Binary),
+            ("order_by_column_name", DataType::Utf8),
+            ("order_by_direction", DataType::Utf8),
+            ("order_by_null_order", DataType::Utf8),
+            ("order_by_limit", DataType::Int64),
+            ("tablesample_percentage", DataType::Float64),
+            ("tablesample_seed", DataType::Int64),
+        ],
+    )
 }
 
 /// Backfill an `init` request's additive nullable columns.
@@ -246,9 +253,7 @@ pub fn backfill_plan_request(
 /// `row_limit` (protocol 1.4.0) is not sent by the DuckDB extension at all —
 /// `TableFunctionInitInput` carries no limit — so this is the ordinary case, not
 /// an old-peer fallback.
-pub fn backfill_init_request(
-    batch: arrow_array::RecordBatch,
-) -> Result<arrow_array::RecordBatch> {
+pub fn backfill_init_request(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
     use arrow_schema::DataType;
     ensure_nullable_columns(
         batch,
@@ -747,6 +752,17 @@ pub struct ScanBranch {
     pub source_catalog: Option<String>,
     pub source_schema: Option<String>,
     pub source_table: Option<String>,
+    /// Format branch only — the format to read (`parquet`, `csv`, `iceberg`, …).
+    /// The CLIENT resolves it to that format's reader, so a worker says what the
+    /// data IS without knowing the reader's name or its argument spelling.
+    pub format_name: Option<String>,
+    /// Format branch only — the paths/URIs to read. Required when `format_name`
+    /// is set; a format branch naming no locations is rejected at catalog-load.
+    pub format_locations: Option<Vec<String>>,
+    /// Format branch only — reader options, passed through as the reader's named
+    /// arguments. A 1-row IPC batch whose COLUMN NAMES are the option names, the
+    /// same shape `arguments` uses, because an option value may be any Arrow type.
+    pub format_options: Option<Bytes>,
 }
 
 /// Response for `catalog_table_scan_branches_get`. The `branches` list must be

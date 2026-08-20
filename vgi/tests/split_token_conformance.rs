@@ -64,13 +64,7 @@ fn shared_vectors_reach_their_recorded_verdict() {
             None
         };
 
-        let result = open_split_token(
-            &token,
-            worker_key,
-            None,
-            Some(&fingerprint),
-            Some(&anchor),
-        );
+        let result = open_split_token(&token, worker_key, None, Some(&fingerprint), Some(&anchor));
 
         if verdict == "ok" {
             let opened =
@@ -79,7 +73,9 @@ fn shared_vectors_reach_their_recorded_verdict() {
             continue;
         }
 
-        let err = result.expect_err(&format!("{name}: expected {verdict}, was ACCEPTED ({note})"));
+        let err = result.expect_err(&format!(
+            "{name}: expected {verdict}, was ACCEPTED ({note})"
+        ));
         assert_eq!(err.kind(), verdict, "{name}: wrong error kind ({note})");
     }
 }
@@ -96,7 +92,10 @@ fn deterministic_vectors_are_reproduced_byte_for_byte() {
 
     let want = fs::read(fixtures_dir().join("valid_unsealed.bin")).unwrap();
     let got = build_split_token(&payload, &fingerprint, &anchor, None, None).unwrap();
-    assert_eq!(got, want, "valid_unsealed bytes differ from the shared vector");
+    assert_eq!(
+        got, want,
+        "valid_unsealed bytes differ from the shared vector"
+    );
 }
 
 #[test]
@@ -115,8 +114,7 @@ fn a_keyed_worker_refuses_an_unsealed_token() {
         "a keyed worker accepted an UNSEALED token: alg:none downgrade",
     );
 
-    let sealed =
-        build_split_token(b"file=ok", &fingerprint, &anchor, Some(&key), None).unwrap();
+    let sealed = build_split_token(b"file=ok", &fingerprint, &anchor, Some(&key), None).unwrap();
     assert!(
         open_split_token(&sealed, None, None, Some(&fingerprint), None).is_err(),
         "a keyless worker claimed to open a SEALED token",
@@ -166,7 +164,10 @@ fn expiry_and_invalidity_are_distinguishable() {
     let token = build_split_token(b"file=1", &fingerprint, &old, None, None).unwrap();
 
     let err = open_split_token(&token, None, None, Some(&fingerprint), Some(&current)).unwrap_err();
-    assert!(matches!(err, SplitTokenError::SnapshotExpired(_)), "got {err:?}");
+    assert!(
+        matches!(err, SplitTokenError::SnapshotExpired(_)),
+        "got {err:?}"
+    );
 
     let other = [0x0au8; 16];
     let err = open_split_token(&token, None, None, Some(&other), Some(&old)).unwrap_err();

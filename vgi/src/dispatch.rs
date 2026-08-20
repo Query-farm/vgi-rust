@@ -1104,9 +1104,7 @@ impl Dispatcher {
                             // operator the query is re-runnable.
                             Some(&live_anchor),
                         )
-                        .map_err(|e| {
-                            RpcError::runtime_error(format!("[{}] {e}", e.kind()))
-                        })?,
+                        .map_err(|e| RpcError::runtime_error(format!("[{}] {e}", e.kind())))?,
                     );
                 }
                 Some(out)
@@ -2364,7 +2362,12 @@ impl Dispatcher {
 
         Ok(Some(wire::to_result_batch(PlanResponse {
             splits,
-            next_cursors: outcome.next_cursors.iter().cloned().map(Bytes::from).collect(),
+            next_cursors: outcome
+                .next_cursors
+                .iter()
+                .cloned()
+                .map(Bytes::from)
+                .collect(),
             execution_id: None,
             init_opaque_data: Bytes::from(Vec::new()),
             max_workers: outcome.max_workers,
@@ -2372,7 +2375,10 @@ impl Dispatcher {
             estimated_total_rows: outcome.estimated_total_rows,
             estimated_total_bytes: outcome.estimated_total_bytes,
             catalog_version: outcome.catalog_version,
-            scope: outcome.scope.clone().unwrap_or_else(|| "catalog".to_string()),
+            scope: outcome
+                .scope
+                .clone()
+                .unwrap_or_else(|| "catalog".to_string()),
             locations: None,
             partitioning: Vec::new(),
             sort_order: Vec::new(),
@@ -2474,6 +2480,17 @@ impl Dispatcher {
                         source_catalog: d.source_catalog.clone(),
                         source_schema: d.source_schema.clone(),
                         source_table: d.source_table.clone(),
+                        format_name: d.format_name.clone(),
+                        format_locations: if d.format_locations.is_empty() {
+                            None
+                        } else {
+                            Some(d.format_locations.clone())
+                        },
+                        format_options: if d.format_options.is_empty() {
+                            None
+                        } else {
+                            Some(Bytes::from(d.format_options.clone()))
+                        },
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -2486,6 +2503,9 @@ impl Dispatcher {
                 source_catalog: None,
                 source_schema: None,
                 source_table: None,
+                format_name: None,
+                format_locations: None,
+                format_options: None,
             })?],
         };
         Ok(Some(wire::to_result_batch(ScanBranchesResult {

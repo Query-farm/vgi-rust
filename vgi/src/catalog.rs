@@ -965,7 +965,12 @@ impl CatTable {
 /// A *function* branch sets `function_name` (+ `scan_arguments`); a
 /// *catalog-table* branch leaves `function_name` empty and sets
 /// `source_catalog`/`source_schema`/`source_table` to scan a companion-catalog
-/// base table.
+/// base table; a *format* branch leaves both empty and sets `format_name` +
+/// `format_locations`, letting the client resolve the format to its reader.
+///
+/// Exactly one of the three, enforced client-side at catalog-load — a branch
+/// naming two kinds is a worker bug, and catching it there rather than at bind
+/// blames the catalog instead of the query.
 #[derive(Clone, Default)]
 pub struct CatBranch {
     pub function_name: String,
@@ -975,6 +980,22 @@ pub struct CatBranch {
     pub source_catalog: Option<String>,
     pub source_schema: Option<String>,
     pub source_table: Option<String>,
+    /// Format branch only — the format to read (`parquet`, `csv`, `iceberg`, …).
+    ///
+    /// Saying what the data IS rather than how to read it is the whole point:
+    /// the client owns the mapping to a reader (`csv` -> `read_csv`, `iceberg` ->
+    /// `iceberg_scan`) and the argument shape it wants (a LIST of paths, or a
+    /// bare scalar for readers that accept only one), so a worker never has to
+    /// track DuckDB's reader spellings.
+    pub format_name: Option<String>,
+    /// Format branch only — the paths/URIs to read. Required when `format_name`
+    /// is set; a format branch naming no locations is rejected at catalog-load.
+    pub format_locations: Vec<String>,
+    /// Format branch only — reader options, which BECOME the reader's named
+    /// arguments. Pre-serialized like `scan_arguments`: a 1-row IPC batch whose
+    /// COLUMN NAMES are the option names, since an option value may be any Arrow
+    /// type. Empty means no options.
+    pub format_options: Vec<u8>,
 }
 
 /// A foreign-key constraint (referenced table in the same schema by default).

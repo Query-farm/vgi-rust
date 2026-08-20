@@ -830,6 +830,42 @@ fn data_tables() -> Vec<CatTable> {
             },
         ],
     ));
+    {
+        // A FORMAT branch: name the format and the locations, and let the client
+        // resolve the reader. The options BECOME the reader's named arguments —
+        // `nullstr` is the load-bearing one here, since DuckDB's CSV sniffer works
+        // out the delimiter and the header unaided and so proves nothing on its own.
+        let mut t = dtable(
+            "multi_branch_format",
+            vec![f("n", Int64), f("label", Utf8)],
+            "Format branch: read_csv with delim/header options — used by multi_branch_format.test",
+        );
+        let options = Arguments::serialize_scan_args_named(
+            &[],
+            &[
+                (
+                    "delim",
+                    Arc::new(arrow_array::StringArray::from(vec!["|"])) as ArrayRef,
+                ),
+                (
+                    "header",
+                    Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
+                ),
+                (
+                    "nullstr",
+                    Arc::new(arrow_array::StringArray::from(vec!["row_2"])) as ArrayRef,
+                ),
+            ],
+        )
+        .unwrap_or_default();
+        t.branches = Some(vec![vgi::catalog::CatBranch {
+            format_name: Some("csv".to_string()),
+            format_locations: vec![branch_path("vgi_format_branch.csv")],
+            format_options: options,
+            ..Default::default()
+        }]);
+        tables.push(t);
+    }
     tables.push(mb(
         "multi_branch_hetero",
         "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
