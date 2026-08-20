@@ -876,7 +876,7 @@ impl Dispatcher {
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
-                        opaque_data: Bytes::from(Vec::new()),
+                        opaque_data: Some(Bytes::from(Vec::new())),
                         lookup_secret_types: lookups
                             .iter()
                             .map(|l| l.secret_type.clone())
@@ -896,7 +896,7 @@ impl Dispatcher {
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
-                opaque_data: Bytes::from(bind.opaque_data),
+                opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
@@ -924,7 +924,7 @@ impl Dispatcher {
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
-                        opaque_data: Bytes::from(Vec::new()),
+                        opaque_data: Some(Bytes::from(Vec::new())),
                         lookup_secret_types: lookups
                             .iter()
                             .map(|l| l.secret_type.clone())
@@ -944,7 +944,7 @@ impl Dispatcher {
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
-                opaque_data: Bytes::from(bind.opaque_data),
+                opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
@@ -972,7 +972,7 @@ impl Dispatcher {
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
-                        opaque_data: Bytes::from(Vec::new()),
+                        opaque_data: Some(Bytes::from(Vec::new())),
                         lookup_secret_types: lookups
                             .iter()
                             .map(|l| l.secret_type.clone())
@@ -992,7 +992,7 @@ impl Dispatcher {
             let bind = f.on_bind(&params)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
-                opaque_data: Bytes::from(bind.opaque_data),
+                opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
@@ -1014,7 +1014,7 @@ impl Dispatcher {
             if !lookups.is_empty() {
                 let resp = BindResponse {
                     output_schema: Bytes::from(Vec::new()),
-                    opaque_data: Bytes::from(Vec::new()),
+                    opaque_data: Some(Bytes::from(Vec::new())),
                     lookup_secret_types: lookups.iter().map(|l| l.secret_type.clone()).collect(),
                     lookup_scopes: lookups
                         .iter()
@@ -1035,7 +1035,7 @@ impl Dispatcher {
         let bind = f.on_bind(&params)?;
         let resp = BindResponse {
             output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
-            opaque_data: Bytes::from(bind.opaque_data),
+            opaque_data: Some(Bytes::from(bind.opaque_data)),
             lookup_secret_types: Vec::new(),
             lookup_scopes: Vec::new(),
             lookup_names: Vec::new(),
@@ -2303,9 +2303,9 @@ impl Dispatcher {
             })?;
             return Ok(Some(wire::to_result_batch(PlanResponse {
                 splits: vec![Bytes::from(ipc::write_batch(&one)?)],
-                next_cursors: Vec::new(),
+                next_cursors: Some(Vec::new()),
                 execution_id: None,
-                init_opaque_data: Bytes::from(Vec::new()),
+                init_opaque_data: Some(Bytes::from(Vec::new())),
                 max_workers: None,
                 estimated_total_splits: None,
                 estimated_total_rows: None,
@@ -2313,11 +2313,11 @@ impl Dispatcher {
                 catalog_version: None,
                 scope: "catalog".to_string(),
                 locations: None,
-                partitioning: Vec::new(),
-                sort_order: Vec::new(),
+                partitioning: Some(Vec::new()),
+                sort_order: Some(Vec::new()),
                 cache_max_age_seconds: None,
-                start_position: Bytes::from(Vec::new()),
-                end_position: Bytes::from(Vec::new()),
+                start_position: Some(Bytes::from(Vec::new())),
+                end_position: Some(Bytes::from(Vec::new())),
             })?));
         };
 
@@ -2362,14 +2362,16 @@ impl Dispatcher {
 
         Ok(Some(wire::to_result_batch(PlanResponse {
             splits,
-            next_cursors: outcome
-                .next_cursors
-                .iter()
-                .cloned()
-                .map(Bytes::from)
-                .collect(),
+            next_cursors: Some(
+                outcome
+                    .next_cursors
+                    .iter()
+                    .cloned()
+                    .map(Bytes::from)
+                    .collect(),
+            ),
             execution_id: None,
-            init_opaque_data: Bytes::from(Vec::new()),
+            init_opaque_data: Some(Bytes::from(Vec::new())),
             max_workers: outcome.max_workers,
             estimated_total_splits: outcome.estimated_total_splits,
             estimated_total_rows: outcome.estimated_total_rows,
@@ -2380,11 +2382,11 @@ impl Dispatcher {
                 .clone()
                 .unwrap_or_else(|| "catalog".to_string()),
             locations: None,
-            partitioning: Vec::new(),
-            sort_order: Vec::new(),
+            partitioning: Some(Vec::new()),
+            sort_order: Some(Vec::new()),
             cache_max_age_seconds: outcome.cache_max_age_seconds,
-            start_position: Bytes::from(Vec::new()),
-            end_position: Bytes::from(Vec::new()),
+            start_position: Some(Bytes::from(Vec::new())),
+            end_position: Some(Bytes::from(Vec::new())),
         })?))
     }
 

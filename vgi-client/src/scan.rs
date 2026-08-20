@@ -174,7 +174,7 @@ impl BoundFunction {
         InitRequest {
             bind_call: self.bind_call.clone(),
             output_schema: self.response.output_schema.clone(),
-            bind_opaque_data: Some(self.response.opaque_data.clone()),
+            bind_opaque_data: self.response.opaque_data.clone(),
             projection_ids: opts.wire_projection(),
             pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
             join_keys: opts
@@ -211,8 +211,8 @@ impl BoundFunction {
     }
 
     /// The worker's opaque bind state.
-    pub fn opaque_data(&self) -> &Bytes {
-        &self.response.opaque_data
+    pub fn opaque_data(&self) -> Option<&Bytes> {
+        self.response.opaque_data.as_ref()
     }
 
     /// Secret types the worker asked the client to resolve, if any.
@@ -793,7 +793,7 @@ impl VgiClient {
 
             let request = TableFunctionPlanRequest {
                 bind_call: bound.bind_call.clone(),
-                bind_opaque_data: Some(bound.response.opaque_data.clone()),
+                bind_opaque_data: bound.response.opaque_data.clone(),
                 projection_ids: opts.wire_projection(),
                 pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
                 join_keys: None,
@@ -863,7 +863,7 @@ impl VgiClient {
             // that is a worker obligation with no enforcement — so this client
             // takes the serial path, which every worker supports, rather than
             // trusting a contract it cannot check.
-            match response.next_cursors.first() {
+            match response.next_cursors.iter().flatten().next() {
                 Some(next) if !next.0.is_empty() => cursor = Some(next.clone()),
                 _ => break,
             }
@@ -1026,7 +1026,7 @@ mod tests {
             Bytes(Vec::new()),
             vgi_protocol::protocol::dtos::BindResponse {
                 output_schema: Bytes(ipc::write_schema(&out).unwrap()),
-                opaque_data: Bytes(Vec::new()),
+                opaque_data: Some(Bytes(Vec::new())),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
@@ -1164,9 +1164,9 @@ mod tests {
             let response = vgi_protocol::protocol::dtos::PlanResponse {
                 splits: vec![split; self.splits_per_page],
                 // Never exhausted: the failure this test is about.
-                next_cursors: vec![Bytes(b"more".to_vec())],
+                next_cursors: Some(vec![Bytes(b"more".to_vec())]),
                 execution_id: None,
-                init_opaque_data: Bytes(Vec::new()),
+                init_opaque_data: Some(Bytes(Vec::new())),
                 max_workers: Some(4),
                 estimated_total_splits: None,
                 estimated_total_rows: None,
@@ -1174,11 +1174,11 @@ mod tests {
                 catalog_version: None,
                 scope: "catalog".to_string(),
                 locations: None,
-                partitioning: Vec::new(),
-                sort_order: Vec::new(),
+                partitioning: Some(Vec::new()),
+                sort_order: Some(Vec::new()),
                 cache_max_age_seconds: None,
-                start_position: Bytes(Vec::new()),
-                end_position: Bytes(Vec::new()),
+                start_position: Some(Bytes(Vec::new())),
+                end_position: Some(Bytes(Vec::new())),
             };
             let inner = ipc::write_batch(&wire::to_batch(response)?)?;
             let field = Field::new("result", DataType::Binary, false);

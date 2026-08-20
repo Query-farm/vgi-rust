@@ -334,8 +334,9 @@ impl VgiClient {
         table: &TableInfo,
         at: Option<&At>,
     ) -> Result<ScanFunctionResult> {
-        if !table.scan_function.0.is_empty() {
-            let batch = vgi_protocol::ipc::read_batch(&table.scan_function.0)?;
+        // Nullable on the wire: absent OR empty both mean "not inlined".
+        if let Some(inlined) = table.scan_function.as_ref().filter(|b| !b.0.is_empty()) {
+            let batch = vgi_protocol::ipc::read_batch(&inlined.0)?;
             return vgi_protocol::wire::from_batch(&batch);
         }
         call(

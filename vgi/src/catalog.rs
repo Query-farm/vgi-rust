@@ -96,7 +96,7 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
         Field::new(
             "released_at",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
+            true,
         ),
         Field::new("summary", DataType::Utf8, false),
         Field::new("notes_url", DataType::Utf8, true),
@@ -415,7 +415,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         late_materialization: None,
         supported_expression_filters: Vec::new(),
         order_preservation: None,
-        max_workers: 0,
+        max_workers: Some(0),
         supports_batch_index: false,
         supports_splits: false,
         filters_exactly_applied: false,
@@ -465,7 +465,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     fi.sink_order_dependent = meta.sink_order_dependent;
     fi.source_order_dependent = meta.source_order_dependent;
     fi.requires_input_batch_index = meta.requires_input_batch_index;
-    fi.max_workers = meta.max_workers;
+    fi.max_workers = Some(meta.max_workers);
     fi.supports_window = meta.supports_window;
     fi.streaming_partitioned = meta.streaming_partitioned;
     fi.late_materialization = Some(meta.late_materialization);
@@ -1198,15 +1198,15 @@ pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::T
         supports_delete: false,
         supports_returning: false,
         supports_column_statistics: !t.statistics.is_empty(),
-        scan_function: Bytes::from(scan),
-        insert_function: Bytes::from(Vec::new()),
-        update_function: Bytes::from(Vec::new()),
-        delete_function: Bytes::from(Vec::new()),
+        scan_function: Some(Bytes::from(scan)),
+        insert_function: Some(Bytes::from(Vec::new())),
+        update_function: Some(Bytes::from(Vec::new())),
+        delete_function: Some(Bytes::from(Vec::new())),
         cardinality_estimate: t.cardinality.into(),
         cardinality_max: t.cardinality.into(),
         required_filters: t.required_filters.clone(),
-        column_statistics: Bytes::from(Vec::new()),
-        bind_result: Bytes::from(Vec::new()),
+        column_statistics: Some(Bytes::from(Vec::new())),
+        bind_result: Some(Bytes::from(Vec::new())),
     })
 }
 
@@ -1223,11 +1223,11 @@ pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInf
             "scalar".into()
         }),
         parameters: m.parameters.clone(),
-        parameter_default_values: Bytes::from(
+        parameter_default_values: Some(Bytes::from(
             build_macro_defaults(&m.defaults).unwrap_or_default(),
-        ),
+        )),
         definition: m.definition.clone(),
-        arguments_schema: Bytes::from(build_macro_arguments_schema(m).unwrap_or_default()),
+        arguments_schema: Some(Bytes::from(build_macro_arguments_schema(m).unwrap_or_default())),
     }
 }
 
@@ -1325,33 +1325,9 @@ pub fn serialize_items<T: vgi_rpc::VgiArrow>(items: Vec<T>) -> Result<Vec<Bytes>
         .into_iter()
         .map(|item| {
             let batch = crate::wire::to_batch(item)?;
-            let schema = tighten_inline_schema(&batch.schema());
-            Ok(Bytes::from(ipc::write_batch_with_schema(&batch, &schema)?))
+            Ok(Bytes::from(ipc::write_batch(&batch)?))
         })
         .collect()
-}
-
-/// Mark the `cardinality_estimate` / `cardinality_max` columns non-nullable in
-/// the item schema (the C++ extension's `catalog_schema_contents_*` result-schema
-/// check requires `int64 not null`), while the arrays still carry any NULL
-/// values. `arrow`'s safe `RecordBatch`/`StructArray` constructors reject a
-/// non-nullable field with nulls, so these columns are built nullable and the
-/// declared wire schema is tightened only at IPC-write time — matching the
-/// canonical convention (NULL in a non-nullable column = "not inlined").
-fn tighten_inline_schema(schema: &Schema) -> Schema {
-    const TIGHTEN: [&str; 2] = ["cardinality_estimate", "cardinality_max"];
-    let fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            if TIGHTEN.contains(&f.name().as_str()) {
-                Field::new(f.name(), f.data_type().clone(), false)
-            } else {
-                f.as_ref().clone()
-            }
-        })
-        .collect();
-    Schema::new(fields)
 }
 
 /// Wrap a `DictString` enum value (re-export convenience).
@@ -1653,9 +1629,13 @@ mod tests {
     fn test_macro_info_appends_arguments_schema_with_docs() {
         let info = macro_info("main", &macro_with_docs());
         // arguments_schema is populated for a documented macro.
-        assert!(!info.arguments_schema.0.is_empty());
+        let arguments_schema = info
+            .arguments_schema
+            .as_ref()
+            .expect("arguments_schema column present");
+        assert!(!arguments_schema.0.is_empty());
         let decoded =
-            ipc::read_schema(&info.arguments_schema.0).expect("read MacroInfo.arguments_schema");
+            ipc::read_schema(&arguments_schema.0).expect("read MacroInfo.arguments_schema");
         assert_eq!(decoded.fields().len(), 3);
         assert_eq!(
             decoded
@@ -1685,7 +1665,12 @@ mod tests {
         );
         // And the DTO carries empty bytes (older readers unaffected).
         let info = macro_info("main", &m);
-        assert!(info.arguments_schema.0.is_empty());
+        assert!(info
+            .arguments_schema
+            .as_ref()
+            .expect("arguments_schema column present")
+            .0
+            .is_empty());
     }
 
     fn ab_table(required: Vec<Vec<String>>) -> CatTable {

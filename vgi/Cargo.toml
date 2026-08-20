@@ -28,7 +28,11 @@ http-storage = ["dep:ureq", "dep:bincode"]
 transport-http = ["dep:tokio", "vgi-rpc/http"]
 
 [dependencies]
-vgi-rpc = { workspace = true }
+# `crypto` (XChaCha20-Poly1305 seal/open) is enabled unconditionally, NOT via
+# `transport-http`: split tokens (`src/split_token.rs`) are a core feature that
+# must work on every transport, wasm included. It carries no server stack —
+# AEAD + RNG + base64 only — so it does not compromise the wasm build.
+vgi-rpc = { workspace = true, features = ["crypto"] }
 # Split-token bind fingerprint (see src/split_token.rs). Already in the lock
 # file via a transitive dependency, so this adds no new crate to the build.
 sha2 = "0.10"

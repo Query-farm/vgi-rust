@@ -20,14 +20,14 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.22.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
+vgi-rpc = { version = "0.23.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
 # The direction-agnostic wire protocol (DTOs + Arrow codec + IPC helpers), shared
 # by the worker framework and any client. Kept feature-free and wasm-buildable.
 vgi-protocol = { version = "0.29.0", path = "vgi-protocol" }
 # The VGI protocol client (attach, discovery, function calls).
 vgi-client = { version = "0.29.0", path = "vgi-client" }
 # Transport-level RPC client the VGI client is built on.
-vgi-rpc-client = { version = "0.22.0", default-features = false }
+vgi-rpc-client = { version = "0.23.0", default-features = false }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
@@ -45,6 +45,15 @@ serde_json = "1"
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
+
+# Local co-development patch. `vgi` asks for vgi-rpc's `crypto` feature, which
+# does not exist in the published 0.22.0 — split tokens need the AEAD envelope
+# without dragging in the `http` server stack (see vgi/Cargo.toml). Drop this
+# once vgi-rpc 0.23.0 is on crates.io. Mirrors the same patch the sabtable test
+# harness in the vgi repo already carries.
+[patch.crates-io]
+vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
+vgi-rpc-client = { path = "../vgi-rpc-rust/vgi-rpc-client" }
 
 [profile.release]
 opt-level = 2

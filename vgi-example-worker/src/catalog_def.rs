@@ -900,7 +900,7 @@ fn data_tables() -> Vec<CatTable> {
     ));
     tables.push(mb(
         "multi_branch_split",
-        "Multi-branch: split_sequence(30 over 6 splits) + sequence(20) —          used by splits/multi_branch.test",
+        "Multi-branch: split_sequence(30, splits=6) + sequence(20) — used by splits/multi_branch.test",
         vec![
             // The split-capable arm. Its plan call happens at THIS arm's own
             // InitGlobal, independently of the plain arm beside it — the two

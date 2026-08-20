@@ -17,11 +17,12 @@ pub type StrMap = Vec<(String, String)>;
 /// `map<utf8, int64>` payload.
 pub type IntMap = Vec<(String, i64)>;
 
-/// An optionally-inlined `int64` whose wire field is declared **non-nullable**
-/// (the C++ extension's result-schema check requires `int64 not null`) yet may
-/// carry a NULL value. The extension reads it via `row[...].as<int64_t>()`,
-/// which yields `nullopt` for NULL — its signal for "not inlined, fire the RPC".
-/// Matches the canonical convention (null in a non-nullable column).
+/// An optionally-inlined `int64`: NULL means "not inlined". The extension reads
+/// it via `row[...].as<int64_t>()`, which yields `nullopt` for NULL — its signal
+/// to fire the per-bind RPC instead. The wire field is nullable (it was declared
+/// non-null until the canonical schema derivation was corrected, and the item
+/// schema was tightened to match; both the tightening and that declaration are
+/// gone).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InlineI64(pub Option<i64>);
 
@@ -35,10 +36,8 @@ impl VgiArrow for InlineI64 {
     fn arrow_data_type() -> arrow_schema::DataType {
         arrow_schema::DataType::Int64
     }
-    // Built nullable (so `arrow`'s StructArray accepts the NULL child), then
-    // the serialized item's schema is tightened back to non-nullable by
-    // `serialize_items` to satisfy the C++ schema check — matching Go/Python,
-    // which emit NULL in a column the schema declares non-nullable.
+    // Nullable, which is both what `arrow`'s StructArray needs to accept a NULL
+    // child and what the canonical wire schema now declares.
     fn nullable() -> bool {
         true
     }
@@ -366,7 +365,7 @@ pub fn read_copy_to(batch: &arrow_array::RecordBatch) -> Result<Option<CopyToCon
 #[derive(Debug, Clone, VgiArrow)]
 pub struct BindResponse {
     pub output_schema: Bytes,
-    pub opaque_data: Bytes,
+    pub opaque_data: Option<Bytes>,
     pub lookup_secret_types: Vec<String>,
     pub lookup_scopes: Vec<String>,
     pub lookup_names: Vec<String>,
@@ -494,9 +493,9 @@ pub struct PlanResponse {
     /// scan), it compared token bytes so it could never work on a keyed worker where
     /// each mint uses a fresh nonce, and the most a client can do with a duplicate is
     /// refuse anyway. Violating this returns DUPLICATE ROWS, silently.
-    pub next_cursors: Vec<Bytes>,
+    pub next_cursors: Option<Vec<Bytes>>,
     pub execution_id: Option<Bytes>,
-    pub init_opaque_data: Bytes,
+    pub init_opaque_data: Option<Bytes>,
     /// NORMATIVE on redemption, not advisory.
     pub max_workers: Option<i64>,
     pub estimated_total_splits: Option<i64>,
@@ -515,16 +514,16 @@ pub struct PlanResponse {
     /// values: `country=US` does not say whether partitions are
     /// `identity(country)` or `bucket(16, user_id)`. Report nothing here unless
     /// every split really is single-valued.
-    pub partitioning: Vec<Bytes>,
+    pub partitioning: Option<Vec<Bytes>>,
     /// Ordering WITHIN each split, never a global claim across splits. An engine
     /// that bin-packs several splits into one partition must declare no ordering
     /// at all — concatenating K non-contiguous sorted runs is not sorted.
-    pub sort_order: Vec<Bytes>,
+    pub sort_order: Option<Vec<Bytes>>,
     pub cache_max_age_seconds: Option<i64>,
-    pub start_position: Bytes,
+    pub start_position: Option<Bytes>,
     /// The data frontier resolved at plan time — checkpoint it and pass it back
     /// as the next `start_position`.
-    pub end_position: Bytes,
+    pub end_position: Option<Bytes>,
 }
 
 /// `ScanSplit` — one named, independently redeemable unit of scan work.
@@ -899,7 +898,7 @@ pub struct CatalogSchemaContentsFunctionsParams {
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CatalogRelease {
     pub version: String,
-    pub released_at: UtcTimestamp,
+    pub released_at: Option<UtcTimestamp>,
     pub summary: String,
     pub notes_url: Option<String>,
 }
@@ -977,18 +976,18 @@ pub struct TableInfo {
     pub supports_returning: bool,
     pub supports_column_statistics: bool,
     /// IPC `ScanFunctionResult`, empty if not inlined.
-    pub scan_function: Bytes,
-    pub insert_function: Bytes,
-    pub update_function: Bytes,
-    pub delete_function: Bytes,
+    pub scan_function: Option<Bytes>,
+    pub insert_function: Option<Bytes>,
+    pub update_function: Option<Bytes>,
+    pub delete_function: Option<Bytes>,
     /// Inlined optimizer cardinality. `None` → NULL on the wire, which the C++
     /// reads as "not inlined" → it fires the per-bind `table_function_cardinality`
     /// RPC instead. Emitting a sentinel (e.g. -1) would be read as an inlined
     /// value and wrongly skip the RPC.
     pub cardinality_estimate: InlineI64,
     pub cardinality_max: InlineI64,
-    pub column_statistics: Bytes,
-    pub bind_result: Bytes,
+    pub column_statistics: Option<Bytes>,
+    pub bind_result: Option<Bytes>,
     /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
     /// (outer list) of OR-groups (inner lists) of dotted-path column references.
     /// A group is satisfied when any one of its member paths has a WHERE filter;
@@ -1017,7 +1016,7 @@ pub struct MacroInfo {
     pub schema_name: String,
     pub macro_type: DictString,
     pub parameters: Vec<String>,
-    pub parameter_default_values: Bytes,
+    pub parameter_default_values: Option<Bytes>,
     pub definition: String,
     /// Optional Arrow schema (IPC bytes) with one nullable field per parameter,
     /// in `parameters` order. Each field's type is the parameter's default value
@@ -1027,7 +1026,7 @@ pub struct MacroInfo {
     /// `FunctionInfo.arguments`. Empty means the worker supplied no per-parameter
     /// docs (older workers); readers fall back to `parameters` for names. Appended
     /// last for consistency with the reference wire contract.
-    pub arguments_schema: Bytes,
+    pub arguments_schema: Option<Bytes>,
 }
 
 /// `ScanFunctionResult` — names the table function that scans a catalog table.
@@ -1059,7 +1058,7 @@ pub struct FunctionInfo {
     pub late_materialization: Option<bool>,
     pub supported_expression_filters: Vec<String>,
     pub order_preservation: Option<DictString>,
-    pub max_workers: i32,
+    pub max_workers: Option<i32>,
     pub supports_batch_index: bool,
     /// Opts this table function into the split path: the scan divides into
     /// named, independently redeemable units (see `TableFunction::on_plan`).
@@ -1302,6 +1301,9 @@ mod federation_tests {
             source_catalog: Some("acme_lake".to_string()),
             source_schema: Some("main".to_string()),
             source_table: Some("events".to_string()),
+            format_name: None,
+            format_locations: None,
+            format_options: None,
         };
         let batch = crate::wire::to_batch(b).unwrap();
         let back: ScanBranch = crate::wire::from_batch(&batch).unwrap();

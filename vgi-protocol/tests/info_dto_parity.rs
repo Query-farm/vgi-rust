@@ -23,51 +23,19 @@ fn schema_info_matches() {
     assert_eq!(flat_schema::<SchemaInfo>(), gen::schema_info_schema());
 }
 
-/// The two `InlineI64` columns on `TableInfo`, which are deliberately built
-/// nullable and tightened to non-null on serialization.
-const INLINE_I64_COLUMNS: &[&str] = &["cardinality_estimate", "cardinality_max"];
-
 #[test]
-fn table_info_matches_apart_from_the_inline_i64_columns() {
-    // `TableInfo` is the one DTO whose derived schema is *intentionally* not
-    // the wire schema. `InlineI64::nullable()` returns true so Arrow will
-    // accept a NULL child when building the StructArray; `serialize_items`
-    // then tightens those columns back to non-null, because the C++
-    // extension's result-schema check requires `int64 not null` while still
-    // reading NULL as "not inlined, fire the RPC". See the `InlineI64` docs
-    // in `dtos.rs`.
+fn table_info_matches() {
+    // `TableInfo` used to be the one DTO whose derived schema was
+    // *intentionally* not the wire schema: `cardinality_estimate` /
+    // `cardinality_max` were built nullable (so Arrow accepts a NULL child)
+    // and then tightened back to non-null on serialization, because the
+    // canonical schema declared them `int64 not null` while every peer wrote
+    // NULL into them for "not inlined, fire the RPC".
     //
-    // So this test asserts the delta is *exactly* those two columns and
-    // *exactly* nullability — anything else is real drift.
-    let derived = flat_schema::<TableInfo>();
-    let canonical = gen::table_info_schema();
-
-    let derived_names: Vec<&str> = derived.fields().iter().map(|f| f.name().as_str()).collect();
-    let canonical_names: Vec<&str> = canonical
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    assert_eq!(derived_names, canonical_names, "field set or order drifted");
-
-    for (d, c) in derived.fields().iter().zip(canonical.fields().iter()) {
-        assert_eq!(d.data_type(), c.data_type(), "type drift on `{}`", d.name());
-        if INLINE_I64_COLUMNS.contains(&d.name().as_str()) {
-            assert!(d.is_nullable(), "`{}` must build nullable", d.name());
-            assert!(
-                !c.is_nullable(),
-                "`{}` must be non-null on the wire",
-                c.name()
-            );
-        } else {
-            assert_eq!(
-                d.is_nullable(),
-                c.is_nullable(),
-                "nullability drift on `{}`",
-                d.name()
-            );
-        }
-    }
+    // That non-null declaration was the `Annotated[X | None, ...]` derivation
+    // bug in vgi-rpc; the canonical schema now declares them nullable, the
+    // tightening is gone, and the derived schema is simply the wire schema.
+    assert_eq!(flat_schema::<TableInfo>(), gen::table_info_schema());
 }
 
 #[test]

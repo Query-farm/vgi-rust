@@ -26,11 +26,17 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     {
         let d = disp.clone();
         let dd = disp.clone();
-        let empty = Arc::new(arrow_schema::Schema::empty());
-        let info =
-            vgi_rpc::MethodInfo::stream("init", MethodType::Dynamic, empty, move |req, ctx| {
-                d.handle_init(req, ctx)
-            })
+        // `init` declares the same boxed `{request: binary}` params schema as
+        // every other method. It used to register `Schema::empty()` — harmless
+        // while nothing validated it, but vgi-rpc now enforces the declared
+        // parameter contract before dispatch, and an empty declaration means
+        // "this method takes no columns", which rejects the boxed request.
+        let info = vgi_rpc::MethodInfo::stream(
+            "init",
+            MethodType::Dynamic,
+            wire::params_schema_for("init"),
+            move |req, ctx| d.handle_init(req, ctx),
+        )
             // HTTP continuations rebuild the (stateless) exchange handler from an
             // AEAD state token; without a decoder the server 500s on /init/exchange.
             .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
