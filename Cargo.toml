@@ -51,6 +51,14 @@ env_logger = "0.11"
 # without dragging in the `http` server stack (see vgi/Cargo.toml). Drop this
 # once vgi-rpc 0.23.0 is on crates.io. Mirrors the same patch the sabtable test
 # harness in the vgi repo already carries.
+#
+# CI IMPLICATION, until that release ships: .github/workflows/integration.yml
+# checks out this repo at the workspace root and Query-farm/vgi at
+# vgi-upstream/, and nothing at ../vgi-rpc-rust — a path actions/checkout
+# cannot populate, since it is outside the workspace. So this stanza does not
+# resolve on a runner. Publishing vgi-rpc 0.23.0 and deleting these lines is
+# the fix; adding a checkout + rewriting this path in CI would only be worth it
+# if the release slips.
 [patch.crates-io]
 vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
 vgi-rpc-client = { path = "../vgi-rpc-rust/vgi-rpc-client" }
