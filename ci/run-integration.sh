@@ -49,17 +49,29 @@ fi
 # expression_filter.test (its EXPLAIN assertion renders the spatial predicate's
 # WKT differently under the prebuilt binary's DuckDB/spatial build than the
 # locally-built unittest the worker is developed against — a plan-text rendering
-# difference, not a worker behaviour difference; covered by the local suite);
-# bool_in_union.test (a pre-existing, arch-dependent union-bool bug — its pinned
-# expected output matches arm64 but not amd64; dropped on all platforms).
-# The http lane drops two files the prebuilt binary can't serve; Windows drops
-# the fixtures that read parquet/csv from POSIX /tmp paths.
+# difference, not a worker behaviour difference; covered by the local suite).
+# The http lane drops one file (see HTTP_SKIP below); Windows drops the fixtures
+# that read parquet/csv from POSIX /tmp paths.
+#
+# bool_in_union.test is NO LONGER excluded here (removed 2026-08-21). It does not
+# need a per-SDK exclusion: the file disables itself centrally with `mode skip`
+# at test/sql/integration/table_in_out/echo/bool_in_union.test:20, which survives
+# preprocess-require.awk, so staging it costs one skipped file and zero
+# assertions. (Its own header attributes the pinned output to amd64 and not
+# arm64 — the opposite of what this comment used to claim. The central skip makes
+# the direction moot here; see the upstream file for the live rationale.)
 # ---------------------------------------------------------------------------
 AWK_HTTP=0
 HTTP_SKIP=()
 if [ "$TRANSPORT" = "http" ]; then
   AWK_HTTP=1
-  HTTP_SKIP=(-not -name 'projection_pushdown_repro.test' -not -name 'dynamic_filter.test')
+  # dynamic_filter.test used to be dropped here too, blamed on the prebuilt
+  # binary. That was wrong: this SDK's HTTP server discarded a continuation
+  # turn's Arrow custom_metadata, so DuckDB's tightening Top-N filter never
+  # reached the worker. Fixed in vgi-rpc-rust 52b702d, which the committed
+  # [patch.crates-io] in Cargo.toml picks up. Verified 2026-08-21 against this
+  # SDK's own http worker: 52/52 assertions pass. Exclusion removed.
+  HTTP_SKIP=(-not -name 'projection_pushdown_repro.test')
 fi
 # The native-branch fixtures (multi_branch_*, required_filters_native)
 # used to stage and read parquet/csv from POSIX `/tmp/...` paths the worker's
@@ -75,7 +87,6 @@ mkdir -p "$STAGE/test/sql/integration"
        -not -path '*/writable/*' -not -path '*/simple_writable/*' \
        -not -name 'nested_type_combinations.test' \
        -not -name 'expression_filter.test' \
-       -not -name 'bool_in_union.test' \
        ${HTTP_SKIP[@]+"${HTTP_SKIP[@]}"} ${WIN_SKIP[@]+"${WIN_SKIP[@]}"} | while read -r f; do
     mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")"
     awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" > "$STAGE/test/sql/integration/$f"
