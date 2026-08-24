@@ -3669,6 +3669,11 @@ impl TableProducer for EmptyProducer {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
         Ok(None)
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 /// Emits a fixed list of batches (table-in-out FINALIZE flush).
@@ -3683,6 +3688,16 @@ impl TableProducer for VecProducer {
             self.pos += 1;
         }
         Ok(b)
+    }
+    fn resume_supported(&self) -> bool {
+        // Multi-batch (it walks a Vec of finalize batches), so this `false`
+        // is a real limitation, not a formality: a table-in-out FINALIZE that
+        // produces more than one batch is refused over HTTP. Declared rather
+        // than inherited so it is visible. Making it resumable needs proof
+        // that re-running `finish()` on rebuild reproduces the same batches
+        // (it reads BoundStorage keyed by execution_id, so probably — but
+        // "probably" is not enough to risk duplicating finalize rows).
+        false
     }
 }
 

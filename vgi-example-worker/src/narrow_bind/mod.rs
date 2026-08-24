@@ -62,6 +62,11 @@ impl TableProducer for OneShot {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         Ok(self.batch.take())
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 /// `narrow_scan(count)` — binds to a NARROWER schema than the catalog

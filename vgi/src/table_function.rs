@@ -61,12 +61,33 @@ pub trait TableProducer: Send {
     ///
     /// A producer is rebuilt fresh from its bind params on resume and then has
     /// [`restore_resume`](Self::restore_resume) called, so
-    /// [`encode_resume`](Self::encode_resume) only needs to carry the scan
-    /// *position* — never anything regenerable from the params. Override this to
-    /// `true` whenever you implement those two hooks.
-    fn resume_supported(&self) -> bool {
-        false
-    }
+    /// [`encode_resume`](Self::encode_resume) only needs to carry what ADVANCES
+    /// — never anything regenerable from the params.
+    ///
+    /// Do not implement these three by hand. [`resume_fields!`](crate::resume_fields)
+    /// writes all of them from a list of the advancing fields:
+    ///
+    /// ```ignore
+    /// vgi::resume_fields!(cursor, rows_emitted);
+    /// ```
+    ///
+    /// The `false` default is a historical wart, kept only because 84
+    /// implementations rely on it. It is the wrong default: a producer that
+    /// chunks its output and forgets to override it compiles, passes the
+    /// byte-stream transports (which never consult this flag), and fails only
+    /// over HTTP. That is how several producers shipped drain-only —
+    /// `batch_limit` used to make declining harmless, and when vgi-rpc 0.23.0
+    /// removed it the bill arrived all at once.
+    ///
+    /// So state the decision explicitly even when it is `false`, and say why —
+    /// the two producers that legitimately could not resume both turned out to
+    /// be fixable once their STATE travelled instead of just a position.
+    ///
+    /// REQUIRED — deliberately no default. A default of `false` let a producer
+    /// decline continuation by saying nothing, which is how several shipped
+    /// drain-only and stayed that way until lock-step removed the escape hatch.
+    /// A wrong answer here is still possible, but it is now a written one.
+    fn resume_supported(&self) -> bool;
     /// Per-batch wire metadata for the batch just returned by `next_batch`
     /// (e.g. `vgi_batch_index` for `supports_batch_index` functions). Default
     /// none. Called once after each `next_batch` that returns `Some`.
@@ -132,6 +153,10 @@ pub trait TableProducer: Send {
 ///         let batch = RecordBatch::try_new(self.schema.clone(), vec![col])
 ///             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
 ///         Ok(Some(batch))
+///     }
+///     fn resume_supported(&self) -> bool {
+///         // Single batch — nothing to resume. Required, so it is stated.
+///         false
 ///     }
 /// }
 ///
@@ -294,4 +319,88 @@ pub fn project_schema(full: &SchemaRef, ids: &Option<Vec<i64>>) -> SchemaRef {
         }
         _ => full.clone(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resume via serde — the ergonomic path
+// ---------------------------------------------------------------------------
+
+/// Encode a producer's advancing scan position with bincode.
+///
+/// The counterpart to [`decode_resume_state`]. Used by
+/// [`resume_fields!`](crate::resume_fields), not usually called directly.
+pub fn encode_resume_state<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    // A failure here would silently lose the position and restart the scan at
+    // row 0, so it must not be swallowed. Encoding a tuple of plain scalars
+    // cannot realistically fail; if it ever does, that is a bug worth seeing.
+    vgi_rpc::stream_codec::bincode_encode(value).unwrap_or_else(|e| panic!("encode_resume: {e}"))
+}
+
+/// Decode what [`encode_resume_state`] wrote, or `None` if the bytes are not
+/// what this producer wrote.
+///
+/// `None` rather than a panic: the bytes arrive from a client-supplied token.
+/// They are AEAD-sealed, so they cannot be forged — but a worker rolled back to
+/// an older build can legitimately meet a token minted by a newer one, and
+/// dropping the position is survivable where a panic is not.
+pub fn decode_resume_state<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    vgi_rpc::stream_codec::bincode_decode(bytes).ok()
+}
+
+/// Implement the three [`TableProducer`] resume hooks from a list of fields.
+///
+/// A producer that chunks its output MUST be resumable, or it cannot serve
+/// HTTP: vgi-rpc 0.23.0 made producers strictly lock-step (one invocation, at
+/// most one batch per response), so every multi-batch scan takes a
+/// continuation. Writing the three hooks by hand is what that used to mean, and
+/// it is why producers kept shipping without them — `resume_supported`
+/// defaults to `false`, so declining was silent and, before lock-step,
+/// harmless.
+///
+/// Name the fields that ADVANCE and nothing else:
+///
+/// ```ignore
+/// impl TableProducer for MyProducer {
+///     fn next_batch(&mut self, out: &mut OutputCollector) -> Result<Option<RecordBatch>> { ... }
+///     vgi::resume_fields!(cursor, rows_emitted);
+/// }
+/// ```
+///
+/// Only advancing fields, because a resumed producer is rebuilt from its bind
+/// params FIRST and this then overwrites the cursor — so the schema, the
+/// argument values, storage handles and anything else derived from the params
+/// are already correct and must not be carried. That is also why this takes a
+/// field list rather than serializing the producer whole: most producers hold a
+/// `SchemaRef` or an `Arc<dyn FunctionStorage>`, neither of which is
+/// `Serialize`, and neither of which should travel.
+///
+/// The listed fields must be `Serialize + DeserializeOwned` — cursors, counts
+/// and offsets are.
+#[macro_export]
+macro_rules! resume_fields {
+    ($($field:ident),+ $(,)?) => {
+        fn resume_supported(&self) -> bool {
+            true
+        }
+
+        fn encode_resume(&self) -> ::std::vec::Vec<u8> {
+            $crate::table_function::encode_resume_state(&($(self.$field.clone(),)+))
+        }
+
+        fn restore_resume(&mut self, bytes: &[u8]) {
+            if bytes.is_empty() {
+                return;
+            }
+            if let ::std::option::Option::Some(($($field,)+)) =
+                $crate::table_function::decode_resume_state::<($(
+                    $crate::resume_fields!(@ty $field),
+                )+)>(bytes)
+            {
+                $(self.$field = $field;)+
+            }
+        }
+    };
+    // Field types are inferred from the assignment target, so the tuple element
+    // type only needs a placeholder the compiler can unify.
+    (@ty $field:ident) => { _ };
 }

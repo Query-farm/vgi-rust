@@ -87,6 +87,11 @@ impl TableProducer for CitiesProducer {
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
     }
+    fn resume_supported(&self) -> bool {
+        // Multi-batch; a docs example, never served over HTTP. Declared so
+        // the decision is visible rather than inherited from a default.
+        false
+    }
 }
 
 /// The scan behind the table. It is an ordinary table function — nothing about

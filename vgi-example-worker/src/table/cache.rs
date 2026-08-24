@@ -235,6 +235,11 @@ impl TableProducer for OneRow {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 pub struct CacheNonceFunction;
@@ -338,6 +343,11 @@ impl TableProducer for ScopedTxnProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 
@@ -459,6 +469,11 @@ impl TableProducer for RevalidatableProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 pub struct CacheRevalidatableFunction;
@@ -522,6 +537,11 @@ impl TableProducer for MultiColProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 
@@ -594,6 +614,11 @@ impl TableProducer for WhoamiProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 
@@ -694,6 +719,11 @@ impl TableProducer for StaticRows {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +769,11 @@ impl TableProducer for ProjectionProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 

@@ -892,10 +892,14 @@ impl TableProducer for ValuePruneProducer {
         self.cursor = end;
         Ok(Some(batch))
     }
-    // NOT resumable: the pruned `values` come from a *dynamic* `get_column_values`
-    // filter that is not part of the bind params an HTTP continuation rebuilds
-    // from, so a resumed producer would regenerate the unpruned set. Drain in one
-    // response instead (the key set is small).
+    // Resumable BECAUSE the state travels, not just a position. The pruned
+    // `values` come from a *dynamic* `get_column_values` filter that is absent
+    // from the bind params a continuation rebuilds from, so carrying only a
+    // cursor would resume against the UNPRUNED set — which is why this producer
+    // was drain-only until the lock-step change made draining impossible.
+    // Sending `values` and `resolved` along with the cursor removes the problem
+    // rather than working around it (the key set is small).
+    vgi::resume_fields!(values, resolved, cursor);
 }
 
 pub struct ValuePruneFunction;

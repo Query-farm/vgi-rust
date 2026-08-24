@@ -243,6 +243,11 @@ impl TableProducer for TaggedDrain {
         self.after_id = log_id;
         Ok(Some(ipc::read_batch(&value)?))
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +438,11 @@ impl TableProducer for CachedTagRow {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 

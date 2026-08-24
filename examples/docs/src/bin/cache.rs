@@ -107,6 +107,11 @@ impl TableProducer for RatesProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 struct Rates;
@@ -161,6 +166,11 @@ impl TableProducer for CallsProducer {
         RecordBatch::try_new(self.schema.clone(), vec![col])
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
     }
 }
 

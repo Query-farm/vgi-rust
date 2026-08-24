@@ -111,6 +111,11 @@ impl TableProducer for BrokenPartProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        // Single batch: there is nothing to resume. Declared explicitly —
+        // `resume_supported` has no default, so every producer states this.
+        false
+    }
 }
 
 pub struct BrokenPartitionFunction {
