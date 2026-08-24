@@ -114,6 +114,7 @@ fn start_server() -> u16 {
         name: "test_drain",
         resumable: false,
     });
+    w.register_table_in_out(MultiBatchFinishFunction);
     let server = Arc::new(w.build_server());
     let state = HttpState::builder()
         .server(server)
@@ -566,5 +567,172 @@ fn buffering_bind_resolves_after_secrets_provided() {
     assert!(
         !resp.output_schema.0.is_empty(),
         "on_bind should have produced the output schema"
+    );
+}
+
+/// A table-in-out function whose FINALIZE flush is MORE THAN ONE batch.
+///
+/// This shape had no fixture in any SDK, which is why nothing caught that it
+/// was a hard error over HTTP: the dispatcher builds a `VecProducer` for the
+/// flush, and a producer that cannot resume gets exactly one turn — so the
+/// second batch tripped "emits more than one batch but cannot serve an HTTP
+/// continuation". Every existing finalize fixture returns `vec![batch]`.
+struct MultiBatchFinishFunction;
+
+impl crate::table_in_out::TableInOutFunction for MultiBatchFinishFunction {
+    fn name(&self) -> &str {
+        "test_multi_finish"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        // A positional arg is not incidental: `Arguments::serialize_positional`
+        // over an empty slice writes an IPC stream with no record batch, which
+        // the bind decoder rejects with "ipc stream had no record batch".
+        vec![ArgSpec::const_arg(
+            "n_batches",
+            0,
+            "int64",
+            "Batches the finalize flush emits",
+        )]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, _p: &ProcessParams, _b: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(Vec::new())
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn finish(&self, p: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        let n = p.arguments.const_i64(0).unwrap_or(FINISH_BATCHES);
+        // One row per batch, so batch boundaries are unambiguous in the assert.
+        Ok((0..n)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema_n(),
+                    vec![Arc::new(Int64Array::from(vec![i])) as ArrayRef],
+                )
+                .unwrap()
+            })
+            .collect())
+    }
+}
+
+const FINISH_BATCHES: i64 = 4;
+
+/// The `init` body for a FINALIZE-phase call on a table-in-out function.
+fn finalize_init_body(function: &str) -> Vec<u8> {
+    let args = crate::arguments::Arguments::serialize_positional(&[
+        Arc::new(Int64Array::from(vec![FINISH_BATCHES])) as ArrayRef,
+    ])
+    .unwrap();
+    let bind = BindRequest {
+        function_name: function.to_string(),
+        arguments: Bytes::from(args),
+        function_type: DictString("table".to_string()),
+        // A table-in-out bind carries the input schema; FINALIZE reuses the
+        // same bind call the INPUT phase used.
+        input_schema: Some(Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap())),
+        settings: None,
+        secrets: None,
+        attach_opaque_data: None,
+        transaction_opaque_data: None,
+        resolved_secrets_provided: false,
+        at_unit: None,
+        at_value: None,
+        schema_name: Some(crate::catalog::MAIN_SCHEMA.to_string()),
+    };
+    let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
+    let init = InitRequest {
+        bind_call: Bytes::from(bind_bytes),
+        output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
+        bind_opaque_data: None,
+        projection_ids: None,
+        pushdown_filters: None,
+        join_keys: None,
+        phase: Some(DictString(
+            crate::protocol::enums::phase::FINALIZE.to_string(),
+        )),
+        execution_id: Some(Bytes::from(b"finalize-exec".to_vec())),
+        init_opaque_data: None,
+        substream_id: None,
+        order_by_column_name: None,
+        order_by_direction: None,
+        order_by_null_order: None,
+        order_by_limit: None,
+        tablesample_percentage: None,
+        tablesample_seed: None,
+        finalize_state_id: None,
+        split_tokens: None,
+        row_limit: None,
+    };
+    let inner = ipc::write_batch(&wire::to_batch(init).unwrap()).unwrap();
+    let req_schema = Arc::new(Schema::new(vec![Field::new(
+        "request",
+        DataType::Binary,
+        false,
+    )]));
+    let req = RecordBatch::try_new(
+        req_schema,
+        vec![Arc::new(BinaryArray::from(vec![inner.as_slice()])) as ArrayRef],
+    )
+    .unwrap();
+    frame(&req, "init", None)
+}
+
+/// A multi-batch table-in-out FINALIZE flush paginates over HTTP instead of
+/// failing — every row exactly once, in order, one batch per response.
+///
+/// Before the fix this returned an error naming the producer, because the flush
+/// producer declared `resume_supported() = false` AND was built with no rebuild
+/// blob. The fix does NOT re-run `finish()` to rebuild: `finish()` drains
+/// accumulated partials, so a second call is not obliged to return the same
+/// rows. The flush is persisted once at init and the continuation replays it,
+/// with only the position in the token.
+#[test]
+fn multi_batch_finalize_paginates_over_http() {
+    let port = start_server();
+
+    let mut all = Vec::new();
+    let mut responses = 0i64;
+    let first = parse(&post(
+        port,
+        "init/init",
+        finalize_init_body("test_multi_finish"),
+    ));
+    assert!(
+        first.max_batch_rows <= 1,
+        "first finalize response carried {} rows — the flush drained instead of paginating",
+        first.max_batch_rows
+    );
+    all.extend(first.values);
+    let mut token = first.token;
+    responses += 1;
+
+    while let Some(t) = token.take() {
+        let r = parse(&post(port, "init/exchange", exchange_body(&t)));
+        all.extend(r.values);
+        token = r.token;
+        responses += 1;
+        assert!(
+            responses <= FINISH_BATCHES + 5,
+            "finalize continuation did not terminate"
+        );
+    }
+
+    assert_eq!(
+        all,
+        (0..FINISH_BATCHES).collect::<Vec<_>>(),
+        "finalize rows or order wrong — a replayed flush must not drop or repeat rows"
+    );
+    assert!(
+        responses > 1,
+        "finalize did not paginate (drained in one response)"
     );
 }

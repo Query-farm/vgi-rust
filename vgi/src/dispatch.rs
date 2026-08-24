@@ -1309,11 +1309,50 @@ impl Dispatcher {
                     opaque_data: None,
                 })?;
                 let batches = f.finish(&params)?;
+                // Over HTTP a producer gets ONE batch per response, so a flush
+                // of more than one batch needs a continuation — and until this
+                // was wired it got a hard error instead ("emits more than one
+                // batch but cannot serve an HTTP continuation"). Nothing caught
+                // that because no fixture's `finish()` returned more than one
+                // batch.
+                //
+                // The continuation must NOT rebuild by calling `finish()` again:
+                // its contract is to *drain* accumulated partials, so a second
+                // call may legitimately return something different (or nothing).
+                // So persist the flush once, here, and replay it from storage.
+                // The scan position rides the token; the rows do not, which
+                // keeps a cursor small no matter how large the flush is.
+                //
+                // Gated on HTTP + >1 batch so the byte-stream transports, which
+                // never continue, pay nothing — and a single-batch flush keeps
+                // its existing one-turn drain with no storage write at all.
+                let resume_blob = if ctx.kind == Some(vgi_rpc::transport::TransportKind::Http)
+                    && batches.len() > 1
+                {
+                    self.store.kv_put(
+                        &execution_id,
+                        TIO_FINALIZE_KEY,
+                        &encode_finalize_flush(&batches, &output_schema)?,
+                    );
+                    Some(self.exchange_blob(
+                        "table_in_out_finalize",
+                        bind_call.function_name.clone(),
+                        &output_schema,
+                        input_schema.as_ref(),
+                        &bind_call,
+                        &dto,
+                        &execution_id,
+                        false,
+                        &[],
+                    )?)
+                } else {
+                    None
+                };
                 let state = TableProducerState {
                     inner: Box::new(VecProducer { batches, pos: 0 }),
                     filters: None,
                     project_to: None,
-                    resume_blob: None,
+                    resume_blob,
                     conditional_checked: false,
                 };
                 return Ok(
@@ -1659,6 +1698,38 @@ impl Dispatcher {
                 TableProducerState {
                     inner: producer,
                     filters,
+                    project_to: None,
+                    resume_blob: Some(bytes.to_vec()),
+                    conditional_checked: false,
+                },
+            )));
+        }
+        // Table-in-out FINALIZE flush. Rebuilt by REPLAYING the batches persisted
+        // at init (see `TIO_FINALIZE_KEY`), never by calling `finish()` again —
+        // `finish()` drains accumulated partials, so a second call is not
+        // required to return the same rows, and re-running it would risk both
+        // duplicating and losing finalize output.
+        if blob.kind == "table_in_out_finalize" {
+            let bytes_stored = self
+                .store
+                .kv_get(&blob.execution_id, TIO_FINALIZE_KEY)
+                .ok_or_else(|| {
+                    RpcError::runtime_error(format!(
+                        "cannot resume the FINALIZE flush for '{}': its persisted batches are \
+                         gone from storage. The continuation is served by whichever worker \
+                         instance receives it, so the storage backend must be shared across \
+                         every instance behind the endpoint (and must outlive a single \
+                         request); an in-memory store cannot serve HTTP continuations.",
+                        blob.function_name
+                    ))
+                })?;
+            let batches = decode_finalize_flush(&bytes_stored)?;
+            let mut producer = VecProducer { batches, pos: 0 };
+            producer.restore_resume(&blob.inner_resume);
+            return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
+                TableProducerState {
+                    inner: Box::new(producer),
+                    filters: None,
                     project_to: None,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
@@ -3690,15 +3761,58 @@ impl TableProducer for VecProducer {
         Ok(b)
     }
     fn resume_supported(&self) -> bool {
-        // Multi-batch (it walks a Vec of finalize batches), so this `false`
-        // is a real limitation, not a formality: a table-in-out FINALIZE that
-        // produces more than one batch is refused over HTTP. Declared rather
-        // than inherited so it is visible. Making it resumable needs proof
-        // that re-running `finish()` on rebuild reproduces the same batches
-        // (it reads BoundStorage keyed by execution_id, so probably — but
-        // "probably" is not enough to risk duplicating finalize rows).
-        false
+        // Resumable, but ONLY because the continuation replays a persisted copy
+        // of the flush rather than re-running `finish()`. See
+        // `persist_finalize_flush`: the position below is meaningless against a
+        // differently-shaped rebuild, so the two must stay together.
+        true
     }
+    fn encode_resume(&self) -> Vec<u8> {
+        // The position IS the whole state — the batches are rebuilt from
+        // storage, not from the token, so a cursor stays a few bytes no matter
+        // how large the flush is.
+        crate::table_function::encode_resume_state(&(self.pos as i64,))
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some((pos,)) = crate::table_function::decode_resume_state::<(i64,)>(bytes) {
+            self.pos = pos.max(0) as usize;
+        }
+    }
+}
+
+/// Storage key holding a table-in-out FINALIZE flush, scoped by `execution_id`.
+///
+/// Framework-owned, hence the reserved `_vgi/` prefix — a worker must never see
+/// or write this.
+const TIO_FINALIZE_KEY: &[u8] = b"_vgi/tio_finalize_flush";
+
+/// Serialize a finalize flush as one Arrow IPC stream.
+fn encode_finalize_flush(
+    batches: &[RecordBatch],
+    schema: &arrow_schema::SchemaRef,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut w = vgi_rpc::wire::StreamWriter::new(&mut buf, schema.as_ref())?;
+        for b in batches {
+            w.write(b, None)?;
+        }
+        w.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Read back a flush written by [`encode_finalize_flush`].
+fn decode_finalize_flush(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    let mut r = vgi_rpc::wire::StreamReader::new(std::io::Cursor::new(bytes))?;
+    let mut out = Vec::new();
+    while let Some((b, _md)) = r.read_next()? {
+        out.push(b);
+    }
+    Ok(out)
 }
 
 /// Per-input-batch table-in-out exchange. Applies auto-filter pushdown.
