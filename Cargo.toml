@@ -4,7 +4,7 @@ members = ["vgi-protocol", "vgi-client", "vgi", "vgi-example-worker", "vgi-stora
 
 
 [workspace.package]
-version = "0.29.0"
+version = "0.30.0"
 edition = "2021"
 rust-version = "1.97"
 license-file = "LICENSE"
@@ -23,9 +23,9 @@ repository = "https://github.com/Query-farm/vgi-rust"
 vgi-rpc = { version = "0.23.0", default-features = false, features = ["macros", "stream-codec", "shm"] }
 # The direction-agnostic wire protocol (DTOs + Arrow codec + IPC helpers), shared
 # by the worker framework and any client. Kept feature-free and wasm-buildable.
-vgi-protocol = { version = "0.29.0", path = "vgi-protocol" }
+vgi-protocol = { version = "0.30.0", path = "vgi-protocol" }
 # The VGI protocol client (attach, discovery, function calls).
-vgi-client = { version = "0.29.0", path = "vgi-client" }
+vgi-client = { version = "0.30.0", path = "vgi-client" }
 # Transport-level RPC client the VGI client is built on.
 vgi-rpc-client = { version = "0.23.0", default-features = false }
 arrow = { version = "59", default-features = false, features = ["ipc"] }

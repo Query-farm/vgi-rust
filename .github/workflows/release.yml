@@ -66,13 +66,62 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish vgi
+      # Publish in dependency order. `vgi` gained a dependency on the
+      # `vgi-protocol` crate after v0.29.0, and this step still published only
+      # `-p vgi` — which cannot work, because cargo resolves a path+version
+      # dependency against the REGISTRY when packaging, and vgi-protocol had
+      # never been published (crates.io returned 404 for it). The first tag
+      # after the split would have failed here.
+      #
+      # Order is vgi-protocol -> vgi -> vgi-client (vgi-client depends on both).
+      # vgi-example-worker / vgi-storage-server / vgi-docs-examples are
+      # `publish = false` and excluded.
+      #
+      # Idempotent by design: a version already on crates.io is skipped rather
+      # than failing the job, so a re-run after a partial publish completes the
+      # remainder instead of needing a version bump.
+      - name: Publish crates in dependency order
         run: |
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            cargo publish --dry-run -p vgi
-          else
-            cargo publish -p vgi
-          fi
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys,json;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='vgi'))")
+          echo "Publishing workspace version $version"
+
+          already_published() {
+            # 200 with a matching version => this exact version exists.
+            curl -sf "https://crates.io/api/v1/crates/$1/$2" \
+              -H 'User-Agent: vgi-release' >/dev/null 2>&1
+          }
+
+          for crate in vgi-protocol vgi vgi-client; do
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              echo "::group::dry-run $crate"
+              cargo publish --dry-run -p "$crate"
+              echo "::endgroup::"
+              continue
+            fi
+
+            if already_published "$crate" "$version"; then
+              echo "$crate $version already on crates.io — skipping"
+              continue
+            fi
+
+            echo "::group::publish $crate $version"
+            cargo publish -p "$crate"
+            echo "::endgroup::"
+
+            # cargo publish waits for the index, but the sparse index and the
+            # API can lag each other by a few seconds. The next crate in the
+            # chain resolves this one from the registry, so confirm it is
+            # actually visible before moving on.
+            for _ in $(seq 1 60); do
+              if already_published "$crate" "$version"; then
+                echo "$crate $version is visible on crates.io"
+                break
+              fi
+              sleep 5
+            done
+          done
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
