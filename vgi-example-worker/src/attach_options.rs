@@ -241,7 +241,6 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
 /// `serialize_attach_option_spec` rejects declaring both. `region` carries a
 /// default, so the catalog also proves that required and optional coexist.
 pub fn required_catalog() -> vgi::catalog::CatalogModel {
-
     let api_key = vgi::catalog::serialize_attach_option_spec(
         "api_key",
         "API key",

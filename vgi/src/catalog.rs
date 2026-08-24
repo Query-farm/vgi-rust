@@ -1270,7 +1270,9 @@ pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInf
             build_macro_defaults(&m.defaults).unwrap_or_default(),
         )),
         definition: m.definition.clone(),
-        arguments_schema: Some(Bytes::from(build_macro_arguments_schema(m).unwrap_or_default())),
+        arguments_schema: Some(Bytes::from(
+            build_macro_arguments_schema(m).unwrap_or_default(),
+        )),
     }
 }
 
@@ -1956,7 +1958,8 @@ mod required_attach_option_discovery_tests {
     fn required_names_come_back_out_of_the_advertised_specs() {
         let default: ArrayRef = Arc::new(StringArray::from(vec!["us-east-1"]));
         let specs = vec![
-            serialize_attach_option_spec("api_key", "API key", &DataType::Utf8, None, true).unwrap(),
+            serialize_attach_option_spec("api_key", "API key", &DataType::Utf8, None, true)
+                .unwrap(),
             serialize_attach_option_spec(
                 "region",
                 "Region",
@@ -2013,7 +2016,8 @@ mod required_attach_option_discovery_tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("required but also declares a default"),
+            err.to_string()
+                .contains("required but also declares a default"),
             "unexpected message: {err}"
         );
     }

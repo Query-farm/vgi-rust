@@ -37,9 +37,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             wire::params_schema_for("init"),
             move |req, ctx| d.handle_init(req, ctx),
         )
-            // HTTP continuations rebuild the (stateless) exchange handler from an
-            // AEAD state token; without a decoder the server 500s on /init/exchange.
-            .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
+        // HTTP continuations rebuild the (stateless) exchange handler from an
+        // AEAD state token; without a decoder the server 500s on /init/exchange.
+        .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
         srv.register(info);
     }
 
