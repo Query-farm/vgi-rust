@@ -21,6 +21,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(SecretInOutFunction);
     w.register_table_in_out(RepeatInputsFunction);
     w.register_table_in_out(SubstreamPartialSumFunction);
+    w.register_table_in_out(MultiBatchFinishFunction);
     w.register_table_in_out(SlowCancellableInOutFunction);
     blended::register(w);
     cached::register(w);
@@ -162,6 +163,114 @@ impl TableInOutFunction for SubstreamPartialSumFunction {
         let batch = RecordBatch::try_new(params.output_schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(vec![batch])
+    }
+}
+
+const MBF_NS: &[u8] = b"mbf_rows";
+
+/// `multi_batch_finish(input)` — a streaming FINALIZE that emits MANY batches.
+///
+/// Every other finalize fixture, in every SDK, emits exactly ONE batch — and one
+/// batch is the easy case: over HTTP a producer is strictly lock-step, so a
+/// single-batch flush completes inside its one turn and never needs a
+/// continuation. Two or more do, and that path was broken in two independent
+/// places until this fixture existed to run it.
+///
+/// It emits one batch per input row the substream saw: the first carries that
+/// substream's `total`, the rest carry 0. The split makes the failure modes
+/// distinguishable — a wrong SUM means a batch's CONTENTS were lost, a wrong
+/// COUNT means a whole BATCH was, and a flush truncated after its first batch
+/// still sums correctly, so only the count betrays it.
+pub struct MultiBatchFinishFunction;
+
+impl MultiBatchFinishFunction {
+    fn state_scope(params: &ProcessParams) -> Vec<u8> {
+        params
+            .substream_id
+            .clone()
+            .unwrap_or_else(|| params.execution_id.clone())
+    }
+}
+
+impl TableInOutFunction for MultiBatchFinishFunction {
+    fn name(&self) -> &str {
+        "multi_batch_finish"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description:
+                "Streaming finalize that emits one batch per input row (multi-batch flush)"
+                    .to_string(),
+            categories: vec!["testing".into(), "aggregation".into()],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![table_arg("data", 0)]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| RpcError::value_error("multi_batch_finish requires input"))?;
+        let field = input
+            .fields()
+            .first()
+            .ok_or_else(|| RpcError::value_error("multi_batch_finish requires a column"))?;
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                field.name(),
+                arrow_schema::DataType::Int64,
+                true,
+            )])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        let cast = arrow_cast::cast(batch.column(0), &arrow_schema::DataType::Int64)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let a = cast.as_primitive::<Int64Type>();
+        let s: i64 = (0..a.len())
+            .filter(|&i| a.is_valid(i))
+            .map(|i| a.value(i))
+            .sum();
+        if let Some(store) = &params.storage {
+            // (sum, rows) for this process call; finish() folds them.
+            let mut blob = s.to_le_bytes().to_vec();
+            blob.extend_from_slice(&(a.len() as i64).to_le_bytes());
+            store.append(&Self::state_scope(params), MBF_NS, b"", blob);
+        }
+        Ok(Vec::new()) // accumulate only; the whole point is the flush
+    }
+    fn finish(&self, params: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        let mut total = 0i64;
+        let mut rows = 0i64;
+        if let Some(store) = &params.storage {
+            for (_id, blob) in store.scan(&Self::state_scope(params), MBF_NS, b"", -1, usize::MAX) {
+                if blob.len() == 16 {
+                    if let (Ok(t), Ok(r)) = (
+                        <[u8; 8]>::try_from(&blob[0..8]),
+                        <[u8; 8]>::try_from(&blob[8..16]),
+                    ) {
+                        total += i64::from_le_bytes(t);
+                        rows += i64::from_le_bytes(r);
+                    }
+                }
+            }
+        }
+        (0..rows)
+            .map(|i| {
+                let v = if i == 0 { total } else { 0 };
+                let col = Arc::new(arrow_array::Int64Array::from(vec![v])) as Arc<dyn Array>;
+                RecordBatch::try_new(params.output_schema.clone(), vec![col])
+                    .map_err(|e| RpcError::runtime_error(e.to_string()))
+            })
+            .collect()
     }
 }
 

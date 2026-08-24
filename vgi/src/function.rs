@@ -562,6 +562,11 @@ pub struct ProcessParams {
     /// it. `None` for the serial path or an old client that did not supply one.
     /// See `InitRequest::substream_id`.
     pub substream_id: Option<Vec<u8>>,
+    /// Opaque state returned by `on_bind` and echoed through
+    /// `InitRequest.bind_opaque_data`.
+    pub bind_opaque_data: Vec<u8>,
+    /// Opaque state returned by split planning and echoed through
+    /// `InitRequest.init_opaque_data`.
     pub init_opaque_data: Vec<u8>,
     /// Parsed call arguments (const values).
     pub arguments: crate::arguments::Arguments,

@@ -585,7 +585,7 @@ impl TableFunction for TxCachedValueFunction {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let v = params
-            .init_opaque_data
+            .bind_opaque_data
             .get(..8)
             .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
             .unwrap_or(0);

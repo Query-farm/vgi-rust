@@ -73,6 +73,19 @@ Two limits are worth knowing:
   iterations). A caller that owns its client retries it with
   `RetryPolicy::run`.
 
+## Split planning
+
+`VgiClient::plan` follows paginated split enumeration to completion and returns
+the full protocol 1.4 plan: redemption context, row and byte estimates,
+partition bounds, column statistics, locality, partition transforms, within-split
+ordering, cache age, and streaming positions. Plan-level facts are taken from
+the first page; later pages contribute splits and cursors only.
+
+Redeem a packed token group with `ScanPlan::redemption_options`. It echoes the
+plan's `execution_id` and `init_opaque_data` along with the tokens, avoiding a
+subtle cross-process state mismatch that is easy to create by assembling
+`ScanOptions` manually.
+
 ## Blocking
 
 Every call blocks, matching the underlying transport client and both other VGI

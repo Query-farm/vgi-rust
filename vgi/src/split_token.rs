@@ -316,8 +316,9 @@ pub struct PlanOutcome {
     /// rather than an error.
     pub splits: Vec<PlannedSplit>,
     /// Continued enumeration. If more than one is returned they MUST partition
-    /// the remaining enumeration disjointly and exhaustively — the client dedups
-    /// by token regardless, because violating it produces duplicate ROWS.
+    /// the remaining enumeration disjointly and exhaustively. Clients deliberately
+    /// do not deduplicate opaque or randomly sealed tokens, so violating this
+    /// contract produces duplicate rows.
     pub next_cursors: Vec<Vec<u8>>,
     /// NORMATIVE cap on redemption concurrency, not advisory.
     pub max_workers: Option<i64>,
@@ -330,7 +331,24 @@ pub struct PlanOutcome {
     /// `catalog` (the default) or `transaction`. A transaction-scoped plan is
     /// not cacheable and is not redeemable after commit or rollback.
     pub scope: Option<String>,
+    /// Identifier for state shared by planning and every split redemption.
+    /// Workers that set it must keep the corresponding state cross-process.
+    pub execution_id: Option<Vec<u8>>,
+    /// Opaque planning state echoed unchanged on every split init.
+    pub init_opaque_data: Option<Vec<u8>>,
+    /// Hoisted location names. Individual splits refer to these by index through
+    /// [`PlannedSplit::location_ids`].
+    pub locations: Option<Vec<String>>,
+    /// How single-valued partition columns are derived. Report this only when
+    /// every split has exact single-valued [`PlannedSplit::partition_bounds`].
+    pub partitioning: Option<Vec<crate::protocol::dtos::PartitionTransform>>,
+    /// Ordering guaranteed within each individual split.
+    pub sort_order: Option<Vec<crate::protocol::dtos::SortField>>,
     pub cache_max_age_seconds: Option<i64>,
+    /// Exclusive lower bound actually used for the plan's data range.
+    pub start_position: Option<Vec<u8>>,
+    /// Inclusive frontier resolved at planning time.
+    pub end_position: Option<Vec<u8>>,
 }
 
 /// One planned unit of work, before the framework stamps its token.
@@ -353,4 +371,24 @@ pub struct PlannedSplit {
     pub start_position: Option<Vec<u8>>,
     /// `None` means UNBOUNDED — a shard read forever.
     pub end_position: Option<Vec<u8>>,
+}
+
+impl PlannedSplit {
+    /// Attach a two-row `(min, max)` Arrow batch of partition bounds.
+    pub fn with_partition_bounds(
+        mut self,
+        bounds: &arrow_array::RecordBatch,
+    ) -> vgi_rpc::Result<Self> {
+        self.partition_bounds = Some(crate::ipc::write_batch(bounds)?);
+        Ok(self)
+    }
+
+    /// Attach optimizer column statistics using VGI's canonical IPC encoding.
+    pub fn with_column_statistics(
+        mut self,
+        statistics: &[crate::statistics::CatColStat],
+    ) -> vgi_rpc::Result<Self> {
+        self.column_statistics = Some(crate::statistics::serialize_column_statistics(statistics)?);
+        Ok(self)
+    }
 }

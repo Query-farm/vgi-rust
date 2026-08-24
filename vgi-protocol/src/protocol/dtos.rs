@@ -526,6 +526,37 @@ pub struct PlanResponse {
     pub end_position: Option<Bytes>,
 }
 
+/// How a partition column is derived, for engines that understand storage
+/// partitioning. Serialized individually into [`PlanResponse::partitioning`].
+///
+/// The transform vocabulary is the canonical VGI/Iceberg vocabulary:
+/// `identity`, `bucket`, `truncate`, `year`, `month`, `day`, and `hour`.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct PartitionTransform {
+    /// Output-schema column produced by the transform.
+    pub column: String,
+    /// Transform name from the canonical vocabulary.
+    pub transform: String,
+    /// Bucket count for `bucket`, width for `truncate`, otherwise `None`.
+    pub param: Option<i64>,
+}
+
+/// Ordering guaranteed within each split. Serialized individually into
+/// [`PlanResponse::sort_order`].
+///
+/// This is not a global ordering claim across splits. A client that concatenates
+/// multiple splits into one physical partition must discard the ordering unless
+/// it can independently prove that the runs are contiguous and ordered.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct SortField {
+    /// Output-schema column that is ordered.
+    pub column: String,
+    /// `asc` or `desc`.
+    pub direction: DictString,
+    /// `nulls_first` or `nulls_last`.
+    pub nulls: DictString,
+}
+
 /// `ScanSplit` — one named, independently redeemable unit of scan work.
 ///
 /// A split NAMES work rather than describing it: "these three files at version
@@ -1290,6 +1321,31 @@ pub struct AggregateDestructorRequest {
 #[cfg(test)]
 mod federation_tests {
     use super::*;
+
+    #[test]
+    fn split_optimizer_metadata_roundtrips() {
+        let transform = PartitionTransform {
+            column: "customer_id".to_string(),
+            transform: "bucket".to_string(),
+            param: Some(32),
+        };
+        let batch = crate::wire::to_batch(transform).unwrap();
+        let back: PartitionTransform = crate::wire::from_batch(&batch).unwrap();
+        assert_eq!(back.column, "customer_id");
+        assert_eq!(back.transform, "bucket");
+        assert_eq!(back.param, Some(32));
+
+        let sort = SortField {
+            column: "event_time".to_string(),
+            direction: DictString("desc".to_string()),
+            nulls: DictString("nulls_last".to_string()),
+        };
+        let batch = crate::wire::to_batch(sort).unwrap();
+        let back: SortField = crate::wire::from_batch(&batch).unwrap();
+        assert_eq!(back.column, "event_time");
+        assert_eq!(back.direction.0, "desc");
+        assert_eq!(back.nulls.0, "nulls_last");
+    }
 
     #[test]
     fn scan_branch_catalog_table_roundtrips() {

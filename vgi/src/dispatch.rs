@@ -1118,8 +1118,13 @@ impl Dispatcher {
                 input_schema: input_schema.clone(),
                 execution_id: execution_id.clone(),
                 substream_id: dto.substream_id.clone().map(|b| b.into()),
-                init_opaque_data: dto
+                bind_opaque_data: dto
                     .bind_opaque_data
+                    .clone()
+                    .map(|b| b.into())
+                    .unwrap_or_default(),
+                init_opaque_data: dto
+                    .init_opaque_data
                     .clone()
                     .map(|b| b.into())
                     .unwrap_or_default(),
@@ -1556,6 +1561,11 @@ impl Dispatcher {
                 .clone()
                 .map(|b| b.0)
                 .unwrap_or_default(),
+            plan_init_opaque: dto
+                .init_opaque_data
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
             pushdown_filters: dto
                 .pushdown_filters
                 .clone()
@@ -1617,7 +1627,8 @@ impl Dispatcher {
             } else {
                 Some(blob.split_payloads.clone())
             },
-            init_opaque_data: blob.init_opaque.clone(),
+            bind_opaque_data: blob.init_opaque.clone(),
+            init_opaque_data: blob.plan_init_opaque.clone(),
             arguments: args,
             settings: settings.clone(),
             secrets: secrets.clone(),
@@ -2494,6 +2505,44 @@ impl Dispatcher {
             })?));
         };
 
+        if let Some(locations) = &outcome.locations {
+            for (split_index, split) in outcome.splits.iter().enumerate() {
+                for location_id in split.location_ids.iter().flatten() {
+                    let valid = usize::try_from(*location_id)
+                        .ok()
+                        .is_some_and(|id| id < locations.len());
+                    if !valid {
+                        return Err(RpcError::value_error(format!(
+                            "split {split_index} refers to location id {location_id}, but the plan has {} location(s)",
+                            locations.len()
+                        )));
+                    }
+                }
+            }
+        } else if let Some((split_index, _)) = outcome
+            .splits
+            .iter()
+            .enumerate()
+            .find(|(_, split)| split.location_ids.is_some())
+        {
+            return Err(RpcError::value_error(format!(
+                "split {split_index} has location_ids but the plan has no locations"
+            )));
+        }
+        if outcome
+            .partitioning
+            .as_ref()
+            .is_some_and(|partitioning| !partitioning.is_empty())
+            && outcome
+                .splits
+                .iter()
+                .any(|split| split.partition_bounds.is_none())
+        {
+            return Err(RpcError::value_error(
+                "a partitioned plan requires partition_bounds on every split",
+            ));
+        }
+
         // The framework stamps every token: an author cannot forget the
         // consistency anchor, cannot mis-bind the fingerprint, and never writes
         // crypto — and the envelope stays a private implementation detail.
@@ -2533,6 +2582,37 @@ impl Dispatcher {
             splits.push(Bytes::from(ipc::write_batch(&batch)?));
         }
 
+        let partitioning = outcome
+            .partitioning
+            .as_ref()
+            .map(|transforms| {
+                transforms
+                    .iter()
+                    .cloned()
+                    .map(|transform| {
+                        wire::to_batch(transform)
+                            .and_then(|batch| ipc::write_batch(&batch))
+                            .map(Bytes::from)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let sort_order = outcome
+            .sort_order
+            .as_ref()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .cloned()
+                    .map(|field| {
+                        wire::to_batch(field)
+                            .and_then(|batch| ipc::write_batch(&batch))
+                            .map(Bytes::from)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+
         Ok(Some(wire::to_result_batch(PlanResponse {
             splits,
             next_cursors: Some(
@@ -2543,8 +2623,8 @@ impl Dispatcher {
                     .map(Bytes::from)
                     .collect(),
             ),
-            execution_id: None,
-            init_opaque_data: Some(Bytes::from(Vec::new())),
+            execution_id: outcome.execution_id.clone().map(Bytes::from),
+            init_opaque_data: outcome.init_opaque_data.clone().map(Bytes::from),
             max_workers: outcome.max_workers,
             estimated_total_splits: outcome.estimated_total_splits,
             estimated_total_rows: outcome.estimated_total_rows,
@@ -2554,12 +2634,12 @@ impl Dispatcher {
                 .scope
                 .clone()
                 .unwrap_or_else(|| "catalog".to_string()),
-            locations: None,
-            partitioning: Some(Vec::new()),
-            sort_order: Some(Vec::new()),
+            locations: outcome.locations.clone(),
+            partitioning,
+            sort_order,
             cache_max_age_seconds: outcome.cache_max_age_seconds,
-            start_position: Some(Bytes::from(Vec::new())),
-            end_position: Some(Bytes::from(Vec::new())),
+            start_position: outcome.start_position.clone().map(Bytes::from),
+            end_position: outcome.end_position.clone().map(Bytes::from),
         })?))
     }
 
@@ -3701,6 +3781,10 @@ pub struct ExchangeBlob {
     /// a continuation would rebuild a source pointed at nothing.
     #[serde(default)]
     pub finalize_state_id: Vec<u8>,
+    /// Plan-scoped opaque state. The older `init_opaque` field carries
+    /// bind-scoped state and is retained for continuation-token compatibility.
+    #[serde(default)]
+    pub plan_init_opaque: Vec<u8>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.

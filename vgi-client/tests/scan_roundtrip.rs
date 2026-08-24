@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use arrow_array::{cast::AsArray, types::Int64Type};
-use vgi_client::{Arguments, AttachOptions, BindSpec, ScanOptions, VgiClient};
+use vgi_client::{Arguments, AttachOptions, BindSpec, PlanOptions, ScanOptions, VgiClient};
 
 fn example_worker() -> Option<PathBuf> {
     let mut dir = std::env::current_exe().ok()?;
@@ -107,6 +107,51 @@ fn a_large_scan_drains_every_row_in_order() {
         seen.windows(2).all(|w| w[1] == w[0] + 1),
         "the drained sequence has a gap or a repeat"
     );
+}
+
+#[test]
+fn planned_split_metadata_and_redemption_context_round_trip() {
+    skip_without_worker!();
+    let mut client = connect();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let schema_name = cat.default_schema().to_string();
+    let spec = BindSpec::table("split_partitioned")
+        .in_schema(&schema_name)
+        .with_arguments(Arguments::new().named("rows_per_country", 3i64));
+    let bound = client.bind(&cat, &spec).expect("bind");
+    let plan = client
+        .plan(&bound, &PlanOptions::default())
+        .expect("plan splits");
+
+    assert_eq!(plan.splits.len(), 4);
+    assert_eq!(plan.estimated_total_rows, Some(12));
+    assert_eq!(
+        plan.locations.as_deref(),
+        Some(["local".to_string()].as_slice())
+    );
+    assert_eq!(plan.partitioning.as_ref().unwrap()[0].column, "country");
+    assert_eq!(plan.sort_order.as_ref().unwrap()[0].column, "sales");
+    assert!(plan
+        .splits
+        .iter()
+        .all(|split| split.partition_bounds.is_some()
+            && split.column_statistics.is_some()
+            && split.location_ids.as_deref() == Some([0].as_slice())));
+
+    let tokens = plan
+        .splits
+        .iter()
+        .map(|split| split.token.clone())
+        .collect();
+    let options = plan.redemption_options(tokens, ScanOptions::default());
+    let batches = client
+        .scan(&bound, &options)
+        .expect("split init")
+        .collect()
+        .expect("drain splits");
+    assert_eq!(total_rows(&batches), 12);
 }
 
 #[test]

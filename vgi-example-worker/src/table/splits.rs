@@ -19,10 +19,11 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::protocol::dtos::TableFunctionPlanRequest;
+use vgi::protocol::dtos::{PartitionTransform, SortField, TableFunctionPlanRequest};
 use vgi::split_token::{PlanOutcome, PlannedSplit};
+use vgi::statistics::{CatColStat, StatValue};
 use vgi::table_function::{resume, TableFunction, TableProducer};
-use vgi_rpc::{Result, RpcError};
+use vgi_rpc::{DictString, Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(SplitScan::new(
@@ -1394,6 +1395,8 @@ impl TableProducer for CacheableProducer {
 struct SplitPartitioned;
 
 const COUNTRIES: [&str; 4] = ["US", "DE", "JP", "BR"];
+const SPLIT_PLAN_EXECUTION_ID: &[u8] = b"split-partitioned-execution";
+const SPLIT_PLAN_OPAQUE: &[u8] = b"split-partitioned-plan-state";
 
 impl SplitPartitioned {
     fn schema() -> SchemaRef {
@@ -1425,6 +1428,13 @@ impl TableFunction for SplitPartitioned {
             ArgSpec::const_arg("rows_per_country", -1, "int64", "Rows in each partition")
                 .with_ge(0.0)
                 .with_default(5),
+            ArgSpec::const_arg(
+                "require_plan_context",
+                -1,
+                "boolean",
+                "Reject redemption unless plan execution context is echoed",
+            )
+            .with_default(false),
         ]
     }
 
@@ -1437,24 +1447,95 @@ impl TableFunction for SplitPartitioned {
 
     fn on_plan(
         &self,
-        _params: &BindParams,
+        params: &BindParams,
         _request: &TableFunctionPlanRequest,
     ) -> Result<Option<PlanOutcome>> {
+        let rows = params.arguments.named_i64("rows_per_country").unwrap_or(5);
         // The payload names the partition by INDEX, so a redemption reads the
         // same partition however many times it runs and in whichever process.
         Ok(Some(PlanOutcome {
             estimated_total_splits: Some(COUNTRIES.len() as i64),
+            estimated_total_rows: Some(rows.max(0) * COUNTRIES.len() as i64),
+            estimated_total_bytes: Some(rows.max(0) * COUNTRIES.len() as i64 * 16),
+            execution_id: Some(SPLIT_PLAN_EXECUTION_ID.to_vec()),
+            init_opaque_data: Some(SPLIT_PLAN_OPAQUE.to_vec()),
+            locations: Some(vec!["local".to_string()]),
+            partitioning: Some(vec![PartitionTransform {
+                column: "country".to_string(),
+                transform: "identity".to_string(),
+                param: None,
+            }]),
+            sort_order: Some(vec![SortField {
+                column: "sales".to_string(),
+                direction: DictString("asc".to_string()),
+                nulls: DictString("nulls_last".to_string()),
+            }]),
+            cache_max_age_seconds: Some(60),
             splits: (0..COUNTRIES.len() as i64)
-                .map(|i| PlannedSplit {
-                    payload: i.to_le_bytes().to_vec(),
-                    ..Default::default()
+                .map(|i| {
+                    let country = COUNTRIES[i as usize];
+                    let bounds = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new(
+                            "country",
+                            DataType::Utf8,
+                            true,
+                        )])),
+                        vec![Arc::new(arrow_array::StringArray::from(vec![
+                            country, country,
+                        ]))],
+                    )
+                    .map_err(|error| RpcError::runtime_error(error.to_string()))?;
+                    let base = i * 100;
+                    PlannedSplit {
+                        payload: i.to_le_bytes().to_vec(),
+                        estimated_rows: Some(rows.max(0)),
+                        rows_exact: true,
+                        estimated_bytes: Some(rows.max(0) * 16),
+                        location_ids: Some(vec![0]),
+                        ..Default::default()
+                    }
+                    .with_partition_bounds(&bounds)?
+                    .with_column_statistics(&[
+                        CatColStat {
+                            column_name: "country".to_string(),
+                            min: StatValue::Utf8(country.to_string()),
+                            max: StatValue::Utf8(country.to_string()),
+                            has_null: false,
+                            has_not_null: rows > 0,
+                            distinct_count: Some((rows > 0) as i64),
+                            contains_unicode: Some(false),
+                            max_string_length: Some(country.len() as u64),
+                        },
+                        CatColStat {
+                            column_name: "sales".to_string(),
+                            min: StatValue::Int64(base + 1),
+                            max: StatValue::Int64(base + rows.max(1)),
+                            has_null: false,
+                            has_not_null: rows > 0,
+                            distinct_count: Some(rows.max(0)),
+                            contains_unicode: None,
+                            max_string_length: None,
+                        },
+                    ])
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             ..Default::default()
         }))
     }
 
-    fn on_split(&self, _params: &ProcessParams) -> Result<()> {
+    fn on_split(&self, params: &ProcessParams) -> Result<()> {
+        let require_plan_context = params
+            .arguments
+            .named_bool("require_plan_context")
+            .unwrap_or(false);
+        if require_plan_context
+            && (params.execution_id != SPLIT_PLAN_EXECUTION_ID
+                || params.init_opaque_data != SPLIT_PLAN_OPAQUE)
+        {
+            return Err(RpcError::runtime_error(
+                "split_partitioned redemption did not echo its plan execution context",
+            ));
+        }
         Ok(())
     }
 

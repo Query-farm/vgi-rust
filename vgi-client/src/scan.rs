@@ -21,12 +21,12 @@ use arrow_schema::SchemaRef;
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    BindRequest, BindResponse, GlobalInitResponse, InitRequest, PlanResponse, ScanSplit,
-    TableFunctionPlanRequest,
+    BindRequest, BindResponse, GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse,
+    ScanSplit, SortField, TableFunctionPlanRequest,
 };
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
-use vgi_rpc::{Bytes, DictString, LargeBytes};
+use vgi_rpc::{Bytes, DictString, LargeBytes, VgiArrow};
 
 use crate::args::Arguments;
 use crate::catalog::{At, AttachedCatalog};
@@ -183,7 +183,7 @@ impl BoundFunction {
                 .map(|ks| ks.iter().cloned().map(LargeBytes).collect()),
             phase: phase.map(|p| DictString(p.to_string())),
             execution_id: opts.execution_id.clone(),
-            init_opaque_data: None,
+            init_opaque_data: opts.init_opaque_data.clone(),
             substream_id: opts.substream_id.clone(),
             order_by_column_name: opts.order_by.as_ref().map(|o| o.column.clone()),
             order_by_direction: opts
@@ -315,6 +315,10 @@ pub struct ScanOptions {
     /// `execution_id`; parallel connections pass that id back so the worker
     /// knows they are the same scan.
     pub execution_id: Option<Bytes>,
+    /// Opaque state returned by split planning and echoed unchanged on every
+    /// redemption init. Use [`ScanPlan::redemption_options`] rather than setting
+    /// this by hand when scanning planned splits.
+    pub init_opaque_data: Option<Bytes>,
     /// A client-minted per-substream identity, for the exchange shapes.
     pub substream_id: Option<Bytes>,
     /// The split envelopes this connection redeems, from a prior `plan()`.
@@ -661,6 +665,12 @@ pub struct ScanSplitInfo {
     /// planning time. `None` degrades such an engine to round-robin by count;
     /// a greedily-claiming engine needs no cost model at all.
     pub estimated_bytes: Option<i64>,
+    /// Two-row `(min, max)` partition bounds in Arrow form.
+    pub partition_bounds: Option<RecordBatch>,
+    /// Per-column optimizer statistics in VGI's canonical Arrow form.
+    pub column_statistics: Option<RecordBatch>,
+    /// Indices into [`ScanPlan::locations`] where this split is cheap to read.
+    pub location_ids: Option<Vec<i64>>,
     /// Where this split's range in the DATA begins. Its presence is what makes
     /// an unbounded split recognizable: `end_position: None` alone cannot say,
     /// because it is also the default for every ordinary batch split.
@@ -679,6 +689,10 @@ pub struct ScanPlan {
     /// rather than an error. An engine that maps partitions to splits must still
     /// clamp to at least one (empty) partition.
     pub splits: Vec<ScanSplitInfo>,
+    /// Identifier for state shared by planning and split redemption.
+    pub execution_id: Option<Bytes>,
+    /// Opaque planning state that must be echoed on every split init.
+    pub init_opaque_data: Option<Bytes>,
     /// NORMATIVE cap on how many splits may be redeemed concurrently, not
     /// advisory. An engine whose partition count IS its concurrency must enforce
     /// it at planning time rather than relying on the worker to push back.
@@ -694,6 +708,37 @@ pub struct ScanPlan {
     /// `catalog` or `transaction`. A transaction-scoped plan is not cacheable
     /// and is not redeemable after commit or rollback.
     pub scope: String,
+    /// Hoisted location names indexed by [`ScanSplitInfo::location_ids`].
+    pub locations: Option<Vec<String>>,
+    /// Storage partition transforms, when every split is single-valued.
+    pub partitioning: Option<Vec<PartitionTransform>>,
+    /// Ordering guaranteed within each individual split.
+    pub sort_order: Option<Vec<SortField>>,
+    /// How long this plan may be reused. Ignored for transaction-scoped plans.
+    pub cache_max_age_seconds: Option<i64>,
+    /// Exclusive lower bound actually used for the planned data range.
+    pub start_position: Option<Vec<u8>>,
+    /// Inclusive frontier resolved at planning time.
+    pub end_position: Option<Vec<u8>>,
+}
+
+impl ScanPlan {
+    /// Apply this plan's redemption context and one physical partition's split
+    /// tokens to otherwise ordinary scan options.
+    ///
+    /// This deliberately overwrites any execution/init context in `options`:
+    /// those values belong to the plan that minted the tokens and mixing them
+    /// with another plan is a protocol error.
+    pub fn redemption_options(
+        &self,
+        tokens: Vec<Vec<u8>>,
+        mut options: ScanOptions,
+    ) -> ScanOptions {
+        options.execution_id = self.execution_id.clone();
+        options.init_opaque_data = self.init_opaque_data.clone();
+        options.split_tokens = Some(tokens.into_iter().map(LargeBytes).collect());
+        options
+    }
 }
 
 /// Sizing inputs for [`VgiClient::plan`].
@@ -707,15 +752,31 @@ pub struct PlanOptions {
     pub filter_columns: Option<Vec<i64>>,
     /// Serialized static filters, in the extension's filter encoding.
     pub pushdown_filters: Option<Vec<u8>>,
+    /// Serialized join-key sets available before enumeration begins.
+    pub join_keys: Option<Vec<Vec<u8>>>,
     /// The primary sizing lever: every engine is byte-driven.
     pub target_split_bytes: Option<i64>,
     /// The parallelism FLOOR. A small but expensive table still needs one reader
     /// per thread, which a byte target alone would never give it.
     pub min_splits: Option<i64>,
+    /// Pagination cap requested from the worker, not a sizing hint.
+    pub max_splits_per_response: Option<i64>,
     /// A plain fetch limit. Push the FULL limit into every split rather than
     /// dividing it: over-production is legal and the engine re-applies above the
     /// coalesce, whereas dividing by N under-produces under skew.
     pub row_limit: Option<i64>,
+    /// Conjunctive narrowing applied to continuation pages.
+    pub refined_filters: Option<Vec<u8>>,
+    /// Whether no further filter refinement will arrive. `None` means true.
+    pub filters_complete: Option<bool>,
+    /// Exclusive lower data position for an incremental scan.
+    pub start_position: Option<Vec<u8>>,
+    /// Inclusive upper data position, or `None` for the current frontier.
+    pub end_position: Option<Vec<u8>>,
+    /// ORDER BY / Top-N planning hint.
+    pub order_by: Option<OrderBy>,
+    /// TABLESAMPLE planning hint.
+    pub sample: Option<Sample>,
 }
 
 impl PlanOptions {
@@ -723,6 +784,163 @@ impl PlanOptions {
     pub fn wire_projection(&self) -> Option<Vec<i64>> {
         union_projection(self.projection.as_ref(), self.filter_columns.as_ref())
     }
+}
+
+fn decode_plan_items<T: VgiArrow>(values: Option<&[Bytes]>, field: &str) -> Result<Option<Vec<T>>> {
+    values
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let batch = ipc::read_batch(&value.0).map_err(|error| {
+                        RpcError::runtime_error(format!(
+                            "invalid {field}[{index}] IPC: {}",
+                            error.message
+                        ))
+                    })?;
+                    wire::from_batch(&batch).map_err(|error| {
+                        RpcError::runtime_error(format!(
+                            "invalid {field}[{index}] value: {}",
+                            error.message
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+}
+
+fn decode_split_batch(value: Bytes, split: usize, field: &str) -> Result<RecordBatch> {
+    ipc::read_batch(&value.0).map_err(|error| {
+        RpcError::runtime_error(format!(
+            "invalid split {split} {field} IPC: {}",
+            error.message
+        ))
+    })
+}
+
+fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> {
+    match &plan.locations {
+        Some(locations) => {
+            for (split_index, split) in plan.splits.iter().enumerate() {
+                for location_id in split.location_ids.iter().flatten() {
+                    let valid = usize::try_from(*location_id)
+                        .ok()
+                        .is_some_and(|id| id < locations.len());
+                    if !valid {
+                        return Err(RpcError::runtime_error(format!(
+                            "function `{}`: split {split_index} refers to location id \
+                             {location_id}, but the plan has {} location(s)",
+                            bound.function_name(),
+                            locations.len()
+                        )));
+                    }
+                }
+            }
+        }
+        None => {
+            if let Some((split_index, _)) = plan
+                .splits
+                .iter()
+                .enumerate()
+                .find(|(_, split)| split.location_ids.is_some())
+            {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} has location_ids but the plan has no locations",
+                    bound.function_name()
+                )));
+            }
+        }
+    }
+
+    if plan
+        .partitioning
+        .as_ref()
+        .is_some_and(|partitioning| !partitioning.is_empty())
+        && plan
+            .splits
+            .iter()
+            .any(|split| split.partition_bounds.is_none())
+    {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: a partitioned plan requires partition_bounds on every split",
+            bound.function_name()
+        )));
+    }
+
+    for (split_index, split) in plan.splits.iter().enumerate() {
+        if let Some(bounds) = &split.partition_bounds {
+            if bounds.num_rows() != 2 {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} partition_bounds has {} rows, expected 2",
+                    bound.function_name(),
+                    bounds.num_rows()
+                )));
+            }
+            for field in bounds.schema().fields() {
+                let output = bound.output_schema().field_with_name(field.name()).map_err(|_| {
+                    RpcError::runtime_error(format!(
+                        "function `{}`: split {split_index} partition_bounds names unknown column `{}`",
+                        bound.function_name(),
+                        field.name()
+                    ))
+                })?;
+                if output.data_type() != field.data_type() {
+                    return Err(RpcError::runtime_error(format!(
+                        "function `{}`: split {split_index} partition bound `{}` has type {:?}, expected {:?}",
+                        bound.function_name(),
+                        field.name(),
+                        field.data_type(),
+                        output.data_type()
+                    )));
+                }
+            }
+        }
+    }
+
+    for transform in plan.partitioning.iter().flatten() {
+        if bound
+            .output_schema()
+            .field_with_name(&transform.column)
+            .is_err()
+        {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: partition transform names unknown column `{}`",
+                bound.function_name(),
+                transform.column
+            )));
+        }
+        let valid = match transform.transform.as_str() {
+            "bucket" | "truncate" => transform.param.is_some_and(|param| param > 0),
+            "identity" | "year" | "month" | "day" | "hour" => transform.param.is_none(),
+            _ => false,
+        };
+        if !valid {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: invalid partition transform `{}` with parameter {:?}",
+                bound.function_name(),
+                transform.transform,
+                transform.param
+            )));
+        }
+    }
+
+    for sort in plan.sort_order.iter().flatten() {
+        if bound.output_schema().field_with_name(&sort.column).is_err()
+            || !matches!(sort.direction.0.as_str(), "asc" | "desc")
+            || !matches!(sort.nulls.0.as_str(), "nulls_first" | "nulls_last")
+        {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: invalid sort field for column `{}` ({}, {})",
+                bound.function_name(),
+                sort.column,
+                sort.direction.0,
+                sort.nulls.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl VgiClient {
@@ -796,22 +1014,31 @@ impl VgiClient {
                 bind_opaque_data: bound.response.opaque_data.clone(),
                 projection_ids: opts.wire_projection(),
                 pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
-                join_keys: None,
+                join_keys: opts
+                    .join_keys
+                    .as_ref()
+                    .map(|keys| keys.iter().cloned().map(LargeBytes).collect()),
                 row_limit: opts.row_limit,
                 target_split_bytes: opts.target_split_bytes,
                 min_splits: opts.min_splits,
-                max_splits_per_response: None,
+                max_splits_per_response: opts.max_splits_per_response,
                 cursor: cursor.clone(),
-                refined_filters: None,
-                filters_complete: Some(true),
-                start_position: None,
-                end_position: None,
-                order_by_column_name: None,
-                order_by_direction: None,
-                order_by_null_order: None,
-                order_by_limit: None,
-                tablesample_percentage: None,
-                tablesample_seed: None,
+                refined_filters: opts.refined_filters.clone().map(LargeBytes),
+                filters_complete: Some(opts.filters_complete.unwrap_or(true)),
+                start_position: opts.start_position.clone().map(Bytes),
+                end_position: opts.end_position.clone().map(Bytes),
+                order_by_column_name: opts.order_by.as_ref().map(|o| o.column.clone()),
+                order_by_direction: opts
+                    .order_by
+                    .as_ref()
+                    .map(|o| DictString(o.direction.as_str().to_string())),
+                order_by_null_order: opts
+                    .order_by
+                    .as_ref()
+                    .map(|o| DictString(o.null_order.as_str().to_string())),
+                order_by_limit: opts.order_by.as_ref().and_then(|o| o.limit),
+                tablesample_percentage: opts.sample.map(|s| s.percentage),
+                tablesample_seed: opts.sample.and_then(|s| s.seed),
             };
 
             let response: PlanResponse = call(
@@ -823,12 +1050,22 @@ impl VgiClient {
             )?;
 
             for blob in &response.splits {
+                let split_index = plan.splits.len();
                 let split: ScanSplit = wire::from_batch(&ipc::read_batch(&blob.0)?)?;
                 plan.splits.push(ScanSplitInfo {
                     token: split.token.0.clone(),
                     estimated_rows: split.estimated_rows,
                     rows_exact: split.rows_exact,
                     estimated_bytes: split.estimated_bytes,
+                    partition_bounds: split
+                        .partition_bounds
+                        .map(|value| decode_split_batch(value, split_index, "partition_bounds"))
+                        .transpose()?,
+                    column_statistics: split
+                        .column_statistics
+                        .map(|value| decode_split_batch(value, split_index, "column_statistics"))
+                        .transpose()?,
+                    location_ids: split.location_ids,
                     start_position: split.start_position.map(|b| b.0),
                     end_position: split.end_position.map(|b| b.0),
                 });
@@ -848,11 +1085,20 @@ impl VgiClient {
             // subsequent page's default, recording a transaction-scoped plan
             // (not cacheable, not redeemable after commit) as catalog-scoped.
             if pages == 1 {
+                plan.execution_id = response.execution_id.clone();
+                plan.init_opaque_data = response.init_opaque_data.clone();
                 plan.max_workers = response.max_workers;
                 plan.estimated_total_splits = response.estimated_total_splits;
                 plan.estimated_total_rows = response.estimated_total_rows;
                 plan.estimated_total_bytes = response.estimated_total_bytes;
                 plan.catalog_version = response.catalog_version;
+                plan.locations = response.locations.clone();
+                plan.partitioning =
+                    decode_plan_items(response.partitioning.as_deref(), "partitioning")?;
+                plan.sort_order = decode_plan_items(response.sort_order.as_deref(), "sort_order")?;
+                plan.cache_max_age_seconds = response.cache_max_age_seconds;
+                plan.start_position = response.start_position.clone().map(|b| b.0);
+                plan.end_position = response.end_position.clone().map(|b| b.0);
                 if !response.scope.is_empty() {
                     plan.scope = response.scope.clone();
                 }
@@ -869,6 +1115,7 @@ impl VgiClient {
             }
         }
 
+        validate_plan_metadata(&plan, bound)?;
         Ok(plan)
     }
 }
@@ -1215,6 +1462,223 @@ mod tests {
         fn label(&self) -> &str {
             "endless"
         }
+    }
+
+    struct MetadataPlanTransport {
+        page: usize,
+        seen: Arc<std::sync::Mutex<Vec<TableFunctionPlanRequest>>>,
+    }
+
+    impl MetadataPlanTransport {
+        fn response(&self, first: bool) -> Result<RecordBatch> {
+            use arrow_array::BinaryArray;
+
+            let bounds = RecordBatch::try_new(
+                Arc::new(schema(&[("a", DataType::Int64)])),
+                vec![Arc::new(Int64Array::from(vec![0, 9]))],
+            )
+            .unwrap();
+            let statistics = RecordBatch::try_new(
+                Arc::new(schema(&[("column_name", DataType::Utf8)])),
+                vec![Arc::new(StringArray::from(vec!["a"]))],
+            )
+            .unwrap();
+            let split = wire::to_batch(ScanSplit {
+                payload: Bytes(Vec::new()),
+                token: Bytes(if first { b"split-0" } else { b"split-1" }.to_vec()),
+                estimated_rows: Some(10),
+                rows_exact: true,
+                estimated_bytes: Some(80),
+                partition_bounds: Some(Bytes(ipc::write_batch(&bounds)?)),
+                column_statistics: Some(Bytes(ipc::write_batch(&statistics)?)),
+                location_ids: Some(vec![0]),
+                start_position: None,
+                end_position: None,
+            })?;
+            let partitioning = wire::to_batch(PartitionTransform {
+                column: "a".to_string(),
+                transform: "identity".to_string(),
+                param: None,
+            })?;
+            let sort = wire::to_batch(SortField {
+                column: "c".to_string(),
+                direction: DictString("asc".to_string()),
+                nulls: DictString("nulls_last".to_string()),
+            })?;
+            let response = PlanResponse {
+                splits: vec![Bytes(ipc::write_batch(&split)?)],
+                next_cursors: first.then(|| vec![Bytes(b"next".to_vec())]),
+                execution_id: Some(Bytes(
+                    if first {
+                        b"plan-exec".as_slice()
+                    } else {
+                        b"wrong".as_slice()
+                    }
+                    .to_vec(),
+                )),
+                init_opaque_data: Some(Bytes(
+                    if first {
+                        b"plan-state".as_slice()
+                    } else {
+                        b"wrong".as_slice()
+                    }
+                    .to_vec(),
+                )),
+                max_workers: Some(if first { 2 } else { 99 }),
+                estimated_total_splits: Some(2),
+                estimated_total_rows: Some(20),
+                estimated_total_bytes: Some(160),
+                catalog_version: Some(if first { 7 } else { 99 }),
+                scope: if first { "transaction" } else { "catalog" }.to_string(),
+                locations: Some(vec![if first { "host-a" } else { "wrong" }.to_string()]),
+                partitioning: Some(vec![Bytes(ipc::write_batch(&partitioning)?)]),
+                sort_order: Some(vec![Bytes(ipc::write_batch(&sort)?)]),
+                cache_max_age_seconds: Some(if first { 60 } else { 1 }),
+                start_position: Some(Bytes(if first { b"begin" } else { b"wrong" }.to_vec())),
+                end_position: Some(Bytes(
+                    if first {
+                        b"frontier".as_slice()
+                    } else {
+                        b"wrong".as_slice()
+                    }
+                    .to_vec(),
+                )),
+            };
+            let inner = ipc::write_batch(&wire::to_batch(response)?)?;
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "result",
+                    DataType::Binary,
+                    false,
+                )])),
+                vec![Arc::new(BinaryArray::from(vec![inner.as_slice()]))],
+            )
+            .map_err(|error| RpcError::runtime_error(error.to_string()))
+        }
+    }
+
+    impl crate::transport::VgiTransport for MetadataPlanTransport {
+        fn call_unary(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+            assert_eq!(method, "table_function_plan");
+            let params: p::TableFunctionPlanParams = wire::from_batch(params)?;
+            let request = wire::from_batch(&ipc::read_batch(&params.request.0)?)?;
+            self.seen.lock().unwrap().push(request);
+            let first = self.page == 0;
+            self.page += 1;
+            self.response(first)
+        }
+
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("no scan here"))
+        }
+
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn crate::transport::ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("no exchange here"))
+        }
+
+        fn label(&self) -> &str {
+            "metadata-plan"
+        }
+    }
+
+    #[test]
+    fn plan_metadata_roundtrips_and_first_page_wins() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut client = crate::VgiClient::new(Box::new(MetadataPlanTransport {
+            page: 0,
+            seen: Arc::clone(&seen),
+        }));
+        let options = PlanOptions {
+            join_keys: Some(vec![b"keys".to_vec()]),
+            max_splits_per_response: Some(1),
+            refined_filters: Some(b"refined".to_vec()),
+            filters_complete: Some(false),
+            start_position: Some(b"requested-start".to_vec()),
+            end_position: Some(b"requested-end".to_vec()),
+            order_by: Some(OrderBy {
+                column: "c".to_string(),
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+                limit: Some(5),
+            }),
+            sample: Some(Sample {
+                percentage: 25.0,
+                seed: Some(42),
+            }),
+            ..PlanOptions::default()
+        };
+        let plan = client.plan(&bound_stub(), &options).unwrap();
+
+        assert_eq!(plan.splits.len(), 2);
+        assert_eq!(plan.execution_id.as_ref().unwrap().0, b"plan-exec");
+        assert_eq!(plan.init_opaque_data.as_ref().unwrap().0, b"plan-state");
+        assert_eq!(plan.max_workers, Some(2));
+        assert_eq!(plan.catalog_version, Some(7));
+        assert_eq!(plan.scope, "transaction");
+        assert_eq!(
+            plan.locations.as_deref(),
+            Some(["host-a".to_string()].as_slice())
+        );
+        assert_eq!(plan.partitioning.as_ref().unwrap()[0].transform, "identity");
+        assert_eq!(plan.sort_order.as_ref().unwrap()[0].column, "c");
+        assert_eq!(plan.cache_max_age_seconds, Some(60));
+        assert_eq!(plan.start_position.as_deref(), Some(b"begin".as_slice()));
+        assert_eq!(plan.end_position.as_deref(), Some(b"frontier".as_slice()));
+        assert_eq!(
+            plan.splits[0].partition_bounds.as_ref().unwrap().num_rows(),
+            2
+        );
+        assert_eq!(plan.splits[0].location_ids.as_deref(), Some([0].as_slice()));
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].cursor.is_none());
+        assert_eq!(requests[1].cursor.as_ref().unwrap().0, b"next");
+        assert_eq!(requests[0].join_keys.as_ref().unwrap()[0].0, b"keys");
+        assert_eq!(requests[0].max_splits_per_response, Some(1));
+        assert_eq!(requests[0].filters_complete, Some(false));
+        assert_eq!(requests[0].order_by_column_name.as_deref(), Some("c"));
+        assert_eq!(requests[0].tablesample_seed, Some(42));
+
+        let redemption = plan.redemption_options(vec![b"split-0".to_vec()], ScanOptions::default());
+        assert_eq!(redemption.execution_id.unwrap().0, b"plan-exec");
+        assert_eq!(redemption.init_opaque_data.unwrap().0, b"plan-state");
+        assert_eq!(redemption.split_tokens.unwrap()[0].0, b"split-0");
+    }
+
+    #[test]
+    fn malformed_split_metadata_and_location_ids_are_rejected() {
+        let error =
+            decode_split_batch(Bytes(b"not-arrow".to_vec()), 3, "partition_bounds").unwrap_err();
+        assert!(error.message.contains("split 3 partition_bounds"));
+
+        let plan = ScanPlan {
+            locations: Some(vec!["only-location".to_string()]),
+            splits: vec![ScanSplitInfo {
+                token: b"token".to_vec(),
+                estimated_rows: None,
+                rows_exact: false,
+                estimated_bytes: None,
+                partition_bounds: None,
+                column_statistics: None,
+                location_ids: Some(vec![1]),
+                start_position: None,
+                end_position: None,
+            }],
+            ..ScanPlan::default()
+        };
+        let error = validate_plan_metadata(&plan, &bound_stub()).unwrap_err();
+        assert!(error.message.contains("location id 1"), "{}", error.message);
     }
 
     #[test]
