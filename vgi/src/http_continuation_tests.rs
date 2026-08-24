@@ -7,9 +7,9 @@
 //! a resumable table scan returns ONE bounded batch per response and resumes via
 //! a stateless continuation token, so the whole result set never has to fit in
 //! memory — matching the Python and Go workers. A producer that does NOT support
-//! resume drains in a single response (the [`crate::dispatch`] batch-limit
-//! guard), which is the "maximum batch size returned over HTTP without
-//! externalization" boundary.
+//! resume gets exactly ONE lock-step turn: it completes inside the `/init`
+//! response when it has a single batch to give, and is refused with a clear
+//! error when it has more (see [`crate::dispatch`]).
 
 use std::sync::Arc;
 
@@ -341,22 +341,46 @@ fn resumable_scan_paginates_over_http() {
     );
 }
 
-/// A non-resumable producer is REFUSED over HTTP, rather than quietly repeating
-/// its first batch.
+/// A non-resumable producer with ONE batch still completes over HTTP, in a
+/// single response and with no continuation token.
 ///
-/// This used to assert the opposite — that such a producer drained its whole
-/// result in one response and minted no continuation token — and that was the
-/// correct behaviour while `ProducerState::batch_limit` existed: returning
-/// `Some(0)` opted the stream out of pagination precisely because it could not
-/// be resumed.
+/// This is the half of the pre-0.23 contract that had to survive. While
+/// `ProducerState::batch_limit` existed, returning `Some(0)` let a
+/// non-resumable producer drain its whole result in one response, so no
+/// continuation was ever needed. 0.23 made producers strictly lock-step and
+/// removed the knob — and with it, the one-batch case broke too: `produce`
+/// emitted the batch, left the stream unfinished, and the framework asked for
+/// a cursor the producer could not mint. That is a large class of ordinary
+/// functions (every fixture that returns a single batch), not an exotic one.
+///
+/// Confirming exhaustion inside the same turn restores it without reintroducing
+/// draining: exactly one batch is still emitted per response.
+#[test]
+fn single_batch_non_resumable_scan_completes_in_one_response() {
+    let port = start_server();
+    let count = BATCH / 2; // one batch, comfortably under the per-batch size
+
+    let r = parse(&post(port, "init/init", init_body("test_drain", count)));
+    assert_eq!(
+        r.values,
+        (0..count).collect::<Vec<_>>(),
+        "the whole result must arrive in the init response"
+    );
+    assert!(
+        r.token.is_none(),
+        "a completed scan must not mint a continuation token it cannot honour"
+    );
+}
+
+/// A non-resumable producer with MORE than one batch is REFUSED over HTTP,
+/// rather than quietly repeating its first batch.
 ///
 /// vgi-rpc 0.23.0 made HTTP producers strictly lock-step: one invocation, at
-/// most one data batch per response, and `batch_limit` is gone. Draining is no
-/// longer expressible, so EVERY multi-batch producer now takes a continuation.
-/// For a producer with no serialized scan position that is not merely slower —
-/// it is wrong. Measured before this test was rewritten: a 35-row scan returned
-/// rows 0..9 with a token, and the token rebuilt the producer at row 0, so
-/// following it yielded 0..9 again, forever.
+/// most one data batch per response. A second batch therefore needs a
+/// continuation, and for a producer with no serialized scan position that is
+/// not merely slower — it is wrong. Measured before this test was rewritten: a
+/// 35-row scan returned rows 0..9 with a token, and the token rebuilt the
+/// producer at row 0, so following it yielded 0..9 again, forever.
 ///
 /// So the only honest answer is to refuse, which the framework renders as an
 /// error envelope. A worker that needs this shape uses a byte-stream transport

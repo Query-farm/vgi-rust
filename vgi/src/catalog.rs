@@ -196,7 +196,7 @@ pub fn serialize_attach_option_spec(
 }
 
 /// Names of the options a catalog declares `required`, read back out of the
-/// serialized [`AttachOptionSpec`] records it advertises.
+/// serialized [`serialize_attach_option_spec`] records it advertises.
 ///
 /// Enforcement is derived from the SAME bytes the client was shown, rather than
 /// from a second structured list kept beside them. A catalog that advertises an

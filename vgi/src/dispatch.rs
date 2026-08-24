@@ -1194,11 +1194,29 @@ impl Dispatcher {
                     None
                 };
                 let producer = f.finalize_producer(&bparams, fsid)?;
+                // A buffering source drains a possibly multi-batch result, and
+                // over HTTP each batch is its own lock-step turn — so it needs
+                // the same rebuild blob the table path carries. Rebuilding is
+                // sound here for the same reason the FINALIZE phase can run on
+                // a different worker process than the sink did: everything the
+                // source reads lives in the execution-scoped store, keyed by
+                // `execution_id` + `finalize_state_id`.
+                let resume_blob = Some(self.exchange_blob(
+                    "buffering_finalize",
+                    bind_call.function_name.clone(),
+                    &output_schema,
+                    input_schema.as_ref(),
+                    &bind_call,
+                    &dto,
+                    &bparams.execution_id,
+                    auto_apply,
+                    split_payload_slice,
+                )?);
                 let state = TableProducerState {
                     inner: producer,
                     filters,
                     project_to: None,
-                    resume_blob: None,
+                    resume_blob,
                     conditional_checked: false,
                 };
                 return Ok(
@@ -1390,8 +1408,8 @@ impl Dispatcher {
             // Always carry the rebuild blob so any resumable producer can yield a
             // continuation token over HTTP (one batch per response, like the
             // Python/Go workers) instead of draining the whole scan into memory.
-            // Producers that can't serialize their position drain anyway — see
-            // `TableProducerState::batch_limit`.
+            // A producer that can't serialize its position gets one turn to
+            // finish in — see `TableProducerState::drains_in_one_turn`.
             let resume_blob = Some(self.exchange_blob(
                 "table",
                 bind_call.function_name.clone(),
@@ -1484,6 +1502,16 @@ impl Dispatcher {
             execution_id: execution_id.to_vec(),
             substream_id: dto.substream_id.clone().map(|b| b.0).unwrap_or_default(),
             split_payloads: split_payloads.to_vec(),
+            attach_opaque_data: bind_call
+                .attach_opaque_data
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
+            finalize_state_id: dto
+                .finalize_state_id
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
             init_opaque: dto
                 .bind_opaque_data
                 .clone()
@@ -1569,7 +1597,7 @@ impl Dispatcher {
             order_by_limit: None,
             tablesample_percentage: None,
             tablesample_seed: None,
-            attach_opaque_data: None,
+            attach_opaque_data: Some(blob.attach_opaque_data.clone()).filter(|v| !v.is_empty()),
             at_unit: Some(blob.at_unit.clone()).filter(|s| !s.is_empty()),
             at_value: Some(blob.at_value.clone()).filter(|s| !s.is_empty()),
             // COPY-FROM producers drain fully (no HTTP continuation token is
@@ -1580,8 +1608,10 @@ impl Dispatcher {
             if_none_match: None,
             if_modified_since: None,
         };
-        // Rehydrated ticks carry no attach_opaque_data; the scope folded into the
-        // blob is what keeps them on the function the original bind resolved.
+        // The `(catalog, schema)` folded into the blob is what keeps a rehydrated
+        // tick on the function the original bind resolved — an HTTP continuation
+        // carries no attach_opaque_data of its own, so the bytes replayed onto
+        // `ProcessParams` above are for the FUNCTION's use, not for resolution.
         // An empty schema means the minting bind named none, which is only legal
         // for a COPY handler — and a COPY-FROM producer drains fully, so it is
         // never issued a continuation token in the first place.
@@ -1590,6 +1620,51 @@ impl Dispatcher {
         } else {
             CallScope::qualified(&blob.catalog_name, &blob.schema_name)
         };
+        if blob.kind == "buffering_finalize" {
+            let f = self.resolve_buffering(&blob.function_name, call)?;
+            args.remap_positional(&f.argument_specs());
+            // Everything except the arguments comes back off the
+            // execution-scoped store, through the SAME helpers the process /
+            // combine RPCs use — those RPCs already rebuild this context from
+            // scratch on a worker that never saw the bind, so reusing them
+            // keeps one replay path instead of a second that can drift.
+            let bparams = BufferingParams {
+                execution_id: blob.execution_id.clone(),
+                storage: self.store.clone(),
+                output_schema: output_schema.clone(),
+                arguments: args,
+                settings,
+                secrets,
+                attach_opaque_data: Some(blob.attach_opaque_data.clone())
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| self.store.kv_get(&blob.execution_id, b"bufattach")),
+                batch_index: None,
+                copy_to: self.buffering_copy_to(&blob.execution_id),
+                input_schema: input_schema
+                    .clone()
+                    .or_else(|| self.buffering_input_schema(&blob.execution_id)),
+                logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            };
+            let mut producer = f.finalize_producer(&bparams, blob.finalize_state_id.clone())?;
+            producer.restore_resume(&blob.inner_resume);
+            let filters = if blob.auto_apply {
+                pushdown
+                    .as_ref()
+                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
+                    .transpose()?
+            } else {
+                None
+            };
+            return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
+                TableProducerState {
+                    inner: producer,
+                    filters,
+                    project_to: None,
+                    resume_blob: Some(bytes.to_vec()),
+                    conditional_checked: false,
+                },
+            )));
+        }
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
@@ -3541,6 +3616,20 @@ pub struct ExchangeBlob {
     /// per continuation would only re-check bytes this worker already sealed.
     #[serde(default)]
     pub split_payloads: Vec<Vec<u8>>,
+    /// The plaintext per-ATTACH state the original bind carried. A continuation
+    /// arrives with none, and the `(catalog, schema)` pair below is enough to
+    /// re-RESOLVE the function — but not to re-CREATE it: a function that scopes
+    /// its storage by these bytes (the documented way to keep per-attach state
+    /// off a pooled worker's `self`) rebuilds against the wrong scope without
+    /// them, and silently returns another attach's rows or none at all.
+    #[serde(default)]
+    pub attach_opaque_data: Vec<u8>,
+    /// Buffering-FINALIZE only: which combined state this source drains. The
+    /// producer is rebuilt by re-running `finalize_producer` against the
+    /// execution-scoped store, and this names the bucket to read — without it
+    /// a continuation would rebuild a source pointed at nothing.
+    #[serde(default)]
+    pub finalize_state_id: Vec<u8>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -3676,6 +3765,59 @@ struct TableProducerState {
     conditional_checked: bool,
 }
 
+impl TableProducerState {
+    /// Whether this producer must deliver its whole result inside a single
+    /// HTTP turn, because it cannot be resumed from a continuation token.
+    ///
+    /// Two shapes qualify. No rebuild blob at all: the buffering SINK (which
+    /// emits nothing) and the table-in-out FINALIZE flush (whose batches come
+    /// from `finish()`, a call whose re-run semantics are the function's own
+    /// business, so it is not replayed). Or a rebuild blob whose producer does
+    /// not serialize a scan position — re-running the bind gets the producer
+    /// back, but it restarts at row 0.
+    fn drains_in_one_turn(&self) -> bool {
+        self.resume_blob.is_none() || !self.inner.resume_supported()
+    }
+
+    /// Best-effort function name for diagnostics, read back out of the rebuild
+    /// blob. `<unknown>` for the producers that have none, which is itself the
+    /// useful signal: it says the refusal came from a flush, not a scan.
+    fn producer_label(&self) -> String {
+        self.resume_blob
+            .as_ref()
+            .and_then(|b| vgi_rpc::stream_codec::bincode_decode::<ExchangeBlob>(b).ok())
+            .map(|b| b.function_name)
+            .unwrap_or_else(|| "<unknown>".to_string())
+    }
+
+    /// Pull one batch from the inner producer and emit it (post filter +
+    /// projection). Returns `false` once the scan is exhausted.
+    fn emit_next(
+        &mut self,
+        out: &mut OutputCollector,
+        dynamic: Option<&crate::pushdown::PushdownFilters>,
+    ) -> Result<bool> {
+        let Some(batch) = self.inner.next_batch(out)? else {
+            return Ok(false);
+        };
+        let meta = self.inner.last_metadata();
+        let active = dynamic.or(self.filters.as_ref());
+        let batch = match active {
+            Some(f) => f.apply(&batch)?,
+            None => batch,
+        };
+        let batch = match &self.project_to {
+            Some(ps) => crate::table_in_out::project_batch(&batch, ps)?,
+            None => batch,
+        };
+        match meta {
+            Some(m) => out.emit_with_metadata(batch, m)?,
+            None => out.emit(batch)?,
+        }
+        Ok(true)
+    }
+}
+
 impl vgi_rpc::ProducerState for TableProducerState {
     fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
         // Per-tick dynamic filter (e.g. a tightening Top-N) arrives in the
@@ -3701,28 +3843,42 @@ impl vgi_rpc::ProducerState for TableProducerState {
                 self.inner.on_conditional_request(&conditional);
             }
         }
-        match self.inner.next_batch(out)? {
-            None => {
-                out.finish();
-                Ok(())
+        // A producer that cannot be resumed gets exactly ONE turn over HTTP,
+        // because there is no honest continuation token to hand back afterwards
+        // (see `encode_state`). So finish it inside that turn: emit its batch
+        // and immediately confirm the scan is exhausted, rather than leaving
+        // `finished` false and forcing the framework to mint a cursor.
+        //
+        // Under vgi-rpc 0.22 this was `batch_limit() == Some(0)` — the HTTP
+        // turn looped until the producer finished. 0.23 made producers strictly
+        // lock-step (one `produce`, one batch per response) and removed the
+        // knob, which silently turned every one-batch non-resumable producer
+        // into a two-turn stream needing a cursor it cannot mint. Confirming
+        // exhaustion in the same turn restores the single-turn shape for the
+        // producers that legitimately have one batch to give; a producer with
+        // MORE than one batch genuinely cannot serve HTTP without resume, and
+        // says so here rather than surfacing the framework's opaque
+        // "only one data batch may be emitted per stream turn".
+        if self.drains_in_one_turn() && ctx.kind == Some(vgi_rpc::transport::TransportKind::Http) {
+            if self.emit_next(out, dynamic.as_ref())? && self.inner.next_batch(out)?.is_some() {
+                return Err(RpcError::runtime_error(format!(
+                    "producer for '{}' emits more than one batch but cannot serve an \
+                     HTTP continuation: it does not serialize a scan position, so \
+                     resuming would restart it at row 0 and repeat rows already sent. \
+                     vgi-rpc's lock-step producer protocol allows one batch per \
+                     response. Use a byte-stream transport (pipe / unix / tcp), or \
+                     implement resume_supported/encode_resume/restore_resume on the \
+                     producer.",
+                    self.producer_label()
+                )));
             }
-            Some(batch) => {
-                let meta = self.inner.last_metadata();
-                let active = dynamic.as_ref().or(self.filters.as_ref());
-                let batch = match active {
-                    Some(f) => f.apply(&batch)?,
-                    None => batch,
-                };
-                let batch = match &self.project_to {
-                    Some(ps) => crate::table_in_out::project_batch(&batch, ps)?,
-                    None => batch,
-                };
-                match meta {
-                    Some(m) => out.emit_with_metadata(batch, m),
-                    None => out.emit(batch),
-                }
-            }
+            out.finish();
+            return Ok(());
         }
+        if !self.emit_next(out, dynamic.as_ref())? {
+            out.finish();
+        }
+        Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         match &self.resume_blob {
@@ -3732,14 +3888,13 @@ impl vgi_rpc::ProducerState for TableProducerState {
             // producer silently restarting at row 0 and re-emitting everything
             // it already sent.
             //
-            // That used to be unreachable: `batch_limit()` returned `Some(0)`
-            // for exactly this case, draining the whole stream in one turn so
-            // no continuation was ever needed. vgi-rpc 0.23.0 made HTTP
-            // producers strictly lock-step — one invocation, at most one batch
-            // per response — and removed `batch_limit` with it, so every
-            // multi-batch producer now continues. An error is the only honest
-            // answer left, and the framework turns it into a clear error
-            // envelope rather than a hung stream.
+            // This is a backstop, not the normal path: `produce` drains a
+            // non-resumable producer to `out.finish()` inside its single HTTP
+            // turn (see `drains_in_one_turn`), so the framework never asks for
+            // a cursor. It stays here because "no cursor" and "a cursor that
+            // silently rewinds" are not interchangeable — if some future turn
+            // structure does reach this point, an error envelope is the only
+            // honest answer.
             None => Err(RpcError::runtime_error(
                 "this producer cannot be resumed across an HTTP continuation: it was \
                  built without a rebuild blob, and vgi-rpc's lock-step producer protocol \
@@ -3750,7 +3905,9 @@ impl vgi_rpc::ProducerState for TableProducerState {
             // the producer back, but without a serialized SCAN POSITION it
             // restarts at row 0 and re-emits what it already sent. Measured, not
             // assumed — a 35-row non-resumable scan returns rows 0..9 with a
-            // token, and following that token yields 0..9 again.
+            // token, and following that token yields 0..9 again. Same backstop
+            // role as the arm above: `produce` finishes such a producer in one
+            // turn, so reaching here means the drain did not happen.
             Some(_) if !self.inner.resume_supported() => Err(RpcError::runtime_error(
                 "this producer cannot serve an HTTP continuation: it does not serialize \
                  a scan position, so resuming would restart it at row 0 and repeat rows \

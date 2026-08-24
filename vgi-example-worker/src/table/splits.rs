@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::protocol::dtos::TableFunctionPlanRequest;
 use vgi::split_token::{PlanOutcome, PlannedSplit};
-use vgi::table_function::{TableFunction, TableProducer};
+use vgi::table_function::{resume, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -355,6 +355,21 @@ impl TableProducer for SplitProducer {
         }
         Ok(None)
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `(idx, cur)` is the whole scan position: the ranges themselves are
+    /// rebuilt from the split payloads the continuation blob carries, so only
+    /// how far through them this reader got has to travel.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64, self.cur])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.idx = v[0] as usize;
+            self.cur = v[1];
+        }
+    }
 }
 
 // --- fixtures that exercise the CLIENT's split machinery -------------------
@@ -550,6 +565,21 @@ impl TableProducer for FailProducer {
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
         }
         Ok(None)
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `(idx, cur)` is the whole scan position: the ranges themselves are
+    /// rebuilt from the split payloads the continuation blob carries, so only
+    /// how far through them this reader got has to travel.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64, self.cur])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.idx = v[0] as usize;
+            self.cur = v[1];
+        }
     }
 }
 
@@ -752,6 +782,17 @@ impl TableProducer for EchoProducer {
         RecordBatch::try_new(echo_schema(), vec![ordinals, saw, nproj])
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.done as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.done = v[0] != 0;
+        }
     }
 }
 
@@ -1160,6 +1201,28 @@ impl TableProducer for BatchIndexProducer {
             self.last_index.to_string(),
         )]))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `last_index` rides along with the cursor: the client asserts the index
+    /// is monotonic across the whole reader, so a continuation that restarted
+    /// the counter would break the contract this fixture exists to prove.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[
+            self.idx as i64,
+            self.cur,
+            self.emitted_in_split,
+            self.last_index,
+        ])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 4) {
+            self.idx = v[0] as usize;
+            self.cur = v[1];
+            self.emitted_in_split = v[2];
+            self.last_index = v[3];
+        }
+    }
 }
 
 /// A split scan whose result is cacheable, so never-partial becomes assertable.
@@ -1295,6 +1358,22 @@ impl TableProducer for CacheableProducer {
         self.advertised.then(|| {
             std::collections::HashMap::from([("vgi.cache.ttl".to_string(), "300".to_string())])
         })
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `first` travels too — freshness is advertised on this reader's FIRST
+    /// batch only, and a continuation that reset the flag would re-advertise
+    /// mid-stream.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64, self.cur, self.first as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 3) {
+            self.idx = v[0] as usize;
+            self.cur = v[1];
+            self.first = v[2] != 0;
+        }
     }
 }
 
@@ -1452,6 +1531,19 @@ impl TableProducer for PartitionedProducer {
         vgi::partition::partition_metadata(&self.schema, batch)
             .ok()
             .flatten()
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// Only `at`: `last` is set by the `next_batch` that precedes every
+    /// `last_metadata` call, so it never has to survive a continuation.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.at as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.at = v[0] as usize;
+        }
     }
 }
 
@@ -1664,5 +1756,20 @@ impl TableProducer for DynFilterProducer {
                 .map_err(|e| RpcError::runtime_error(e.to_string()));
         }
         Ok(None)
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `(idx, cur)` is the whole scan position: the ranges themselves are
+    /// rebuilt from the split payloads the continuation blob carries, so only
+    /// how far through them this reader got has to travel.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64, self.cur])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.idx = v[0] as usize;
+            self.cur = v[1];
+        }
     }
 }

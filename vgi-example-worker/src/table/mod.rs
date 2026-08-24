@@ -351,9 +351,31 @@ impl TableProducer for ProfilingProducer {
         }
         Ok(Some(batch))
     }
-    // NOT resumable: the EXPLAIN ANALYZE counters (`rows`/`batches`) accumulate in
-    // the producer and are snapshotted to storage each batch. A resumed rebuild
-    // would reset them to zero and undercount, so drain in one response.
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// The EXPLAIN ANALYZE counters travel with the cursor. They accumulate in
+    /// the producer and are snapshotted to storage on every batch, so a rebuild
+    /// that restored only `offset` would restart them at zero and undercount —
+    /// which is why this used to declare itself non-resumable and rely on the
+    /// whole scan draining in one HTTP response. Lock-step producers removed
+    /// that option, so the counters are part of the position now.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[
+            self.offset as i64,
+            self.rows as i64,
+            self.batches as i64,
+            self.start_ns as i64,
+        ])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 4) {
+            self.offset = v[0] as usize;
+            self.rows = v[1] as u64;
+            self.batches = v[2] as u64;
+            self.start_ns = v[3] as u64;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

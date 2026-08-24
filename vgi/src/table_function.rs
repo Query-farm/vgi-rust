@@ -48,9 +48,16 @@ pub trait TableProducer: Send {
     /// Whether this producer can serialize its scan position for HTTP
     /// continuation. When `true`, the HTTP transport returns one batch per
     /// response and resumes via a state token (so the whole result set never
-    /// has to fit in memory), exactly like the Python and Go workers. When
-    /// `false` (the default), the producer is drained fully into a single init
-    /// response — correct, but unbounded in memory.
+    /// has to fit in memory), exactly like the Python and Go workers.
+    ///
+    /// When `false` (the default) the producer gets exactly ONE HTTP turn: it
+    /// completes inside the `/init` response if it has a single batch to give,
+    /// and is REFUSED with a clear error if it has more. So `false` is only
+    /// safe for a producer that is genuinely one batch (or none), or that will
+    /// never be served over HTTP. Anything that chunks its output — any loop,
+    /// any batch-size argument — must implement these three methods. Over the
+    /// byte-stream transports (pipe / unix / tcp) this flag is not consulted at
+    /// all: the client ticks the producer directly, one batch per tick.
     ///
     /// A producer is rebuilt fresh from its bind params on resume and then has
     /// [`restore_resume`](Self::restore_resume) called, so

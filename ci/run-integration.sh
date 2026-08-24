@@ -129,7 +129,20 @@ boot_http_worker() {
 }
 
 export VGI_WORKER_BIN
-export VGI_TEST_BEARER_TOKEN="test-secret-token"
+# NOT exported here. bearer_auth/bearer_token.test gates on this variable
+# (`require-env VGI_TEST_BEARER_TOKEN`) and its very first statement is an
+# ATTACH carrying the `bearer_token` option — which the client rejects at bind
+# on any non-HTTP LOCATION ("bearer_token is only valid for HTTP transport").
+# So the file is meaningful on the http lane only, where it is run separately
+# against a bearer-PROTECTED server and the variable is exported for that run.
+#
+# It used to be exported unconditionally and the file still vanished on every
+# lane, because its expected errors say "(HTTP 401)" and DuckDB's default
+# ignore_error_messages matches "HTTP" as a bare substring. The file now opts
+# out of that default upstream, so on stdio/launch the ATTACH stopped being
+# swallowed and started failing the lane for real. Letting the require-env gate
+# do its job is the fix — an exclusion list would have to be kept in step with
+# the suite; this cannot drift.
 # Scratch dir shared by the native-branch fixtures (their read_parquet /
 # read_csv / iceberg_scan arms) and the .test files' COPY-TO targets. The worker
 # reads the same variable; the multi_branch_* and rff_*_native tests `require-env`
@@ -236,7 +249,7 @@ rm -f "$STAGE/test/_warm.test"
 
 # Run the suite in one invocation, streaming the native sqllogictest report.
 # bearer_auth/* runs separately on the http lane against a bearer-protected
-# worker; on stdio/launch it runs inline (VGI_TEST_BEARER_TOKEN is set).
+# worker; on stdio/launch it self-skips (no VGI_TEST_BEARER_TOKEN — see above).
 echo "Running suite (transport=$TRANSPORT) ..."
 rc=0
 
@@ -320,6 +333,7 @@ if [ "$TRANSPORT" = "http" ]; then
   # Subshell so the override doesn't outlive the call: a `VAR=v func` prefix
   # persists after the function returns in bash, unlike `VAR=v some_binary`.
   ( export VGI_TEST_WORKER="http://localhost:${BOOTED_PORT}"
+    export VGI_TEST_BEARER_TOKEN="test-secret-token"
     run_unittest "test/sql/integration/bearer_auth/*" ) || rc=$?
 else
   run_unittest "test/sql/integration/*" || rc=$?

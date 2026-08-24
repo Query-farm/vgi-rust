@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -85,6 +85,20 @@ impl TableProducer for BrokenProducer {
                 BATCH_TAG.to_string(),
                 (1i64 << 60).to_string(),
             )])),
+        }
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `step` IS the position — and it has to survive an HTTP continuation or
+    /// the non-monotone fixture never reaches its second batch, which is the
+    /// only thing it exists to emit.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.step as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.step = v[0] as u32;
         }
     }
 }

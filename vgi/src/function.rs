@@ -403,7 +403,8 @@ pub struct FunctionMetadata {
     pub auto_apply_filters: bool,
     pub supports_batch_index: bool,
     /// Declares that this table function divides its scan into named,
-    /// independently redeemable splits (see [`TableFunction::on_plan`]).
+    /// independently redeemable splits (see
+    /// [`TableFunction::on_plan`](crate::table_function::TableFunction::on_plan)).
     ///
     /// A distributed engine reads this to decide whether it can retry a task: a
     /// split NAMES its work, so re-running one reads exactly the same rows.

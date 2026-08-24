@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use vgi::cache_control::{CacheControl, ConditionalRequest};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::partition::partition_field;
-use vgi::table_function::{TableCardinality, TableFunction, TableProducer};
+use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 /// Default freshness lifetime (seconds) for the fixtures that don't take a
@@ -826,6 +826,21 @@ impl TableProducer for PoisonProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// Both flags travel, so the poisoning turn lands on the SECOND tick over
+    /// HTTP exactly as it does over a pipe — the whole point of the fixture is
+    /// that the failure arrives AFTER a cacheable batch has already streamed.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.emitted as i64, self.poisoned as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.emitted = v[0] != 0;
+            self.poisoned = v[1] != 0;
+        }
+    }
 }
 
 pub struct CachePoisonFunction;
@@ -1009,6 +1024,28 @@ impl TableProducer for QueueProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// The queue itself is process-global and keyed by `execution_id`, so a
+    /// rebuilt producer keeps draining where this one left off. What the queue
+    /// CANNOT re-supply is the chunk already popped: `queue_pop` removes it, so
+    /// a mid-chunk cursor lives only here. `advertised` rides along so freshness
+    /// is not re-advertised mid-stream.
+    fn encode_resume(&self) -> Vec<u8> {
+        match self.cur {
+            Some((pid, idx, end)) if idx < end => {
+                resume::pack(&[1, pid, idx, end, self.advertised as i64])
+            }
+            _ => resume::pack(&[0, 0, 0, 0, self.advertised as i64]),
+        }
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 5) {
+            self.cur = (v[0] != 0).then_some((v[1], v[2], v[3]));
+            self.advertised = v[4] != 0;
+        }
     }
 }
 
@@ -1260,6 +1297,18 @@ impl TableProducer for TypesProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.current_index, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.current_index = v[0];
+            self.remaining = v[1];
+        }
+    }
 }
 
 pub struct CacheTypesFunction;
@@ -1380,6 +1429,18 @@ impl TableProducer for PartitionedProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.country_idx as i64, self.advertised as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.country_idx = v[0] as usize;
+            self.advertised = v[1] != 0;
+        }
     }
 }
 
@@ -1538,6 +1599,17 @@ impl TableProducer for PartitionScopeProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.country_idx as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.country_idx = v[0] as usize;
+        }
+    }
 }
 
 pub struct CachePartitionScopeFunction;
@@ -1609,6 +1681,16 @@ impl TableProducer for PartitionParallelProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// Nothing to carry: one `queue_pop` yields one whole partition, so this
+    /// producer is never mid-chunk. The remaining work lives in the shared
+    /// `execution_id`-keyed queue, which a rebuilt producer reattaches to — the
+    /// empty cursor is the honest answer, not a missing one.
+    fn encode_resume(&self) -> Vec<u8> {
+        Vec::new()
     }
 }
 
@@ -1717,6 +1799,17 @@ impl TableProducer for PartitionMultiColProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.idx = v[0] as usize;
+        }
+    }
 }
 
 pub struct CachePartitionMultiColFunction;
@@ -1813,6 +1906,17 @@ impl TableProducer for PartitionProjProducer {
     }
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.country_idx as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.country_idx = v[0] as usize;
+        }
     }
 }
 

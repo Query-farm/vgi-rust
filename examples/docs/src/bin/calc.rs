@@ -25,7 +25,7 @@ use vgi::catalog::CatalogModel;
 use vgi::function::{
     ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction,
 };
-use vgi::table_function::{TableFunction, TableProducer};
+use vgi::table_function::{resume, TableFunction, TableProducer};
 use vgi::vgi_rpc::OutputCollector;
 use vgi::{Result, RpcError};
 
@@ -93,6 +93,23 @@ impl TableProducer for SeriesProducer {
         RecordBatch::try_new(self.schema.clone(), vec![col])
             .map(Some)
             .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+
+    // Any producer that emits MORE than one batch has to be able to say where
+    // it stopped, or it cannot be served over HTTP: each response carries one
+    // batch and a token that rebuilds the producer for the next one. The
+    // rebuild replays the bind, so `count` and `schema` come back on their own
+    // — only `next`, the position, has to travel.
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.next])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.next = v[0];
+        }
     }
 }
 

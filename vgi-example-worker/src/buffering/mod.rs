@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata};
 use vgi::ipc;
-use vgi::table_function::TableProducer;
+use vgi::table_function::{resume, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 /// Register buffering fixtures.
@@ -90,6 +90,23 @@ impl TableProducer for LogDrain {
     fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
         self.metadata.clone()
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// `after_id` is the log cursor and `error` is one-shot; both have to
+    /// survive an HTTP continuation. The log itself is execution-scoped
+    /// storage, which the rebuild reattaches to, so nothing else travels.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.after_id, self.error.is_some() as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.after_id = v[0];
+            if v[1] == 0 {
+                self.error = None;
+            }
+        }
+    }
 }
 
 /// Emits exactly one row `{v: <value>}` (ordered_source per finalize_state_id).
@@ -109,6 +126,17 @@ impl TableProducer for OneRowProducer {
             RecordBatch::try_new(self.output_schema.clone(), vec![col])
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         ))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.emitted as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.emitted = v[0] != 0;
+        }
     }
 }
 
@@ -248,6 +276,17 @@ impl TableProducer for WideProducer {
             RecordBatch::try_new(self.output_schema.clone(), vec![col])
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         ))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.emitted as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.emitted = v[0] != 0;
+        }
     }
 }
 

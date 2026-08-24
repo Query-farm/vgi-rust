@@ -25,7 +25,7 @@ use vgi::buffering::{BufferingParams, TableBufferingFunction};
 use vgi::catalog::{CatSchema, CatalogModel};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::ipc;
-use vgi::table_function::{TableFunction, TableProducer};
+use vgi::table_function::{resume, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
 
 const TS_COL: &str = "_timestamp";
@@ -308,6 +308,17 @@ impl TableProducer for BatchListProducer {
             &self.output_schema,
         )?))
     }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.pos as i64])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.pos = v[0] as usize;
+        }
+    }
 }
 
 /// Drains the execution-scoped output log (NS_OUT), one batch per tick.
@@ -332,6 +343,19 @@ impl TableProducer for OutDrain {
             &batch,
             &self.output_schema,
         )?))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    /// The output log is execution-scoped storage a rebuild reattaches to, so
+    /// only the read cursor has to travel.
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.after_id])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.after_id = v[0];
+        }
     }
 }
 
