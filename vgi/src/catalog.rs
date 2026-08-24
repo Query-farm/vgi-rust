@@ -195,6 +195,49 @@ pub fn serialize_attach_option_spec(
     ipc::write_batch(&batch)
 }
 
+/// Names of the options a catalog declares `required`, read back out of the
+/// serialized [`AttachOptionSpec`] records it advertises.
+///
+/// Enforcement is derived from the SAME bytes the client was shown, rather than
+/// from a second structured list kept beside them. A catalog that advertises an
+/// option as required and then attaches happily without it is worse than one
+/// that never advertised it — the client displayed a promise nobody kept — and
+/// two lists that must agree is exactly how that happens.
+///
+/// A spec that fails to parse is skipped rather than failing the attach: these
+/// are discovery records, and a malformed one should not turn a working catalog
+/// into an unattachable one. It simply is not enforced.
+pub fn required_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
+    use arrow_array::{Array, BooleanArray, StringArray};
+    let mut out = Vec::new();
+    for raw in specs {
+        let Ok(batch) = ipc::read_batch(raw) else {
+            continue;
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // `required` is nullable and was appended after the original columns:
+        // absent (a pre-update peer) and explicit-null both mean "not required".
+        let Some(req) = batch
+            .column_by_name("required")
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        else {
+            continue;
+        };
+        if req.is_null(0) || !req.value(0) {
+            continue;
+        }
+        if let Some(name) = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        {
+            out.push(name.value(0).to_string());
+        }
+    }
+    out
+}
+
 pub fn serialize_setting(spec: &SettingSpec) -> Result<Vec<u8>> {
     use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
     let type_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1892,5 +1935,86 @@ mod attach_option_required_tests {
     #[test]
     fn no_required_specs_accepts_absent_options() {
         assert!(validate_required_attach_options("gated", &[], None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod required_attach_option_discovery_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, StringArray};
+
+    /// The link between advertisement and enforcement.
+    ///
+    /// `serialize_attach_option_spec` could mark an option required and
+    /// `validate_required_attach_options` could refuse a missing one, and the
+    /// two still never met: nothing derived the second's `required_names` from
+    /// the first's bytes, and nothing called it. A Rust worker therefore
+    /// advertised `api_key` as mandatory and then attached happily without it —
+    /// the client showed a promise the worker did not keep. These assert the
+    /// join, so the pieces cannot drift apart again.
+    #[test]
+    fn required_names_come_back_out_of_the_advertised_specs() {
+        let default: ArrayRef = Arc::new(StringArray::from(vec!["us-east-1"]));
+        let specs = vec![
+            serialize_attach_option_spec("api_key", "API key", &DataType::Utf8, None, true).unwrap(),
+            serialize_attach_option_spec(
+                "region",
+                "Region",
+                &DataType::Utf8,
+                Some(&default),
+                false,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            required_attach_option_names(&specs),
+            vec!["api_key".to_string()],
+            "only the option declared required may come back"
+        );
+    }
+
+    #[test]
+    fn a_spec_without_the_required_column_is_not_required() {
+        // A pre-update peer's spec has no `required` column at all. Absent must
+        // read as "not required", not as a parse failure that blocks the attach.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("description", DataType::Utf8, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["legacy"])),
+            Arc::new(StringArray::from(vec!["no required column"])),
+        ];
+        let batch = arrow_array::RecordBatch::try_new(schema, cols).unwrap();
+        let specs = vec![ipc::write_batch(&batch).unwrap()];
+        assert!(required_attach_option_names(&specs).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_spec_is_skipped_rather_than_fatal() {
+        // Discovery records are advisory; a malformed one must not turn a
+        // working catalog into an unattachable one.
+        let specs = vec![vec![0xde, 0xad, 0xbe, 0xef]];
+        assert!(required_attach_option_names(&specs).is_empty());
+    }
+
+    #[test]
+    fn required_plus_default_is_refused_at_declaration() {
+        // An option that falls back to a value is satisfiable without the
+        // caller, so declaring it required is a contradiction — caught where it
+        // is written, not left to surface as an attach that never fails.
+        let default: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+        let err = serialize_attach_option_spec(
+            "both",
+            "contradictory",
+            &DataType::Utf8,
+            Some(&default),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("required but also declares a default"),
+            "unexpected message: {err}"
+        );
     }
 }

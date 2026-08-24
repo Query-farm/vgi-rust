@@ -122,6 +122,17 @@ impl ScalarFunction for DoubleFunction {
                     expected_output: None,
                 },
             ],
+            // VGI_WORKER_BAD_ENUM makes this function advertise an
+            // unrecognized `null_handling` value, so bad_enum.test can assert
+            // the client's catalog parser REJECTS an enum string it does not
+            // know rather than silently defaulting — a silent fallback would
+            // run with behaviour inconsistent with what the worker declared.
+            // The same hook exists on the Python and Java fixture workers; the
+            // shared .test file runs against whichever one is wired.
+            null_handling: match std::env::var("VGI_WORKER_BAD_ENUM") {
+                Ok(v) if !v.is_empty() => Some("WEIRD".to_string()),
+                _ => None,
+            },
             ..meta("Doubles numeric values")
         }
     }

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Copyright 2025, 2026 Query Farm LLC - https://query.farm
+# Routes the single vgi-example-worker into an `example` catalog whose `double`
+# scalar advertises an unrecognized null_handling enum value, so bad_enum.test
+# can assert the client's strict-enum parse. Execs $VGI_WORKER_BIN.
+export VGI_WORKER_CATALOG_NAME=example
+export VGI_WORKER_BAD_ENUM=1
+exec "${VGI_WORKER_BIN:?VGI_WORKER_BIN must point at vgi-example-worker}" "$@"

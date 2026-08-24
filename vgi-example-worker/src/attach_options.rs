@@ -230,6 +230,51 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
     }
 }
 
+/// The `attach_options_required` catalog: one option the caller MUST supply.
+///
+/// Kept separate from [`catalog`] so the defaults-and-round-trip coverage there
+/// can keep attaching with no options at all, mirroring vgi-python's
+/// `RequiredAttachOptions` fixture (the same `.test` file runs against both).
+///
+/// `api_key` is required and therefore has NO default — an option that falls
+/// back to a value is by definition satisfiable without the caller, and
+/// `serialize_attach_option_spec` rejects declaring both. `region` carries a
+/// default, so the catalog also proves that required and optional coexist.
+pub fn required_catalog() -> vgi::catalog::CatalogModel {
+
+    let api_key = vgi::catalog::serialize_attach_option_spec(
+        "api_key",
+        "API key",
+        &DataType::Utf8,
+        None,
+        true,
+    )
+    .unwrap();
+    let region_default: ArrayRef = Arc::new(StringArray::from(vec!["us-east-1"]));
+    let region = vgi::catalog::serialize_attach_option_spec(
+        "region",
+        "Region",
+        &DataType::Utf8,
+        Some(&region_default),
+        false,
+    )
+    .unwrap();
+    vgi::catalog::CatalogModel {
+        name: "attach_options_required".to_string(),
+        attach_option_specs: vec![api_key, region],
+        comment: Some("Catalog that refuses an ATTACH without its required option".to_string()),
+        schemas: vec![vgi::catalog::CatSchema {
+            name: "main".to_string(),
+            comment: None,
+            tags: Vec::new(),
+            views: Vec::new(),
+            macros: Vec::new(),
+            tables: Vec::new(),
+        }],
+        ..Default::default()
+    }
+}
+
 /// `echo_attach_options()` — emit the attach-time option values (one row).
 pub struct EchoAttachOptionsFunction;
 impl TableFunction for EchoAttachOptionsFunction {

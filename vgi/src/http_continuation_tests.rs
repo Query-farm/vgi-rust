@@ -341,24 +341,44 @@ fn resumable_scan_paginates_over_http() {
     );
 }
 
-/// A non-resumable producer drains: with no serializable position, the guard
-/// makes it return the whole result set in a single response (no token), which
-/// is the maximum batch size obtainable over HTTP without state externalization.
+/// A non-resumable producer is REFUSED over HTTP, rather than quietly repeating
+/// its first batch.
+///
+/// This used to assert the opposite — that such a producer drained its whole
+/// result in one response and minted no continuation token — and that was the
+/// correct behaviour while `ProducerState::batch_limit` existed: returning
+/// `Some(0)` opted the stream out of pagination precisely because it could not
+/// be resumed.
+///
+/// vgi-rpc 0.23.0 made HTTP producers strictly lock-step: one invocation, at
+/// most one data batch per response, and `batch_limit` is gone. Draining is no
+/// longer expressible, so EVERY multi-batch producer now takes a continuation.
+/// For a producer with no serialized scan position that is not merely slower —
+/// it is wrong. Measured before this test was rewritten: a 35-row scan returned
+/// rows 0..9 with a token, and the token rebuilt the producer at row 0, so
+/// following it yielded 0..9 again, forever.
+///
+/// So the only honest answer is to refuse, which the framework renders as an
+/// error envelope. A worker that needs this shape uses a byte-stream transport
+/// or implements resume.
 #[test]
-fn non_resumable_scan_drains_in_one_response() {
+fn non_resumable_scan_is_refused_over_http() {
     let port = start_server();
     let count = 35;
 
-    let r = parse(&post(port, "init/init", init_body("test_drain", count)));
+    let raw = post(port, "init/init", init_body("test_drain", count));
+    let r = parse(&raw);
+    let text = String::from_utf8_lossy(&raw);
+
+    // The refusal must arrive as a first-class error, not as a short read that
+    // a client would mistake for the end of the scan.
     assert!(
-        r.token.is_none(),
-        "a non-resumable producer must not mint a continuation token"
+        text.contains("cannot serve an HTTP continuation"),
+        "expected a resumability refusal naming the cause"
     );
-    assert_eq!(r.values, (0..count).collect::<Vec<_>>());
-    // All rows arrived in this single response: the whole scan was drained.
     assert!(
-        r.values.len() as i64 == count,
-        "drain must return the full result set in one response"
+        r.values.len() < count as usize,
+        "a refused scan must not claim to have returned every row"
     );
 }
 

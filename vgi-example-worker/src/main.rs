@@ -56,6 +56,12 @@ fn main() {
     } else {
         catalog_def::build_by_name(&catalog_name)
     };
+    // The gated catalog rides alongside `attach_options` on the same worker, so
+    // one LOCATION serves both — which is what attach_options_required.test
+    // asserts when it queries vgi_catalogs() for the two of them.
+    if catalog_name == "attach_options" {
+        worker.register_secondary_catalog(attach_options::required_catalog(), Vec::new());
+    }
     // The `accumulate` fixture catalog is served (MetaWorker-style) alongside
     // the example catalog — the accumulate tests attach it via the plain worker.
     if catalog.name == "example" {

@@ -1701,6 +1701,33 @@ impl Dispatcher {
 
     pub fn handle_catalog_attach(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: CatalogAttachRequest = boxed(req)?;
+        // Refuse the attach when a declared-`required` option was not supplied,
+        // BEFORE any of the per-catalog-shape work below — including the
+        // secondary early-return, so the rule holds for every catalog this
+        // worker serves rather than only the primary.
+        //
+        // The required names are derived from the very specs the catalog
+        // advertises, so enforcement cannot drift from advertisement. Without
+        // this call `serialize_attach_option_spec`'s `required` flag was a
+        // promise nothing kept: the client displayed the option as mandatory
+        // and the attach then succeeded without it, yielding a catalog missing
+        // whatever the option was supposed to unlock.
+        {
+            let model = self
+                .secondary
+                .iter()
+                .find(|c| c.name == dto.name)
+                .unwrap_or(&self.catalog);
+            let required = catalog::required_attach_option_names(&model.attach_option_specs);
+            if !required.is_empty() {
+                let names: Vec<&str> = required.iter().map(String::as_str).collect();
+                catalog::validate_required_attach_options(
+                    &dto.name,
+                    &names,
+                    dto.options.as_ref().map(|b| b.0.as_ref()),
+                )?;
+            }
+        }
         // Secondary (MetaWorker) catalog: attached by its name, with a random
         // per-session scope id carried back on every request as the storage
         // scope (so two ATTACH sessions of the same catalog stay isolated).
@@ -3697,21 +3724,40 @@ impl vgi_rpc::ProducerState for TableProducerState {
             }
         }
     }
-    fn batch_limit(&self) -> Option<usize> {
-        // Paginate (yield after the server-default batch count, i.e. one batch
-        // per HTTP response — matching the Python/Go workers) only when we can
-        // both rebuild the producer from a token AND the producer serializes its
-        // scan position. Otherwise drain fully (`Some(0)` = unlimited) so a
-        // producer never silently restarts from row 0 on resume.
-        if self.resume_blob.is_some() && self.inner.resume_supported() {
-            None
-        } else {
-            Some(0)
-        }
-    }
     fn encode_state(&self) -> Result<Vec<u8>> {
         match &self.resume_blob {
-            None => Ok(Vec::new()),
+            // No rebuild blob means this producer cannot be reconstructed for a
+            // continuation turn. Returning empty bytes here would hand the
+            // framework a cursor token that rebuilds from nothing — i.e. a
+            // producer silently restarting at row 0 and re-emitting everything
+            // it already sent.
+            //
+            // That used to be unreachable: `batch_limit()` returned `Some(0)`
+            // for exactly this case, draining the whole stream in one turn so
+            // no continuation was ever needed. vgi-rpc 0.23.0 made HTTP
+            // producers strictly lock-step — one invocation, at most one batch
+            // per response — and removed `batch_limit` with it, so every
+            // multi-batch producer now continues. An error is the only honest
+            // answer left, and the framework turns it into a clear error
+            // envelope rather than a hung stream.
+            None => Err(RpcError::runtime_error(
+                "this producer cannot be resumed across an HTTP continuation: it was \
+                 built without a rebuild blob, and vgi-rpc's lock-step producer protocol \
+                 requires one for any stream that emits more than a single batch. Use a \
+                 byte-stream transport, or give the producer a resume blob.",
+            )),
+            // A rebuild blob is not enough on its own: re-running the bind gets
+            // the producer back, but without a serialized SCAN POSITION it
+            // restarts at row 0 and re-emits what it already sent. Measured, not
+            // assumed — a 35-row non-resumable scan returns rows 0..9 with a
+            // token, and following that token yields 0..9 again.
+            Some(_) if !self.inner.resume_supported() => Err(RpcError::runtime_error(
+                "this producer cannot serve an HTTP continuation: it does not serialize \
+                 a scan position, so resuming would restart it at row 0 and repeat rows \
+                 already sent. vgi-rpc's lock-step producer protocol requires a resumable \
+                 producer for any stream emitting more than one batch. Use a byte-stream \
+                 transport (pipe / unix / tcp), or implement resume on the producer.",
+            )),
             Some(bytes) => {
                 // Re-encode the (static) bind blob with the producer's CURRENT
                 // partial-chunk cursor so the continuation resumes mid-chunk.
