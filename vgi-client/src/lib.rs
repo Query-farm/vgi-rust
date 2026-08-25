@@ -77,8 +77,11 @@ pub use arg_spec::{ArgSpec, ArgSpecs};
 pub use args::{ArgValue, Arguments};
 pub use auth::{AuthReason, Unauthorized};
 pub use cache::{CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache};
-pub use catalog::{At, AttachOptions, AttachedCatalog, FunctionKind, MacroKind};
-pub use client::VgiClient;
+pub use catalog::{
+    decode_attach_option_specs, encode_attach_options, At, AttachOptionSpec, AttachOptions,
+    AttachedCatalog, FunctionKind, MacroKind,
+};
+pub use client::{ConnectionOptions, VgiClient};
 pub use location::VgiLocation;
 pub use pool::{PoolConfig, PoolStats, PooledClient, WorkerPool};
 pub use retry::{

@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 /// A parsed `Bearer` challenge.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OAuthChallenge {
     /// Where the protected-resource metadata document lives. Required — without
     /// it there is nothing to discover.
@@ -37,6 +37,28 @@ pub struct OAuthChallenge {
     pub device_code_client_secret: Option<String>,
     /// Whether to present the `id_token` rather than the access token.
     pub use_id_token_as_bearer: bool,
+}
+
+impl std::fmt::Debug for OAuthChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthChallenge")
+            .field("resource_metadata", &self.resource_metadata)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("device_code_client_id", &self.device_code_client_id)
+            .field(
+                "device_code_client_secret",
+                &self
+                    .device_code_client_secret
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("use_id_token_as_bearer", &self.use_id_token_as_bearer)
+            .finish()
+    }
 }
 
 impl OAuthChallenge {

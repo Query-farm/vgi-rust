@@ -96,7 +96,7 @@ impl UserInteraction for StderrInteraction {
 }
 
 /// RFC 9728 protected-resource metadata, plus the VGI extensions.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct ResourceMetadata {
     /// Issuers that can authenticate for this resource. Only the first is used,
     /// matching the reference implementation.
@@ -130,6 +130,31 @@ pub struct ResourceMetadata {
     pub use_id_token_as_bearer: bool,
 }
 
+impl std::fmt::Debug for ResourceMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceMetadata")
+            .field("authorization_servers", &self.authorization_servers)
+            .field("scopes_supported", &self.scopes_supported)
+            .field("resource_name", &self.resource_name)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("device_code_client_id", &self.device_code_client_id)
+            .field(
+                "device_code_client_secret",
+                &self
+                    .device_code_client_secret
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("token_endpoint", &self.token_endpoint)
+            .field("use_id_token_as_bearer", &self.use_id_token_as_bearer)
+            .finish()
+    }
+}
+
 /// The subset of OIDC provider metadata this client needs.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderMetadata {
@@ -145,10 +170,18 @@ pub struct ProviderMetadata {
 }
 
 /// Everything needed to run a flow, resolved from the challenge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveredEndpoints {
-    /// Token endpoint, with the resource metadata's override applied.
+    /// Token endpoint used for refreshes, with the resource metadata's proxy
+    /// override applied when present.
     pub token_endpoint: String,
+    /// The identity provider's token endpoint. Device-code polling must go
+    /// directly here: a VGI token-exchange proxy handles refresh/browser
+    /// grants, but does not necessarily accept the RFC 8628 device grant.
+    pub device_token_endpoint: String,
+    /// Whether `token_endpoint` is a resource-owned proxy rather than the
+    /// identity provider endpoint.
+    pub token_endpoint_is_proxy: bool,
     /// Device-authorization endpoint, when the provider offers one.
     pub device_authorization_endpoint: Option<String>,
     /// Browser authorization endpoint, when the provider offers one.
@@ -169,12 +202,48 @@ pub struct DiscoveredEndpoints {
     pub use_id_token_as_bearer: bool,
 }
 
+impl std::fmt::Debug for DiscoveredEndpoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveredEndpoints")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("device_token_endpoint", &self.device_token_endpoint)
+            .field("token_endpoint_is_proxy", &self.token_endpoint_is_proxy)
+            .field(
+                "device_authorization_endpoint",
+                &self.device_authorization_endpoint,
+            )
+            .field("authorization_endpoint", &self.authorization_endpoint)
+            .field("device_client_id", &self.device_client_id)
+            .field(
+                "device_client_secret",
+                &self.device_client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scope", &self.scope)
+            .field("resource_name", &self.resource_name)
+            .field("use_id_token_as_bearer", &self.use_id_token_as_bearer)
+            .finish()
+    }
+}
+
 /// Something that can perform the HTTP calls discovery and grants need.
 ///
 /// A trait so the flows are testable against a mock provider without a network.
 pub trait HttpTransport: Send + Sync {
     /// GET a URL, returning the body.
     fn get(&self, url: &str) -> Result<String>;
+    /// Read an OAuth challenge from an unauthenticated endpoint.
+    ///
+    /// Mock transports historically returned the challenge string from `get`,
+    /// so the default preserves that behavior. Real HTTP transports override
+    /// this to read the `WWW-Authenticate` response header on a 401.
+    fn www_authenticate(&self, url: &str) -> Result<Option<String>> {
+        self.get(url).map(Some)
+    }
     /// POST a form-encoded body, returning `(status, body)`.
     ///
     /// The status is returned rather than folded into an error because the
@@ -239,13 +308,20 @@ pub fn discover(
         )
     })?;
 
-    // The resource metadata's token_endpoint wins: it points at the VGI
-    // server's exchange proxy, which holds a client secret this client does not.
+    let device_token_endpoint = pm
+        .token_endpoint
+        .clone()
+        .ok_or_else(|| RpcError::new("AuthError", "no token endpoint was discovered"))?;
+    enforce_https(&device_token_endpoint)?;
+
+    // The resource metadata's token_endpoint wins for refresh: it points at
+    // the VGI server's exchange proxy, which holds a client secret this client
+    // does not. Device polling still uses the provider endpoint above.
+    let token_endpoint_is_proxy = rm.token_endpoint.is_some();
     let token_endpoint = rm
         .token_endpoint
         .clone()
-        .or_else(|| pm.token_endpoint.clone())
-        .ok_or_else(|| RpcError::new("AuthError", "no token endpoint was discovered"))?;
+        .unwrap_or_else(|| device_token_endpoint.clone());
     enforce_https(&token_endpoint)?;
     if let Some(d) = &pm.device_authorization_endpoint {
         enforce_https(d)?;
@@ -266,6 +342,8 @@ pub fn discover(
 
     Ok(DiscoveredEndpoints {
         token_endpoint,
+        device_token_endpoint,
+        token_endpoint_is_proxy,
         device_authorization_endpoint: pm.device_authorization_endpoint,
         authorization_endpoint: pm.authorization_endpoint,
         device_client_id: challenge
@@ -285,7 +363,7 @@ pub fn discover(
 }
 
 /// A token set, with the client-side expiry it was received with.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenSet {
     /// The access token.
     pub access_token: String,
@@ -299,6 +377,22 @@ pub struct TokenSet {
     pub use_id_token: bool,
     /// `(issuer, subject)` from the id token, if it carried them.
     pub identity: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("use_id_token", &self.use_id_token)
+            .field("identity", &self.identity)
+            .finish()
+    }
 }
 
 impl TokenSet {
@@ -508,7 +602,7 @@ pub fn device_code_flow(
             form.push(("client_secret", sec));
         }
 
-        let (status, body) = match http.post_form(&endpoints.token_endpoint, &form) {
+        let (status, body) = match http.post_form(&endpoints.device_token_endpoint, &form) {
             Ok(v) => {
                 transient_failures = 0;
                 v
@@ -579,17 +673,27 @@ pub fn refresh(
     endpoints: &DiscoveredEndpoints,
     refresh_token: &str,
 ) -> Result<TokenSet> {
+    // A refresh token issued by the device flow belongs to the device client,
+    // not the ordinary browser client.
     let client_id = endpoints
-        .client_id
+        .device_client_id
         .as_deref()
-        .or(endpoints.device_client_id.as_deref())
+        .or(endpoints.client_id.as_deref())
         .ok_or_else(|| RpcError::new("AuthError", "no client_id available to refresh with"))?;
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", client_id),
     ];
-    if let Some(sec) = endpoints.client_secret.as_deref() {
+    let client_secret = if endpoints.token_endpoint_is_proxy {
+        None
+    } else {
+        endpoints
+            .device_client_secret
+            .as_deref()
+            .or(endpoints.client_secret.as_deref())
+    };
+    if let Some(sec) = client_secret {
         form.push(("client_secret", sec));
     }
     if !endpoints.scope.is_empty() {
@@ -640,8 +744,14 @@ impl HttpTransport for UreqTransport {
             .collect::<Vec<_>>()
             .join("&");
         // A 4xx is a normal outcome here (the device poll reads its body), so
-        // it must not be turned into a transport error.
-        match ureq::post(url)
+        // configure ureq to return the response rather than discarding its
+        // `authorization_pending` / `slow_down` JSON body in StatusCode.
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        match agent
+            .post(url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send(&body)
         {
@@ -650,12 +760,27 @@ impl HttpTransport for UreqTransport {
                 let text = r.body_mut().read_to_string().unwrap_or_default();
                 Ok((status, text))
             }
-            Err(ureq::Error::StatusCode(code)) => Ok((code, String::new())),
             Err(e) => Err(RpcError::new(
                 "AuthError",
                 format!("POST {url} failed: {e}"),
             )),
         }
+    }
+
+    fn www_authenticate(&self, url: &str) -> Result<Option<String>> {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        let response = agent
+            .get(url)
+            .call()
+            .map_err(|e| RpcError::new("AuthError", format!("GET {url} failed: {e}")))?;
+        Ok(response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string))
     }
 }
 
@@ -773,6 +898,8 @@ mod tests {
         let http = mock(&refs, &[]);
         let e = discover(&http, &challenge()).expect("discovery");
         assert_eq!(e.token_endpoint, "https://idp.example.com/token");
+        assert_eq!(e.device_token_endpoint, "https://idp.example.com/token");
+        assert!(!e.token_endpoint_is_proxy);
         assert_eq!(
             e.device_authorization_endpoint.as_deref(),
             Some("https://idp.example.com/device")
@@ -790,6 +917,8 @@ mod tests {
         let http = mock(&refs, &[]);
         let e = discover(&http, &challenge()).expect("discovery");
         assert_eq!(e.token_endpoint, "https://api.example.com/_oauth/token");
+        assert_eq!(e.device_token_endpoint, "https://idp.example.com/token");
+        assert!(e.token_endpoint_is_proxy);
     }
 
     #[test]
@@ -931,7 +1060,9 @@ mod tests {
             ],
         );
         let e = DiscoveredEndpoints {
-            token_endpoint: "https://idp/token".into(),
+            token_endpoint: "https://api/refresh-proxy".into(),
+            device_token_endpoint: "https://idp/token".into(),
+            token_endpoint_is_proxy: true,
             device_authorization_endpoint: Some("https://idp/device".into()),
             authorization_endpoint: None,
             device_client_id: Some("tv".into()),
@@ -950,6 +1081,10 @@ mod tests {
         // client. This is the C++ defect this implementation avoids.
         let posts = http.posts.lock().unwrap();
         let poll = &posts[1];
+        assert_eq!(poll.0, "https://idp/token");
+        assert!(poll.1.iter().any(|(k, v)| {
+            k == "grant_type" && v == "urn:ietf:params:oauth:grant-type:device_code"
+        }));
         assert!(poll.1.iter().any(|(k, v)| k == "client_id" && v == "tv"));
     }
 
@@ -973,6 +1108,8 @@ mod tests {
         );
         let e = DiscoveredEndpoints {
             token_endpoint: "https://idp/token".into(),
+            device_token_endpoint: "https://idp/token".into(),
+            token_endpoint_is_proxy: false,
             device_authorization_endpoint: Some("https://idp/device".into()),
             authorization_endpoint: None,
             device_client_id: Some("tv".into()),

@@ -34,7 +34,7 @@ const BEARER_DOMAIN: &str = "vgi-cache-principal:v1";
 const SEP: u8 = 0x1f;
 
 /// The identity a set of credentials resolves to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Identity {
     /// No credential is configured. All such callers share one cache scope.
     Anonymous,
@@ -49,6 +49,21 @@ pub enum Identity {
     Bearer(String),
     /// Credentials are configured but have not resolved yet.
     Unresolved,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str("Anonymous"),
+            Self::OAuth { issuer, subject } => f
+                .debug_struct("OAuth")
+                .field("issuer", issuer)
+                .field("subject", subject)
+                .finish(),
+            Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Self::Unresolved => f.write_str("Unresolved"),
+        }
+    }
 }
 
 impl Identity {

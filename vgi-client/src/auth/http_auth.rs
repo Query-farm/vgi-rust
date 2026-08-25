@@ -85,10 +85,13 @@ impl AuthenticatedHttpTransport {
     /// endpoints are cached, and a bearer-only catalog never needs one. The
     /// probe is unauthenticated on purpose — that is what provokes the header.
     fn fetch_challenge(&self) -> Option<OAuthChallenge> {
-        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
+        // Probe the VGI endpoint itself. Health endpoints are commonly public
+        // (the Volcanoes deployment is one), so they cannot be relied on to
+        // carry the protected resource's challenge.
+        let url = self.base_url.clone();
         // A challenge is advisory; a probe that fails just means discovery has
         // nothing to go on, which `handle_unauthorized` reports clearly.
-        let header = self.probe.get(&url).ok()?;
+        let header = self.probe.www_authenticate(&url).ok()??;
         OAuthChallenge::parse(&header)
     }
 
@@ -102,7 +105,11 @@ impl AuthenticatedHttpTransport {
             Ok(v) => return Ok(v),
             Err(e) => e,
         };
-        if err.auth_reason.is_none() {
+        // vgi-rpc-client versions through 0.23.x surface HTTP 401 as an
+        // `AuthenticationError` whose body is the JSON envelope, but do not
+        // populate RpcError.auth_reason. Recognize both representations so the
+        // auth layer actually gets a chance to recover.
+        if err.auth_reason.is_none() && err.error_type != "AuthenticationError" {
             return Err(err);
         }
 

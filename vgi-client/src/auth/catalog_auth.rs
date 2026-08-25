@@ -50,9 +50,17 @@ pub trait CatalogAuth: Send + Sync {
 /// Cannot recover from a 401: there is no refresh, no discovery, and retrying
 /// the same token unchanged is exactly what the spec forbids. So a rejection is
 /// terminal and says so.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BearerAuth {
     token: String,
+}
+
+impl std::fmt::Debug for BearerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerAuth")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BearerAuth {

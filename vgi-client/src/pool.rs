@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use vgi_rpc::errors::Result;
 
-use crate::client::VgiClient;
+use crate::client::{ConnectionOptions, VgiClient};
 use crate::location::VgiLocation;
 
 /// How long an idle connection is kept before eviction.
@@ -124,6 +124,36 @@ struct Idle {
     since: Instant,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    location: VgiLocation,
+    connection_options: Option<ConnectionOptions>,
+    /// Process-local identity of the shared auth object. It is deliberately
+    /// neither a bearer value nor an OAuth subject: equal Arc pointers share a
+    /// bucket, distinct auth state never does, and no credential enters a key
+    /// that diagnostics might print.
+    auth_scope: Option<usize>,
+}
+
+impl PoolKey {
+    fn anonymous(location: &VgiLocation) -> Self {
+        Self {
+            location: location.clone(),
+            connection_options: None,
+            auth_scope: None,
+        }
+    }
+
+    #[cfg(all(feature = "http", feature = "oauth"))]
+    fn authenticated(location: &VgiLocation, auth: &Arc<dyn crate::auth::CatalogAuth>) -> Self {
+        Self {
+            location: location.clone(),
+            connection_options: None,
+            auth_scope: Some(Arc::as_ptr(auth) as *const () as usize),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     hits: AtomicU64,
@@ -142,7 +172,7 @@ pub struct WorkerPool {
 }
 
 struct PoolInner {
-    idle: Mutex<HashMap<VgiLocation, Vec<Idle>>>,
+    idle: Mutex<HashMap<PoolKey, Vec<Idle>>>,
     config: PoolConfig,
     counters: Counters,
 }
@@ -179,22 +209,72 @@ impl WorkerPool {
     /// The connection returns to the pool when the guard drops, unless it was
     /// [poisoned](PooledClient::poison).
     pub fn acquire(&self, location: &VgiLocation) -> Result<PooledClient> {
-        if let Some(client) = self.take_idle(location) {
+        let key = PoolKey::anonymous(location);
+        self.acquire_with(key, || VgiClient::connect_location(location))
+    }
+
+    /// Take a connection using local per-attachment transport settings.
+    ///
+    /// Settings are part of the pool key, so two attachments with different
+    /// subprocess stderr or launcher configuration never reuse one another's
+    /// connection.
+    pub fn acquire_with_options(
+        &self,
+        location: &VgiLocation,
+        options: ConnectionOptions,
+    ) -> Result<PooledClient> {
+        let key = PoolKey {
+            location: location.clone(),
+            connection_options: Some(options.clone()),
+            auth_scope: None,
+        };
+        self.acquire_with(key, || {
+            VgiClient::connect_location_with_options(location, &options)
+        })
+    }
+
+    /// Take an authenticated HTTP connection.
+    ///
+    /// Connections pool only with callers sharing the exact same `Arc` auth
+    /// state. That both enables OAuth single-flight refresh across partitions
+    /// and prevents a client carrying one principal's bearer from being handed
+    /// to another attached catalog.
+    #[cfg(all(feature = "http", feature = "oauth"))]
+    pub fn acquire_with_auth(
+        &self,
+        location: &VgiLocation,
+        auth: Arc<dyn crate::auth::CatalogAuth>,
+    ) -> Result<PooledClient> {
+        let VgiLocation::Http(url) = location else {
+            return Err(vgi_rpc::errors::RpcError::value_error(
+                "authenticated connections require an HTTP(S) LOCATION",
+            ));
+        };
+        let key = PoolKey::authenticated(location, &auth);
+        self.acquire_with(key, || Ok(VgiClient::connect_http_with_auth(url, auth)))
+    }
+
+    fn acquire_with(
+        &self,
+        key: PoolKey,
+        connect: impl FnOnce() -> Result<VgiClient>,
+    ) -> Result<PooledClient> {
+        if let Some(client) = self.take_idle(&key) {
             self.inner.counters.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(PooledClient::new(self.clone(), location.clone(), client));
+            return Ok(PooledClient::new(self.clone(), key, client));
         }
         self.inner.counters.misses.fetch_add(1, Ordering::Relaxed);
-        let client = VgiClient::connect_location(location)?;
-        Ok(PooledClient::new(self.clone(), location.clone(), client))
+        let client = connect()?;
+        Ok(PooledClient::new(self.clone(), key, client))
     }
 
     /// Pop a live idle connection, discarding any that timed out on the way.
-    fn take_idle(&self, location: &VgiLocation) -> Option<VgiClient> {
+    fn take_idle(&self, key: &PoolKey) -> Option<VgiClient> {
         if !self.inner.config.pooling_enabled() {
             return None;
         }
         let mut idle = self.inner.idle.lock().ok()?;
-        let bucket = idle.get_mut(location)?;
+        let bucket = idle.get_mut(key)?;
         let timeout = self.inner.config.idle_timeout;
         // Newest first: the most recently returned connection is the one most
         // likely to still be alive, and taking it lets the stale tail age out
@@ -212,7 +292,7 @@ impl WorkerPool {
         None
     }
 
-    fn release(&self, location: VgiLocation, client: VgiClient) {
+    fn release(&self, key: PoolKey, client: VgiClient) {
         if !self.inner.config.pooling_enabled() {
             return;
         }
@@ -227,7 +307,7 @@ impl WorkerPool {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-        idle.entry(location).or_default().push(Idle {
+        idle.entry(key).or_default().push(Idle {
             client,
             since: Instant::now(),
         });
@@ -295,16 +375,16 @@ impl WorkerPool {
 /// A checked-out connection that returns itself to the pool on drop.
 pub struct PooledClient {
     pool: WorkerPool,
-    location: VgiLocation,
+    key: PoolKey,
     client: Option<VgiClient>,
     poisoned: bool,
 }
 
 impl PooledClient {
-    fn new(pool: WorkerPool, location: VgiLocation, client: VgiClient) -> Self {
+    fn new(pool: WorkerPool, key: PoolKey, client: VgiClient) -> Self {
         Self {
             pool,
-            location,
+            key,
             client: Some(client),
             poisoned: false,
         }
@@ -360,7 +440,7 @@ impl Drop for PooledClient {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.pool.release(self.location.clone(), client);
+        self.pool.release(self.key.clone(), client);
     }
 }
 
@@ -414,6 +494,25 @@ mod tests {
             VgiLocation::Subprocess(vec!["w".into()]),
             VgiLocation::Launch(vec!["w".into()])
         );
+    }
+
+    #[test]
+    fn connection_options_are_part_of_the_key() {
+        let location = loc("configured");
+        let plain = PoolKey {
+            location: location.clone(),
+            connection_options: Some(ConnectionOptions::default()),
+            auth_scope: None,
+        };
+        let debug = PoolKey {
+            location,
+            connection_options: Some(ConnectionOptions {
+                worker_debug: true,
+                ..Default::default()
+            }),
+            auth_scope: None,
+        };
+        assert!(plain != debug);
     }
 
     #[test]

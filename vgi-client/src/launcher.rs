@@ -485,7 +485,14 @@ mod tests {
     /// mode is silent (a second worker starts and everything "works", slowly).
     #[test]
     fn hashes_match_the_python_golden_vectors() {
-        let cases: &[(&str, Vec<String>, &str, BTreeMap<String, String>, &str)] = &[
+        type HashCase = (
+            &'static str,
+            Vec<String>,
+            &'static str,
+            BTreeMap<String, String>,
+            &'static str,
+        );
+        let cases: &[HashCase] = &[
             (
                 "empty_argv_empty_env",
                 argv(&[]),

@@ -3,7 +3,9 @@
 //! The client handle and how to connect one.
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
@@ -20,6 +22,21 @@ use crate::transport::{StreamTransport, VgiTransport};
 /// how a scan fans out across the worker's advertised `max_workers`.
 pub struct VgiClient {
     transport: Box<dyn VgiTransport>,
+}
+
+/// Per-attachment transport settings that affect how a worker is reached.
+///
+/// These mirror the local VGI `ATTACH` options. They are deliberately kept
+/// separate from protocol attach options: changing one can select or spawn a
+/// different local worker connection, so a pool must include them in its key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ConnectionOptions {
+    /// Inherit a subprocess worker's stderr when true; discard it otherwise.
+    pub worker_debug: bool,
+    /// Override the idle timeout for a `launch:` worker.
+    pub launcher_idle_timeout: Option<Duration>,
+    /// Override the state directory for a `launch:` worker.
+    pub launcher_state_dir: Option<PathBuf>,
 }
 
 /// Apply the settings every VGI connection needs, whatever the transport.
@@ -136,6 +153,32 @@ impl VgiClient {
         }
     }
 
+    /// Connect using local per-attachment transport settings.
+    ///
+    /// Unlike [`Self::connect_location`], subprocess stderr defaults to being
+    /// discarded here, matching the VGI `worker_debug = false` ATTACH default.
+    pub fn connect_location_with_options(
+        location: &VgiLocation,
+        options: &ConnectionOptions,
+    ) -> Result<Self> {
+        match location {
+            VgiLocation::Subprocess(argv) => {
+                Self::connect_subprocess_with_debug(argv, options.worker_debug)
+            }
+            #[cfg(feature = "launcher")]
+            VgiLocation::Launch(argv) => {
+                let mut config = crate::launcher::LaunchConfig::default();
+                if let Some(timeout) = options.launcher_idle_timeout {
+                    config.idle_timeout = timeout;
+                }
+                config.state_dir = options.launcher_state_dir.clone();
+                let sock = crate::launcher::ensure_worker(argv, &config)?;
+                Self::connect_unix(sock)
+            }
+            _ => Self::connect_location(location),
+        }
+    }
+
     /// Parse a `LOCATION` string and connect to it.
     pub fn connect_to(location: &str) -> Result<Self> {
         Self::connect_location(&VgiLocation::parse(location)?)
@@ -148,6 +191,25 @@ impl VgiClient {
             .map(|s| s.as_ref().to_string_lossy().into_owned())
             .unwrap_or_else(|| "subprocess".to_string());
         let client = configure(RpcClient::connect(cmd)?);
+        Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+    }
+
+    /// Spawn a subprocess with explicit control over whether stderr is shown.
+    pub fn connect_subprocess_with_debug<S: AsRef<OsStr>>(
+        cmd: &[S],
+        worker_debug: bool,
+    ) -> Result<Self> {
+        let label = cmd
+            .first()
+            .map(|s| s.as_ref().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "subprocess".to_string());
+        let stderr = if worker_debug {
+            vgi_rpc_client::StderrMode::Inherit
+        } else {
+            vgi_rpc_client::StderrMode::Null
+        };
+        let transport = vgi_rpc_client::SubprocessTransport::spawn_with_stderr(cmd, stderr)?;
+        let client = configure(RpcClient::from_transport(Box::new(transport)));
         Ok(Self::new(Box::new(StreamTransport::new(client, label))))
     }
 

@@ -2,6 +2,8 @@
 
 //! Attaching a catalog and discovering what it holds.
 
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
+use arrow_schema::DataType;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     CatalogAttachRequest, CatalogAttachResult, CatalogInfo, CatalogTransactionBeginResult,
@@ -13,6 +15,141 @@ use vgi_rpc::{Bytes, DictString};
 
 use crate::client::VgiClient;
 use crate::wire_call::{call, call_items, call_unit, envelope};
+
+/// One attach-time option advertised by a catalog during discovery.
+///
+/// The wire carries the type as an IPC schema and the default as an optional
+/// one-row IPC batch. Decoding that representation here keeps query-engine
+/// integrations from each having to reproduce the protocol's nested IPC
+/// format.
+#[derive(Clone)]
+pub struct AttachOptionSpec {
+    /// Case-preserving option name.
+    pub name: String,
+    /// Human-readable description supplied by the catalog.
+    pub description: String,
+    /// Arrow type the supplied value must have.
+    pub data_type: DataType,
+    /// One-element default array, when the worker declares one.
+    pub default_value: Option<ArrayRef>,
+    /// Whether the caller must supply this option.
+    pub required: bool,
+}
+
+impl std::fmt::Debug for AttachOptionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachOptionSpec")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("data_type", &self.data_type)
+            .field(
+                "default_value",
+                &self.default_value.as_ref().map(|_| "<redacted>"),
+            )
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+impl AttachOptionSpec {
+    /// Decode one IPC-serialized `AttachOptionSpec` from `CatalogInfo`.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let batch = vgi_protocol::ipc::read_batch(bytes)?;
+        if batch.num_rows() != 1 {
+            return Err(vgi_rpc::errors::RpcError::type_error(format!(
+                "AttachOptionSpec must contain one row, found {}",
+                batch.num_rows()
+            )));
+        }
+        let string = |name: &str| -> Result<String> {
+            let array = batch
+                .column_by_name(name)
+                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    vgi_rpc::errors::RpcError::type_error(format!(
+                        "AttachOptionSpec.{name} is not Utf8"
+                    ))
+                })?;
+            if array.is_null(0) {
+                return Err(vgi_rpc::errors::RpcError::type_error(format!(
+                    "AttachOptionSpec.{name} is null"
+                )));
+            }
+            Ok(array.value(0).to_string())
+        };
+        let binary = batch
+            .column_by_name("type")
+            .and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| {
+                vgi_rpc::errors::RpcError::type_error("AttachOptionSpec.type is not Binary")
+            })?;
+        if binary.is_null(0) {
+            return Err(vgi_rpc::errors::RpcError::type_error(
+                "AttachOptionSpec.type is null",
+            ));
+        }
+        let type_schema = vgi_protocol::ipc::read_schema(binary.value(0))?;
+        let field = type_schema.fields().first().ok_or_else(|| {
+            vgi_rpc::errors::RpcError::type_error("AttachOptionSpec.type schema has no field")
+        })?;
+
+        let default_value = match batch.column_by_name("default_value") {
+            Some(array) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        vgi_rpc::errors::RpcError::type_error(
+                            "AttachOptionSpec.default_value is not Binary",
+                        )
+                    })?;
+                if values.is_null(0) {
+                    None
+                } else {
+                    let default = vgi_protocol::ipc::read_batch(values.value(0))?;
+                    if default.num_rows() != 1 || default.num_columns() != 1 {
+                        return Err(vgi_rpc::errors::RpcError::type_error(
+                            "AttachOptionSpec.default_value must contain one value",
+                        ));
+                    }
+                    Some(default.column(0).clone())
+                }
+            }
+            None => None,
+        };
+        let required = batch
+            .column_by_name("required")
+            .and_then(|a| a.as_any().downcast_ref::<BooleanArray>())
+            .is_some_and(|a| !a.is_null(0) && a.value(0));
+
+        Ok(Self {
+            name: string("name")?,
+            description: string("description")?,
+            data_type: field.data_type().clone(),
+            default_value,
+            required,
+        })
+    }
+}
+
+/// Decode all attach-time option declarations in one catalog discovery row.
+pub fn decode_attach_option_specs(info: &CatalogInfo) -> Result<Vec<AttachOptionSpec>> {
+    info.attach_option_specs
+        .iter()
+        .map(|bytes| AttachOptionSpec::decode(&bytes.0))
+        .collect()
+}
+
+/// Encode a one-row typed option batch for [`AttachOptions::options`].
+pub fn encode_attach_options(batch: &RecordBatch) -> Result<Bytes> {
+    if batch.num_rows() != 1 {
+        return Err(vgi_rpc::errors::RpcError::value_error(format!(
+            "attach options must contain exactly one row, found {}",
+            batch.num_rows()
+        )));
+    }
+    Ok(Bytes(vgi_protocol::ipc::write_batch(batch)?))
+}
 
 /// Which kind of function to list from a schema.
 ///
@@ -139,7 +276,7 @@ impl AttachedCatalog {
 }
 
 /// How to attach.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AttachOptions {
     /// IPC-encoded attach options, if the catalog declares any.
     pub options: Option<Bytes>,
@@ -147,6 +284,22 @@ pub struct AttachOptions {
     pub data_version_spec: Option<String>,
     /// Pin the read to a worker implementation version.
     pub implementation_version: Option<String>,
+}
+
+impl std::fmt::Debug for AttachOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachOptions")
+            .field(
+                "options",
+                &self
+                    .options
+                    .as_ref()
+                    .map(|b| format!("<ipc:{} bytes>", b.0.len())),
+            )
+            .field("data_version_spec", &self.data_version_spec)
+            .field("implementation_version", &self.implementation_version)
+            .finish()
+    }
 }
 
 impl VgiClient {
@@ -392,5 +545,91 @@ impl VgiClient {
                 transaction_opaque_data: txn,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod attach_option_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn decodes_type_default_and_required() {
+        let default = Arc::new(StringArray::from(vec!["us-east-1"])) as ArrayRef;
+        let raw = vgi::catalog::serialize_attach_option_spec(
+            "region",
+            "Cloud region",
+            &DataType::Utf8,
+            Some(&default),
+            false,
+        )
+        .unwrap();
+        let spec = AttachOptionSpec::decode(&raw).unwrap();
+        assert_eq!(spec.name, "region");
+        assert_eq!(spec.description, "Cloud region");
+        assert_eq!(spec.data_type, DataType::Utf8);
+        let default = spec.default_value.unwrap();
+        assert_eq!(
+            default
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "us-east-1"
+        );
+        assert!(!spec.required);
+
+        let required = vgi::catalog::serialize_attach_option_spec(
+            "api_key",
+            "API key",
+            &DataType::Utf8,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(AttachOptionSpec::decode(&required).unwrap().required);
+    }
+
+    #[test]
+    fn encodes_one_row_and_rejects_other_cardinality() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "answer",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![42])) as ArrayRef],
+        )
+        .unwrap();
+        let encoded = encode_attach_options(&batch).unwrap();
+        let decoded = vgi_protocol::ipc::read_batch(&encoded.0).unwrap();
+        assert_eq!(decoded.num_rows(), 1);
+        assert_eq!(decoded.schema().field(0).data_type(), &DataType::Int32);
+
+        let empty = RecordBatch::new_empty(schema);
+        assert!(encode_attach_options(&empty).is_err());
+    }
+
+    #[test]
+    fn debug_does_not_render_default_or_option_payloads() {
+        let spec = AttachOptionSpec {
+            name: "api_key".into(),
+            description: "secret-like".into(),
+            data_type: DataType::Utf8,
+            default_value: Some(Arc::new(StringArray::from(vec!["sentinel-secret"]))),
+            required: false,
+        };
+        assert!(!format!("{spec:?}").contains("sentinel-secret"));
+
+        let options = AttachOptions {
+            options: Some(Bytes(b"sentinel-secret".to_vec())),
+            ..Default::default()
+        };
+        assert!(!format!("{options:?}").contains("sentinel-secret"));
     }
 }
