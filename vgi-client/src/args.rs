@@ -25,7 +25,7 @@ use vgi_rpc::Bytes;
 ///
 /// [`ArgValue::Placeholder`] is how a *column* argument is expressed: the type
 /// is stated but the value is null, because the data arrives per-row later.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum ArgValue {
     /// A 64-bit integer.
     Int(i64),
@@ -35,10 +35,30 @@ pub enum ArgValue {
     Text(String),
     /// A boolean.
     Bool(bool),
+    /// An arbitrary one-row Arrow value, preserving its exact logical type.
+    ///
+    /// VGI arguments are Arrow struct fields on the wire, so nested, decimal,
+    /// temporal, unsigned, extension, and other Arrow values need no bespoke
+    /// protocol representation.
+    Arrow(ArrayRef),
     /// A typed null — a bind-time argument explicitly passed as NULL.
     Null(DataType),
     /// A typed placeholder for a column argument whose values arrive later.
     Placeholder(DataType),
+}
+
+impl PartialEq for ArgValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Arrow(a), Self::Arrow(b)) => a.to_data() == b.to_data(),
+            (Self::Null(a), Self::Null(b)) | (Self::Placeholder(a), Self::Placeholder(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl ArgValue {
@@ -48,6 +68,7 @@ impl ArgValue {
             Self::Float(_) => DataType::Float64,
             Self::Text(_) => DataType::Utf8,
             Self::Bool(_) => DataType::Boolean,
+            Self::Arrow(array) => array.data_type().clone(),
             Self::Null(t) | Self::Placeholder(t) => t.clone(),
         }
     }
@@ -58,6 +79,7 @@ impl ArgValue {
             Self::Float(v) => Arc::new(Float64Array::from(vec![*v])),
             Self::Text(v) => Arc::new(StringArray::from(vec![v.clone()])),
             Self::Bool(v) => Arc::new(BooleanArray::from(vec![*v])),
+            Self::Arrow(array) => array.clone(),
             Self::Null(t) | Self::Placeholder(t) => arrow_array::new_null_array(t, 1),
         })
     }
@@ -251,48 +273,18 @@ impl ArgValue {
     /// into an array — an engine is free to materialise a literal across the
     /// batch — and every row then holds the same constant, so row 0 is the
     /// value the bind needs.
-    pub fn from_array_row0(array: &dyn arrow_array::Array, name: &str) -> Result<Self> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::*;
-
+    pub fn from_array_row0(array: &dyn arrow_array::Array, _name: &str) -> Result<Self> {
         if array.is_empty() || array.is_null(0) {
             return Ok(Self::Null(array.data_type().clone()));
         }
-        Ok(match array.data_type() {
-            DataType::Boolean => Self::Bool(array.as_boolean().value(0)),
-            DataType::Int8 => Self::Int(array.as_primitive::<Int8Type>().value(0) as i64),
-            DataType::Int16 => Self::Int(array.as_primitive::<Int16Type>().value(0) as i64),
-            DataType::Int32 => Self::Int(array.as_primitive::<Int32Type>().value(0) as i64),
-            DataType::Int64 => Self::Int(array.as_primitive::<Int64Type>().value(0)),
-            DataType::UInt8 => Self::Int(array.as_primitive::<UInt8Type>().value(0) as i64),
-            DataType::UInt16 => Self::Int(array.as_primitive::<UInt16Type>().value(0) as i64),
-            DataType::UInt32 => Self::Int(array.as_primitive::<UInt32Type>().value(0) as i64),
-            DataType::UInt64 => {
-                let v = array.as_primitive::<UInt64Type>().value(0);
-                i64::try_from(v).map(Self::Int).map_err(|_| {
-                    RpcError::value_error(format!(
-                        "scan argument `{name}` ({v}) exceeds the signed 64-bit range"
-                    ))
-                })?
-            }
-            DataType::Float32 => Self::Float(array.as_primitive::<Float32Type>().value(0) as f64),
-            DataType::Float64 => Self::Float(array.as_primitive::<Float64Type>().value(0)),
-            DataType::Utf8 => Self::Text(array.as_string::<i32>().value(0).to_string()),
-            DataType::LargeUtf8 => Self::Text(array.as_string::<i64>().value(0).to_string()),
-            DataType::Utf8View => Self::Text(array.as_string_view().value(0).to_string()),
-            other => {
-                return Err(RpcError::value_error(format!(
-                    "scan argument `{name}` has type {other}, which this client \
-                     does not carry as a bind argument"
-                )))
-            }
-        })
+        Ok(Self::Arrow(array.slice(0, 1)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Array;
+    use arrow_array::builder::{Int64Builder, ListBuilder};
+    use arrow_array::{Array, Int8Array};
 
     use super::*;
 
@@ -382,5 +374,29 @@ mod tests {
             st.column(0).is_null(0),
             "a column argument carries no value"
         );
+    }
+
+    #[test]
+    fn typed_and_nested_arrow_values_round_trip_without_narrowing() {
+        let tiny: ArrayRef = Arc::new(Int8Array::from(vec![42]));
+        let mut lists = ListBuilder::new(Int64Builder::new());
+        lists.values().append_value(1);
+        lists.values().append_value(2);
+        lists.append(true);
+        let list: ArrayRef = Arc::new(lists.finish());
+
+        let args = Arguments::new()
+            .positional(ArgValue::from_array_row0(tiny.as_ref(), "tiny").unwrap())
+            .positional(ArgValue::from_array_row0(list.as_ref(), "list").unwrap());
+        let batch = ipc::read_batch(&args.to_ipc().unwrap().0).unwrap();
+        let values = batch
+            .column_by_name("args")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(values.column(0).data_type(), &DataType::Int8);
+        assert_eq!(values.column(1).data_type(), list.data_type());
+        assert_eq!(values.column(1).to_data(), list.to_data());
     }
 }
