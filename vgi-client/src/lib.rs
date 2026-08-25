@@ -72,11 +72,13 @@ pub mod scan;
 pub mod transport;
 pub mod wire_call;
 
-pub use aggregate::{with_group_ids, BoundAggregate, GROUP_COLUMN_NAME};
+pub use aggregate::{with_group_ids, BoundAggregate, WindowPartition, GROUP_COLUMN_NAME};
 pub use arg_spec::{ArgSpec, ArgSpecs};
 pub use args::{ArgValue, Arguments};
 pub use auth::{AuthReason, Unauthorized};
-pub use cache::{CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache};
+pub use cache::{
+    CacheEntryInfo, CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache,
+};
 pub use catalog::{
     decode_attach_option_specs, encode_attach_options, At, AttachOptionSpec, AttachOptions,
     AttachedCatalog, FunctionKind, MacroKind,
@@ -90,7 +92,7 @@ pub use retry::{
 };
 pub use scan::{
     BindSpec, BoundFunction, FunctionType, NullOrder, OrderBy, PlanOptions, Sample, Scan,
-    ScanOptions, ScanPlan, ScanSplitInfo, SortDirection,
+    ScanOptions, ScanPlan, ScanSplitInfo, SecretLookupRequest, SortDirection,
 };
 pub use transport::{ExchangeStream, ProducerStream, StreamTransport, VgiTransport};
 

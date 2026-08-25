@@ -196,6 +196,13 @@ impl Arguments {
         if bytes.is_empty() {
             return Ok(Self::new());
         }
+        // The canonical encoding of zero scan arguments is a bare empty
+        // schema. `read_batch` quite correctly reports that such a stream has
+        // no batch, so recognize this valid representation before asking for
+        // row 0.
+        if ipc::read_schema(bytes)?.fields().is_empty() {
+            return Ok(Self::new());
+        }
         let batch = ipc::read_batch(bytes)?;
         if batch.num_rows() == 0 {
             return Ok(Self::new());
@@ -306,6 +313,13 @@ mod tests {
             DataType::Struct(f) => assert!(f.is_empty(), "no argument fields"),
             other => panic!("args should be a struct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bare_empty_schema_decodes_as_no_scan_arguments() {
+        let bytes = ipc::write_schema(&Schema::empty()).unwrap();
+        let decoded = Arguments::from_scan_arguments(&bytes).unwrap();
+        assert!(decoded.is_empty());
     }
 
     #[test]

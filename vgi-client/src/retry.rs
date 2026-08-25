@@ -498,9 +498,11 @@ impl VgiTransport for RetryTransport {
         &'a mut self,
         method: &str,
         params: &RecordBatch,
+        metadata: Option<vgi_rpc::wire::Metadata>,
         has_header: bool,
     ) -> Result<Box<dyn ProducerStream + 'a>> {
-        self.inner.open_producer(method, params, has_header)
+        self.inner
+            .open_producer(method, params, metadata, has_header)
     }
 
     fn open_exchange<'a>(

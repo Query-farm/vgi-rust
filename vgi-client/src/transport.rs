@@ -33,6 +33,19 @@ pub trait ProducerStream {
     /// surface here.
     fn tick(&mut self) -> Result<Option<(RecordBatch, Metadata)>>;
 
+    /// Pull the next batch while attaching application metadata to this tick.
+    ///
+    /// Older/custom transports that do not override this method retain the
+    /// ordinary producer behaviour and ignore the metadata. That is a safe
+    /// fallback for optimisation hints such as dynamic filters: the engine
+    /// still evaluates the join or predicate locally.
+    fn tick_with_metadata(
+        &mut self,
+        _metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.tick()
+    }
+
     /// Ask the worker to stop early.
     fn cancel(&mut self) -> Result<()>;
 }
@@ -65,6 +78,7 @@ pub trait VgiTransport: Send {
         &'a mut self,
         method: &str,
         params: &RecordBatch,
+        metadata: Option<Metadata>,
         has_header: bool,
     ) -> Result<Box<dyn ProducerStream + 'a>>;
 
@@ -107,6 +121,13 @@ impl ProducerStream for StreamSessionAdapter<'_> {
         self.0.tick()
     }
 
+    fn tick_with_metadata(
+        &mut self,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.0.tick_with_metadata(metadata)
+    }
+
     fn cancel(&mut self) -> Result<()> {
         self.0.cancel()
     }
@@ -142,11 +163,12 @@ impl VgiTransport for StreamTransport {
         &'a mut self,
         method: &str,
         params: &RecordBatch,
+        metadata: Option<Metadata>,
         has_header: bool,
     ) -> Result<Box<dyn ProducerStream + 'a>> {
         let session = self
             .client
-            .open_producer(method, params, None, has_header)?;
+            .open_producer(method, params, metadata.as_ref(), has_header)?;
         Ok(Box::new(StreamSessionAdapter(session)))
     }
 
@@ -199,6 +221,13 @@ mod http_impl {
             self.0.tick()
         }
 
+        fn tick_with_metadata(
+            &mut self,
+            metadata: Option<&Metadata>,
+        ) -> Result<Option<(RecordBatch, Metadata)>> {
+            self.0.tick_with_metadata(metadata)
+        }
+
         fn cancel(&mut self) -> Result<()> {
             self.0.cancel()
         }
@@ -234,11 +263,12 @@ mod http_impl {
             &'a mut self,
             method: &str,
             params: &RecordBatch,
+            metadata: Option<Metadata>,
             has_header: bool,
         ) -> Result<Box<dyn ProducerStream + 'a>> {
-            let session = self
-                .client
-                .open_producer(method, params, None, has_header)?;
+            let session =
+                self.client
+                    .open_producer(method, params, metadata.as_ref(), has_header)?;
             Ok(Box::new(HttpSessionAdapter(session)))
         }
 

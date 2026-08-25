@@ -145,10 +145,14 @@ impl PoolKey {
     }
 
     #[cfg(all(feature = "http", feature = "oauth"))]
-    fn authenticated(location: &VgiLocation, auth: &Arc<dyn crate::auth::CatalogAuth>) -> Self {
+    fn authenticated(
+        location: &VgiLocation,
+        auth: &Arc<dyn crate::auth::CatalogAuth>,
+        options: &ConnectionOptions,
+    ) -> Self {
         Self {
             location: location.clone(),
-            connection_options: None,
+            connection_options: Some(options.clone()),
             auth_scope: Some(Arc::as_ptr(auth) as *const () as usize),
         }
     }
@@ -175,6 +179,35 @@ struct PoolInner {
     idle: Mutex<HashMap<PoolKey, Vec<Idle>>>,
     config: PoolConfig,
     counters: Counters,
+}
+
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        // `HttpClient` uses reqwest's blocking client, which owns a private
+        // Tokio runtime. Dropping that runtime from an asynchronous Tokio
+        // worker panics. Pool operations themselves run on blocking threads,
+        // but the final Arc<PoolInner> commonly belongs to an async session
+        // (DataFusion's SessionContext), so drain idle transports onto a plain
+        // OS thread at the ownership boundary.
+        let idle = match self.idle.get_mut() {
+            Ok(idle) => std::mem::take(idle),
+            Err(poisoned) => std::mem::take(poisoned.into_inner()),
+        };
+        let clients = idle
+            .into_values()
+            .flatten()
+            .map(|entry| entry.client)
+            .collect::<Vec<_>>();
+        if clients.is_empty() {
+            return;
+        }
+        if let Ok(handle) = std::thread::Builder::new()
+            .name("vgi-pool-drop".to_string())
+            .spawn(move || drop(clients))
+        {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -244,14 +277,21 @@ impl WorkerPool {
         &self,
         location: &VgiLocation,
         auth: Arc<dyn crate::auth::CatalogAuth>,
+        options: ConnectionOptions,
     ) -> Result<PooledClient> {
         let VgiLocation::Http(url) = location else {
             return Err(vgi_rpc::errors::RpcError::value_error(
                 "authenticated connections require an HTTP(S) LOCATION",
             ));
         };
-        let key = PoolKey::authenticated(location, &auth);
-        self.acquire_with(key, || Ok(VgiClient::connect_http_with_auth(url, auth)))
+        let key = PoolKey::authenticated(location, &auth, &options);
+        self.acquire_with(key, || {
+            Ok(VgiClient::connect_http_with_auth(
+                url,
+                auth,
+                options.rpc_timeout,
+            ))
+        })
     }
 
     fn acquire_with(

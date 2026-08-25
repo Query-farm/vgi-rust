@@ -131,12 +131,33 @@ impl VgiClient {
         spec: &BindSpec,
         input_schema: &Schema,
     ) -> Result<BoundAggregate> {
+        self.aggregate_bind_resolved(cat, spec, input_schema, None)
+    }
+
+    /// Bind an aggregate with secrets resolved from its discovery metadata.
+    pub fn aggregate_bind_with_resolved_secrets(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        input_schema: &Schema,
+        secrets: Vec<u8>,
+    ) -> Result<BoundAggregate> {
+        self.aggregate_bind_resolved(cat, spec, input_schema, Some(secrets))
+    }
+
+    fn aggregate_bind_resolved(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        input_schema: &Schema,
+        secrets: Option<Vec<u8>>,
+    ) -> Result<BoundAggregate> {
         let request = AggregateBindRequest {
             function_name: spec.function_name.clone(),
             arguments: spec.arguments.to_ipc()?,
             input_schema: Some(Bytes(ipc::write_schema(input_schema)?)),
             settings: spec.settings.clone(),
-            secrets: None,
+            secrets: secrets.map(Bytes),
             attach_opaque_data: Some(cat.handle().clone()),
             schema_name: spec.schema_name.clone(),
         };

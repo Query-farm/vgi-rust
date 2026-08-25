@@ -16,6 +16,8 @@
 //! input_schema** — that absence is what puts the worker in tick mode rather
 //! than exchange mode.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use vgi_protocol::generated::request_params as p;
@@ -170,16 +172,39 @@ impl VgiClient {
         spec: &BindSpec,
         input_schema: &Schema,
     ) -> Result<BoundFunction> {
+        self.bind_with_input_resolved(cat, spec, input_schema, None, false)
+    }
+
+    /// Bind an input function with the resolved secret batch requested by its
+    /// first bind pass.
+    pub fn bind_with_input_and_resolved_secrets(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        input_schema: &Schema,
+        secrets: Vec<u8>,
+    ) -> Result<BoundFunction> {
+        self.bind_with_input_resolved(cat, spec, input_schema, Some(secrets), true)
+    }
+
+    fn bind_with_input_resolved(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        input_schema: &Schema,
+        secrets: Option<Vec<u8>>,
+        resolved_secrets_provided: bool,
+    ) -> Result<BoundFunction> {
         let request = BindRequest {
             function_name: spec.function_name.clone(),
             arguments: spec.arguments.to_ipc()?,
             function_type: DictString(spec.function_type.as_str().to_string()),
             input_schema: Some(Bytes(ipc::write_schema(input_schema)?)),
             settings: spec.settings.clone(),
-            secrets: None,
+            secrets: secrets.map(Bytes),
             attach_opaque_data: Some(cat.handle().clone()),
             transaction_opaque_data: cat.transaction().cloned(),
-            resolved_secrets_provided: false,
+            resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
             schema_name: spec.schema_name.clone(),
@@ -192,9 +217,13 @@ impl VgiClient {
                 request: bind_call.clone(),
             },
         )?;
-        let output_schema = ipc::read_schema(&response.output_schema.0).map_err(|e| {
-            RpcError::type_error(format!("bind returned an unreadable output schema: {e}"))
-        })?;
+        let output_schema = if response.lookup_secret_types.is_empty() {
+            ipc::read_schema(&response.output_schema.0).map_err(|e| {
+                RpcError::type_error(format!("bind returned an unreadable output schema: {e}"))
+            })?
+        } else {
+            Arc::new(Schema::empty())
+        };
         Ok(BoundFunction::from_parts(
             spec.function_name.clone(),
             bind_call,
@@ -354,6 +383,7 @@ impl VgiClient {
         Scan::open(
             self.transport_mut(),
             &params,
+            None,
             bound.function_name(),
             bound.output_schema().clone(),
         )

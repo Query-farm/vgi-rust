@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
@@ -33,6 +33,17 @@ use crate::catalog::{At, AttachedCatalog};
 use crate::client::VgiClient;
 use crate::transport::ProducerStream;
 use crate::wire_call::{call, envelope};
+
+/// One secret lookup requested by a worker during the first bind pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretLookupRequest {
+    /// DuckDB/VGI secret type.
+    pub secret_type: String,
+    /// Optional scope, such as an object-store path prefix.
+    pub scope: Option<String>,
+    /// Optional explicit host secret name.
+    pub name: Option<String>,
+}
 
 /// Which flavour of function is being bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +233,30 @@ impl BoundFunction {
     pub fn required_secret_types(&self) -> &[String] {
         &self.response.lookup_secret_types
     }
+
+    /// Secret lookups requested by the worker, preserving type/scope/name.
+    pub fn required_secrets(&self) -> Vec<SecretLookupRequest> {
+        self.response
+            .lookup_secret_types
+            .iter()
+            .enumerate()
+            .map(|(index, secret_type)| SecretLookupRequest {
+                secret_type: secret_type.clone(),
+                scope: self
+                    .response
+                    .lookup_scopes
+                    .get(index)
+                    .filter(|value| !value.is_empty())
+                    .cloned(),
+                name: self
+                    .response
+                    .lookup_names
+                    .get(index)
+                    .filter(|value| !value.is_empty())
+                    .cloned(),
+            })
+            .collect()
+    }
 }
 
 /// Sort direction for an ORDER BY pushdown.
@@ -333,6 +368,11 @@ pub struct ScanOptions {
     /// the engine re-applies above the coalesce, whereas dividing by N
     /// under-produces under skew.
     pub row_limit: Option<i64>,
+    /// Strong validator sent on the first init request when revalidating a
+    /// cached result.
+    pub if_none_match: Option<String>,
+    /// Last-Modified validator sent when no ETag is available.
+    pub if_modified_since: Option<String>,
 }
 
 /// The projection to put on the wire: the requested columns, then any
@@ -377,6 +417,32 @@ impl ScanOptions {
     }
 }
 
+/// Standard-alphabet base64 without line breaks, used for binary continuation
+/// hints carried in Arrow custom metadata.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let bits = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((bits >> 18) & 63) as usize] as char);
+        out.push(TABLE[((bits >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// An open producer stream.
 pub struct Scan<'a> {
     stream: Box<dyn ProducerStream + 'a>,
@@ -395,10 +461,11 @@ impl<'a> Scan<'a> {
     pub(crate) fn open(
         transport: &'a mut dyn crate::transport::VgiTransport,
         params: &RecordBatch,
+        metadata: Option<vgi_rpc::wire::Metadata>,
         function: impl Into<String>,
         schema: SchemaRef,
     ) -> Result<Scan<'a>> {
-        let stream = transport.open_producer("init", params, true)?;
+        let stream = transport.open_producer("init", params, metadata, true)?;
         let header_batch = stream.header().ok_or_else(|| {
             RpcError::type_error("init did not return a GlobalInitResponse header")
         })?;
@@ -419,11 +486,12 @@ impl<'a> Scan<'a> {
     pub(crate) fn open_projected(
         transport: &'a mut dyn crate::transport::VgiTransport,
         params: &RecordBatch,
+        metadata: Option<vgi_rpc::wire::Metadata>,
         function: impl Into<String>,
         schema: SchemaRef,
         emitted_schema: SchemaRef,
     ) -> Result<Scan<'a>> {
-        let mut scan = Scan::open(transport, params, function, emitted_schema)?;
+        let mut scan = Scan::open(transport, params, metadata, function, emitted_schema)?;
         // `open` points both at what the worker emits; narrow the caller-facing
         // one, which is the whole point of the trim.
         scan.schema = schema;
@@ -459,11 +527,37 @@ impl Scan<'_> {
 
     /// Pull the next batch, or `None` at end of stream.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.next_batch_with_pushdown_filters(None)
+    }
+
+    /// Pull the next batch while sending a runtime-refined filter to the
+    /// worker on the producer tick.
+    ///
+    /// `filters` is the same Arrow IPC filter blob used by
+    /// [`ScanOptions::pushdown_filters`]. It is standard-base64 encoded under
+    /// the VGI request-metadata key `vgi_pushdown_filters`. VGI workers that
+    /// understand continuation filters apply the latest value to the next
+    /// produced batch. Older/custom transports may ignore the hint; callers
+    /// must therefore keep the engine-side predicate for correctness.
+    ///
+    /// Join-key side batches cannot ride continuation metadata. Put those in
+    /// [`ScanOptions::join_keys`] and use this method for later constant/range
+    /// refinements.
+    pub fn next_batch_with_pushdown_filters(
+        &mut self,
+        filters: Option<&[u8]>,
+    ) -> Result<Option<RecordBatch>> {
         if self.finished {
             return Ok(None);
         }
+        let metadata = filters.map(|filters| {
+            vgi_rpc::wire::Metadata::from([(
+                "vgi_pushdown_filters".to_string(),
+                base64_encode(filters),
+            )])
+        });
         loop {
-            match self.stream.tick()? {
+            match self.stream.tick_with_metadata(metadata.as_ref())? {
                 None => {
                     self.finished = true;
                     return Ok(None);
@@ -586,6 +680,28 @@ fn check_batch_schema(
 impl VgiClient {
     /// Resolve a function's output schema before any data moves.
     pub fn bind(&mut self, cat: &AttachedCatalog, spec: &BindSpec) -> Result<BoundFunction> {
+        self.bind_resolved(cat, spec, None, false)
+    }
+
+    /// Bind with host-resolved secrets during the second pass of VGI's secret
+    /// protocol. Callers must first inspect [`BoundFunction::required_secrets`]
+    /// and permit at most one resolved retry.
+    pub fn bind_with_resolved_secrets(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        secrets: Vec<u8>,
+    ) -> Result<BoundFunction> {
+        self.bind_resolved(cat, spec, Some(secrets), true)
+    }
+
+    pub(crate) fn bind_resolved(
+        &mut self,
+        cat: &AttachedCatalog,
+        spec: &BindSpec,
+        secrets: Option<Vec<u8>>,
+        resolved_secrets_provided: bool,
+    ) -> Result<BoundFunction> {
         let request = BindRequest {
             function_name: spec.function_name.clone(),
             arguments: match &spec.raw_arguments {
@@ -595,10 +711,10 @@ impl VgiClient {
             function_type: DictString(spec.function_type.as_str().to_string()),
             input_schema: None,
             settings: spec.settings.clone(),
-            secrets: None,
+            secrets: secrets.map(Bytes),
             attach_opaque_data: Some(cat.handle().clone()),
             transaction_opaque_data: cat.transaction().cloned(),
-            resolved_secrets_provided: false,
+            resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
             schema_name: spec.schema_name.clone(),
@@ -616,9 +732,13 @@ impl VgiClient {
             },
         )?;
 
-        let output_schema = ipc::read_schema(&response.output_schema.0).map_err(|e| {
-            RpcError::type_error(format!("bind returned an unreadable output schema: {e}"))
-        })?;
+        let output_schema = if response.lookup_secret_types.is_empty() {
+            ipc::read_schema(&response.output_schema.0).map_err(|e| {
+                RpcError::type_error(format!("bind returned an unreadable output schema: {e}"))
+            })?
+        } else {
+            Arc::new(Schema::empty())
+        };
 
         Ok(BoundFunction {
             function_name: spec.function_name.clone(),
@@ -639,9 +759,23 @@ impl VgiClient {
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
+        let mut metadata = vgi_rpc::wire::Metadata::new();
+        if let Some(value) = &opts.if_none_match {
+            metadata.insert(
+                vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY.to_string(),
+                value.clone(),
+            );
+        }
+        if let Some(value) = &opts.if_modified_since {
+            metadata.insert(
+                vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY.to_string(),
+                value.clone(),
+            );
+        }
         Scan::open_projected(
             self.transport_mut(),
             &params,
+            (!metadata.is_empty()).then_some(metadata),
             bound.function_name(),
             schema,
             emitted,
@@ -1137,6 +1271,14 @@ mod tests {
     }
 
     #[test]
+    fn continuation_filter_metadata_uses_standard_base64() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
     fn a_conforming_batch_passes() {
         let s = schema(&[("n", DataType::Int64)]);
         let b = RecordBatch::try_new(
@@ -1233,6 +1375,7 @@ mod tests {
             &'a mut self,
             _method: &str,
             params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
             _has_header: bool,
         ) -> Result<Box<dyn ProducerStream + 'a>> {
             let p: p::InitParams = wire::from_batch(params)?;
@@ -1358,6 +1501,37 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_without_tick_metadata_support_safely_ignores_the_hint() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let emitted: SchemaRef = Arc::new(schema(&[
+            ("a", DataType::Int64),
+            ("b", DataType::Int64),
+            ("c", DataType::Utf8),
+        ]));
+        let batch = RecordBatch::try_new(
+            emitted,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(StringArray::from(vec!["three"])),
+            ],
+        )
+        .unwrap();
+        let mut client = crate::VgiClient::new(Box::new(StubTransport {
+            batches: vec![batch],
+            seen,
+        }));
+        let bound = bound_stub();
+        let mut scan = client.scan(&bound, &ScanOptions::default()).unwrap();
+
+        let out = scan
+            .next_batch_with_pushdown_filters(Some(b"opaque-filter-ipc"))
+            .unwrap()
+            .expect("fallback transport still returns its batch");
+        assert_eq!(out.num_rows(), 1);
+    }
+
+    #[test]
     fn a_plain_projection_still_emits_exactly_what_it_asked_for() {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let emitted: SchemaRef = Arc::new(schema(&[("c", DataType::Utf8)]));
@@ -1447,6 +1621,7 @@ mod tests {
             &'a mut self,
             _method: &str,
             _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
             _has_header: bool,
         ) -> Result<Box<dyn ProducerStream + 'a>> {
             Err(RpcError::runtime_error("no scan here"))
@@ -1572,6 +1747,7 @@ mod tests {
             &'a mut self,
             _method: &str,
             _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
             _has_header: bool,
         ) -> Result<Box<dyn ProducerStream + 'a>> {
             Err(RpcError::runtime_error("no scan here"))

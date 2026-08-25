@@ -37,6 +37,9 @@ pub struct ConnectionOptions {
     pub launcher_idle_timeout: Option<Duration>,
     /// Override the state directory for a `launch:` worker.
     pub launcher_state_dir: Option<PathBuf>,
+    /// Optional per-request/read deadline. `None` disables the transport's
+    /// built-in default so the embedding query engine owns timeout policy.
+    pub rpc_timeout: Option<Duration>,
 }
 
 /// Apply the settings every VGI connection needs, whatever the transport.
@@ -165,6 +168,40 @@ impl VgiClient {
             VgiLocation::Subprocess(argv) => {
                 Self::connect_subprocess_with_debug(argv, options.worker_debug)
             }
+            VgiLocation::Tcp { host, port } => {
+                let client = configure(RpcClient::tcp_connect_with_timeout(
+                    host,
+                    *port,
+                    options.rpc_timeout,
+                )?);
+                Ok(Self::new(Box::new(StreamTransport::new(
+                    client,
+                    format!("tcp://{host}:{port}"),
+                ))))
+            }
+            #[cfg(feature = "http")]
+            VgiLocation::Http(url) => Self::connect_http_with_retry_and_timeout(
+                url,
+                crate::retry::RetryPolicy::default(),
+                options.rpc_timeout,
+            ),
+            #[cfg(not(feature = "http"))]
+            VgiLocation::Http(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "http:// LOCATIONs need the `http` feature",
+            )),
+            #[cfg(feature = "unix")]
+            VgiLocation::Unix(path) => {
+                let label = format!("unix://{}", path.display());
+                let client = configure(RpcClient::unix_connect_with_timeout(
+                    path,
+                    options.rpc_timeout,
+                )?);
+                Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+            }
+            #[cfg(not(feature = "unix"))]
+            VgiLocation::Unix(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "unix:// LOCATIONs need the `unix` feature",
+            )),
             #[cfg(feature = "launcher")]
             VgiLocation::Launch(argv) => {
                 let mut config = crate::launcher::LaunchConfig::default();
@@ -173,9 +210,17 @@ impl VgiClient {
                 }
                 config.state_dir = options.launcher_state_dir.clone();
                 let sock = crate::launcher::ensure_worker(argv, &config)?;
-                Self::connect_unix(sock)
+                let label = format!("unix://{}", sock.display());
+                let client = configure(RpcClient::unix_connect_with_timeout(
+                    sock,
+                    options.rpc_timeout,
+                )?);
+                Ok(Self::new(Box::new(StreamTransport::new(client, label))))
             }
-            _ => Self::connect_location(location),
+            #[cfg(not(feature = "launcher"))]
+            VgiLocation::Launch(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "launch: LOCATIONs need the `launcher` feature",
+            )),
         }
     }
 
@@ -248,10 +293,21 @@ impl VgiClient {
         base_url: &str,
         policy: crate::retry::RetryPolicy,
     ) -> Result<Self> {
+        Self::connect_http_with_retry_and_timeout(base_url, policy, Some(Duration::from_secs(30)))
+    }
+
+    /// As [`Self::connect_http_with_retry`], with an explicit request timeout.
+    #[cfg(feature = "http")]
+    pub fn connect_http_with_retry_and_timeout(
+        base_url: &str,
+        policy: crate::retry::RetryPolicy,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         use crate::transport::HttpTransport;
         let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .on_log(worker_log_sink())
+            .timeout(timeout)
             .build()?;
         let http = Box::new(HttpTransport::new(client, base_url.to_string()));
         Ok(Self::new(Box::new(crate::retry::RetryTransport::new(
@@ -268,8 +324,11 @@ impl VgiClient {
     pub fn connect_http_with_auth(
         base_url: &str,
         auth: std::sync::Arc<dyn crate::auth::CatalogAuth>,
+        timeout: Option<Duration>,
     ) -> Self {
-        let inner = Box::new(crate::auth::AuthenticatedHttpTransport::new(base_url, auth));
+        let inner = Box::new(crate::auth::AuthenticatedHttpTransport::new(
+            base_url, auth, timeout,
+        ));
         // Retry sits OUTSIDE the 401 recovery, not inside it: a 401 is fatal to
         // the retry classifier and passes straight through to the credential
         // refresh, while a 429 that the refresh would have no answer for is

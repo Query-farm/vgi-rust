@@ -6,11 +6,11 @@ use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, Strin
 use arrow_schema::DataType;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    CatalogAttachRequest, CatalogAttachResult, CatalogInfo, CatalogTransactionBeginResult,
-    CatalogVersionResult, FunctionInfo, MacroInfo, ScanFunctionResult, SchemaInfo, TableInfo,
-    ViewInfo,
+    AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogInfo,
+    CatalogTransactionBeginResult, CatalogVersionResult, FunctionInfo, MacroInfo,
+    ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
 };
-use vgi_rpc::errors::Result;
+use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
 
 use crate::client::VgiClient;
@@ -268,6 +268,42 @@ impl AttachedCatalog {
     /// The transaction handle threaded onto reads, if one is open.
     pub fn transaction(&self) -> Option<&Bytes> {
         self.transaction.as_ref()
+    }
+
+    /// Worker-selected functions to publish in the host's global registry.
+    pub fn global_functions(&self) -> Result<Vec<FunctionInfo>> {
+        self.info
+            .global_functions
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let batch = vgi_protocol::ipc::read_batch(&bytes.0).map_err(|error| {
+                    RpcError::runtime_error(format!(
+                        "invalid global_functions[{index}] IPC: {}",
+                        error.message
+                    ))
+                })?;
+                vgi_protocol::wire::from_batch(&batch)
+            })
+            .collect()
+    }
+
+    /// Catalogs the worker asks the host to attach alongside this one.
+    pub fn companion_catalogs(&self) -> Result<Vec<AttachCatalogInfo>> {
+        self.info
+            .attach_catalogs
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let batch = vgi_protocol::ipc::read_batch(&bytes.0).map_err(|error| {
+                    RpcError::runtime_error(format!(
+                        "invalid attach_catalogs[{index}] IPC: {}",
+                        error.message
+                    ))
+                })?;
+                vgi_protocol::wire::from_batch(&batch)
+            })
+            .collect()
     }
 
     fn txn(&self) -> Option<Bytes> {

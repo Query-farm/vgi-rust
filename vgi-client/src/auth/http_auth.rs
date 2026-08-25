@@ -16,6 +16,7 @@
 //! loop against the identity provider.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use vgi_rpc::errors::Result;
@@ -35,12 +36,22 @@ pub struct AuthenticatedHttpTransport {
     /// The token the live client was built with, so a change is detectable.
     built_with: Option<String>,
     label: String,
+    timeout: Option<Duration>,
 }
 
 impl AuthenticatedHttpTransport {
     /// Build a transport that presents `auth`'s credential.
-    pub fn new(base_url: impl Into<String>, auth: Arc<dyn CatalogAuth>) -> Self {
-        Self::with_probe(base_url, auth, Box::new(super::oauth::UreqTransport))
+    pub fn new(
+        base_url: impl Into<String>,
+        auth: Arc<dyn CatalogAuth>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self::with_probe(
+            base_url,
+            auth,
+            Box::new(super::oauth::UreqTransport),
+            timeout,
+        )
     }
 
     /// As [`Self::new`], with a custom transport for the challenge probe.
@@ -51,6 +62,7 @@ impl AuthenticatedHttpTransport {
         base_url: impl Into<String>,
         auth: Arc<dyn CatalogAuth>,
         probe: Box<dyn OAuthHttp>,
+        timeout: Option<Duration>,
     ) -> Self {
         let base_url = base_url.into();
         Self {
@@ -60,6 +72,7 @@ impl AuthenticatedHttpTransport {
             probe,
             client: None,
             built_with: None,
+            timeout,
         }
     }
 
@@ -69,7 +82,8 @@ impl AuthenticatedHttpTransport {
         if self.client.is_none() || self.built_with != token {
             let mut builder = HttpClient::connect(self.base_url.clone())
                 .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
-                .on_log(crate::client::worker_log_sink());
+                .on_log(crate::client::worker_log_sink())
+                .timeout(self.timeout);
             if let Some(t) = &token {
                 builder = builder.header("Authorization", &format!("Bearer {t}"))?;
             }
@@ -136,6 +150,7 @@ impl VgiTransport for AuthenticatedHttpTransport {
         &'a mut self,
         method: &str,
         params: &RecordBatch,
+        metadata: Option<vgi_rpc::wire::Metadata>,
         has_header: bool,
     ) -> Result<Box<dyn ProducerStream + 'a>> {
         // A stream borrows the client for its whole life, so the retry dance
@@ -143,7 +158,7 @@ impl VgiTransport for AuthenticatedHttpTransport {
         // up front instead: by the time a scan opens, any 401 has already been
         // seen and handled by an earlier unary call (bind, at minimum).
         let client = self.ensure_client()?;
-        let session = client.open_producer(method, params, None, has_header)?;
+        let session = client.open_producer(method, params, metadata.as_ref(), has_header)?;
         Ok(Box::new(super::http_stream::HttpProducerAdapter(session)))
     }
 

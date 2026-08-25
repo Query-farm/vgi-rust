@@ -35,6 +35,8 @@ use vgi_protocol::cache_control::CacheControl;
 /// worker can vary on without adding it here is how a cache serves wrong rows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    /// Catalog name, retained separately for targeted diagnostics and flushes.
+    pub catalog: String,
     /// Catalog name plus the caller's identity fingerprint.
     pub identity_scope: String,
     /// Which worker this came from.
@@ -51,6 +53,18 @@ pub struct CacheKey {
     pub catalog_version: i64,
     /// Time-travel coordinate, if any.
     pub at: Option<(String, String)>,
+    /// Canonical session/worker setting values that can affect results.
+    pub settings: Vec<u8>,
+    /// Canonical catalog attach options and resolved version pins.
+    pub attach_options: Vec<u8>,
+    /// Plain scan limit, distinct from a Top-N hint.
+    pub row_limit: Option<i64>,
+    /// Canonical ORDER BY/Top-N request, if one was pushed.
+    pub ordering: Option<Vec<u8>>,
+    /// Canonical sampling request, if one was pushed.
+    pub sample: Option<Vec<u8>>,
+    /// Stable planning/split shape when it affects the emitted result.
+    pub plan: Option<Vec<u8>>,
 }
 
 /// A stored result.
@@ -63,8 +77,12 @@ pub struct CachedEntry {
     ttl: Option<Duration>,
     /// Validator for a conditional revalidation.
     pub etag: Option<String>,
+    /// Weaker validator used when no ETag was supplied.
+    pub last_modified: Option<String>,
     /// Whether the worker said it can check freshness cheaply.
     pub revalidatable: bool,
+    stale_while_revalidate: Duration,
+    stale_if_error: Duration,
     hits: u64,
 }
 
@@ -89,6 +107,11 @@ impl CachedEntry {
         self.hits
     }
 
+    /// Freshness lifetime last advertised for this payload.
+    pub fn freshness_lifetime(&self) -> Option<Duration> {
+        self.ttl
+    }
+
     /// Whether the entry is past its freshness lifetime.
     ///
     /// An entry with no TTL never goes stale — the worker said so.
@@ -98,6 +121,51 @@ impl CachedEntry {
             Some(ttl) => now.duration_since(self.stored_at) >= ttl,
         }
     }
+
+    /// Age of this entry since it became stale.
+    pub fn stale_age_at(&self, now: Instant) -> Option<Duration> {
+        let ttl = self.ttl?;
+        now.checked_duration_since(self.stored_at + ttl)
+    }
+
+    /// Whether worker policy permits an immediate stale serve while refreshing.
+    pub fn may_serve_while_revalidate_at(&self, now: Instant) -> bool {
+        self.stale_age_at(now)
+            .is_some_and(|age| age <= self.stale_while_revalidate)
+    }
+
+    /// Whether worker policy permits a stale serve after refresh failure.
+    pub fn may_serve_on_error_at(&self, now: Instant) -> bool {
+        self.stale_age_at(now)
+            .is_some_and(|age| age <= self.stale_if_error)
+    }
+}
+
+/// Safe, immutable information about one cache entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntryInfo {
+    /// Stable process-local fingerprint of the complete key.
+    pub key_fingerprint: String,
+    /// Catalog and schema-qualified function, without credentials.
+    pub catalog: String,
+    /// Schema-qualified function name.
+    pub function: String,
+    /// Stored result size.
+    pub rows: usize,
+    /// Approximate Arrow memory held by the result.
+    pub bytes: usize,
+    /// Age and freshness at snapshot time.
+    pub age: Duration,
+    /// Whether the freshness lifetime has elapsed.
+    pub stale: bool,
+    /// Number of successful serves.
+    pub hits: u64,
+    /// Validators are reported only as presence flags.
+    pub has_etag: bool,
+    /// Whether a Last-Modified validator is present.
+    pub has_last_modified: bool,
+    /// Whether the worker permits conditional validation.
+    pub revalidatable: bool,
 }
 
 /// Why a scan was not cached.
@@ -155,6 +223,12 @@ pub struct CacheStats {
     pub evictions_ttl: u64,
     /// Results refused before being stored.
     pub refusals: u64,
+    /// Stale entries served under an explicit worker grace window.
+    pub stale_serves: u64,
+    /// Conditional validations completed with not-modified.
+    pub revalidations: u64,
+    /// Captures abandoned because execution did not complete successfully.
+    pub capture_aborts: u64,
     /// Entries currently held.
     pub entries: usize,
     /// Bytes currently held.
@@ -223,6 +297,21 @@ impl ResultCache {
             // `ttl = 0` with a validator is the HTTP "no-cache" semantic: store
             // it, but treat it as immediately stale so every read revalidates.
             Some(0) if cc.revalidatable => Duration::ZERO,
+            _ if cc.expires.is_some() => {
+                let expires = cc.expires.as_deref().and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .ok()
+                        .map(|value| value.with_timezone(&chrono::Utc))
+                });
+                let Some(expires) = expires else {
+                    return Err(Ineligible::NoFreshness);
+                };
+                let now = chrono::Utc::now();
+                expires
+                    .signed_duration_since(now)
+                    .to_std()
+                    .unwrap_or(Duration::ZERO)
+            }
             _ => {
                 if self.limits.default_ttl.is_zero() {
                     return Err(Ineligible::NoFreshness);
@@ -308,7 +397,18 @@ impl ResultCache {
                 Some(ttl)
             },
             etag: control.and_then(|c| c.etag.clone()),
+            last_modified: control.and_then(|c| c.last_modified.clone()),
             revalidatable: control.is_some_and(|c| c.revalidatable),
+            stale_while_revalidate: control
+                .and_then(|c| c.stale_while_revalidate)
+                .and_then(|v| u64::try_from(v).ok())
+                .map(Duration::from_secs)
+                .unwrap_or_default(),
+            stale_if_error: control
+                .and_then(|c| c.stale_if_error)
+                .and_then(|v| u64::try_from(v).ok())
+                .map(Duration::from_secs)
+                .unwrap_or_default(),
             hits: 0,
         };
 
@@ -341,6 +441,7 @@ impl ResultCache {
             Some(slot) => {
                 slot.entry.stored_at = Instant::now();
                 slot.entry.ttl = Some(ttl);
+                inner.stats.revalidations += 1;
                 true
             }
             None => false,
@@ -367,6 +468,25 @@ impl ResultCache {
             }
         }
         n
+    }
+
+    /// Drop every identity's entries for one catalog.
+    pub fn flush_catalog(&self, catalog: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let doomed: Vec<_> = inner
+            .map
+            .keys()
+            .filter(|key| key.catalog == catalog)
+            .cloned()
+            .collect();
+        let count = doomed.len();
+        for key in doomed {
+            if let Some(slot) = inner.map.remove(&key) {
+                inner.stats.total_bytes -= slot.entry.bytes;
+                inner.stats.entries -= 1;
+            }
+        }
+        count
     }
 
     /// Drop everything.
@@ -406,6 +526,46 @@ impl ResultCache {
     /// A snapshot of the counters.
     pub fn stats(&self) -> CacheStats {
         self.inner.lock().unwrap().stats
+    }
+
+    /// Record that an all-or-nothing capture was abandoned.
+    pub fn record_capture_abort(&self) {
+        self.inner.lock().unwrap().stats.capture_aborts += 1;
+    }
+
+    /// Record a stale serve allowed by worker policy.
+    pub fn record_stale_serve(&self) {
+        self.inner.lock().unwrap().stats.stale_serves += 1;
+    }
+
+    /// Snapshot entries without exposing identity scopes or validator values.
+    pub fn entries(&self) -> Vec<CacheEntryInfo> {
+        use std::hash::{Hash, Hasher};
+
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .iter()
+            .map(|(key, slot)| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                CacheEntryInfo {
+                    key_fingerprint: format!("{:016x}", hasher.finish()),
+                    catalog: key.catalog.clone(),
+                    function: key.function.clone(),
+                    rows: slot.entry.rows,
+                    bytes: slot.entry.bytes,
+                    age: now.duration_since(slot.entry.stored_at),
+                    stale: slot.entry.is_stale_at(now),
+                    hits: slot.entry.hits,
+                    has_etag: slot.entry.etag.is_some(),
+                    has_last_modified: slot.entry.last_modified.is_some(),
+                    revalidatable: slot.entry.revalidatable,
+                }
+            })
+            .collect()
     }
 
     /// Evict least-recently-used entries until every cap is satisfied.
@@ -458,6 +618,7 @@ mod tests {
 
     fn key(scope: &str, func: &str) -> CacheKey {
         CacheKey {
+            catalog: "cat".into(),
             identity_scope: scope.into(),
             worker_label: "w".into(),
             function: func.into(),
@@ -466,6 +627,12 @@ mod tests {
             filters: None,
             catalog_version: 1,
             at: None,
+            settings: vec![],
+            attach_options: vec![],
+            row_limit: None,
+            ordering: None,
+            sample: None,
+            plan: None,
         }
     }
 
@@ -818,5 +985,90 @@ mod tests {
         c.get(&k);
         let e = c.get(&k).unwrap();
         assert_eq!(e.hits(), 2);
+    }
+
+    #[test]
+    fn every_new_result_shape_dimension_is_keyed() {
+        let c = ResultCache::new(CacheLimits::default());
+        let base = key("s", "f");
+        c.insert(
+            base.clone(),
+            vec![batch(1)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        let mutations: Vec<Box<dyn Fn(&mut CacheKey)>> = vec![
+            Box::new(|key| key.settings = vec![1]),
+            Box::new(|key| key.attach_options = vec![2]),
+            Box::new(|key| key.row_limit = Some(10)),
+            Box::new(|key| key.ordering = Some(vec![3])),
+            Box::new(|key| key.sample = Some(vec![4])),
+            Box::new(|key| key.plan = Some(vec![5])),
+        ];
+        for mutate in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(c.get(&changed).is_none());
+        }
+        assert!(c.get(&base).is_some());
+    }
+
+    #[test]
+    fn absolute_expiry_is_a_freshness_key() {
+        let c = ResultCache::new(CacheLimits::default());
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let lifetime = c
+            .eligibility(
+                Some(&CacheControl::default().with_expires(expires)),
+                Some("s"),
+                1,
+            )
+            .expect("valid future expiry");
+        assert!(lifetime > Duration::from_secs(20));
+        assert!(lifetime <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stale_grace_windows_are_preserved() {
+        let c = ResultCache::new(CacheLimits::default());
+        let control = CacheControl {
+            ttl_seconds: Some(0),
+            revalidatable: true,
+            stale_while_revalidate: Some(30),
+            stale_if_error: Some(60),
+            ..Default::default()
+        };
+        let k = key("s", "f");
+        c.insert(k.clone(), vec![batch(1)], Duration::ZERO, Some(&control));
+        let entry = c.get_for_revalidation(&k).expect("retained stale entry");
+        let now = Instant::now();
+        assert!(entry.may_serve_while_revalidate_at(now));
+        assert!(entry.may_serve_on_error_at(now));
+    }
+
+    #[test]
+    fn catalog_flush_and_entry_listing_are_safe() {
+        let c = ResultCache::new(CacheLimits::default());
+        let mut other = key("secret identity", "other");
+        other.catalog = "other".into();
+        c.insert(
+            key("secret identity", "f"),
+            vec![batch(2)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        c.insert(
+            other,
+            vec![batch(1)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        let entries = c.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| !entry.key_fingerprint.contains("secret")));
+        assert_eq!(c.flush_catalog("cat"), 1);
+        assert_eq!(c.stats().entries, 1);
     }
 }

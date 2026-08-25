@@ -14,7 +14,9 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use vgi_client::{Arguments, AttachOptions, BindSpec, ScanOptions, VgiClient};
+use vgi_client::{
+    Arguments, AttachOptions, BindSpec, ScanOptions, VgiClient, VgiLocation, WorkerPool,
+};
 
 fn example_worker() -> Option<PathBuf> {
     let mut dir = std::env::current_exe().ok()?;
@@ -117,6 +119,40 @@ fn the_http_data_path_runs_inside_spawn_blocking() {
             .expect("the blocking HTTP path must not panic under an ambient runtime")
     });
     assert_eq!(rows, 5);
+}
+
+/// DataFusion owns the pool from an async SessionContext, even though every
+/// checked-out client is used and returned on a blocking thread. The last pool
+/// reference therefore has to be safe to drop on a runtime worker too.
+#[test]
+fn an_idle_http_pool_can_drop_inside_tokio() {
+    let Some(exe) = example_worker() else {
+        eprintln!("skipping: vgi-example-worker not built (run `cargo build --workspace`)");
+        return;
+    };
+    let worker = HttpWorker::start(&exe);
+    let location = VgiLocation::Http(worker.url());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        let pool = WorkerPool::default();
+        let blocking_pool = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut client = blocking_pool.acquire(&location).expect("connect");
+            assert_eq!(scan_rows(&mut client), 5);
+            // `client` returns to the pool on this blocking thread.
+        })
+        .await
+        .expect("blocking scan");
+        assert_eq!(pool.stats().idle, 1);
+        // The final pool reference and its idle reqwest client drop here, on a
+        // Tokio worker. This used to panic in reqwest's runtime destructor.
+        drop(pool);
+    });
 }
 
 /// The shape a caller gets wrong: blocking directly on a runtime thread.

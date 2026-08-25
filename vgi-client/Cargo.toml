@@ -40,6 +40,7 @@ arrow-schema = { workspace = true }
 # DataFusion already emit through, and a `tracing` subscriber picks `log`
 # records up while the reverse needs extra wiring.
 log = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `ureq` is pure-sync with no runtime of its own, so it is safe to call from
 # inside a `spawn_blocking` closure — unlike `reqwest::blocking`, which panics
 # when it detects an ambient async runtime.
