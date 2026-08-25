@@ -973,7 +973,7 @@ fn data_tables() -> Vec<CatTable> {
     // `numbers` carries DuckDB-extracted stats (value 0..99); `colors` carries
     // ENUM-ordinal-derived stats (color: red(0)..blue(2)).
     for t in tables.iter_mut() {
-        if t.name == "numbers" {
+        if t.name == "numbers" || t.name == "volatile_numbers" {
             t.statistics = vec![stat(
                 "value",
                 StatValue::Int64(0),
