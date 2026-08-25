@@ -14,7 +14,7 @@ use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
 
 use crate::client::VgiClient;
-use crate::wire_call::{call, call_items, call_unit, envelope};
+use crate::wire_call::{call, call_batch, call_items, call_unit, envelope};
 
 /// One attach-time option advertised by a catalog during discovery.
 ///
@@ -537,6 +537,29 @@ impl VgiClient {
                 name: table.name.clone(),
                 at_unit: at.map(|a| a.unit.clone()),
                 at_value: at.map(|a| a.value.clone()),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
+    }
+
+    /// Fetch the worker's optimizer statistics for one catalog table.
+    ///
+    /// Unlike most catalog responses, this RPC returns the canonical
+    /// sparse-union statistics batch directly inside the result envelope.
+    /// An empty-schema batch means the table declares no column statistics.
+    pub fn table_column_statistics(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema: &str,
+        name: &str,
+    ) -> Result<RecordBatch> {
+        call_batch(
+            self.transport_mut(),
+            "catalog_table_column_statistics_get",
+            p::CatalogTableColumnStatisticsGetParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_name: schema.to_string(),
+                name: name.to_string(),
                 transaction_opaque_data: cat.txn(),
             },
         )

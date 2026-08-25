@@ -62,6 +62,21 @@ fn unwrap_result(
     ipc::read_batch(arr.value(0))
 }
 
+/// Call a method whose result is itself an Arrow batch rather than a typed DTO.
+///
+/// A few protocol methods deliberately return a pre-built batch in the normal
+/// `{result: binary}` envelope. Keeping that unwrapping here means callers do
+/// not need to duplicate the response-envelope contract.
+pub(crate) fn call_batch<P: VgiArrow>(
+    tr: &mut dyn VgiTransport,
+    method: &str,
+    params: P,
+) -> Result<arrow_array::RecordBatch> {
+    let batch = wire::to_batch(params)?;
+    let response = tr.call_unary(method, &batch)?;
+    unwrap_result(&response, method)
+}
+
 /// Call a method that returns a single typed DTO, given a pre-built params batch.
 ///
 /// The batch form exists for the handful of methods whose params carry no
