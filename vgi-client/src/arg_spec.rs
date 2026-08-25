@@ -33,7 +33,12 @@ const VARARGS_KEY: &str = "vgi_varargs";
 /// Field-metadata key carrying a parameter's documentation.
 const DOC_KEY: &str = "vgi_doc";
 /// Prefix on a field name that marks a named (rather than positional) argument.
+/// Retained for compatibility with older workers; current VGI workers use
+/// `vgi_arg=named` field metadata and keep the declared name unchanged.
 const NAMED_PREFIX: &str = "named_";
+/// Current discovery metadata key and value for a named-only parameter.
+const ARG_KIND_KEY: &str = "vgi_arg";
+const NAMED_KIND: &str = "named";
 /// Metadata value meaning "yes" for the boolean markers above.
 const TRUE_VALUE: &str = "true";
 
@@ -62,13 +67,16 @@ impl ArgSpec {
         let md = field.metadata();
         let flag = |key: &str| md.get(key).map(|v| v == TRUE_VALUE).unwrap_or(false);
         let name = field.name();
+        let legacy_name = name.strip_prefix(NAMED_PREFIX);
         Self {
-            // The `named_` prefix is a marker, not part of the name the caller
-            // uses, so it is stripped here rather than at every call site.
-            name: name.strip_prefix(NAMED_PREFIX).unwrap_or(name).to_string(),
+            // The legacy `named_` prefix is a marker, not part of the name the
+            // caller uses. Current discovery leaves the name intact and marks
+            // it with `vgi_arg=named` metadata instead.
+            name: legacy_name.unwrap_or(name).to_string(),
             data_type: field.data_type().clone(),
             is_const: flag(CONST_KEY),
-            is_named: name.starts_with(NAMED_PREFIX),
+            is_named: legacy_name.is_some()
+                || md.get(ARG_KIND_KEY).is_some_and(|kind| kind == NAMED_KIND),
             is_varargs: flag(VARARGS_KEY),
             doc: md.get(DOC_KEY).cloned(),
         }
@@ -170,6 +178,20 @@ mod tests {
         assert!(specs.0[0].is_named);
         // Named arguments are not positional, so they never shift the indices
         // the const lookup uses.
+        assert_eq!(specs.positional().count(), 0);
+    }
+
+    #[test]
+    fn current_named_argument_metadata_is_recognised() {
+        let bytes = encode(vec![field(
+            "batch_size",
+            DataType::Int64,
+            &[("vgi_arg", "named"), ("vgi_const", "true")],
+        )]);
+        let specs = ArgSpecs::parse(&bytes).unwrap();
+        assert_eq!(specs.0[0].name, "batch_size");
+        assert!(specs.0[0].is_named);
+        assert!(specs.0[0].is_const);
         assert_eq!(specs.positional().count(), 0);
     }
 
