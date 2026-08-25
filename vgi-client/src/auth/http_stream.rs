@@ -17,6 +17,12 @@ impl ProducerStream for HttpProducerAdapter<'_> {
     fn tick(&mut self) -> Result<Option<(RecordBatch, Metadata)>> {
         self.0.tick()
     }
+    fn tick_with_metadata(
+        &mut self,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.0.tick_with_metadata(metadata)
+    }
     fn cancel(&mut self) -> Result<()> {
         self.0.cancel()
     }
