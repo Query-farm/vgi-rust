@@ -21,8 +21,8 @@ use arrow_schema::{Schema, SchemaRef};
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    BindRequest, BindResponse, GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse,
-    ScanSplit, SortField, TableFunctionPlanRequest,
+    BindRequest, BindResponse, CardinalityRequest, GlobalInitResponse, InitRequest,
+    PartitionTransform, PlanResponse, ScanSplit, SortField, TableFunctionPlanRequest,
 };
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
@@ -32,7 +32,7 @@ use crate::args::Arguments;
 use crate::catalog::{At, AttachedCatalog};
 use crate::client::VgiClient;
 use crate::transport::ProducerStream;
-use crate::wire_call::{call, envelope};
+use crate::wire_call::{call, call_batch, envelope};
 
 /// One secret lookup requested by a worker during the first bind pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +681,22 @@ impl VgiClient {
     /// Resolve a function's output schema before any data moves.
     pub fn bind(&mut self, cat: &AttachedCatalog, spec: &BindSpec) -> Result<BoundFunction> {
         self.bind_resolved(cat, spec, None, false)
+    }
+
+    /// Fetch per-output-column optimizer statistics for one bound table call.
+    ///
+    /// The response is the protocol's canonical sparse-union statistics batch;
+    /// an empty-schema batch means the function does not provide statistics.
+    pub fn table_function_statistics(&mut self, bound: &BoundFunction) -> Result<RecordBatch> {
+        let request = envelope(CardinalityRequest {
+            bind_call: bound.bind_call.clone(),
+            bind_opaque_data: bound.response.opaque_data.clone(),
+        })?;
+        call_batch(
+            self.transport_mut(),
+            "table_function_statistics",
+            p::TableFunctionStatisticsParams { request },
+        )
     }
 
     /// Bind with host-resolved secrets during the second pass of VGI's secret
