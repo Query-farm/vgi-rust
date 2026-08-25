@@ -142,6 +142,11 @@ fn decode_items<I: VgiArrow>(items: ItemsResult, method: &str) -> Result<Vec<I>>
                     "{method}: item {i} is not a readable IPC batch: {e}"
                 ))
             })?;
+            let batch = if method == "catalog_schema_contents_functions" {
+                vgi_protocol::protocol::dtos::backfill_function_info(batch)?
+            } else {
+                batch
+            };
             wire::from_batch(&batch).map_err(|e| {
                 RpcError::type_error(format!("{method}: item {i} failed to decode: {e}"))
             })

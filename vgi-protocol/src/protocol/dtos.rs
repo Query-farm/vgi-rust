@@ -270,6 +270,56 @@ pub fn backfill_init_request(batch: arrow_array::RecordBatch) -> Result<arrow_ar
     )
 }
 
+/// Backfill split capability discovery for workers released before the
+/// `supports_splits` field was added to [`FunctionInfo`].
+///
+/// Split support is opt-in, so an older worker that omits the column is
+/// unambiguously equivalent to `false`.
+pub fn backfill_function_info(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
+    let rows = batch.num_rows();
+    let mut fields: Vec<arrow_schema::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    let mut appended = false;
+
+    for name in [
+        "supports_splits",
+        "filters_exactly_applied",
+        "supports_positions",
+    ] {
+        if batch.column_by_name(name).is_none() {
+            appended = true;
+            fields.push(arrow_schema::Field::new(
+                name,
+                arrow_schema::DataType::Boolean,
+                false,
+            ));
+            columns.push(Arc::new(arrow_array::BooleanArray::from(vec![false; rows])));
+        }
+    }
+
+    if batch.column_by_name("split_token_ttl_seconds").is_none() {
+        appended = true;
+        fields.push(arrow_schema::Field::new(
+            "split_token_ttl_seconds",
+            arrow_schema::DataType::Int64,
+            true,
+        ));
+        columns.push(Arc::new(arrow_array::Int64Array::new_null(rows)));
+    }
+
+    if !appended {
+        return Ok(batch);
+    }
+
+    arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map_err(|e| RpcError::type_error(format!("backfill FunctionInfo: {e}")))
+}
+
 /// Append a null column for each named field the batch lacks, so a by-name
 /// decode yields `None` rather than failing on a peer that omitted it.
 pub fn ensure_nullable_columns(
@@ -334,6 +384,29 @@ mod backfill_tests {
         let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
         assert!(!legacy);
         assert_eq!(out.num_columns(), 2);
+    }
+
+    #[test]
+    fn legacy_function_info_defaults_split_support_to_false() {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["legacy"]))],
+        )
+        .expect("batch");
+
+        let output = backfill_function_info(input).expect("backfill");
+        let supports_splits = output
+            .column_by_name("supports_splits")
+            .expect("column added")
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("boolean column");
+        assert!(!supports_splits.value(0));
+        assert!(!output
+            .schema()
+            .field_with_name("supports_splits")
+            .unwrap()
+            .is_nullable());
     }
 }
 
