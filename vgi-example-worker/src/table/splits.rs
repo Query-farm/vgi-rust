@@ -14,10 +14,12 @@
 //! claiming is distinguishable from static assignment), and far more splits than
 //! reader threads (which forces sequential re-init on a reused connection).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use vgi::cache_control::{CacheControl, ConditionalRequest};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::protocol::dtos::{PartitionTransform, SortField, TableFunctionPlanRequest};
 use vgi::split_token::{PlanOutcome, PlannedSplit};
@@ -1246,6 +1248,9 @@ impl TableProducer for BatchIndexProducer {
 /// reader happened to arrive first.
 struct SplitCacheable;
 
+static SPLIT_CACHE_PLAN_CALLS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl TableFunction for SplitCacheable {
     fn name(&self) -> &str {
         "split_cacheable"
@@ -1260,7 +1265,14 @@ impl TableFunction for SplitCacheable {
     }
 
     fn argument_specs(&self) -> Vec<ArgSpec> {
-        split_args()
+        let mut args = split_args();
+        args.push(ArgSpec::const_arg(
+            "policy",
+            -1,
+            "varchar",
+            "fresh, not_modified, mixed, disagree, revoke, or error",
+        ));
+        args
     }
 
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
@@ -1275,7 +1287,25 @@ impl TableFunction for SplitCacheable {
         params: &BindParams,
         _request: &TableFunctionPlanRequest,
     ) -> Result<Option<PlanOutcome>> {
-        let ranges = even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4));
+        let policy = params
+            .arguments
+            .named_str("policy")
+            .unwrap_or_else(|| "fresh".to_string());
+        let zero_after_cold = if policy.starts_with("zero_after_cold:") {
+            let mut calls = SPLIT_CACHE_PLAN_CALLS.lock().map_err(|error| {
+                RpcError::runtime_error(format!("split cache plan state poisoned: {error}"))
+            })?;
+            let calls = calls.entry(policy).or_default();
+            *calls += 1;
+            *calls > 1
+        } else {
+            false
+        };
+        let ranges = if zero_after_cold {
+            Vec::new()
+        } else {
+            even_ranges(arg_i64(params, "n", 0), arg_i64(params, "splits", 4))
+        };
         Ok(Some(PlanOutcome {
             estimated_total_splits: Some(ranges.len() as i64),
             splits: ranges
@@ -1306,6 +1336,26 @@ impl TableFunction for SplitCacheable {
             .map(|p| decode(p))
             .collect::<Result<Vec<_>>>()?;
         let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
+        let n = params.arguments.named_i64("n").unwrap_or(0);
+        let policy = params
+            .arguments
+            .named_str("policy")
+            .unwrap_or_else(|| "fresh".to_string());
+        if policy != "fresh" {
+            return Ok(Box::new(SplitRevalidationProducer {
+                schema: seq_schema(),
+                contains_first_split: ranges.iter().any(|range| range.lo == 0),
+                contains_last_split: ranges.iter().any(|range| range.hi == n),
+                ranges,
+                idx: 0,
+                cur,
+                conditional: false,
+                first: true,
+                advertised: false,
+                metadata: None,
+                policy,
+            }));
+        }
         Ok(Box::new(CacheableProducer {
             schema: seq_schema(),
             ranges,
@@ -1324,6 +1374,146 @@ struct CacheableProducer {
     cur: i64,
     first: bool,
     advertised: bool,
+}
+
+const SPLIT_REVALIDATION_ETAG: &str = "\"split-v1\"";
+
+struct SplitRevalidationProducer {
+    schema: SchemaRef,
+    policy: String,
+    contains_first_split: bool,
+    contains_last_split: bool,
+    ranges: Vec<Range>,
+    idx: usize,
+    cur: i64,
+    conditional: bool,
+    first: bool,
+    advertised: bool,
+    metadata: Option<HashMap<String, String>>,
+}
+
+impl SplitRevalidationProducer {
+    fn cache_control() -> CacheControl {
+        CacheControl::ttl(0)
+            .with_etag(SPLIT_REVALIDATION_ETAG)
+            .with_revalidatable()
+    }
+}
+
+impl TableProducer for SplitRevalidationProducer {
+    fn on_conditional_request(&mut self, request: &ConditionalRequest) {
+        self.conditional = request.if_none_match.as_deref() == Some(SPLIT_REVALIDATION_ETAG);
+    }
+
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        self.advertised = false;
+        if self.first && self.conditional {
+            self.first = false;
+            match self.policy.as_str() {
+                "error" if self.contains_first_split => {
+                    return Err(RpcError::runtime_error("injected split validation failure"));
+                }
+                "mixed" if self.contains_last_split => {
+                    // Fall through and stream fresh rows. The validation wave
+                    // must discard them and restart the complete split result.
+                }
+                "revoke" if self.contains_first_split => {
+                    self.idx = self.ranges.len();
+                    self.advertised = true;
+                    self.metadata =
+                        Some(CacheControl::no_store().with_not_modified().to_metadata());
+                    return RecordBatch::try_new(
+                        self.schema.clone(),
+                        vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+                    )
+                    .map(Some)
+                    .map_err(|error| RpcError::runtime_error(error.to_string()));
+                }
+                "disagree" if self.contains_first_split => {
+                    self.idx = self.ranges.len();
+                    self.advertised = true;
+                    self.metadata = Some(
+                        CacheControl::ttl(0)
+                            .with_etag("\"split-v2\"")
+                            .with_revalidatable()
+                            .with_not_modified()
+                            .to_metadata(),
+                    );
+                    return RecordBatch::try_new(
+                        self.schema.clone(),
+                        vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+                    )
+                    .map(Some)
+                    .map_err(|error| RpcError::runtime_error(error.to_string()));
+                }
+                _ => {
+                    self.idx = self.ranges.len();
+                    self.advertised = true;
+                    self.metadata = Some(Self::cache_control().with_not_modified().to_metadata());
+                    return RecordBatch::try_new(
+                        self.schema.clone(),
+                        vec![Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef],
+                    )
+                    .map(Some)
+                    .map_err(|error| RpcError::runtime_error(error.to_string()));
+                }
+            }
+        }
+
+        const MAX_BATCH: i64 = 16;
+        while self.idx < self.ranges.len() {
+            let range = self.ranges[self.idx];
+            if self.cur >= range.hi {
+                self.idx += 1;
+                if self.idx < self.ranges.len() {
+                    self.cur = self.ranges[self.idx].lo;
+                }
+                continue;
+            }
+            let size = (range.hi - self.cur).min(MAX_BATCH);
+            let start = self.cur;
+            self.cur += size;
+            if self.first {
+                self.first = false;
+                self.advertised = true;
+                self.metadata = Some(Self::cache_control().to_metadata());
+            }
+            return RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((start..start + size).collect::<Vec<_>>()))
+                        as ArrayRef,
+                ],
+            )
+            .map(Some)
+            .map_err(|error| RpcError::runtime_error(error.to_string()));
+        }
+        Ok(None)
+    }
+
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        if self.advertised {
+            self.metadata.clone()
+        } else {
+            None
+        }
+    }
+
+    fn resume_supported(&self) -> bool {
+        true
+    }
+
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.idx as i64, self.cur, self.first as i64])
+    }
+
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(values) = resume::unpack(bytes, 3) {
+            self.idx = values[0] as usize;
+            self.cur = values[1];
+            self.first = values[2] != 0;
+        }
+    }
 }
 
 impl TableProducer for CacheableProducer {
