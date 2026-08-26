@@ -81,7 +81,8 @@ pub use cache::{
 };
 pub use catalog::{
     decode_attach_option_specs, decode_macro_defaults, encode_attach_options, At, AttachOptionSpec,
-    AttachOptions, AttachedCatalog, FunctionKind, MacroKind,
+    AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind, MacroKind,
+    ScanBranchesResolution,
 };
 pub use client::{ConnectionOptions, VgiClient};
 pub use location::VgiLocation;
@@ -108,7 +109,7 @@ pub use vgi_protocol::protocol::dtos;
 /// The catalog DTOs a caller handles by name, lifted out of [`dtos`] so the
 /// common ones need no module path.
 pub use vgi_protocol::protocol::dtos::{
-    PartitionTransform, ScanFunctionResult, SortField, TableInfo,
+    PartitionTransform, ScanBranch, ScanBranchesResult, ScanFunctionResult, SortField, TableInfo,
 };
 
 /// An opaque wire blob — a worker handle, or arguments it already encoded.

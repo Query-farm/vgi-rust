@@ -2,13 +2,18 @@
 
 //! Attaching a catalog and discovering what it holds.
 
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
+
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogInfo,
-    CatalogTransactionBeginResult, CatalogVersionResult, FunctionInfo, MacroInfo,
-    ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
+    CatalogTransactionBeginResult, CatalogVersionResult, FunctionInfo, MacroInfo, ScanBranch,
+    ScanBranchesResult, ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
 };
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
@@ -277,6 +282,35 @@ pub struct At {
     pub value: String,
 }
 
+/// How [`VgiClient::table_scan_branches`] resolved a table's physical sources.
+///
+/// Consumers can use this to distinguish a genuine one-branch response from a
+/// legacy worker that only implements `catalog_table_scan_function_get`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanBranchesResolution {
+    /// The worker answered `catalog_table_scan_branches_get`.
+    BranchesRpc,
+    /// The branches RPC was unavailable, so this call probed and fell back.
+    LegacyFallbackAfterProbe,
+    /// A previous call already established that this attach needs fallback.
+    LegacyCached,
+}
+
+/// Decoded physical sources backing a catalog table.
+#[derive(Debug, Clone)]
+pub struct CatalogScanBranches {
+    /// One branch per physical source, in the worker-declared order.
+    pub branches: Vec<ScanBranch>,
+    /// Extensions the host must make available before binding the branches.
+    pub required_extensions: Vec<String>,
+    /// Which protocol path produced this result.
+    pub resolution: ScanBranchesResolution,
+}
+
+const BRANCHES_CAPABILITY_UNKNOWN: u8 = 0;
+const BRANCHES_CAPABILITY_SUPPORTED: u8 = 1;
+const BRANCHES_CAPABILITY_UNSUPPORTED: u8 = 2;
+
 /// A live attach handle.
 ///
 /// The `attach_opaque_data` blob is the worker's session token: every later
@@ -288,6 +322,9 @@ pub struct AttachedCatalog {
     handle: Bytes,
     info: CatalogAttachResult,
     transaction: Option<Bytes>,
+    // Shared by clones because capability belongs to the remote attach, not a
+    // particular Rust handle value.
+    scan_branches_capability: Arc<AtomicU8>,
 }
 
 impl AttachedCatalog {
@@ -410,6 +447,7 @@ impl VgiClient {
             handle: info.attach_opaque_data.clone(),
             info,
             transaction: None,
+            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
         })
     }
 
@@ -588,6 +626,64 @@ impl VgiClient {
         )
     }
 
+    /// Resolve every physical source backing a catalog table.
+    ///
+    /// New workers answer `catalog_table_scan_branches_get`; each nested IPC
+    /// branch is decoded before it reaches the caller. For compatibility, a
+    /// worker that reports `MethodNotImplementedError` is retried through the
+    /// legacy single-function RPC and that answer is represented as one
+    /// unconstrained function branch. The unsupported capability is cached on
+    /// the attach so later tables avoid the doomed probe.
+    ///
+    /// The fallback is deliberately narrow: transport failures and all other
+    /// worker errors are returned unchanged rather than being hidden behind a
+    /// second RPC.
+    pub fn table_scan_branches(
+        &mut self,
+        cat: &AttachedCatalog,
+        table: &TableInfo,
+        at: Option<&At>,
+    ) -> Result<CatalogScanBranches> {
+        if cat.scan_branches_capability.load(Ordering::Acquire) == BRANCHES_CAPABILITY_UNSUPPORTED {
+            return self.table_scan_function(cat, table, at).map(|legacy| {
+                scan_branches_from_legacy(legacy, ScanBranchesResolution::LegacyCached)
+            });
+        }
+
+        let response: Result<ScanBranchesResult> = call(
+            self.transport_mut(),
+            "catalog_table_scan_branches_get",
+            p::CatalogTableScanBranchesGetParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_name: table.schema_name.clone(),
+                name: table.name.clone(),
+                at_unit: at.map(|a| a.unit.clone()),
+                at_value: at.map(|a| a.value.clone()),
+                transaction_opaque_data: cat.txn(),
+            },
+        );
+
+        match response {
+            Ok(response) => {
+                let decoded = decode_scan_branches(response, ScanBranchesResolution::BranchesRpc)?;
+                cat.scan_branches_capability
+                    .store(BRANCHES_CAPABILITY_SUPPORTED, Ordering::Release);
+                Ok(decoded)
+            }
+            Err(error) if error.error_type == "MethodNotImplementedError" => {
+                cat.scan_branches_capability
+                    .store(BRANCHES_CAPABILITY_UNSUPPORTED, Ordering::Release);
+                self.table_scan_function(cat, table, at).map(|legacy| {
+                    scan_branches_from_legacy(
+                        legacy,
+                        ScanBranchesResolution::LegacyFallbackAfterProbe,
+                    )
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Fetch the worker's optimizer statistics for one catalog table.
     ///
     /// Unlike most catalog responses, this RPC returns the canonical
@@ -653,12 +749,123 @@ impl VgiClient {
     }
 }
 
+fn scan_branches_from_legacy(
+    legacy: ScanFunctionResult,
+    resolution: ScanBranchesResolution,
+) -> CatalogScanBranches {
+    CatalogScanBranches {
+        branches: vec![ScanBranch {
+            function_name: legacy.function_name,
+            arguments: legacy.arguments,
+            branch_filter: None,
+            writable: false,
+            source_catalog: None,
+            source_schema: None,
+            source_table: None,
+            format_name: None,
+            format_locations: None,
+            format_options: None,
+        }],
+        required_extensions: legacy.required_extensions,
+        resolution,
+    }
+}
+
+fn decode_scan_branches(
+    response: ScanBranchesResult,
+    resolution: ScanBranchesResolution,
+) -> Result<CatalogScanBranches> {
+    if response.branches.is_empty() {
+        return Err(RpcError::value_error(
+            "VGI table returned zero scan branches",
+        ));
+    }
+
+    let branches: Vec<ScanBranch> = response
+        .branches
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let batch = vgi_protocol::ipc::read_batch(&bytes.0).map_err(|error| {
+                RpcError::type_error(format!(
+                    "invalid ScanBranch #{index} IPC: {}",
+                    error.message
+                ))
+            })?;
+            if batch.num_rows() != 1 {
+                return Err(RpcError::type_error(format!(
+                    "ScanBranch #{index} must contain one row, found {}",
+                    batch.num_rows()
+                )));
+            }
+            vgi_protocol::wire::from_batch(&batch).map_err(|error| {
+                RpcError::type_error(format!("invalid ScanBranch #{index}: {}", error.message))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    validate_scan_branches(&branches)?;
+    Ok(CatalogScanBranches {
+        branches,
+        required_extensions: response.required_extensions,
+        resolution,
+    })
+}
+
+fn validate_scan_branches(branches: &[ScanBranch]) -> Result<()> {
+    let mut writable_ordinals = Vec::new();
+    for (index, branch) in branches.iter().enumerate() {
+        let is_function = !branch.function_name.is_empty();
+        let is_catalog_table = branch
+            .source_table
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let is_format = branch.format_name.as_deref().is_some_and(|s| !s.is_empty());
+        let source_kinds =
+            usize::from(is_function) + usize::from(is_catalog_table) + usize::from(is_format);
+        if source_kinds != 1 {
+            return Err(RpcError::value_error(format!(
+                "VGI scan branch {index} must name exactly one of function_name, source_table, or format_name"
+            )));
+        }
+        if is_format
+            && branch
+                .format_locations
+                .as_ref()
+                .is_none_or(|locations| locations.is_empty())
+        {
+            return Err(RpcError::value_error(format!(
+                "VGI scan branch {index} is a format branch but names no locations"
+            )));
+        }
+        if branch.writable {
+            writable_ordinals.push(index);
+        }
+    }
+
+    if writable_ordinals.len() > 1 {
+        return Err(RpcError::value_error(format!(
+            "VGI multi-branch table declared {} writable branches (ordinals: {})",
+            writable_ordinals.len(),
+            writable_ordinals
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod attach_option_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::{ipc, wire};
+
+    use crate::transport::{ExchangeStream, ProducerStream, VgiTransport};
 
     use super::*;
 
@@ -697,6 +904,146 @@ mod attach_option_tests {
         )
         .unwrap();
         assert!(AttachOptionSpec::decode(&required).unwrap().required);
+    }
+
+    struct LegacyCatalogTransport {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl VgiTransport for LegacyCatalogTransport {
+        fn call_unary(&mut self, method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            self.calls.lock().unwrap().push(method.to_string());
+            match method {
+                "catalog_table_scan_branches_get" => {
+                    Err(RpcError::new("MethodNotImplementedError", "old worker"))
+                }
+                "catalog_table_scan_function_get" => {
+                    let inner = wire::to_batch(ScanFunctionResult {
+                        function_name: "legacy_sequence".to_string(),
+                        arguments: Bytes(vec![42]),
+                        required_extensions: vec!["legacy_ext".to_string()],
+                    })?;
+                    let encoded = ipc::write_batch(&inner)?;
+                    RecordBatch::try_from_iter(vec![(
+                        "result",
+                        Arc::new(BinaryArray::from(vec![encoded.as_slice()])) as ArrayRef,
+                    )])
+                    .map_err(|error| RpcError::runtime_error(error.to_string()))
+                }
+                _ => Err(RpcError::runtime_error(format!("unexpected call {method}"))),
+            }
+        }
+
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("no producer stream"))
+        }
+
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("no exchange stream"))
+        }
+
+        fn label(&self) -> &str {
+            "legacy-catalog-stub"
+        }
+    }
+
+    fn attached_catalog_for_test() -> AttachedCatalog {
+        let info = CatalogAttachResult {
+            attach_opaque_data: Bytes(vec![1]),
+            supports_transactions: false,
+            supports_time_travel: false,
+            catalog_version_frozen: false,
+            catalog_version: 1,
+            attach_opaque_data_required: true,
+            default_schema: "data".to_string(),
+            settings: Vec::new(),
+            secret_types: Vec::new(),
+            attach_catalogs: Vec::new(),
+            comment: None,
+            tags: Vec::new(),
+            supports_column_statistics: false,
+            global_functions: Vec::new(),
+            global_function_prefix: String::new(),
+            resolved_data_version: None,
+            resolved_implementation_version: None,
+        };
+        AttachedCatalog {
+            handle: info.attach_opaque_data.clone(),
+            info,
+            transaction: None,
+            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
+        }
+    }
+
+    fn table_for_test() -> TableInfo {
+        TableInfo {
+            comment: None,
+            tags: Vec::new(),
+            name: "numbers".to_string(),
+            schema_name: "data".to_string(),
+            columns: Bytes(Vec::new()),
+            not_null_constraints: Vec::new(),
+            unique_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            primary_key_constraints: Vec::new(),
+            foreign_key_constraints: Vec::new(),
+            supports_insert: false,
+            supports_update: false,
+            supports_delete: false,
+            supports_returning: false,
+            supports_column_statistics: false,
+            scan_function: Some(Bytes(Vec::new())),
+            insert_function: None,
+            update_function: None,
+            delete_function: None,
+            cardinality_estimate: None.into(),
+            cardinality_max: None.into(),
+            column_statistics: None,
+            bind_result: None,
+            required_filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_branches_fallback_is_narrow_and_cached_per_attach() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut client = VgiClient::new(Box::new(LegacyCatalogTransport {
+            calls: Arc::clone(&calls),
+        }));
+        let cat = attached_catalog_for_test();
+        let table = table_for_test();
+
+        let first = client.table_scan_branches(&cat, &table, None).unwrap();
+        assert_eq!(
+            first.resolution,
+            ScanBranchesResolution::LegacyFallbackAfterProbe
+        );
+        assert_eq!(first.branches.len(), 1);
+        assert_eq!(first.branches[0].function_name, "legacy_sequence");
+        assert_eq!(first.required_extensions, ["legacy_ext"]);
+
+        let second = client.table_scan_branches(&cat, &table, None).unwrap();
+        assert_eq!(second.resolution, ScanBranchesResolution::LegacyCached);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "catalog_table_scan_branches_get",
+                "catalog_table_scan_function_get",
+                "catalog_table_scan_function_get"
+            ],
+            "the second scan must skip the known-unsupported branches RPC"
+        );
     }
 
     #[test]

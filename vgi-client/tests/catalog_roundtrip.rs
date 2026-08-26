@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use vgi_client::{AttachOptions, FunctionKind, MacroKind, VgiClient};
+use vgi_client::{AttachOptions, FunctionKind, MacroKind, ScanBranchesResolution, VgiClient};
 
 /// Locate the sibling `vgi-example-worker` binary.
 ///
@@ -198,6 +198,79 @@ fn reads_one_table_back_by_name() {
             .expect("a miss is not an error")
             .is_none(),
         "an unknown table must come back as None, not an error",
+    );
+
+    client.detach(&cat).expect("detach");
+}
+
+#[test]
+fn decodes_and_validates_catalog_scan_branches() {
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+
+    let table = |client: &mut VgiClient, name: &str| {
+        client
+            .table_get(&cat, "data", name, None)
+            .unwrap_or_else(|error| panic!("catalog_table_get({name}) failed: {error}"))
+            .unwrap_or_else(|| panic!("example worker did not advertise data.{name}"))
+    };
+
+    let mut numbers = table(&mut client, "multi_branch_numbers");
+    let inlined_single_branch = table(&mut client, "large_sequence").scan_function;
+    assert!(
+        inlined_single_branch
+            .as_ref()
+            .is_some_and(|bytes| !bytes.0.is_empty()),
+        "large_sequence must provide valid legacy inline scan metadata"
+    );
+    numbers.scan_function = inlined_single_branch;
+    let numbers = client
+        .table_scan_branches(&cat, &numbers, None)
+        .expect("decode multi_branch_numbers");
+    assert_eq!(numbers.resolution, ScanBranchesResolution::BranchesRpc);
+    assert_eq!(numbers.branches.len(), 2);
+    assert!(numbers
+        .branches
+        .iter()
+        .all(|branch| branch.function_name == "sequence"));
+    assert!(numbers
+        .branches
+        .iter()
+        .all(|branch| branch.branch_filter.is_none()));
+
+    let filtered = table(&mut client, "multi_branch_filtered_numbers");
+    let filtered = client
+        .table_scan_branches(&cat, &filtered, None)
+        .expect("decode multi_branch_filtered_numbers");
+    assert_eq!(
+        filtered
+            .branches
+            .iter()
+            .map(|branch| branch.branch_filter.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("n < 50"), Some("n >= 50")],
+        "branch order and branch-local filters must survive nested IPC decoding"
+    );
+
+    let empty = table(&mut client, "multi_branch_empty");
+    let error = client
+        .table_scan_branches(&cat, &empty, None)
+        .expect_err("an empty branches list is invalid");
+    assert!(
+        error.message.contains("zero scan branches"),
+        "unexpected error: {error}"
+    );
+
+    let two_writable = table(&mut client, "multi_branch_two_writable");
+    let error = client
+        .table_scan_branches(&cat, &two_writable, None)
+        .expect_err("more than one writable branch is ambiguous");
+    assert!(
+        error.message.contains("declared 2 writable branches"),
+        "unexpected error: {error}"
     );
 
     client.detach(&cat).expect("detach");
