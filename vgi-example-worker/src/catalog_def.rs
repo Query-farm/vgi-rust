@@ -1370,7 +1370,7 @@ pub fn build() -> CatalogModel {
                         // Keep the public result simple while making the macro
                         // exercise same-schema scalar resolution: `double` is
                         // a VGI scalar in `main`, not a host built-in.
-                        ..smacro("vgi_multiply", &["x", "y"], "double(x * y) / 2")
+                        ..smacro("vgi_multiply", &["x", "y"], "main.double(x * y) / 2")
                     },
                     CatMacro {
                         comment: Some(
@@ -1382,10 +1382,15 @@ pub fn build() -> CatalogModel {
                             ("lo".to_string(), "Lower bound (inclusive)".to_string()),
                             ("hi".to_string(), "Upper bound (inclusive)".to_string()),
                         ],
+                        // Exercise a same-schema table-macro dependency below a
+                        // scalar subquery. The single-row range preserves the
+                        // public scalar result while requiring the host adapter
+                        // to qualify `main.vgi_range_table` to the attach alias.
                         ..smacro(
                             "vgi_clamp",
                             &["val", "lo", "hi"],
-                            "GREATEST(lo, LEAST(hi, val))",
+                            "(SELECT GREATEST(lo, LEAST(hi, val)) \
+                             FROM main.vgi_range_table(1) LIMIT 1)",
                         )
                     },
                     CatMacro {
