@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{Field, Schema};
+use vgi::cache_control::CacheControl;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::table_in_out::{project_batch, TableInOutFunction};
+use vgi::table_in_out::{project_batch, EmitOptions, TableInOutFunction, TableInOutOutput};
 use vgi_rpc::{Result, RpcError};
 
 /// Register table-in-out fixtures.
@@ -317,7 +318,12 @@ impl TableInOutFunction for SecretInOutFunction {
             opaque_data: Vec::new(),
         })
     }
-    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        output: &mut TableInOutOutput,
+    ) -> Result<()> {
         let value = params
             .secrets
             .of_type("vgi_example")
@@ -327,9 +333,15 @@ impl TableInOutFunction for SecretInOutFunction {
         let mut cols: Vec<Arc<dyn Array>> = batch.columns().to_vec();
         let secret_col: StringArray = std::iter::repeat_n(value.as_deref(), n).collect();
         cols.push(Arc::new(secret_col));
-        let out = RecordBatch::try_new(params.output_schema.clone(), cols)
+        let batch = RecordBatch::try_new(params.output_schema.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        Ok(vec![out])
+        output.emit_with(
+            batch,
+            EmitOptions {
+                cache_control: Some(CacheControl::ttl(300)),
+                ..Default::default()
+            },
+        )
     }
 }
 

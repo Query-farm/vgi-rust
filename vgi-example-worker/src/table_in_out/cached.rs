@@ -18,6 +18,8 @@ use vgi_rpc::{Result, RpcError};
 /// Register the exchange-cache fixtures.
 pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(CachedEchoFunction);
+    w.register_table_in_out(CachedSerialEchoFunction);
+    w.register_table_in_out(CachedFinalizingEchoFunction);
     w.register_table_in_out(CachedDoubleFunction);
     w.register_table_in_out(CachedExplodeFunction);
     w.register_table_in_out(CachedRevalidatingEchoFunction);
@@ -115,6 +117,79 @@ impl TableInOutFunction for CachedEchoFunction {
                 ..Default::default()
             },
         )
+    }
+}
+
+/// Cache-advertising passthrough whose serial execution contract makes an
+/// input batch stateful with respect to the surrounding stream.
+pub struct CachedSerialEchoFunction;
+impl TableInOutFunction for CachedSerialEchoFunction {
+    fn name(&self) -> &str {
+        "cached_serial_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            max_workers: 1,
+            ..cache_meta(
+                "Cacheable-looking serial passthrough (must not be batch-memoized)",
+                &["cache", "test"],
+                false,
+            )
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("data", 0, "table", "Input table")]
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        out.emit_with(
+            project_batch(batch, &params.output_schema)?,
+            EmitOptions {
+                cache_control: Some(CacheControl::ttl(CACHE_TTL)),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// Cache-advertising passthrough with a finalize phase. Even an empty finish
+/// makes output dependent on stream completion, so individual input batches
+/// are not valid memoization units.
+pub struct CachedFinalizingEchoFunction;
+impl TableInOutFunction for CachedFinalizingEchoFunction {
+    fn name(&self) -> &str {
+        "cached_finalizing_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta(
+            "Cacheable-looking finalizing passthrough (must not be batch-memoized)",
+            &["cache", "test"],
+            false,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("data", 0, "table", "Input table")]
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        out.emit_with(
+            project_batch(batch, &params.output_schema)?,
+            EmitOptions {
+                cache_control: Some(CacheControl::ttl(CACHE_TTL)),
+                ..Default::default()
+            },
+        )
+    }
+    fn has_finish(&self) -> bool {
+        true
     }
 }
 

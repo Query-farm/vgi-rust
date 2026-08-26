@@ -41,6 +41,106 @@ pub struct AttachOptionSpec {
     pub required: bool,
 }
 
+/// One typed session setting advertised by an attached VGI catalog.
+///
+/// The protocol intentionally transports setting declarations as nested IPC
+/// rather than flattening Arrow types into strings. Keeping the decoded type
+/// here lets query-engine adapters build a correctly typed one-row settings
+/// batch without depending on the worker SDK crate.
+#[derive(Clone)]
+pub struct SettingSpec {
+    /// Case-preserving setting name.
+    pub name: String,
+    /// Human-readable description supplied by the worker.
+    pub description: String,
+    /// Arrow type accepted by the worker.
+    pub data_type: DataType,
+    /// Typed one-element default, when a newer worker advertises one.
+    pub default_value: Option<ArrayRef>,
+}
+
+impl std::fmt::Debug for SettingSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingSpec")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("data_type", &self.data_type)
+            .field(
+                "default_value",
+                &self.default_value.as_ref().map(|_| "<typed value>"),
+            )
+            .finish()
+    }
+}
+
+impl SettingSpec {
+    /// Decode the nested IPC shape used by `CatalogAttachResult.settings`.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let batch = vgi_protocol::ipc::read_batch(bytes)?;
+        if batch.num_rows() != 1 {
+            return Err(RpcError::type_error(format!(
+                "SettingSpec must contain one row, found {}",
+                batch.num_rows()
+            )));
+        }
+        let string = |name: &str| -> Result<String> {
+            let array = batch
+                .column_by_name(name)
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| RpcError::type_error(format!("SettingSpec.{name} is not Utf8")))?;
+            if array.is_null(0) {
+                return Err(RpcError::type_error(format!("SettingSpec.{name} is null")));
+            }
+            Ok(array.value(0).to_string())
+        };
+        let types = batch
+            .column_by_name("type")
+            .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| RpcError::type_error("SettingSpec.type is not Binary"))?;
+        if types.is_null(0) {
+            return Err(RpcError::type_error("SettingSpec.type is null"));
+        }
+        let schema = vgi_protocol::ipc::read_schema(types.value(0))?;
+        let field = schema
+            .fields()
+            .first()
+            .ok_or_else(|| RpcError::type_error("SettingSpec.type schema has no value field"))?;
+        let default_value = match batch.column_by_name("default_value") {
+            Some(array) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        RpcError::type_error("SettingSpec.default_value is not Binary")
+                    })?;
+                if values.is_null(0) {
+                    None
+                } else {
+                    let default = vgi_protocol::ipc::read_batch(values.value(0))?;
+                    if default.num_rows() != 1 || default.num_columns() != 1 {
+                        return Err(RpcError::type_error(
+                            "SettingSpec.default_value must contain one value",
+                        ));
+                    }
+                    if default.column(0).data_type() != field.data_type() {
+                        return Err(RpcError::type_error(
+                            "SettingSpec.default_value does not match its declared type",
+                        ));
+                    }
+                    Some(default.column(0).clone())
+                }
+            }
+            None => None,
+        };
+        Ok(Self {
+            name: string("name")?,
+            description: string("description")?,
+            data_type: field.data_type().clone(),
+            default_value,
+        })
+    }
+}
+
 impl std::fmt::Debug for AttachOptionSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttachOptionSpec")
@@ -142,6 +242,14 @@ pub fn decode_attach_option_specs(info: &CatalogInfo) -> Result<Vec<AttachOption
     info.attach_option_specs
         .iter()
         .map(|bytes| AttachOptionSpec::decode(&bytes.0))
+        .collect()
+}
+
+/// Decode every setting declaration returned by `catalog_attach`.
+pub fn decode_setting_specs(info: &CatalogAttachResult) -> Result<Vec<SettingSpec>> {
+    info.settings
+        .iter()
+        .map(|bytes| SettingSpec::decode(&bytes.0))
         .collect()
 }
 
@@ -1083,6 +1191,81 @@ mod attach_option_tests {
             ..Default::default()
         };
         assert!(!format!("{options:?}").contains("sentinel-secret"));
+    }
+}
+
+#[cfg(test)]
+mod setting_spec_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    fn encoded_setting(default: Option<&RecordBatch>) -> Vec<u8> {
+        let type_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let type_bytes = vgi_protocol::ipc::write_schema_ref(&type_schema).unwrap();
+        let default_bytes = default.map(|batch| vgi_protocol::ipc::write_batch(batch).unwrap());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("description", DataType::Utf8, false),
+            Field::new("type", DataType::Binary, false),
+            Field::new("default_value", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["multiplier"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["Multiplier"])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![type_bytes.as_slice()])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![default_bytes.as_deref()])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        vgi_protocol::ipc::write_batch(&batch).unwrap()
+    }
+
+    #[test]
+    fn decodes_typed_setting_and_default() {
+        let default = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        )
+        .unwrap();
+        let spec = SettingSpec::decode(&encoded_setting(Some(&default))).unwrap();
+        assert_eq!(spec.name, "multiplier");
+        assert_eq!(spec.data_type, DataType::Int64);
+        assert_eq!(
+            spec.default_value
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+    }
+
+    #[test]
+    fn rejects_a_default_with_the_wrong_type() {
+        let default = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["seven"]))],
+        )
+        .unwrap();
+        assert!(SettingSpec::decode(&encoded_setting(Some(&default)))
+            .unwrap_err()
+            .message
+            .contains("does not match"));
     }
 }
 

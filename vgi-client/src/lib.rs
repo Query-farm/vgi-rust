@@ -80,9 +80,9 @@ pub use cache::{
     CacheEntryInfo, CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache,
 };
 pub use catalog::{
-    decode_attach_option_specs, decode_macro_defaults, encode_attach_options, At, AttachOptionSpec,
-    AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind, MacroKind,
-    ScanBranchesResolution,
+    decode_attach_option_specs, decode_macro_defaults, decode_setting_specs, encode_attach_options,
+    At, AttachOptionSpec, AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind,
+    MacroKind, ScanBranchesResolution, SettingSpec,
 };
 pub use client::{ConnectionOptions, VgiClient};
 pub use location::VgiLocation;
