@@ -18,7 +18,10 @@ The suite still drives a prebuilt standalone `haybarn-unittest`. Its Haybarn
 release is pinned to the engine revision used by the VGI source checkout, so
 the local extension's ABI/platform metadata matches the runner. VGI loads by
 absolute artifact path; `httpfs`/`json`/`parquet`/`spatial` remain signed core
-extensions.
+extensions. Because recursive Actions checkouts are shallow and carry no
+submodule tags, the producer also sets `OVERRIDE_GIT_DESCRIBE=v1.5.5` and the
+pinned `HAYBARN_GIT_DESCRIBE` explicitly; otherwise CMake stamps the extension
+with its `v0.0.1` fallback and the strict warm-load check correctly rejects it.
 
 - [`run-integration.sh`](run-integration.sh) — the driver: stages the suite,
   boots the worker(s), and runs `haybarn-unittest` for one transport lane.

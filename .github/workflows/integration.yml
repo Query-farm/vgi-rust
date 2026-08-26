@@ -78,6 +78,13 @@ jobs:
 
       - name: Build release extension
         working-directory: vgi-source
+        env:
+          # Recursive action checkouts are intentionally shallow and the
+          # Haybarn/DuckDB submodule therefore has no release tags available
+          # to `git describe`. Stamp the exact ABI version used by the pinned
+          # standalone runner instead of accepting CMake's v0.0.1 fallback.
+          OVERRIDE_GIT_DESCRIBE: v1.5.5
+          HAYBARN_GIT_DESCRIBE: ${{ env.HAYBARN_RELEASE }}
         run: make release
 
       - name: Stage exact extension artifact
