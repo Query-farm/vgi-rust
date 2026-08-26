@@ -93,6 +93,11 @@ pub const CACHE_SCOPE_TRANSACTION: &str = "transaction";
 /// Presence of [`ttl`](Self::ttl_seconds) **or** [`expires`](Self::expires) is
 /// what makes a result cacheable; [`no_store`](Self::no_store) overrides any
 /// freshness key. [`scope`](Self::scope) defaults to [`CACHE_SCOPE_CATALOG`].
+/// For an eligible stateless streaming table-in/out function, ordinary cache
+/// control applies independently to the answer for each complete input batch;
+/// advertising it is therefore also the worker's promise that the answer does
+/// not depend on earlier/later batches or FINALIZE state. Stateful, serial, and
+/// literal single-row scan shapes must not use that per-batch tier.
 ///
 /// Build one with [`CacheControl::ttl`] / [`CacheControl::no_store`] /
 /// [`CacheControl::default`] plus the `with_*` setters, then render it with

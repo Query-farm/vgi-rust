@@ -16,6 +16,7 @@ mod copy_from;
 mod copy_to;
 #[cfg(feature = "coverage")]
 mod coverage;
+mod datafusion_companion;
 mod global_functions;
 mod narrow_bind;
 mod same_name;
@@ -41,6 +42,12 @@ fn main() {
         std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
 
     let mut worker = Worker::new();
+    if catalog_name == datafusion_companion::ROOT_CATALOG {
+        datafusion_companion::register(&mut worker);
+        worker.set_catalog(datafusion_companion::root_catalog());
+        worker.run();
+        return;
+    }
     scalar::register(&mut worker);
     table::register(&mut worker, &catalog_name);
     table_in_out::register(&mut worker);

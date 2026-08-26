@@ -16,6 +16,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use sha2::{Digest, Sha256};
 use util::*;
+use vgi::cache_control::CacheControl;
 use vgi::function::{
     ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
     ScalarFunction, ADDABLE, MULTIPLIABLE,
@@ -921,6 +922,11 @@ impl ScalarFunction for ReturnSecretValueFunction {
             name: None,
         }]
     }
+    fn cache_control(&self) -> Option<CacheControl> {
+        // Deliberately advertises caching so clients prove secret-dependent
+        // results are excluded rather than merely relying on no opt-in.
+        Some(CacheControl::ttl(300).with_per_value())
+    }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         let fields = params
             .secrets
@@ -959,6 +965,9 @@ impl ScalarFunction for SecretFieldFunction {
             scope: None,
             name: None,
         }]
+    }
+    fn cache_control(&self) -> Option<CacheControl> {
+        Some(CacheControl::ttl(300).with_per_value())
     }
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
         // `port` is a named field on the first secret of type `vgi_example`.

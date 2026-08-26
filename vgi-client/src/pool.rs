@@ -41,10 +41,11 @@
 //!
 //! [`PooledClient`] derefs to [`VgiClient`] and returns the connection on drop.
 //! A connection that saw an error is **not** returned: [`PooledClient::poison`]
-//! marks it, and a poisoned connection is closed instead. This is deliberate —
-//! a VGI connection carries per-session state (bind results, transaction
-//! tokens), so recycling one that failed mid-protocol would hand the next
-//! caller a worker in an unknown state.
+//! marks ordinary protocol failures, while exchange streams automatically mark
+//! their owning connection unusable on send/terminal errors. Such a connection
+//! is closed instead. This is deliberate — a VGI connection carries per-session
+//! state (bind results, transaction tokens), so recycling one that failed
+//! mid-protocol would hand the next caller a worker in an unknown state.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -472,7 +473,7 @@ impl Drop for PooledClient {
         let Some(client) = self.client.take() else {
             return;
         };
-        if self.poisoned {
+        if self.poisoned || !client.exchange_is_reusable() {
             self.pool
                 .inner
                 .counters
@@ -486,7 +487,44 @@ impl Drop for PooledClient {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::RecordBatch;
+    use vgi_rpc::errors::RpcError;
+    use vgi_rpc::wire::Metadata;
+
+    use crate::transport::{ExchangeStream, ProducerStream, VgiTransport};
+
     use super::*;
+
+    struct StubTransport;
+
+    impl VgiTransport for StubTransport {
+        fn call_unary(&mut self, _method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            Err(RpcError::runtime_error("unused stub transport"))
+        }
+
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _metadata: Option<Metadata>,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("unused stub transport"))
+        }
+
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("unused stub transport"))
+        }
+
+        fn label(&self) -> &str {
+            "stub"
+        }
+    }
 
     /// A location that would fail to connect, used to drive the bookkeeping
     /// paths that never touch a worker.
@@ -561,5 +599,25 @@ mod tests {
         let b = a.clone();
         assert!(a.acquire(&loc("x")).is_err());
         assert_eq!(b.stats().misses, 1, "clone sees the same counters");
+    }
+
+    #[test]
+    fn an_exchange_marked_connection_is_discarded_without_explicit_poison() {
+        let pool = WorkerPool::default();
+        let location = loc("exchange-failure");
+        let client = VgiClient::new(Box::new(StubTransport));
+        client
+            .exchange_reuse_guard()
+            .store(false, Ordering::Release);
+
+        drop(PooledClient::new(
+            pool.clone(),
+            PoolKey::anonymous(&location),
+            client,
+        ));
+
+        let stats = pool.stats();
+        assert_eq!(stats.discarded_poisoned, 1);
+        assert_eq!(stats.idle, 0);
     }
 }

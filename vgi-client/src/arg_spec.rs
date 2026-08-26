@@ -30,6 +30,8 @@ use vgi_rpc::errors::Result;
 const CONST_KEY: &str = "vgi_const";
 /// Field-metadata key marking the function as variadic.
 const VARARGS_KEY: &str = "vgi_varargs";
+/// Field-metadata key carrying the JSON-encoded default value.
+const DEFAULT_KEY: &str = "vgi_default";
 /// Field-metadata key carrying a parameter's documentation.
 const DOC_KEY: &str = "vgi_doc";
 /// Prefix on a field name that marks a named (rather than positional) argument.
@@ -58,6 +60,11 @@ pub struct ArgSpec {
     pub is_named: bool,
     /// The variadic tail.
     pub is_varargs: bool,
+    /// JSON-encoded default value advertised in `vgi_default`.
+    ///
+    /// The worker remains responsible for decoding and applying it at bind;
+    /// the client retains it to determine the minimum positional arity.
+    pub default: Option<String>,
     /// The worker's documentation for this parameter, when it gave any.
     pub doc: Option<String>,
 }
@@ -78,6 +85,7 @@ impl ArgSpec {
             is_named: legacy_name.is_some()
                 || md.get(ARG_KIND_KEY).is_some_and(|kind| kind == NAMED_KIND),
             is_varargs: flag(VARARGS_KEY),
+            default: md.get(DEFAULT_KEY).cloned(),
             doc: md.get(DOC_KEY).cloned(),
         }
     }
@@ -109,6 +117,17 @@ impl ArgSpecs {
     /// The positional parameters, in declared order.
     pub fn positional(&self) -> impl Iterator<Item = &ArgSpec> {
         self.0.iter().filter(|a| !a.is_named)
+    }
+
+    /// Minimum number of positional arguments a caller must provide.
+    ///
+    /// VGI defaults form an omittable positional suffix, and a variadic tail
+    /// can contain zero values. Named-only parameters do not contribute to
+    /// positional arity.
+    pub fn minimum_positional_arity(&self) -> usize {
+        self.positional()
+            .take_while(|spec| spec.default.is_none() && !spec.is_varargs)
+            .count()
     }
 
     /// Whether the parameter at positional index `i` is a bind-time constant.
@@ -206,6 +225,37 @@ mod tests {
         assert!(spec.is_varargs);
         assert_eq!(spec.doc.as_deref(), Some("the tail"));
         assert!(!spec.is_const);
+        assert_eq!(spec.default, None);
+    }
+
+    #[test]
+    fn positional_defaults_determine_minimum_arity() {
+        let bytes = encode(vec![
+            field("required", DataType::Int64, &[]),
+            field("optional", DataType::Int64, &[("vgi_default", "42")]),
+            field("rest", DataType::Utf8, &[("vgi_varargs", "true")]),
+            field(
+                "named_option",
+                DataType::Boolean,
+                &[("vgi_arg", "named"), ("vgi_default", "true")],
+            ),
+        ]);
+        let specs = ArgSpecs::parse(&bytes).unwrap();
+        assert_eq!(specs.0[1].default.as_deref(), Some("42"));
+        assert_eq!(specs.0[3].default.as_deref(), Some("true"));
+        assert_eq!(specs.minimum_positional_arity(), 1);
+
+        let all_defaulted = encode(vec![field(
+            "optional",
+            DataType::Int64,
+            &[("vgi_default", "42")],
+        )]);
+        assert_eq!(
+            ArgSpecs::parse(&all_defaulted)
+                .unwrap()
+                .minimum_positional_arity(),
+            0
+        );
     }
 
     #[test]

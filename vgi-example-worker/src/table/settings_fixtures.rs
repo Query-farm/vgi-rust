@@ -3,12 +3,14 @@
 //! Settings-aware table fixtures: read DuckDB settings (scalar + struct) and
 //! reflect them in the generated rows.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use vgi::cache_control::CacheControl;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{resume, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
@@ -38,6 +40,7 @@ struct SecretRows {
     schema: SchemaRef,
     rows: Vec<(String, String, String)>,
     emitted: bool,
+    meta: Option<HashMap<String, String>>,
 }
 impl TableProducer for SecretRows {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
@@ -45,6 +48,7 @@ impl TableProducer for SecretRows {
             return Ok(None);
         }
         self.emitted = true;
+        self.meta = Some(CacheControl::ttl(300).to_metadata());
         if self.rows.is_empty() {
             return Ok(None);
         }
@@ -65,6 +69,9 @@ impl TableProducer for SecretRows {
     }
     fn resume_supported(&self) -> bool {
         true
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
     }
     fn encode_resume(&self) -> Vec<u8> {
         resume::pack(&[if self.emitted { 1 } else { 0 }])
@@ -120,6 +127,7 @@ impl TableFunction for SecretDemoFunction {
             schema: params.output_schema.clone(),
             rows,
             emitted: false,
+            meta: None,
         }))
     }
 }

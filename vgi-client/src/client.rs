@@ -4,6 +4,7 @@
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,10 @@ use crate::transport::{StreamTransport, VgiTransport};
 /// how a scan fans out across the worker's advertised `max_workers`.
 pub struct VgiClient {
     transport: Box<dyn VgiTransport>,
+    /// Cleared when an exchange fails in a state where transport framing may
+    /// no longer be synchronized. A pooled owner checks this bit on drop and
+    /// discards the connection even when its caller forgot to call `poison`.
+    exchange_reusable: Arc<AtomicBool>,
 }
 
 /// Per-attachment transport settings that affect how a worker is reached.
@@ -119,7 +124,18 @@ fn format_worker_log(msg: &vgi_rpc_client::LogMessage) -> String {
 impl VgiClient {
     /// Build a client over any transport.
     pub fn new(transport: Box<dyn VgiTransport>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            exchange_reusable: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) fn exchange_reuse_guard(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exchange_reusable)
+    }
+
+    pub(crate) fn exchange_is_reusable(&self) -> bool {
+        self.exchange_reusable.load(Ordering::Acquire)
     }
 
     /// Connect to wherever a `LOCATION` string points.

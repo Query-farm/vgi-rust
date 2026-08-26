@@ -296,7 +296,13 @@ impl ResultCache {
             Some(s) if s > 0 => Duration::from_secs(s as u64),
             // `ttl = 0` with a validator is the HTTP "no-cache" semantic: store
             // it, but treat it as immediately stale so every read revalidates.
-            Some(0) if cc.revalidatable => Duration::ZERO,
+            Some(0) if cc.revalidatable && (cc.etag.is_some() || cc.last_modified.is_some()) => {
+                Duration::ZERO
+            }
+            // An explicit zero is never replaced by the client's configured
+            // default. It means immediately stale, and is useful only when a
+            // conditional validator makes the stored bytes reusable.
+            Some(0) => return Err(Ineligible::NoFreshness),
             _ if cc.expires.is_some() => {
                 let expires = cc.expires.as_deref().and_then(|value| {
                     chrono::DateTime::parse_from_rfc3339(value)
@@ -730,6 +736,39 @@ mod tests {
         assert_eq!(
             c.eligibility(Some(&bare), Some("s"), 100),
             Ok(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_ttl_never_falls_back_to_the_client_default() {
+        let c = ResultCache::new(CacheLimits {
+            default_ttl: Duration::from_secs(30),
+            ..Default::default()
+        });
+        assert_eq!(
+            c.eligibility(Some(&CacheControl::ttl(0)), Some("s"), 100),
+            Err(Ineligible::NoFreshness)
+        );
+        assert_eq!(
+            c.eligibility(
+                Some(&CacheControl::ttl(0).with_revalidatable()),
+                Some("s"),
+                100
+            ),
+            Err(Ineligible::NoFreshness),
+            "revalidation without a validator cannot reuse stored bytes"
+        );
+        assert_eq!(
+            c.eligibility(
+                Some(
+                    &CacheControl::ttl(0)
+                        .with_etag("\"v1\"")
+                        .with_revalidatable()
+                ),
+                Some("s"),
+                100
+            ),
+            Ok(Duration::ZERO)
         );
     }
 

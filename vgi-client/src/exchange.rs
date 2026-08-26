@@ -16,10 +16,12 @@
 //! input_schema** — that absence is what puts the worker in tick mode rather
 //! than exchange mode.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     BindRequest, BindResponse, GlobalInitResponse, TableBufferingCombineRequest,
@@ -42,6 +44,8 @@ pub struct Exchange<'a> {
     header: GlobalInitResponse,
     schema: SchemaRef,
     parent_rows: Option<Vec<i32>>,
+    last_cache_control: Option<CacheControl>,
+    connection_reusable: Arc<AtomicBool>,
     closed: bool,
 }
 
@@ -67,6 +71,15 @@ impl Exchange<'_> {
         self.parent_rows.as_deref()
     }
 
+    /// Cache directives from the most recent advertising answer.
+    ///
+    /// Workers commonly advertise only on their first output batch, so the
+    /// value is latched for the lifetime of the exchange rather than cleared
+    /// when a later answer carries no `vgi.cache.*` metadata.
+    pub fn cache_control(&self) -> Option<&CacheControl> {
+        self.last_cache_control.as_ref()
+    }
+
     /// Send one input batch and read the worker's answer.
     ///
     /// `Ok(None)` means the worker ended the stream. A zero-row answer is
@@ -77,10 +90,14 @@ impl Exchange<'_> {
         if self.closed {
             return Err(RpcError::protocol_error("send after close"));
         }
-        match self.stream.exchange(input)? {
+        let response = self.stream.exchange(input);
+        if response.is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
+        match response? {
             None => Ok(None),
             Some((batch, md)) => {
-                self.parent_rows = parse_parent_rows(&md)?;
+                update_answer_metadata(&mut self.parent_rows, &mut self.last_cache_control, &md)?;
                 Ok(Some(batch))
             }
         }
@@ -92,18 +109,57 @@ impl Exchange<'_> {
             return Ok(());
         }
         self.closed = true;
-        self.stream.close()
+        let result = self.stream.close();
+        if result.is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
+        result
     }
 
     /// Ask the worker to stop early.
     pub fn cancel(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
         self.closed = true;
-        self.stream.cancel()
+        let result = self.stream.cancel();
+        if result.is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+impl Drop for Exchange<'_> {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        // Dropping is often an early-return/error path, so there is nowhere to
+        // report a cleanup failure. Mark closed first to preserve the same
+        // exactly-once guarantee as explicit close/cancel, then best-effort
+        // release the worker-side execution.
+        self.closed = true;
+        if self.stream.cancel().is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
     }
 }
 
 /// Metadata key carrying per-output-row provenance.
 const PARENT_ROW_KEY: &str = "vgi_rpc.parent_row#b64";
+
+fn update_answer_metadata(
+    parent_rows: &mut Option<Vec<i32>>,
+    cache_control: &mut Option<CacheControl>,
+    metadata: &vgi_rpc::wire::Metadata,
+) -> Result<()> {
+    *parent_rows = parse_parent_rows(metadata)?;
+    if let Some(control) = CacheControl::from_metadata(metadata) {
+        *cache_control = Some(control);
+    }
+    Ok(())
+}
 
 /// Decode the `vgi_rpc.parent_row` array: base64 of raw little-endian `int32`.
 fn parse_parent_rows(md: &vgi_rpc::wire::Metadata) -> Result<Option<Vec<i32>>> {
@@ -242,17 +298,34 @@ impl VgiClient {
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
-        let stream = self.transport_mut().open_exchange("init", &params, true)?;
-        let header_batch = stream.header().ok_or_else(|| {
-            RpcError::type_error("init did not return a GlobalInitResponse header")
-        })?;
-        let header: GlobalInitResponse = wire::from_batch(header_batch)?;
+        let connection_reusable = self.exchange_reuse_guard();
+        let mut stream = match self.transport_mut().open_exchange("init", &params, true) {
+            Ok(stream) => stream,
+            Err(error) => {
+                connection_reusable.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let header = stream
+            .header()
+            .ok_or_else(|| RpcError::type_error("init did not return a GlobalInitResponse header"))
+            .and_then(wire::from_batch);
+        let header: GlobalInitResponse = match header {
+            Ok(header) => header,
+            Err(error) => {
+                connection_reusable.store(false, Ordering::Release);
+                let _ = stream.cancel();
+                return Err(error);
+            }
+        };
         let schema = bound.output_schema().clone();
         Ok(Exchange {
             stream,
             header,
             schema,
             parent_rows: None,
+            last_cache_control: None,
+            connection_reusable,
             closed: false,
         })
     }
@@ -425,8 +498,144 @@ pub(crate) fn encode_parent_rows(rows: &[i32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use vgi_rpc::wire::Metadata;
+
+    #[derive(Default)]
+    struct StreamCalls {
+        closes: AtomicUsize,
+        cancels: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StreamFailure {
+        None,
+        Send,
+        Close,
+        Cancel,
+    }
+
+    struct StubExchangeStream {
+        calls: Arc<StreamCalls>,
+        failure: StreamFailure,
+    }
+
+    impl ExchangeStream for StubExchangeStream {
+        fn header(&self) -> Option<&RecordBatch> {
+            None
+        }
+
+        fn exchange(&mut self, _input: &RecordBatch) -> Result<Option<(RecordBatch, Metadata)>> {
+            if self.failure == StreamFailure::Send {
+                return Err(RpcError::runtime_error("stub send failure"));
+            }
+            Ok(None)
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.calls.closes.fetch_add(1, Ordering::SeqCst);
+            if self.failure == StreamFailure::Close {
+                return Err(RpcError::runtime_error("stub close failure"));
+            }
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            self.calls.cancels.fetch_add(1, Ordering::SeqCst);
+            if self.failure == StreamFailure::Cancel {
+                return Err(RpcError::runtime_error("stub cancel failure"));
+            }
+            Ok(())
+        }
+    }
+
+    fn stub_exchange(calls: Arc<StreamCalls>) -> Exchange<'static> {
+        stub_exchange_with_failure(calls, StreamFailure::None).0
+    }
+
+    fn stub_exchange_with_failure(
+        calls: Arc<StreamCalls>,
+        failure: StreamFailure,
+    ) -> (Exchange<'static>, Arc<AtomicBool>) {
+        let connection_reusable = Arc::new(AtomicBool::new(true));
+        let exchange = Exchange {
+            stream: Box::new(StubExchangeStream { calls, failure }),
+            header: GlobalInitResponse {
+                execution_id: Bytes(b"stub".to_vec()),
+                max_workers: 1,
+                opaque_data: None,
+            },
+            schema: Arc::new(Schema::empty()),
+            parent_rows: None,
+            last_cache_control: None,
+            connection_reusable: Arc::clone(&connection_reusable),
+            closed: false,
+        };
+        (exchange, connection_reusable)
+    }
+
+    #[test]
+    fn dropping_an_open_exchange_cancels_once() {
+        let calls = Arc::new(StreamCalls::default());
+        drop(stub_exchange(Arc::clone(&calls)));
+
+        assert_eq!(calls.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicit_close_and_cancel_are_idempotent_and_suppress_drop_cleanup() {
+        let closed_calls = Arc::new(StreamCalls::default());
+        {
+            let mut exchange = stub_exchange(Arc::clone(&closed_calls));
+            exchange.close().unwrap();
+            exchange.close().unwrap();
+            exchange.cancel().unwrap();
+        }
+        assert_eq!(closed_calls.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(closed_calls.cancels.load(Ordering::SeqCst), 0);
+
+        let cancelled_calls = Arc::new(StreamCalls::default());
+        {
+            let mut exchange = stub_exchange(Arc::clone(&cancelled_calls));
+            exchange.cancel().unwrap();
+            exchange.cancel().unwrap();
+            exchange.close().unwrap();
+        }
+        assert_eq!(cancelled_calls.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(cancelled_calls.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_close_and_cancel_failures_make_the_connection_unpoolable() {
+        let send_calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) =
+            stub_exchange_with_failure(Arc::clone(&send_calls), StreamFailure::Send);
+        let input = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        assert!(exchange.send(&input).is_err());
+        assert!(!reusable.load(Ordering::Acquire));
+        drop(exchange);
+        assert_eq!(send_calls.cancels.load(Ordering::SeqCst), 1);
+
+        let close_calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) =
+            stub_exchange_with_failure(Arc::clone(&close_calls), StreamFailure::Close);
+        assert!(exchange.close().is_err());
+        assert!(!reusable.load(Ordering::Acquire));
+        drop(exchange);
+        assert_eq!(close_calls.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(close_calls.cancels.load(Ordering::SeqCst), 0);
+
+        let cancel_calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) =
+            stub_exchange_with_failure(Arc::clone(&cancel_calls), StreamFailure::Cancel);
+        assert!(exchange.cancel().is_err());
+        assert!(!reusable.load(Ordering::Acquire));
+        drop(exchange);
+        assert_eq!(cancel_calls.cancels.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn absent_provenance_reads_as_an_identity_map() {
@@ -461,5 +670,25 @@ mod tests {
         let mut md = Metadata::new();
         md.insert(PARENT_ROW_KEY.to_string(), "not base64!!".to_string());
         assert!(parse_parent_rows(&md).is_err());
+    }
+
+    #[test]
+    fn cache_control_is_decoded_and_latched_across_answers() {
+        let mut parent_rows = None;
+        let mut cache_control = None;
+        let first = Metadata::from([
+            ("vgi.cache.ttl".to_string(), "300".to_string()),
+            ("vgi.cache.scope".to_string(), "catalog".to_string()),
+            ("vgi.cache.per_value".to_string(), "1".to_string()),
+        ]);
+        update_answer_metadata(&mut parent_rows, &mut cache_control, &first).unwrap();
+        let control = cache_control.as_ref().expect("cache control");
+        assert_eq!(control.ttl_seconds, Some(300));
+        assert!(control.per_value);
+
+        update_answer_metadata(&mut parent_rows, &mut cache_control, &Metadata::new()).unwrap();
+        let control = cache_control.as_ref().expect("latched cache control");
+        assert_eq!(control.ttl_seconds, Some(300));
+        assert!(control.per_value);
     }
 }

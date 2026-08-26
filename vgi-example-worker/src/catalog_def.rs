@@ -1362,7 +1362,10 @@ pub fn build() -> CatalogModel {
                             ("x".to_string(), "First factor".to_string()),
                             ("y".to_string(), "Second factor".to_string()),
                         ],
-                        ..smacro("vgi_multiply", &["x", "y"], "x * y")
+                        // Keep the public result simple while making the macro
+                        // exercise same-schema scalar resolution: `double` is
+                        // a VGI scalar in `main`, not a host built-in.
+                        ..smacro("vgi_multiply", &["x", "y"], "double(x * y) / 2")
                     },
                     CatMacro {
                         comment: Some(
@@ -1386,7 +1389,17 @@ pub fn build() -> CatalogModel {
                             "n".to_string(),
                             "Number of rows to generate".to_string(),
                         )],
-                        ..tmacro("vgi_range_table", &["n"], "SELECT * FROM range(n)")
+                        // `sequence` deliberately means two different things
+                        // here: the CTE for the bare relation and the VGI table
+                        // function for the call with arguments. `range` stays
+                        // a host built-in. The result remains exactly 0..n.
+                        ..tmacro(
+                            "vgi_range_table",
+                            &["n"],
+                            "WITH sequence AS (SELECT * FROM range(n)) \
+                             SELECT * FROM sequence \
+                             UNION ALL SELECT * FROM sequence(0)",
+                        )
                     },
                 ],
                 tables: vec![],
