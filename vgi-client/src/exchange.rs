@@ -38,6 +38,23 @@ use crate::scan::{BindSpec, BoundFunction, Scan, ScanOptions};
 use crate::transport::ExchangeStream;
 use crate::wire_call::{call, envelope};
 
+fn conditional_request_metadata(opts: &ScanOptions) -> Option<vgi_rpc::wire::Metadata> {
+    let mut metadata = vgi_rpc::wire::Metadata::new();
+    if let Some(value) = &opts.if_none_match {
+        metadata.insert(
+            vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY.to_string(),
+            value.clone(),
+        );
+    }
+    if let Some(value) = &opts.if_modified_since {
+        metadata.insert(
+            vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY.to_string(),
+            value.clone(),
+        );
+    }
+    (!metadata.is_empty()).then_some(metadata)
+}
+
 /// An open exchange: send input batches, read answers.
 pub struct Exchange<'a> {
     stream: Box<dyn ExchangeStream + 'a>,
@@ -327,22 +344,7 @@ impl VgiClient {
             schema,
             parent_rows: None,
             last_cache_control: None,
-            first_input_metadata: {
-                let mut metadata = vgi_rpc::wire::Metadata::new();
-                if let Some(value) = &opts.if_none_match {
-                    metadata.insert(
-                        vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY.to_string(),
-                        value.clone(),
-                    );
-                }
-                if let Some(value) = &opts.if_modified_since {
-                    metadata.insert(
-                        vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY.to_string(),
-                        value.clone(),
-                    );
-                }
-                (!metadata.is_empty()).then_some(metadata)
-            },
+            first_input_metadata: conditional_request_metadata(opts),
             connection_reusable,
             closed: false,
         })
@@ -435,10 +437,25 @@ impl VgiClient {
         execution_id: &Bytes,
         finalize_state_id: &Bytes,
     ) -> Result<Scan<'a>> {
-        let opts = ScanOptions {
-            execution_id: Some(execution_id.clone()),
-            ..Default::default()
-        };
+        self.buffering_finalize_with_options(
+            bound,
+            execution_id,
+            finalize_state_id,
+            &ScanOptions::default(),
+        )
+    }
+
+    /// Drain one finalize state id while forwarding scan metadata such as
+    /// conditional cache validators.
+    pub fn buffering_finalize_with_options<'a>(
+        &'a mut self,
+        bound: &BoundFunction,
+        execution_id: &Bytes,
+        finalize_state_id: &Bytes,
+        options: &ScanOptions,
+    ) -> Result<Scan<'a>> {
+        let mut opts = options.clone();
+        opts.execution_id = Some(execution_id.clone());
         self.open_phase_stream(
             bound,
             &opts,
@@ -475,7 +492,7 @@ impl VgiClient {
         Scan::open(
             self.transport_mut(),
             &params,
-            None,
+            conditional_request_metadata(opts),
             bound.function_name(),
             bound.output_schema().clone(),
             connection_reusable,
@@ -641,6 +658,29 @@ mod tests {
             Some("v1")
         );
         assert!(metadata[1].is_none());
+    }
+
+    #[test]
+    fn conditional_scan_metadata_carries_both_validators() {
+        let metadata = conditional_request_metadata(&ScanOptions {
+            if_none_match: Some("\"etag-v1\"".to_string()),
+            if_modified_since: Some("Wed, 26 Aug 2026 12:00:00 GMT".to_string()),
+            ..Default::default()
+        })
+        .expect("conditional metadata");
+        assert_eq!(
+            metadata
+                .get(vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY)
+                .map(String::as_str),
+            Some("\"etag-v1\"")
+        );
+        assert_eq!(
+            metadata
+                .get(vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY)
+                .map(String::as_str),
+            Some("Wed, 26 Aug 2026 12:00:00 GMT")
+        );
+        assert!(conditional_request_metadata(&ScanOptions::default()).is_none());
     }
 
     #[test]

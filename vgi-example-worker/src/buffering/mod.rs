@@ -9,6 +9,7 @@ use arrow_array::types::{Float64Type, Int64Type};
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
+use vgi::cache_control::{CacheControl, ConditionalRequest};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata};
 use vgi::ipc;
 use vgi::table_function::{resume, TableProducer};
@@ -41,6 +42,13 @@ pub fn register(w: &mut vgi::Worker) {
     // Cacheable buffered reducer: advertises vgi.cache.ttl on its finalize
     // output (exchange-mode buffered result cache; cache/exchange_buffered.test).
     w.register_buffering(SumAllColumnsFunction::new("cached_sum_all"));
+    w.register_buffering(SumAllColumnsFunction::new("cached_slow_sum_all"));
+    w.register_buffering(SumAllColumnsFunction::new("cached_reval_sum_all"));
+    w.register_buffering(SumAllColumnsFunction::new("cached_reval_error_sum_all"));
+    w.register_buffering(SumAllColumnsFunction::new("cached_reval_no_store_sum_all"));
+    w.register_buffering(SumAllColumnsFunction::new(
+        "cached_reval_fresh_no_store_sum_all",
+    ));
     w.register_buffering(
         SumAllColumnsFunction::new("exception_finalize")
             .finalize_error("Intentional exception during finalize()"),
@@ -70,9 +78,47 @@ struct LogDrain {
     output_schema: arrow_schema::SchemaRef,
     error: Option<String>,
     metadata: Option<std::collections::HashMap<String, String>>,
+    cache_behavior: BufferedCacheBehavior,
+    conditional_match: bool,
+    conditional_answered: bool,
 }
 impl TableProducer for LogDrain {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.conditional_match && !self.conditional_answered {
+            self.conditional_answered = true;
+            match self.cache_behavior {
+                BufferedCacheBehavior::Revalidate => {
+                    std::thread::sleep(std::time::Duration::from_millis(75));
+                    self.metadata = Some(
+                        buffered_revalidation_control(false)
+                            .with_not_modified()
+                            .to_metadata(),
+                    );
+                    return Ok(Some(RecordBatch::new_empty(self.output_schema.clone())));
+                }
+                BufferedCacheBehavior::RevalidateError => {
+                    return Err(RpcError::runtime_error(
+                        "intentional buffered conditional cache failure",
+                    ));
+                }
+                BufferedCacheBehavior::RevalidateNoStore => {
+                    self.metadata =
+                        Some(CacheControl::no_store().with_not_modified().to_metadata());
+                    return Ok(Some(RecordBatch::new_empty(self.output_schema.clone())));
+                }
+                BufferedCacheBehavior::RevalidateFreshNoStore => {
+                    self.metadata = Some(CacheControl::no_store().to_metadata());
+                }
+                BufferedCacheBehavior::None | BufferedCacheBehavior::Ttl => {}
+            }
+        } else if self.conditional_answered
+            && matches!(
+                self.cache_behavior,
+                BufferedCacheBehavior::Revalidate | BufferedCacheBehavior::RevalidateNoStore
+            )
+        {
+            return Ok(None);
+        }
         if let Some(msg) = self.error.take() {
             return Err(RpcError::value_error(msg));
         }
@@ -90,6 +136,9 @@ impl TableProducer for LogDrain {
     fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
         self.metadata.clone()
     }
+    fn on_conditional_request(&mut self, request: &ConditionalRequest) {
+        self.conditional_match = request.if_none_match.as_deref() == Some(BUFFERED_ETAG);
+    }
     fn resume_supported(&self) -> bool {
         true
     }
@@ -97,15 +146,61 @@ impl TableProducer for LogDrain {
     /// survive an HTTP continuation. The log itself is execution-scoped
     /// storage, which the rebuild reattaches to, so nothing else travels.
     fn encode_resume(&self) -> Vec<u8> {
-        resume::pack(&[self.after_id, self.error.is_some() as i64])
+        resume::pack(&[
+            self.after_id,
+            self.error.is_some() as i64,
+            self.conditional_match as i64,
+            self.conditional_answered as i64,
+        ])
     }
     fn restore_resume(&mut self, bytes: &[u8]) {
-        if let Some(v) = resume::unpack(bytes, 2) {
+        if let Some(v) = resume::unpack(bytes, 4) {
             self.after_id = v[0];
             if v[1] == 0 {
                 self.error = None;
             }
+            self.conditional_match = v[2] != 0;
+            self.conditional_answered = v[3] != 0;
+            if self.conditional_match && self.conditional_answered {
+                self.metadata = match self.cache_behavior {
+                    BufferedCacheBehavior::Revalidate => Some(
+                        buffered_revalidation_control(false)
+                            .with_not_modified()
+                            .to_metadata(),
+                    ),
+                    BufferedCacheBehavior::RevalidateNoStore => {
+                        Some(CacheControl::no_store().with_not_modified().to_metadata())
+                    }
+                    BufferedCacheBehavior::RevalidateFreshNoStore => {
+                        Some(CacheControl::no_store().to_metadata())
+                    }
+                    _ => self.metadata.clone(),
+                };
+            }
         }
+    }
+}
+
+const BUFFERED_ETAG: &str = "\"buffered-sum-v1\"";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferedCacheBehavior {
+    None,
+    Ttl,
+    Revalidate,
+    RevalidateError,
+    RevalidateNoStore,
+    RevalidateFreshNoStore,
+}
+
+fn buffered_revalidation_control(stale_if_error: bool) -> CacheControl {
+    let control = CacheControl::ttl(0)
+        .with_etag(BUFFERED_ETAG)
+        .with_revalidatable();
+    if stale_if_error {
+        control.with_stale_if_error(60)
+    } else {
+        control
     }
 }
 
@@ -253,6 +348,9 @@ impl TableBufferingFunction for BufferInputFunction {
             output_schema: params.output_schema.clone(),
             error: self.finalize_error.map(|s| s.to_string()),
             metadata: None,
+            cache_behavior: BufferedCacheBehavior::None,
+            conditional_match: false,
+            conditional_answered: false,
         }))
     }
 }
@@ -415,6 +513,9 @@ impl TableBufferingFunction for LargeStateFunction {
             output_schema: params.output_schema.clone(),
             error: None,
             metadata: None,
+            cache_behavior: BufferedCacheBehavior::None,
+            conditional_match: false,
+            conditional_answered: false,
         }))
     }
 }
@@ -500,6 +601,9 @@ impl TableBufferingFunction for BatchIndexBufferInputFunction {
             output_schema: params.output_schema.clone(),
             error: None,
             metadata: None,
+            cache_behavior: BufferedCacheBehavior::None,
+            conditional_match: false,
+            conditional_answered: false,
         }))
     }
 }
@@ -582,6 +686,16 @@ impl SumAllColumnsFunction {
     fn process_every_other(mut self) -> Self {
         self.process_every_other = true;
         self
+    }
+    fn cache_behavior(&self) -> BufferedCacheBehavior {
+        match self.name {
+            "cached_sum_all" | "cached_slow_sum_all" => BufferedCacheBehavior::Ttl,
+            "cached_reval_sum_all" => BufferedCacheBehavior::Revalidate,
+            "cached_reval_error_sum_all" => BufferedCacheBehavior::RevalidateError,
+            "cached_reval_no_store_sum_all" => BufferedCacheBehavior::RevalidateNoStore,
+            "cached_reval_fresh_no_store_sum_all" => BufferedCacheBehavior::RevalidateFreshNoStore,
+            _ => BufferedCacheBehavior::None,
+        }
     }
     /// Whether the `logging` flag (persisted at sink init) is set for this run.
     fn logging_enabled(params: &BufferingParams) -> bool {
@@ -673,7 +787,12 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             "sum_all_columns_simple_distributed" => {
                 "Distributed sum using the buffered (Sink+Combine+Source) model"
             }
-            "cached_sum_all" => {
+            "cached_sum_all"
+            | "cached_slow_sum_all"
+            | "cached_reval_sum_all"
+            | "cached_reval_error_sum_all"
+            | "cached_reval_no_store_sum_all"
+            | "cached_reval_fresh_no_store_sum_all" => {
                 "Cacheable column-wise sum across all input (advertises vgi.cache.ttl)"
             }
             _ => "Computes column-wise sums across all batches",
@@ -682,7 +801,9 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             "sum_all_columns_simple_distributed" => {
                 vec!["aggregation".into(), "numeric".into(), "distributed".into()]
             }
-            "cached_sum_all" => vec!["aggregation".into(), "cache".into(), "test".into()],
+            name if name.starts_with("cached_") => {
+                vec!["aggregation".into(), "cache".into(), "test".into()]
+            }
             _ => vec!["aggregation".into(), "numeric".into()],
         };
         FunctionMetadata {
@@ -713,6 +834,9 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         })
     }
     fn process(&self, params: &BufferingParams, batch: &RecordBatch) -> Result<Vec<u8>> {
+        if self.name == "cached_slow_sum_all" {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         if self.process_every_other {
             params
                 .storage
@@ -803,6 +927,19 @@ impl TableBufferingFunction for SumAllColumnsFunction {
         params: &BufferingParams,
         _finalize_state_id: Vec<u8>,
     ) -> Result<Box<dyn TableProducer>> {
+        let cache_behavior = self.cache_behavior();
+        let metadata = match cache_behavior {
+            BufferedCacheBehavior::None => None,
+            BufferedCacheBehavior::Ttl => Some(CacheControl::ttl(300).to_metadata()),
+            BufferedCacheBehavior::Revalidate
+            | BufferedCacheBehavior::RevalidateNoStore
+            | BufferedCacheBehavior::RevalidateFreshNoStore => {
+                Some(buffered_revalidation_control(false).to_metadata())
+            }
+            BufferedCacheBehavior::RevalidateError => {
+                Some(buffered_revalidation_control(true).to_metadata())
+            }
+        };
         Ok(Box::new(LogDrain {
             storage: params.storage.clone(),
             execution_id: params.execution_id.clone(),
@@ -810,14 +947,12 @@ impl TableBufferingFunction for SumAllColumnsFunction {
             after_id: -1,
             output_schema: params.output_schema.clone(),
             error: self.finalize_error.map(|s| s.to_string()),
-            // The cacheable variant advertises vgi.cache.ttl on its finalize
-            // output — what opts a buffered function into the exchange-mode
-            // result cache (parity with the streaming emit path).
-            metadata: if self.name == "cached_sum_all" {
-                Some(vgi::cache_control::CacheControl::ttl(300).to_metadata())
-            } else {
-                None
-            },
+            // Finalize metadata opts the complete sink+combine+source
+            // lifecycle into whole-input caching.
+            metadata,
+            cache_behavior,
+            conditional_match: false,
+            conditional_answered: false,
         }))
     }
 }
