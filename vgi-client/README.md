@@ -34,6 +34,20 @@ All of them come from [`vgi-rpc-client`](https://crates.io/crates/vgi-rpc-client
 behind the `UnaryTransport` trait, so the protocol layer holds no assumptions
 about I/O.
 
+## Worker logs
+
+Built-in subprocess, TCP, HTTP, and AF_UNIX clients decode in-band VGI log
+batches. By default they forward each message and its structured extras to the
+Rust `log` facade under target `vgi::worker`. An embedding host can install a
+structured `WorkerLogSink` for a checked-out client with
+`VgiClient::set_worker_log_sink`; `WorkerPool` restores the default sink before
+that connection is reused, preventing diagnostics from leaking between host
+sessions. Authenticated HTTP rebuilds retain the active checkout sink.
+
+An `EXCEPTION` batch remains an RPC error and is not downgraded to a log event.
+Custom `VgiTransport` implementations own their diagnostic channel, so
+`set_worker_log_sink` returns `false` for those clients.
+
 ## Design
 
 - **`VgiClient`** owns one connection and carries the method surface. A worker is
