@@ -12,8 +12,9 @@
 
 use std::path::PathBuf;
 
+use arrow_schema::DataType;
 use vgi_client::{
-    Arguments, AttachOptions, FunctionKind, MacroKind, ScanBranchesResolution, VgiClient,
+    ArgSpecs, Arguments, AttachOptions, FunctionKind, MacroKind, ScanBranchesResolution, VgiClient,
 };
 
 /// Locate the sibling `vgi-example-worker` binary.
@@ -87,6 +88,48 @@ fn attaches_and_reports_a_default_schema() {
     );
 
     client.detach(&cat).expect("catalog_detach");
+}
+
+#[test]
+fn attached_catalog_preserves_every_global_scalar_overload() {
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+
+    let overloads = cat
+        .global_functions()
+        .expect("decode global function nominations")
+        .into_iter()
+        .filter(|function| function.schema_name == "main" && function.name == "global_scalar")
+        .map(|function| {
+            let arguments = ArgSpecs::parse(&function.arguments.0)
+                .expect("decode global_scalar argument schema");
+            assert_eq!(arguments.0.len(), 1, "each overload has one argument");
+            arguments.0[0].data_type.clone()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(overloads.len(), 2, "expected both global_scalar overloads");
+    assert_eq!(
+        overloads
+            .iter()
+            .filter(|data_type| **data_type == DataType::Int64)
+            .count(),
+        1,
+        "expected exactly one Int64 overload"
+    );
+    assert_eq!(
+        overloads
+            .iter()
+            .filter(|data_type| **data_type == DataType::Utf8)
+            .count(),
+        1,
+        "expected exactly one Utf8 overload"
+    );
+
+    client.detach(&cat).expect("detach");
 }
 
 #[test]
