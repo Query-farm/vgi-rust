@@ -458,6 +458,13 @@ impl TableProducer for RevalidatableProducer {
             .with_etag(REVALIDATABLE_ETAG)
             .with_revalidatable();
         if self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG) {
+            // Keep the conditional RPC open briefly so concurrency tests prove
+            // single-flight behavior against genuinely overlapping requests.
+            // Without a deterministic overlap window, a saturated test host
+            // can schedule one barrier participant only after the first 304
+            // has completed, correctly starting a second (non-overlapping)
+            // revalidation and making the test timing-dependent.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             // 304 Not Modified: the client's stored copy is still valid. A 0-row
             // batch with fresh validators (ttl=0 so it keeps revalidating).
             self.meta = Some(fresh.with_not_modified().to_metadata());

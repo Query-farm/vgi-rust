@@ -23,7 +23,7 @@
 //!   under a byte cap while still making every lookup and sweep expensive.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
@@ -184,7 +184,7 @@ pub enum Ineligible {
 }
 
 /// Caps.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheLimits {
     /// Largest single entry.
     pub max_entry_bytes: usize,
@@ -244,7 +244,7 @@ struct Slot {
 
 /// The cache.
 pub struct ResultCache {
-    limits: CacheLimits,
+    limits: RwLock<CacheLimits>,
     inner: Mutex<Inner>,
 }
 
@@ -258,13 +258,32 @@ impl ResultCache {
     /// A cache with the given caps.
     pub fn new(limits: CacheLimits) -> Self {
         Self {
-            limits,
+            limits: RwLock::new(limits),
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 stats: CacheStats::default(),
                 tick: 0,
             }),
         }
+    }
+
+    /// Return the cache's current caps.
+    pub fn limits(&self) -> CacheLimits {
+        *self.limits.read().unwrap()
+    }
+
+    /// Replace the cache caps, evicting entries that no longer fit.
+    ///
+    /// The limits write lock remains held while existing entries are checked,
+    /// so an insert cannot race a cap reduction using the former limits.
+    /// Returns the number of entries evicted by the update.
+    pub fn set_limits(&self, limits: CacheLimits) -> usize {
+        let mut configured = self.limits.write().unwrap();
+        *configured = limits;
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.stats.entries;
+        Self::enforce_caps(&mut inner, &limits);
+        before.saturating_sub(inner.stats.entries)
     }
 
     /// Decide whether a result may be stored, given what the worker advertised.
@@ -289,7 +308,8 @@ impl ResultCache {
         if cc.scope == vgi_protocol::cache_control::CACHE_SCOPE_TRANSACTION {
             return Err(Ineligible::TransactionScoped);
         }
-        if bytes > self.limits.max_entry_bytes {
+        let limits = self.limits.read().unwrap();
+        if bytes > limits.max_entry_bytes {
             return Err(Ineligible::EntryTooLarge);
         }
         let ttl = match cc.ttl_seconds {
@@ -319,10 +339,10 @@ impl ResultCache {
                     .unwrap_or(Duration::ZERO)
             }
             _ => {
-                if self.limits.default_ttl.is_zero() {
+                if limits.default_ttl.is_zero() {
                     return Err(Ineligible::NoFreshness);
                 }
-                self.limits.default_ttl
+                limits.default_ttl
             }
         };
         Ok(ttl)
@@ -385,7 +405,8 @@ impl ResultCache {
     ) {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let bytes = batches.iter().map(approx_bytes).sum();
-        if bytes > self.limits.max_entry_bytes {
+        let limits = self.limits.read().unwrap();
+        if bytes > limits.max_entry_bytes {
             let mut inner = self.inner.lock().unwrap();
             inner.stats.refusals += 1;
             return;
@@ -435,7 +456,7 @@ impl ResultCache {
                 last_used: tick,
             },
         );
-        self.enforce_caps(&mut inner);
+        Self::enforce_caps(&mut inner, &limits);
     }
 
     /// Slide a revalidated entry's lifetime forward.
@@ -590,14 +611,23 @@ impl ResultCache {
     }
 
     /// Evict least-recently-used entries until every cap is satisfied.
-    fn enforce_caps(&self, inner: &mut Inner) {
-        while inner.stats.entries > self.limits.max_entries
-            || inner.stats.total_bytes > self.limits.max_total_bytes
+    fn enforce_caps(inner: &mut Inner, limits: &CacheLimits) {
+        while inner
+            .map
+            .values()
+            .any(|slot| slot.entry.bytes > limits.max_entry_bytes)
+            || inner.stats.entries > limits.max_entries
+            || inner.stats.total_bytes > limits.max_total_bytes
         {
+            let has_oversized = inner
+                .map
+                .values()
+                .any(|slot| slot.entry.bytes > limits.max_entry_bytes);
             let Some(victim) = inner
                 .map
                 .iter()
-                .min_by_key(|(_, s)| s.last_used)
+                .filter(|(_, slot)| !has_oversized || slot.entry.bytes > limits.max_entry_bytes)
+                .min_by_key(|(_, slot)| slot.last_used)
                 .map(|(k, _)| k.clone())
             else {
                 break;
@@ -915,6 +945,56 @@ mod tests {
         }
         assert_eq!(c.stats().entries, 3);
         assert_eq!(c.stats().evictions_lru, 2);
+    }
+
+    #[test]
+    fn lowering_live_limits_evicts_existing_entries_and_governs_future_inserts() {
+        let c = ResultCache::new(CacheLimits::default());
+        let small = key("s", "small");
+        let large = key("s", "large");
+        c.insert(
+            small.clone(),
+            vec![batch(1)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        c.insert(
+            large.clone(),
+            vec![batch(1_000)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        let small_bytes = c
+            .entries()
+            .into_iter()
+            .find(|entry| entry.function == "small")
+            .unwrap()
+            .bytes;
+
+        let updated = CacheLimits {
+            max_entry_bytes: small_bytes,
+            max_total_bytes: small_bytes,
+            max_entries: 1,
+            ..CacheLimits::default()
+        };
+        assert_eq!(c.set_limits(updated), 1);
+        assert_eq!(c.limits(), updated);
+        assert_eq!(c.stats().entries, 1);
+        assert!(c.get(&small).is_some());
+        assert!(c.get(&large).is_none());
+
+        assert_eq!(
+            c.eligibility(Some(&cc(60)), Some("s"), small_bytes + 1),
+            Err(Ineligible::EntryTooLarge)
+        );
+        c.insert(
+            key("s", "too-large"),
+            vec![batch(1_000)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        assert_eq!(c.stats().entries, 1);
+        assert_eq!(c.stats().refusals, 1);
     }
 
     #[test]
