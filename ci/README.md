@@ -2,21 +2,30 @@
 
 `.github/workflows/integration.yml` runs the **canonical `Query-farm/vgi`
 integration sqllogictest suite** against the Rust example worker on every push /
-PR, across three transports and three operating systems.
+PR, across all three public transports on Linux.
 
-## How it works (no C++ build from source)
+## How it works
 
-Rather than building the DuckDB `vgi` C++ extension, CI drives a **prebuilt
-standalone `haybarn-unittest`** (the DuckDB/Haybarn sqllogictest runner) and
-installs the *signed* `vgi` extension from the Haybarn **community** channel,
-with `httpfs`/`json`/`parquet`/`spatial` from **core**. The `.test` files come
-from a pinned `Query-farm/vgi` checkout.
+The workflow pins one full `Query-farm/vgi` commit as the authority for both
+the C++ extension and `.test` corpus. A Linux producer job checks out that exact
+revision, builds `vgi.duckdb_extension` once, records its SHA-256 and source
+revision, and uploads it as a one-day workflow artifact. Every integration and
+coverage lane downloads and verifies that same artifact. The tests therefore
+cannot silently move ahead of the client implementation, which happened when
+the workflow tracked VGI main while loading an older community release.
+
+The suite still drives a prebuilt standalone `haybarn-unittest`. Its Haybarn
+release is pinned to the engine revision used by the VGI source checkout, so
+the local extension's ABI/platform metadata matches the runner. VGI loads by
+absolute artifact path; `httpfs`/`json`/`parquet`/`spatial` remain signed core
+extensions.
 
 - [`run-integration.sh`](run-integration.sh) — the driver: stages the suite,
   boots the worker(s), and runs `haybarn-unittest` for one transport lane.
-- [`preprocess-require.awk`](preprocess-require.awk) — rewrites each
-  `require <ext>` gate into a signed `INSTALL`+`LOAD` (the standalone runner
-  links none of these extensions), and injects `LOAD httpfs` on the http lane.
+- [`preprocess-require.awk`](preprocess-require.awk) — rewrites `require vgi`
+  into an absolute load of the verified local artifact, rewrites other
+  `require <ext>` gates into core `INSTALL`+`LOAD`, and injects `LOAD httpfs`
+  on the http lane.
 - [`wrappers/`](wrappers) — the single `vgi-example-worker` binary is routed
   into each catalog (`versioned`, `versioned_tables`, `attach_options`,
   `bad_protocol`) by a wrapper that sets `VGI_WORKER_CATALOG_NAME` and execs it.
@@ -25,27 +34,23 @@ from a pinned `Query-farm/vgi` checkout.
 
 | OS | stdio (subprocess) | launch (AF_UNIX) | http |
 |----|:------------------:|:----------------:|:----:|
-| Linux  | — (covered by launch) | ✅ | ✅ |
-| macOS  | — (covered by launch) | ✅ | ✅ |
-| Windows | — (slow; AF_UNIX is Unix-only) | — | ✅ |
+| Linux | ✅ | ✅ | ✅ |
 
-The launcher lane runs the whole suite over the AF_UNIX worker pool, so it
-covers the subprocess (stdio) path too. **Windows** runs the http lane only: the
-worker's AF_UNIX launcher transport is Unix-only, and the bare stdio lane is slow
-(a fresh worker process per query). Over http, Windows exercises the main
-`example` catalog only (the secondary-catalog tests self-skip via `require-env`,
-since the runner can't exec a shell catalog-wrapper as a Windows `LOCATION`) and
-drops the fixtures that read parquet/csv from POSIX `/tmp` paths.
+The artifact is a Linux-amd64 native library, so every consumer job runs on
+Linux. Building additional native artifacts would require one producer per OS,
+which would violate this workflow's build-once invariant. Platform packaging
+remains covered by VGI's extension-distribution pipeline; this workflow owns
+Rust worker protocol/integration compatibility across the three transports.
 
-## Out of scope / known prebuilt-binary differences
+## Out of scope / known standalone-runner differences
 
 Dropped at staging (covered by the locally-built `unittest` in the `vgi` repo):
 
 - `writable/` + `simple_writable/` — the write path (deferred read-only port).
-- `nested_type_combinations.test` — segfaults the prebuilt standalone runner.
+- `nested_type_combinations.test` — segfaults the standalone runner.
 - `expression_filter.test` — its `EXPLAIN` assertion renders the spatial
   predicate's WKT differently under the prebuilt DuckDB/spatial build.
-- http lane only: `projection_pushdown_repro.test`, `dynamic_filter.test`.
+- http lane only: `projection_pushdown_repro.test`.
 
 ## Executed-case floor
 
@@ -55,15 +60,14 @@ its own is not evidence anything ran: a dead shared worker, an empty stage, or a
 mis-wired env var all read as green while the suite quietly tested nothing.
 `run_unittest` accumulates the executed count (staged cases minus skips) across
 every invocation, and the run fails if it collapses below a per-lane
-`MIN_EXECUTED` (stdio 250, launch 255, http 245, Windows-http 240 — floors ~15
-below the measured 269 / 270 / 262 / 256, leaving room for upstream growth).
+`MIN_EXECUTED` (stdio 250, launch 255, http 245 — conservative floors below
+the current pinned suite, leaving room for environment-dependent skips).
 A collapse in that number is the tell of a suite-wide silent skip; it is a floor,
 not an equality, so **do not lower it to make a run pass** — find what stopped
 running. An empty stage (`No test cases matched`) fails outright.
 
-Only the floor is ported from vgi-typescript, not its per-reason skip allowlist:
-this port's three-OS matrix would need per-OS allowlists to maintain, and the
-floor alone catches the whole-suite collapses that are the real risk. The
+Only the floor is ported from vgi-typescript, not its per-reason skip allowlist.
+The floor alone catches the whole-suite collapses that are the real risk. The
 existing fatal-signal scan (a `fatal error condition` block a fork()ed child
 prints against the parent's counters, invisible to the exit code) stays.
 
@@ -97,7 +101,8 @@ input would otherwise abort the whole merge).
 
 ## Version pinning
 
-`integration.yml` pins `VGI_REF` (the `Query-farm/vgi` commit whose suite runs)
-and `HAYBARN_RELEASE` (the prebuilt runner). The suite and the community `vgi`
-extension are coupled — bump `VGI_REF` deliberately and re-validate against the
-then-current community extension.
+`integration.yml` pins `VGI_REF` to a full commit SHA and `HAYBARN_RELEASE` to
+the runner built from the same Haybarn engine revision. The producer verifies
+its checkout before building; consumers verify the artifact's recorded source
+revision and SHA-256. Bump the two pins deliberately and together whenever the
+VGI corpus or Haybarn ABI advances.

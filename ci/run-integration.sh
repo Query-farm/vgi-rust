@@ -3,7 +3,8 @@
 #
 # Run the canonical Query-farm/vgi integration sqllogictest suite against the
 # Rust example worker, using a prebuilt standalone `haybarn-unittest` and the
-# signed community vgi extension — no C++ build from source. See ci/README.md.
+# exact source-built VGI extension artifact selected by the workflow. See
+# ci/README.md.
 #
 # The single `vgi-example-worker` binary is routed into each catalog by the
 # ci/wrappers/* scripts (which set VGI_WORKER_CATALOG_NAME); on Windows, which
@@ -15,6 +16,7 @@
 #   VGI_SRC          path to a Query-farm/vgi checkout (contains test/sql/integration)
 #   HAYBARN_UNITTEST path to the haybarn-unittest binary
 #   VGI_WORKER_BIN   path to the built vgi-example-worker
+#   VGI_EXTENSION_PATH path to the matching local vgi.duckdb_extension artifact
 # Optional:
 #   TRANSPORT        stdio | launch | http   (default stdio)
 #   STAGE            scratch dir for the preprocessed test tree (default: mktemp)
@@ -23,6 +25,17 @@ set -uo pipefail  # not -e: the suite exit code is managed explicitly (`|| rc=$?
 : "${VGI_SRC:?path to a Query-farm/vgi checkout}"
 : "${HAYBARN_UNITTEST:?path to the haybarn-unittest binary}"
 : "${VGI_WORKER_BIN:?path to the built vgi-example-worker}"
+: "${VGI_EXTENSION_PATH:?path to the pinned vgi.duckdb_extension artifact}"
+[ -f "$VGI_EXTENSION_PATH" ] || {
+  echo "::error::VGI extension artifact does not exist: $VGI_EXTENSION_PATH" >&2
+  exit 1
+}
+VGI_EXTENSION_DIR="$(cd "$(dirname "$VGI_EXTENSION_PATH")" && pwd)" || {
+  echo "::error::cannot resolve VGI extension directory: $VGI_EXTENSION_PATH" >&2
+  exit 1
+}
+VGI_EXTENSION_PATH="$VGI_EXTENSION_DIR/$(basename "$VGI_EXTENSION_PATH")"
+export VGI_EXTENSION_PATH
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STAGE="${STAGE:-$(mktemp -d)}"
@@ -82,15 +95,19 @@ WIN_SKIP=()
 
 echo "Staging preprocessed tests into $STAGE (transport=$TRANSPORT, windows=$WINDOWS) ..."
 mkdir -p "$STAGE/test/sql/integration"
-( cd "$INTEGRATION"
+if ! ( cd "$INTEGRATION" || exit 1
   find . -name '*.test' \
        -not -path '*/writable/*' -not -path '*/simple_writable/*' \
        -not -name 'nested_type_combinations.test' \
        -not -name 'expression_filter.test' \
        ${HTTP_SKIP[@]+"${HTTP_SKIP[@]}"} ${WIN_SKIP[@]+"${WIN_SKIP[@]}"} | while read -r f; do
-    mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")"
-    awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" > "$STAGE/test/sql/integration/$f"
-  done )
+    mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")" || exit 1
+    awk -v http="$AWK_HTTP" -v vgi_extension="$VGI_EXTENSION_PATH" \
+        -f "$HERE/preprocess-require.awk" "$f" > "$STAGE/test/sql/integration/$f" || exit 1
+  done ); then
+  echo "::error::failed to stage the pinned VGI test corpus" >&2
+  exit 1
+fi
 
 # Background worker processes (http servers) tracked here and killed on exit.
 BG_PIDS=()
@@ -222,16 +239,29 @@ case "$TRANSPORT" in
     echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http)"; exit 1 ;;
 esac
 
-cd "$STAGE"
+cd "$STAGE" || {
+  echo "::error::cannot enter integration stage: $STAGE" >&2
+  exit 1
+}
 
-echo "Warming the extension cache (vgi from community, deps from core) ..."
-mkdir -p "$STAGE/test"
-cat > "$STAGE/test/_warm.test" <<'EOF'
-# name: test/_warm.test
-# group: [warm]
+echo "Validating pinned local VGI extension and warming core dependencies ..."
+mkdir -p "$STAGE/test" || exit 1
+VGI_EXTENSION_SQL_PATH="${VGI_EXTENSION_PATH//\'/\'\'}"
+cat > "$STAGE/test/_warm_vgi.test" <<EOF
+# name: test/_warm_vgi.test
+# group: [warm_vgi]
 statement ok
-FORCE INSTALL vgi FROM community;
+LOAD '$VGI_EXTENSION_SQL_PATH';
+EOF
+if ! "$HAYBARN_UNITTEST" "test/_warm_vgi.test"; then
+  echo "::error::pinned local VGI extension failed to load" >&2
+  exit 1
+fi
+rm -f "$STAGE/test/_warm_vgi.test"
 
+cat > "$STAGE/test/_warm_core.test" <<'EOF'
+# name: test/_warm_core.test
+# group: [warm_core]
 statement ok
 INSTALL httpfs FROM core;
 
@@ -244,8 +274,9 @@ INSTALL parquet FROM core;
 statement ok
 INSTALL spatial FROM core;
 EOF
-"$HAYBARN_UNITTEST" "test/_warm.test" >/dev/null 2>&1 || echo "::warning::extension warm step did not fully succeed"
-rm -f "$STAGE/test/_warm.test"
+"$HAYBARN_UNITTEST" "test/_warm_core.test" >/dev/null 2>&1 || \
+  echo "::warning::core extension warm-up did not fully succeed; individual require gates remain authoritative"
+rm -f "$STAGE/test/_warm_core.test"
 
 # Run the suite in one invocation, streaming the native sqllogictest report.
 # bearer_auth/* runs separately on the http lane against a bearer-protected
@@ -262,14 +293,12 @@ rc=0
 # check at the end fails the lane if it collapses below MIN_EXECUTED. This is a
 # floor, not an equality — the upstream suite grows — so do NOT lower it to make
 # a run pass; find what stopped running. (Only the floor is ported from
-# vgi-typescript here, not its per-reason skip allowlist: this port's 3-OS matrix
-# would need per-OS allowlists to maintain, and the floor alone catches the
-# whole-suite collapses that are the real risk. The existing fatal-signal scan in
-# run_unittest stays.)
+# vgi-typescript here, not its per-reason skip allowlist. The floor alone catches
+# the whole-suite collapses that are the real risk. The existing fatal-signal
+# scan in run_unittest stays.)
 #
-# Measured 2026-07-24 against Query-farm/vgi main: stdio 269, launch 270, http
-# 262 (Linux/macOS) / 256 (Windows, which runs the main catalog only). Floors sit
-# ~15 below, with a lower Windows-http value for its smaller staged set.
+# The Linux floors are deliberately conservative relative to the pinned suite;
+# the lower Windows-http value remains for local use of this portable driver.
 TOTAL_EXECUTED=0
 case "$TRANSPORT" in
   stdio)  MIN_EXECUTED="${MIN_EXECUTED:-250}" ;;
