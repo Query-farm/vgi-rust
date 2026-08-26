@@ -149,6 +149,23 @@ impl Arguments {
         self.positional.is_empty() && self.named.is_empty()
     }
 
+    /// Positional values in call order.
+    ///
+    /// This is primarily useful to adapters that translate worker-declared
+    /// catalog scan arguments into a host-native table provider rather than
+    /// sending them back through a VGI bind.
+    pub fn positional_values(&self) -> &[ArgValue] {
+        &self.positional
+    }
+
+    /// Named values in declaration order.
+    ///
+    /// Names are unique because [`Self::named`] replaces an earlier value with
+    /// the same name.
+    pub fn named_values(&self) -> &[(String, ArgValue)] {
+        &self.named
+    }
+
     /// Encode to the IPC blob a `BindRequest` carries.
     ///
     /// An empty argument list encodes to empty bytes, which the worker reads as
@@ -336,6 +353,8 @@ mod tests {
     #[test]
     fn a_repeated_named_argument_replaces_rather_than_duplicates() {
         let args = Arguments::new().named("n", 1i64).named("n", 2i64);
+        assert_eq!(args.named_values().len(), 1);
+        assert_eq!(args.named_values()[0], ("n".to_string(), ArgValue::Int(2)));
         let batch = ipc::read_batch(&args.to_ipc().unwrap().0).unwrap();
         let st = batch
             .column_by_name("args")

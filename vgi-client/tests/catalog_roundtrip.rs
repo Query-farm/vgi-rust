@@ -12,7 +12,9 @@
 
 use std::path::PathBuf;
 
-use vgi_client::{AttachOptions, FunctionKind, MacroKind, ScanBranchesResolution, VgiClient};
+use vgi_client::{
+    Arguments, AttachOptions, FunctionKind, MacroKind, ScanBranchesResolution, VgiClient,
+};
 
 /// Locate the sibling `vgi-example-worker` binary.
 ///
@@ -253,6 +255,27 @@ fn decodes_and_validates_catalog_scan_branches() {
             .collect::<Vec<_>>(),
         vec![Some("n < 50"), Some("n >= 50")],
         "branch order and branch-local filters must survive nested IPC decoding"
+    );
+
+    let format = table(&mut client, "multi_branch_format");
+    let format = client
+        .table_scan_branches(&cat, &format, None)
+        .expect("decode multi_branch_format");
+    let [format] = format.branches.as_slice() else {
+        panic!("multi_branch_format must have exactly one branch")
+    };
+    assert_eq!(format.format_name.as_deref(), Some("csv"));
+    assert!(format.function_name.is_empty());
+    let options =
+        Arguments::from_scan_arguments(&format.format_options.as_ref().expect("format options").0)
+            .expect("decode format options");
+    assert_eq!(
+        options
+            .named_values()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["delim", "header", "nullstr"]
     );
 
     let empty = table(&mut client, "multi_branch_empty");
