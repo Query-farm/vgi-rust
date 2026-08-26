@@ -22,8 +22,9 @@ use arrow_schema::{Schema, SchemaRef};
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    BindRequest, BindResponse, CardinalityRequest, GlobalInitResponse, InitRequest,
-    PartitionTransform, PlanResponse, ScanSplit, SortField, TableFunctionPlanRequest,
+    BindRequest, BindResponse, CardinalityRequest, DynamicToStringRequest, DynamicToStringResponse,
+    GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse, ScanSplit, SortField,
+    TableFunctionPlanRequest,
 };
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
@@ -759,6 +760,29 @@ impl VgiClient {
             self.transport_mut(),
             "table_function_statistics",
             p::TableFunctionStatisticsParams { request },
+        )
+    }
+
+    /// Fetch post-execution diagnostics for one completed table-function scan.
+    ///
+    /// Callers must only invoke this after the scan reached clean end-of-stream.
+    /// The worker keys its execution-local state by `execution_id`; cancellation,
+    /// errors, and cache replays do not represent completed worker executions and
+    /// must not trigger this callback.
+    pub fn table_function_dynamic_to_string(
+        &mut self,
+        bound: &BoundFunction,
+        execution_id: Bytes,
+    ) -> Result<DynamicToStringResponse> {
+        let request = envelope(DynamicToStringRequest {
+            bind_call: bound.bind_call.clone(),
+            bind_opaque_data: bound.response.opaque_data.clone(),
+            global_execution_id: execution_id,
+        })?;
+        call(
+            self.transport_mut(),
+            "table_function_dynamic_to_string",
+            p::TableFunctionDynamicToStringParams { request },
         )
     }
 
@@ -1746,6 +1770,81 @@ mod tests {
             },
             out,
         )
+    }
+
+    struct DynamicToStringTransport {
+        seen: Arc<std::sync::Mutex<Option<DynamicToStringRequest>>>,
+    }
+
+    impl crate::transport::VgiTransport for DynamicToStringTransport {
+        fn call_unary(&mut self, method: &str, params: &RecordBatch) -> Result<RecordBatch> {
+            use arrow_array::BinaryArray;
+
+            assert_eq!(method, "table_function_dynamic_to_string");
+            let params: p::TableFunctionDynamicToStringParams = wire::from_batch(params)?;
+            let request = wire::from_batch(&ipc::read_batch(&params.request.0)?)?;
+            *self.seen.lock().unwrap() = Some(request);
+
+            let response = wire::to_batch(DynamicToStringResponse {
+                keys: vec!["rows_produced".to_string(), "elapsed_ms".to_string()],
+                values: vec!["42".to_string(), "7".to_string()],
+            })?;
+            let inner = ipc::write_batch(&response)?;
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "result",
+                    DataType::Binary,
+                    false,
+                )])),
+                vec![Arc::new(BinaryArray::from(vec![inner.as_slice()]))],
+            )
+            .map_err(|error| RpcError::runtime_error(error.to_string()))
+        }
+
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("unexpected producer"))
+        }
+
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn crate::transport::ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("unexpected exchange"))
+        }
+
+        fn label(&self) -> &str {
+            "dynamic-to-string"
+        }
+    }
+
+    #[test]
+    fn dynamic_to_string_forwards_the_bound_call_and_execution_id() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut client = crate::VgiClient::new(Box::new(DynamicToStringTransport {
+            seen: Arc::clone(&seen),
+        }));
+
+        let response = client
+            .table_function_dynamic_to_string(&bound_stub(), Bytes(b"completed-execution".to_vec()))
+            .unwrap();
+        assert_eq!(response.keys, ["rows_produced", "elapsed_ms"]);
+        assert_eq!(response.values, ["42", "7"]);
+
+        let request = seen.lock().unwrap().clone().expect("request");
+        assert_eq!(request.bind_call, Bytes(Vec::new()));
+        assert_eq!(request.bind_opaque_data, Some(Bytes(Vec::new())));
+        assert_eq!(
+            request.global_execution_id,
+            Bytes(b"completed-execution".to_vec())
+        );
     }
 
     #[test]
