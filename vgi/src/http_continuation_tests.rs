@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
 use vgi_rpc::metadata::{
     REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
 };
 use vgi_rpc::wire::{md_get, StreamReader, StreamWriter};
-use vgi_rpc::{Bytes, DictString, OutputCollector, Result, RpcError};
+use vgi_rpc::{Bytes, DictString, LargeBytes, OutputCollector, Result, RpcError};
 
 use crate::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use crate::protocol::dtos::{BindRequest, InitRequest};
@@ -81,7 +81,11 @@ impl TableFunction for SeqFunction {
         self.name
     }
     fn metadata(&self) -> FunctionMetadata {
-        FunctionMetadata::default()
+        FunctionMetadata {
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![ArgSpec::const_arg("count", 0, "int64", "rows to generate")]
@@ -168,6 +172,15 @@ fn frame(batch: &RecordBatch, method: &str, state_token: Option<&str>) -> Vec<u8
 
 /// The boxed `init` request body for `function(count)`.
 fn init_body(function: &str, count: i64) -> Vec<u8> {
+    init_body_with_filter(function, count, None, None)
+}
+
+fn init_body_with_filter(
+    function: &str,
+    count: i64,
+    pushdown_filters: Option<Vec<u8>>,
+    join_keys: Option<Vec<Vec<u8>>>,
+) -> Vec<u8> {
     let args = crate::arguments::Arguments::serialize_positional(&[
         Arc::new(Int64Array::from(vec![count])) as ArrayRef,
     ])
@@ -195,8 +208,8 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
         output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,
-        pushdown_filters: None,
-        join_keys: None,
+        pushdown_filters: pushdown_filters.map(LargeBytes),
+        join_keys: join_keys.map(|batches| batches.into_iter().map(LargeBytes).collect()),
         phase: None,
         execution_id: None,
         init_opaque_data: None,
@@ -223,6 +236,43 @@ fn init_body(function: &str, count: i64) -> Vec<u8> {
     )
     .unwrap();
     frame(&req, "init", None)
+}
+
+fn join_key_filter(values: &[i64]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let filter_schema = Arc::new(Schema::new(vec![Field::new(
+        "filter_spec",
+        DataType::Utf8,
+        false,
+    )
+    .with_metadata(
+        [("vgi_filter_version".to_string(), "1".to_string())]
+            .into_iter()
+            .collect(),
+    )]));
+    let filter = RecordBatch::try_new(
+        filter_schema,
+        vec![Arc::new(StringArray::from(vec![
+            r#"[{"type":"join_keys","column_name":"n","column_index":0,"keys_column":"n"}]"#,
+        ])) as ArrayRef],
+    )
+    .unwrap();
+
+    let keys_schema = Arc::new(
+        Schema::new(vec![Field::new("n", DataType::Int64, true)]).with_metadata(
+            [("vgi_join_keys_version".to_string(), "2".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let keys = RecordBatch::try_new(
+        keys_schema,
+        vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+    )
+    .unwrap();
+    (
+        ipc::write_batch(&filter).unwrap(),
+        vec![ipc::write_batch(&keys).unwrap()],
+    )
 }
 
 /// The `exchange` continuation body: an empty batch carrying the state token.
@@ -340,6 +390,36 @@ fn resumable_scan_paginates_over_http() {
         data_batches + 1,
         "expected one bounded response per batch plus a terminal probe"
     );
+}
+
+/// Init-time join-key side batches survive every stateless HTTP rebuild. Before
+/// they were folded into `ExchangeBlob`, only the first response was filtered;
+/// resumed batches silently lost the values referenced by the filter AST.
+#[test]
+fn join_key_filter_survives_http_continuations() {
+    let port = start_server();
+    let count = 35;
+    let expected = vec![1, 12, 23, 34];
+    let (filter, join_keys) = join_key_filter(&expected);
+
+    let first = parse(&post(
+        port,
+        "init/init",
+        init_body_with_filter("test_seq", count, Some(filter), Some(join_keys)),
+    ));
+    let mut all = first.values;
+    let mut token = first.token;
+    let mut responses = 1;
+    while let Some(t) = token.take() {
+        let response = parse(&post(port, "init/exchange", exchange_body(&t)));
+        all.extend(response.values);
+        token = response.token;
+        responses += 1;
+        assert!(responses <= count + 5, "continuation did not terminate");
+    }
+
+    assert_eq!(all, expected);
+    assert!(responses > 1, "the filtered scan did not exercise resume");
 }
 
 /// A non-resumable producer with ONE batch still completes over HTTP, in a

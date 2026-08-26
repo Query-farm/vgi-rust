@@ -1571,6 +1571,13 @@ impl Dispatcher {
                 .clone()
                 .map(|b| b.0)
                 .unwrap_or_default(),
+            join_keys: dto
+                .join_keys
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| b.0)
+                .collect(),
             auto_apply,
             inner_resume: Vec::new(),
             at_unit: bind_call.at_unit.clone().unwrap_or_default(),
@@ -1635,7 +1642,7 @@ impl Dispatcher {
             auth_principal: None,
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
-            join_keys: Vec::new(),
+            join_keys: blob.join_keys.clone(),
             // The file-backed store is process-global; resumed states (e.g. a
             // distributed table-in-out's `process` appending partials, or a
             // work-queue producer) must keep access to it across HTTP
@@ -3739,6 +3746,11 @@ pub struct ExchangeBlob {
     pub substream_id: Vec<u8>,
     pub init_opaque: Vec<u8>,
     pub pushdown_filters: Vec<u8>, // empty = none
+    /// Init-time VGI v2 side batches referenced by `join_keys` filters. These
+    /// must survive HTTP continuation rebuilds along with the filter AST;
+    /// dropping them turns every resumed membership filter into an unresolved
+    /// no-op while byte-stream transports continue to work.
+    pub join_keys: Vec<Vec<u8>>,
     pub auto_apply: bool,
     /// Producer-only: the inner producer's partial-chunk cursor
     /// ([`crate::table_function::TableProducer::encode_resume`]). Empty for
