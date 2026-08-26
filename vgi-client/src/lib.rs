@@ -87,7 +87,7 @@ pub use catalog::{
     At, AttachOptionSpec, AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind,
     MacroKind, ScanBranchesResolution, SettingSpec,
 };
-pub use client::{ConnectionOptions, VgiClient};
+pub use client::{ConnectionOptions, VgiClient, WorkerLogSink};
 #[cfg(feature = "disk-cache")]
 pub use disk_cache::{
     DiskCache, DiskCacheCodec, DiskCacheCommit, DiskCacheEntryInfo, DiskCacheError, DiskCacheHit,
@@ -105,6 +105,7 @@ pub use scan::{
     ScanOptions, ScanPlan, ScanSplitInfo, SecretLookupRequest, SortDirection,
 };
 pub use transport::{ExchangeStream, ProducerStream, StreamTransport, VgiTransport};
+pub use vgi_rpc_client::{LogLevel as WorkerLogLevel, LogMessage as WorkerLogMessage};
 
 #[cfg(feature = "http")]
 pub use transport::HttpTransport;

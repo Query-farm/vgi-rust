@@ -470,7 +470,7 @@ impl DerefMut for PooledClient {
 
 impl Drop for PooledClient {
     fn drop(&mut self) {
-        let Some(client) = self.client.take() else {
+        let Some(mut client) = self.client.take() else {
             return;
         };
         if self.poisoned || !client.exchange_is_reusable() {
@@ -481,6 +481,7 @@ impl Drop for PooledClient {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        client.reset_worker_log_sink();
         self.pool.release(self.key.clone(), client);
     }
 }
@@ -488,6 +489,7 @@ impl Drop for PooledClient {
 #[cfg(test)]
 mod tests {
     use arrow_array::RecordBatch;
+    use std::sync::atomic::AtomicUsize;
     use vgi_rpc::errors::RpcError;
     use vgi_rpc::wire::Metadata;
 
@@ -619,5 +621,29 @@ mod tests {
         let stats = pool.stats();
         assert_eq!(stats.discarded_poisoned, 1);
         assert_eq!(stats.idle, 0);
+    }
+
+    #[test]
+    fn releasing_to_pool_drops_checkout_worker_log_sink() {
+        let pool = WorkerPool::default();
+        let location = loc("worker-log-reset");
+        let router = crate::client::WorkerLogRouter::default();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&delivered);
+        let mut client = VgiClient::with_worker_log_router(Box::new(StubTransport), router.clone());
+        assert!(client.set_worker_log_sink(Arc::new(move |_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        drop(PooledClient::new(
+            pool,
+            PoolKey::anonymous(&location),
+            client,
+        ));
+        router.emit(vgi_rpc_client::LogMessage::new(
+            vgi_rpc_client::LogLevel::Info,
+            "belongs to next checkout",
+        ));
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
     }
 }

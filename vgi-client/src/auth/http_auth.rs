@@ -37,6 +37,7 @@ pub struct AuthenticatedHttpTransport {
     built_with: Option<String>,
     label: String,
     timeout: Option<Duration>,
+    worker_logs: crate::client::WorkerLogRouter,
 }
 
 impl AuthenticatedHttpTransport {
@@ -46,11 +47,21 @@ impl AuthenticatedHttpTransport {
         auth: Arc<dyn CatalogAuth>,
         timeout: Option<Duration>,
     ) -> Self {
-        Self::with_probe(
+        Self::new_with_worker_logs(base_url, auth, timeout, Default::default())
+    }
+
+    pub(crate) fn new_with_worker_logs(
+        base_url: impl Into<String>,
+        auth: Arc<dyn CatalogAuth>,
+        timeout: Option<Duration>,
+        worker_logs: crate::client::WorkerLogRouter,
+    ) -> Self {
+        Self::with_probe_and_worker_logs(
             base_url,
             auth,
             Box::new(super::oauth::UreqTransport),
             timeout,
+            worker_logs,
         )
     }
 
@@ -64,6 +75,16 @@ impl AuthenticatedHttpTransport {
         probe: Box<dyn OAuthHttp>,
         timeout: Option<Duration>,
     ) -> Self {
+        Self::with_probe_and_worker_logs(base_url, auth, probe, timeout, Default::default())
+    }
+
+    fn with_probe_and_worker_logs(
+        base_url: impl Into<String>,
+        auth: Arc<dyn CatalogAuth>,
+        probe: Box<dyn OAuthHttp>,
+        timeout: Option<Duration>,
+        worker_logs: crate::client::WorkerLogRouter,
+    ) -> Self {
         let base_url = base_url.into();
         Self {
             label: base_url.clone(),
@@ -73,6 +94,7 @@ impl AuthenticatedHttpTransport {
             client: None,
             built_with: None,
             timeout,
+            worker_logs,
         }
     }
 
@@ -82,7 +104,7 @@ impl AuthenticatedHttpTransport {
         if self.client.is_none() || self.built_with != token {
             let mut builder = HttpClient::connect(self.base_url.clone())
                 .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
-                .on_log(crate::client::worker_log_sink())
+                .on_log(self.worker_logs.callback())
                 .timeout(self.timeout);
             if let Some(t) = &token {
                 builder = builder.header("Authorization", &format!("Bearer {t}"))?;

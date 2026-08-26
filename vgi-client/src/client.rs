@@ -5,7 +5,7 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -23,10 +23,47 @@ use crate::transport::{StreamTransport, VgiTransport};
 /// how a scan fans out across the worker's advertised `max_workers`.
 pub struct VgiClient {
     transport: Box<dyn VgiTransport>,
+    worker_logs: Option<WorkerLogRouter>,
     /// Cleared when an exchange fails in a state where transport framing may
     /// no longer be synchronized. A pooled owner checks this bit on drop and
     /// discards the connection even when its caller forgot to call `poison`.
     exchange_reusable: Arc<AtomicBool>,
+}
+
+/// A destination for structured log messages emitted in-band by a VGI worker.
+pub type WorkerLogSink = Arc<dyn Fn(vgi_rpc_client::LogMessage) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub(crate) struct WorkerLogRouter(Arc<RwLock<WorkerLogSink>>);
+
+impl Default for WorkerLogRouter {
+    fn default() -> Self {
+        Self(Arc::new(RwLock::new(default_worker_log_sink())))
+    }
+}
+
+impl WorkerLogRouter {
+    pub(crate) fn callback(&self) -> vgi_rpc_client::OnLog {
+        let router = self.clone();
+        Box::new(move |message| router.emit(message))
+    }
+
+    pub(crate) fn emit(&self, message: vgi_rpc_client::LogMessage) {
+        let sink = self.0.read().ok().map(|current| Arc::clone(&*current));
+        if let Some(sink) = sink {
+            sink(message);
+        }
+    }
+
+    fn replace(&self, sink: WorkerLogSink) {
+        if let Ok(mut current) = self.0.write() {
+            *current = sink;
+        }
+    }
+
+    fn reset(&self) {
+        self.replace(default_worker_log_sink());
+    }
 }
 
 /// Per-attachment transport settings that affect how a worker is reached.
@@ -64,11 +101,11 @@ pub struct ConnectionOptions {
 /// Neither is optional in practice, which is why this is applied centrally
 /// rather than left to each `connect_*`: a new transport added later inherits
 /// both instead of rediscovering them.
-fn configure(client: RpcClient) -> RpcClient {
+fn configure(client: RpcClient, worker_logs: &WorkerLogRouter) -> RpcClient {
     client
         .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
         .relax_nullability(true)
-        .on_log(worker_log_sink())
+        .on_log(worker_logs.callback())
 }
 
 /// Where a worker's in-band log batches go.
@@ -85,8 +122,8 @@ fn configure(client: RpcClient) -> RpcClient {
 /// sink is consulted, so a worker failure is a failed call and not a line in a
 /// log nobody read. The mapping below exists for a peer that mislabels one, and
 /// it is loud for the same reason.
-pub(crate) fn worker_log_sink() -> vgi_rpc_client::OnLog {
-    Box::new(|msg: vgi_rpc_client::LogMessage| {
+fn default_worker_log_sink() -> WorkerLogSink {
+    Arc::new(|msg: vgi_rpc_client::LogMessage| {
         log::log!(
             target: "vgi::worker",
             worker_log_level(msg.level),
@@ -126,7 +163,43 @@ impl VgiClient {
     pub fn new(transport: Box<dyn VgiTransport>) -> Self {
         Self {
             transport,
+            worker_logs: None,
             exchange_reusable: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn configured_stream(client: RpcClient, label: String) -> Self {
+        let worker_logs = WorkerLogRouter::default();
+        let client = configure(client, &worker_logs);
+        Self::with_worker_log_router(Box::new(StreamTransport::new(client, label)), worker_logs)
+    }
+
+    pub(crate) fn with_worker_log_router(
+        transport: Box<dyn VgiTransport>,
+        worker_logs: WorkerLogRouter,
+    ) -> Self {
+        Self {
+            transport,
+            worker_logs: Some(worker_logs),
+            exchange_reusable: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Replace the log destination for a built-in VGI transport.
+    ///
+    /// Returns false for a custom [`VgiTransport`], which has no standard
+    /// in-band log callback to replace.
+    pub fn set_worker_log_sink(&mut self, sink: WorkerLogSink) -> bool {
+        let Some(router) = &self.worker_logs else {
+            return false;
+        };
+        router.replace(sink);
+        true
+    }
+
+    pub(crate) fn reset_worker_log_sink(&mut self) {
+        if let Some(router) = &self.worker_logs {
+            router.reset();
         }
     }
 
@@ -185,15 +258,11 @@ impl VgiClient {
                 Self::connect_subprocess_with_debug(argv, options.worker_debug)
             }
             VgiLocation::Tcp { host, port } => {
-                let client = configure(RpcClient::tcp_connect_with_timeout(
-                    host,
-                    *port,
-                    options.rpc_timeout,
-                )?);
-                Ok(Self::new(Box::new(StreamTransport::new(
+                let client = RpcClient::tcp_connect_with_timeout(host, *port, options.rpc_timeout)?;
+                Ok(Self::configured_stream(
                     client,
                     format!("tcp://{host}:{port}"),
-                ))))
+                ))
             }
             #[cfg(feature = "http")]
             VgiLocation::Http(url) => Self::connect_http_with_retry_and_timeout(
@@ -208,11 +277,8 @@ impl VgiClient {
             #[cfg(feature = "unix")]
             VgiLocation::Unix(path) => {
                 let label = format!("unix://{}", path.display());
-                let client = configure(RpcClient::unix_connect_with_timeout(
-                    path,
-                    options.rpc_timeout,
-                )?);
-                Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+                let client = RpcClient::unix_connect_with_timeout(path, options.rpc_timeout)?;
+                Ok(Self::configured_stream(client, label))
             }
             #[cfg(not(feature = "unix"))]
             VgiLocation::Unix(_) => Err(vgi_rpc::errors::RpcError::value_error(
@@ -227,11 +293,8 @@ impl VgiClient {
                 config.state_dir = options.launcher_state_dir.clone();
                 let sock = crate::launcher::ensure_worker(argv, &config)?;
                 let label = format!("unix://{}", sock.display());
-                let client = configure(RpcClient::unix_connect_with_timeout(
-                    sock,
-                    options.rpc_timeout,
-                )?);
-                Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+                let client = RpcClient::unix_connect_with_timeout(sock, options.rpc_timeout)?;
+                Ok(Self::configured_stream(client, label))
             }
             #[cfg(not(feature = "launcher"))]
             VgiLocation::Launch(_) => Err(vgi_rpc::errors::RpcError::value_error(
@@ -251,8 +314,8 @@ impl VgiClient {
             .first()
             .map(|s| s.as_ref().to_string_lossy().into_owned())
             .unwrap_or_else(|| "subprocess".to_string());
-        let client = configure(RpcClient::connect(cmd)?);
-        Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+        let client = RpcClient::connect(cmd)?;
+        Ok(Self::configured_stream(client, label))
     }
 
     /// Spawn a subprocess with explicit control over whether stderr is shown.
@@ -270,25 +333,25 @@ impl VgiClient {
             vgi_rpc_client::StderrMode::Null
         };
         let transport = vgi_rpc_client::SubprocessTransport::spawn_with_stderr(cmd, stderr)?;
-        let client = configure(RpcClient::from_transport(Box::new(transport)));
-        Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+        let client = RpcClient::from_transport(Box::new(transport));
+        Ok(Self::configured_stream(client, label))
     }
 
     /// Connect to a worker listening on TCP.
     pub fn connect_tcp(host: &str, port: u16) -> Result<Self> {
-        let client = configure(RpcClient::tcp_connect(host, port)?);
-        Ok(Self::new(Box::new(StreamTransport::new(
+        let client = RpcClient::tcp_connect(host, port)?;
+        Ok(Self::configured_stream(
             client,
             format!("tcp://{host}:{port}"),
-        ))))
+        ))
     }
 
     /// Connect to a worker on a Unix domain socket.
     #[cfg(feature = "unix")]
     pub fn connect_unix(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let label = format!("unix://{}", path.as_ref().display());
-        let client = configure(RpcClient::unix_connect(path)?);
-        Ok(Self::new(Box::new(StreamTransport::new(client, label))))
+        let client = RpcClient::unix_connect(path)?;
+        Ok(Self::configured_stream(client, label))
     }
 
     /// Connect to a worker serving VGI over HTTP.
@@ -320,15 +383,17 @@ impl VgiClient {
         timeout: Option<Duration>,
     ) -> Result<Self> {
         use crate::transport::HttpTransport;
+        let worker_logs = WorkerLogRouter::default();
         let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
-            .on_log(worker_log_sink())
+            .on_log(worker_logs.callback())
             .timeout(timeout)
             .build()?;
         let http = Box::new(HttpTransport::new(client, base_url.to_string()));
-        Ok(Self::new(Box::new(crate::retry::RetryTransport::new(
-            http, policy,
-        ))))
+        Ok(Self::with_worker_log_router(
+            Box::new(crate::retry::RetryTransport::new(http, policy)),
+            worker_logs,
+        ))
     }
 
     /// Connect over HTTP, presenting a credential and recovering from a 401.
@@ -342,17 +407,26 @@ impl VgiClient {
         auth: std::sync::Arc<dyn crate::auth::CatalogAuth>,
         timeout: Option<Duration>,
     ) -> Self {
-        let inner = Box::new(crate::auth::AuthenticatedHttpTransport::new(
-            base_url, auth, timeout,
-        ));
+        let worker_logs = WorkerLogRouter::default();
+        let inner = Box::new(
+            crate::auth::AuthenticatedHttpTransport::new_with_worker_logs(
+                base_url,
+                auth,
+                timeout,
+                worker_logs.clone(),
+            ),
+        );
         // Retry sits OUTSIDE the 401 recovery, not inside it: a 401 is fatal to
         // the retry classifier and passes straight through to the credential
         // refresh, while a 429 that the refresh would have no answer for is
         // absorbed here.
-        Self::new(Box::new(crate::retry::RetryTransport::new(
-            inner,
-            crate::retry::RetryPolicy::default(),
-        )))
+        Self::with_worker_log_router(
+            Box::new(crate::retry::RetryTransport::new(
+                inner,
+                crate::retry::RetryPolicy::default(),
+            )),
+            worker_logs,
+        )
     }
 
     /// A short label for this connection, for error messages and logs.
@@ -404,5 +478,30 @@ mod tests {
 
         let rich = LogMessage::new(LogLevel::Info, "pruned").with_extra("splits", "3");
         assert_eq!(format_worker_log(&rich), r#"pruned {"splits":"3"}"#);
+    }
+
+    #[test]
+    fn worker_log_router_can_be_replaced_and_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let router = WorkerLogRouter::default();
+        let seen = Arc::clone(&delivered);
+        let reentrant = router.clone();
+        router.replace(Arc::new(move |message| {
+            assert_eq!(message.level, LogLevel::Warn);
+            assert_eq!(message.message, "slow split");
+            assert!(message
+                .extras
+                .iter()
+                .any(|(key, value)| key == "split" && value == "7"));
+            seen.fetch_add(1, Ordering::Relaxed);
+            reentrant.reset();
+        }));
+        router.emit(LogMessage::new(LogLevel::Warn, "slow split").with_extra("split", "7"));
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+
+        router.emit(LogMessage::new(LogLevel::Warn, "not routed to prior owner"));
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
     }
 }
