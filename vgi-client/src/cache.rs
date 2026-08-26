@@ -324,6 +324,15 @@ impl CacheFreshness {
     pub fn is_expired(self) -> bool {
         self.remaining().is_zero()
     }
+
+    /// Whether the worker made the result stale at the instant it was received.
+    ///
+    /// This distinguishes the intentional HTTP `no-cache` shape (a zero
+    /// lifetime paired with a validator) from a positive lifetime that elapsed
+    /// while a durable tier was publishing the result.
+    pub fn is_immediately_stale(self) -> bool {
+        self.lifetime.is_zero()
+    }
 }
 
 /// Caps.
@@ -682,6 +691,21 @@ impl ResultCache {
     ///
     /// What a 304 buys: the stored bytes stay, and only the clock moves.
     pub fn slide(&self, key: &CacheKey, ttl: Duration) -> bool {
+        self.slide_inner(key, ttl, None)
+    }
+
+    /// Slide a revalidated entry and atomically replace its retained worker
+    /// policy from the successful conditional response.
+    pub fn slide_with_control(
+        &self,
+        key: &CacheKey,
+        ttl: Duration,
+        control: &CacheControl,
+    ) -> bool {
+        self.slide_inner(key, ttl, Some(control))
+    }
+
+    fn slide_inner(&self, key: &CacheKey, ttl: Duration, control: Option<&CacheControl>) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.tick += 1;
         let tick = inner.tick;
@@ -689,6 +713,22 @@ impl ResultCache {
             Some(slot) => {
                 slot.entry.stored_at = Instant::now();
                 slot.entry.ttl = Some(ttl);
+                if let Some(control) = control {
+                    slot.entry.etag = control.etag.clone();
+                    slot.entry.last_modified = control.last_modified.clone();
+                    slot.entry.revalidatable = control.revalidatable
+                        && (control.etag.is_some() || control.last_modified.is_some());
+                    slot.entry.stale_while_revalidate = control
+                        .stale_while_revalidate
+                        .and_then(|value| u64::try_from(value).ok())
+                        .map(Duration::from_secs)
+                        .unwrap_or_default();
+                    slot.entry.stale_if_error = control
+                        .stale_if_error
+                        .and_then(|value| u64::try_from(value).ok())
+                        .map(Duration::from_secs)
+                        .unwrap_or_default();
+                }
                 slot.last_used = tick;
                 inner.stats.revalidations += 1;
                 true
@@ -1241,6 +1281,33 @@ mod tests {
             5,
             "a 304 reuses the stored bytes rather than refetching"
         );
+    }
+
+    #[test]
+    fn revalidation_atomically_rotates_and_withdraws_memory_policy() {
+        let c = ResultCache::new(CacheLimits::default());
+        let original = CacheControl::ttl(0)
+            .with_etag("\"v1\"")
+            .with_revalidatable()
+            .with_stale_if_error(60);
+        let k = key("s", "rotate");
+        c.insert(k.clone(), vec![batch(5)], Duration::ZERO, Some(&original));
+
+        let rotated = CacheControl::ttl(0)
+            .with_etag("\"v2\"")
+            .with_revalidatable();
+        assert!(c.slide_with_control(&k, Duration::ZERO, &rotated));
+        let entry = c.get_for_revalidation(&k).unwrap();
+        assert_eq!(entry.etag.as_deref(), Some("\"v2\""));
+        assert!(!entry.may_serve_on_error_at(Instant::now()));
+
+        let withdrawn = CacheControl::ttl(60);
+        assert!(c.slide_with_control(&k, Duration::from_secs(60), &withdrawn));
+        let entry = c.get(&k).expect("new positive freshness remains reusable");
+        assert_eq!(entry.etag, None);
+        assert_eq!(entry.last_modified, None);
+        assert!(!entry.revalidatable);
+        assert!(!entry.may_serve_on_error_at(Instant::now()));
     }
 
     #[test]

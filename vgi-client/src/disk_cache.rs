@@ -207,6 +207,10 @@ pub struct DiskCacheStats {
     pub corruptions: u64,
     /// Captures explicitly or implicitly aborted.
     pub capture_aborts: u64,
+    /// Stale entries served under an explicit worker grace window.
+    pub stale_serves: u64,
+    /// Conditional validations completed with not-modified.
+    pub revalidations: u64,
     /// Currently committed references.
     pub entries: usize,
     /// Encoded Arrow bytes currently referenced.
@@ -238,6 +242,12 @@ pub struct DiskCacheEntryInfo {
     pub freshness_remaining: Duration,
     /// Time-travel coordinate included in this result's identity.
     pub at: Option<(String, String)>,
+    /// Whether an ETag validator is retained (the value is never exposed).
+    pub has_etag: bool,
+    /// Whether a Last-Modified validator is retained.
+    pub has_last_modified: bool,
+    /// Whether the worker permits conditional validation.
+    pub revalidatable: bool,
 }
 
 /// A persistent result cache.
@@ -322,11 +332,13 @@ pub struct DiskCapture {
     active_temps: Arc<Inner>,
 }
 
-/// A fully validated fresh cache hit.
+/// A fully validated cache hit. Fresh lookups return fresh entries, while the
+/// explicit revalidation lookup may return a stale, leased generation.
 pub struct DiskCacheHit {
     schema: SchemaRef,
     object_dir: PathBuf,
     manifest: Manifest,
+    record: RefRecord,
     lease: Arc<Lease>,
 }
 
@@ -426,6 +438,14 @@ struct RefRecord {
     partitions: usize,
     codec: DiskCacheCodec,
     at: Option<(String, String)>,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    last_modified: Option<String>,
+    #[serde(default)]
+    revalidatable: bool,
+    #[serde(default)]
+    stale_if_error_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +630,8 @@ impl DiskCache {
                 CacheFreshness::is_expired,
             )
         };
+        let immediate_revalidation = freshness.is_some_and(CacheFreshness::is_immediately_stale)
+            && control.is_some_and(valid_revalidation_control);
         if capture.owner_root != self.inner.format_root {
             return Err(DiskCacheError::Invalid(
                 "capture belongs to a different disk cache".into(),
@@ -628,7 +650,7 @@ impl DiskCache {
             Some(control) if control.scope != CACHE_SCOPE_CATALOG => {
                 Some(DiskCacheSkip::UnsupportedScope)
             }
-            _ if expired() => Some(DiskCacheSkip::NoFreshness),
+            _ if expired() && !immediate_revalidation => Some(DiskCacheSkip::NoFreshness),
             _ if self.inner.options.max_entries == 0 || self.inner.options.max_bytes == 0 => {
                 Some(DiskCacheSkip::Disabled)
             }
@@ -694,12 +716,19 @@ impl DiskCache {
             partitions: manifest.parts.len(),
             codec: capture.codec,
             at: key.at,
+            etag: control.and_then(|control| control.etag.clone()),
+            last_modified: control.and_then(|control| control.last_modified.clone()),
+            revalidatable: control.is_some_and(valid_revalidation_control),
+            stale_if_error_seconds: control
+                .and_then(|control| control.stale_if_error)
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .filter(|seconds| *seconds > 0),
         };
         let ref_bytes = serde_json::to_vec(&record)?;
 
         let _operation = self.inner.operations.lock().unwrap();
         let _root_operation = self.lock_root_exclusive()?;
-        if expired() {
+        if expired() && !immediate_revalidation {
             self.inner.stats.lock().unwrap().refusals += 1;
             drop(_root_operation);
             drop(_operation);
@@ -715,7 +744,7 @@ impl DiskCache {
             capture.remove_temp(false)?;
             return Ok(DiskCacheCommit::Skipped(DiskCacheSkip::Capacity));
         }
-        if expired() {
+        if expired() && !immediate_revalidation {
             self.inner.stats.lock().unwrap().refusals += 1;
             drop(_root_operation);
             drop(_operation);
@@ -742,7 +771,7 @@ impl DiskCache {
         sync_dir(&refs)?;
         self.maybe_fail_commit(CommitFault::AfterRefPublish)?;
         self.wait_after_ref_publish();
-        if expired() {
+        if expired() && !immediate_revalidation {
             self.inner.stats.lock().unwrap().refusals += 1;
             return Ok(DiskCacheCommit::Skipped(DiskCacheSkip::NoFreshness));
         }
@@ -775,7 +804,7 @@ impl DiskCache {
     /// Expired or corrupt entries are removed and returned as a clean miss, so
     /// a caller can recompute without ever mixing cached and live rows.
     pub fn lookup(&self, key: &CacheKey) -> DiskCacheResult<Option<DiskCacheHit>> {
-        self.lookup_inner(key, None)
+        self.lookup_inner(key, None, false)
     }
 
     /// Find a fresh entry whose stored schema exactly matches the caller's
@@ -789,13 +818,28 @@ impl DiskCache {
         key: &CacheKey,
         expected_schema: &SchemaRef,
     ) -> DiskCacheResult<Option<DiskCacheHit>> {
-        self.lookup_inner(key, Some(expected_schema.as_ref()))
+        self.lookup_inner(key, Some(expected_schema.as_ref()), false)
+    }
+
+    /// Find and fully validate a retained entry for conditional revalidation.
+    ///
+    /// Unlike a fresh lookup, this may return an expired entry, but only when
+    /// the stored worker policy opted into revalidation and supplied an ETag or
+    /// Last-Modified validator. Corruption and schema mismatch remain clean
+    /// misses with generation-conditional cleanup.
+    pub fn lookup_for_revalidation_expected_schema(
+        &self,
+        key: &CacheKey,
+        expected_schema: &SchemaRef,
+    ) -> DiskCacheResult<Option<DiskCacheHit>> {
+        self.lookup_inner(key, Some(expected_schema.as_ref()), true)
     }
 
     fn lookup_inner(
         &self,
         key: &CacheKey,
         expected_schema: Option<&Schema>,
+        allow_stale_revalidation: bool,
     ) -> DiskCacheResult<Option<DiskCacheHit>> {
         let key_digest = self.digest(&key.stable_bytes());
         let identity_digest = self.digest(key.identity_scope.as_bytes());
@@ -843,13 +887,31 @@ impl DiskCache {
             return Ok(None);
         }
         if record.expires_ms <= epoch_ms(SystemTime::now()) {
-            drop(root_operation);
-            let _root_operation = self.lock_root_exclusive()?;
-            self.remove_record_if_current(&ref_path, &record)?;
-            let mut stats = self.inner.stats.lock().unwrap();
-            stats.misses += 1;
-            stats.evictions_ttl += 1;
-            return Ok(None);
+            if record.revalidatable && (record.etag.is_some() || record.last_modified.is_some()) {
+                if allow_stale_revalidation {
+                    // Continue through full integrity/schema validation. The
+                    // caller may send these validators but must not serve the
+                    // bytes unless validation succeeds or stale-if-error allows it.
+                } else {
+                    self.inner.stats.lock().unwrap().misses += 1;
+                    return Ok(None);
+                }
+            } else {
+                drop(root_operation);
+                let _root_operation = self.lock_root_exclusive()?;
+                self.remove_record_if_current(&ref_path, &record)?;
+                let mut stats = self.inner.stats.lock().unwrap();
+                stats.misses += 1;
+                stats.evictions_ttl += 1;
+                return Ok(None);
+            }
+        } else if allow_stale_revalidation {
+            // A caller should normally try the fresh path first. Returning a
+            // fresh validator is still safe and keeps this API race tolerant.
+            if !record.revalidatable || (record.etag.is_none() && record.last_modified.is_none()) {
+                self.inner.stats.lock().unwrap().misses += 1;
+                return Ok(None);
+            }
         }
 
         let object_dir = self
@@ -878,9 +940,11 @@ impl DiskCache {
         drop(operation);
         match self.validate_hit(&record, &object_dir, Arc::clone(&lease), expected_schema) {
             Ok(hit) => {
-                let now = epoch_ms(SystemTime::now());
-                self.inner.access.lock().unwrap().insert(ref_path, now);
-                self.inner.stats.lock().unwrap().hits += 1;
+                if !allow_stale_revalidation {
+                    let now = epoch_ms(SystemTime::now());
+                    self.inner.access.lock().unwrap().insert(ref_path, now);
+                    self.inner.stats.lock().unwrap().hits += 1;
+                }
                 Ok(Some(hit))
             }
             Err(_) => {
@@ -916,6 +980,100 @@ impl DiskCache {
         self.remove_record(&ref_path, &record)?;
         self.refresh_current_stats()?;
         Ok(true)
+    }
+
+    /// Slide the observed generation's freshness after a successful
+    /// conditional `not_modified` response.
+    ///
+    /// The update is generation conditional: if another process published a
+    /// replacement after this hit was read, that newer ref is left untouched.
+    pub fn revalidate_freshness(
+        &self,
+        hit: &DiskCacheHit,
+        freshness: CacheFreshness,
+        control: &CacheControl,
+    ) -> DiskCacheResult<bool> {
+        if control.no_store
+            || control.scope != CACHE_SCOPE_CATALOG
+            || (freshness.is_immediately_stale() && !valid_revalidation_control(control))
+        {
+            return Ok(false);
+        }
+        if !hit.record.revalidatable
+            || (hit.record.etag.is_none() && hit.record.last_modified.is_none())
+        {
+            return Ok(false);
+        }
+        if freshness.is_expired() && !freshness.is_immediately_stale() {
+            return Ok(false);
+        }
+        let ref_path = self
+            .inner
+            .format_root
+            .join(&hit.record.identity_digest)
+            .join("refs")
+            .join(format!("{}.ref", hit.record.key_digest));
+        let _operation = self.inner.operations.lock().unwrap();
+        let _root_operation = self.lock_root_exclusive()?;
+        let current = match read_ref(&ref_path) {
+            Ok(current) if current == hit.record => current,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let now = SystemTime::now();
+        let mut refreshed = current;
+        refreshed.created_ms = epoch_ms(now);
+        refreshed.expires_ms = epoch_ms(freshness.expires_at());
+        refreshed.etag = control.etag.clone();
+        refreshed.last_modified = control.last_modified.clone();
+        refreshed.revalidatable = valid_revalidation_control(control);
+        refreshed.stale_if_error_seconds = if refreshed.revalidatable {
+            control
+                .stale_if_error
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .filter(|seconds| *seconds > 0)
+        } else {
+            None
+        };
+        write_replace_synced(&ref_path, &serde_json::to_vec(&refreshed)?)?;
+        if !freshness.is_immediately_stale() && freshness.is_expired() {
+            // A positive receipt lifetime elapsed while the ref was being
+            // synchronized. Remove only the generation we just observed.
+            self.remove_record_if_current(&ref_path, &refreshed)?;
+            self.refresh_current_stats()?;
+            return Ok(false);
+        }
+        self.inner
+            .access
+            .lock()
+            .unwrap()
+            .insert(ref_path, epoch_ms(now));
+        self.inner.stats.lock().unwrap().revalidations += 1;
+        Ok(true)
+    }
+
+    /// Remove exactly the generation represented by a validated hit.
+    ///
+    /// Used when a conditional response revokes cache eligibility. Concurrent
+    /// replacements are preserved.
+    pub fn remove_hit(&self, hit: &DiskCacheHit) -> DiskCacheResult<bool> {
+        let ref_path = self
+            .inner
+            .format_root
+            .join(&hit.record.identity_digest)
+            .join("refs")
+            .join(format!("{}.ref", hit.record.key_digest));
+        let _operation = self.inner.operations.lock().unwrap();
+        let _root_operation = self.lock_root_exclusive()?;
+        let removed = self.remove_record_if_current(&ref_path, &hit.record)?;
+        self.refresh_current_stats()?;
+        Ok(removed)
+    }
+
+    /// Count a worker-authorized stale-if-error replay.
+    pub fn record_stale_serve(&self) {
+        self.inner.stats.lock().unwrap().stale_serves += 1;
     }
 
     /// Remove every entry for one authenticated catalog scope.
@@ -992,6 +1150,9 @@ impl DiskCache {
                 age: Duration::from_millis(now.saturating_sub(record.created_ms)),
                 freshness_remaining: Duration::from_millis(record.expires_ms.saturating_sub(now)),
                 at: record.at,
+                has_etag: record.etag.is_some(),
+                has_last_modified: record.last_modified.is_some(),
+                revalidatable: record.revalidatable,
             });
         }
         Ok(entries)
@@ -1118,6 +1279,7 @@ impl DiskCache {
             schema,
             object_dir: object_dir.to_path_buf(),
             manifest,
+            record: record.clone(),
             lease,
         })
     }
@@ -1240,7 +1402,7 @@ impl DiskCache {
         let now = epoch_ms(SystemTime::now());
         let mut removed = 0;
         for (path, record) in self.refs()? {
-            if record.expires_ms <= now {
+            if record.expires_ms <= now && !record.revalidatable {
                 self.remove_record(&path, &record)?;
                 removed += 1;
             }
@@ -1648,6 +1810,31 @@ impl DiskCacheHit {
         self.manifest.stored_bytes
     }
 
+    /// Opaque ETag to send on a conditional request.
+    pub fn etag(&self) -> Option<&str> {
+        self.record.etag.as_deref()
+    }
+
+    /// Opaque Last-Modified validator to send when no ETag is available.
+    pub fn last_modified(&self) -> Option<&str> {
+        self.record.last_modified.as_deref()
+    }
+
+    /// Whether the stored worker policy permits conditional validation.
+    pub fn revalidatable(&self) -> bool {
+        self.record.revalidatable
+    }
+
+    /// Whether worker policy permits replay after a failed conditional request.
+    pub fn may_serve_on_error_at(&self, now: SystemTime) -> bool {
+        let Some(grace_seconds) = self.record.stale_if_error_seconds else {
+            return false;
+        };
+        let stale_age_ms = epoch_ms(now).saturating_sub(self.record.expires_ms);
+        stale_age_ms <= grace_seconds.saturating_mul(1_000)
+            && self.record.expires_ms <= epoch_ms(now)
+    }
+
     /// Open one partition for bounded streaming replay.
     pub fn open_partition(&self, partition: usize) -> DiskCacheResult<DiskPartitionReader> {
         let part = self
@@ -1662,6 +1849,10 @@ impl DiskCacheHit {
             _lease: Arc::clone(&self.lease),
         })
     }
+}
+
+fn valid_revalidation_control(control: &CacheControl) -> bool {
+    control.revalidatable && (control.etag.is_some() || control.last_modified.is_some())
 }
 
 fn ipc_options(codec: DiskCacheCodec) -> DiskCacheResult<IpcWriteOptions> {
@@ -3102,24 +3293,106 @@ mod tests {
     }
 
     #[test]
-    fn immediately_stale_results_are_not_persisted() {
+    fn immediately_stale_validated_results_persist_for_revalidation() {
         let root = TestRoot::new("stale");
         let cache = open_cache(&root);
-        let capture = cache.begin_capture(schema(), 1).unwrap();
+        let mut capture = cache.begin_capture(schema(), 2).unwrap();
+        capture.push_batch(0, &batch(&[7])).unwrap();
         let control = CacheControl {
             ttl_seconds: Some(0),
-            etag: Some("opaque".into()),
+            etag: Some("opaque-etag".into()),
             revalidatable: true,
+            stale_if_error: Some(60),
             ..Default::default()
         };
-        assert_eq!(
-            cache
-                .commit(key("alice", "f"), capture, Duration::ZERO, Some(&control))
-                .unwrap(),
-            DiskCacheCommit::Skipped(DiskCacheSkip::NoFreshness)
+        let cache_key = key("alice", "f");
+        assert!(cache
+            .commit(cache_key.clone(), capture, Duration::ZERO, Some(&control))
+            .unwrap()
+            .is_stored());
+        drop(cache);
+
+        let reopened = open_cache(&root);
+        assert!(reopened.lookup(&cache_key).unwrap().is_none());
+        let stale = reopened
+            .lookup_for_revalidation_expected_schema(&cache_key, &schema())
+            .unwrap()
+            .expect("validator survives restart");
+        assert_eq!(stale.etag(), Some("opaque-etag"));
+        assert_eq!(stale.last_modified(), None);
+        assert!(stale.revalidatable());
+        assert!(stale.may_serve_on_error_at(SystemTime::now()));
+        assert_eq!(stale.partitions(), 2);
+        let [entry] = reopened.entries().unwrap().try_into().unwrap();
+        assert!(entry.has_etag);
+        assert!(!entry.has_last_modified);
+        assert!(entry.revalidatable);
+
+        let refreshed = CacheFreshness::from_lifetime(Duration::ZERO).unwrap();
+        let rotated = CacheControl::ttl(0)
+            .with_etag("rotated-etag")
+            .with_revalidatable();
+        assert!(reopened
+            .revalidate_freshness(&stale, refreshed, &rotated)
+            .unwrap());
+        drop(stale);
+        assert!(reopened.lookup(&cache_key).unwrap().is_none());
+        let refreshed = reopened
+            .lookup_for_revalidation_expected_schema(&cache_key, &schema())
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.etag(), Some("rotated-etag"));
+        assert!(
+            !refreshed.may_serve_on_error_at(SystemTime::now()),
+            "omitting stale-if-error on not_modified withdraws the old grace"
         );
-        assert_eq!(cache.stats().unwrap().entries, 0);
-        assert_eq!(count_object_dirs(&root.0), 0);
+        assert_eq!(reopened.stats().unwrap().revalidations, 1);
+    }
+
+    #[test]
+    fn default_zero_stale_if_error_never_authorizes_replay() {
+        let root = TestRoot::new("zero-stale-grace");
+        let cache = open_cache(&root);
+        let cache_key = key("alice", "zero-grace");
+        let control = CacheControl::ttl(0)
+            .with_etag("opaque-etag")
+            .with_revalidatable();
+        let capture = cache.begin_capture(schema(), 1).unwrap();
+        assert!(cache
+            .commit(cache_key.clone(), capture, Duration::ZERO, Some(&control))
+            .unwrap()
+            .is_stored());
+        let hit = cache
+            .lookup_for_revalidation_expected_schema(&cache_key, &schema())
+            .unwrap()
+            .unwrap();
+        assert!(!hit.may_serve_on_error_at(SystemTime::now()));
+    }
+
+    #[test]
+    fn revocation_removes_only_the_observed_validator_generation() {
+        let root = TestRoot::new("validator-revocation");
+        let cache = open_cache(&root);
+        let cache_key = key("alice", "f");
+        let control = CacheControl::ttl(0)
+            .with_etag("opaque-etag")
+            .with_revalidatable();
+        let mut capture = cache.begin_capture(schema(), 1).unwrap();
+        capture.push_batch(0, &batch(&[1])).unwrap();
+        assert!(cache
+            .commit(cache_key.clone(), capture, Duration::ZERO, Some(&control))
+            .unwrap()
+            .is_stored());
+        let stale = cache
+            .lookup_for_revalidation_expected_schema(&cache_key, &schema())
+            .unwrap()
+            .unwrap();
+        assert!(cache.remove_hit(&stale).unwrap());
+        assert!(cache
+            .lookup_for_revalidation_expected_schema(&cache_key, &schema())
+            .unwrap()
+            .is_none());
+        assert!(!cache.remove_hit(&stale).unwrap());
     }
 
     #[test]

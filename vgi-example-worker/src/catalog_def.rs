@@ -756,6 +756,11 @@ fn data_tables() -> Vec<CatTable> {
             "Always-revalidate result (304 not_modified reuses stored bytes)",
         ),
         cache_table(
+            "cache_revalidation_policy",
+            &[("nonce", Int64)],
+            "Conditional revalidation fixture for not-modified, revocation, and stale-if-error",
+        ),
+        cache_table(
             "cache_whoami",
             &[("who", Utf8)],
             "Cacheable result echoing the caller's auth principal (identity-scoped)",

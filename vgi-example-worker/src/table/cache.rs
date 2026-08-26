@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow_array::builder::{Int64Builder, ListBuilder, StringBuilder};
 use arrow_array::{
@@ -35,6 +36,8 @@ const DEFAULT_TTL_SECONDS: i64 = 300;
 /// cache MISS). A pooled worker persists it across calls, so a served-from-cache
 /// hit never advances it — that's exactly the HIT/MISS signal tests assert on.
 static NONCE_COUNTER: AtomicI64 = AtomicI64::new(0);
+static REVALIDATION_POLICY_CALLS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn next_nonce() -> i64 {
     NONCE_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -47,6 +50,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(CacheScopedTxnFunction);
     w.register_table(CacheBigFunction);
     w.register_table(CacheRevalidatableFunction);
+    w.register_table(CacheRevalidationPolicyFunction);
     w.register_table(CacheMultiColFunction);
     w.register_table(CacheWhoamiFunction);
     w.register_table(CacheVersionedFunction);
@@ -501,6 +505,184 @@ impl TableFunction for CacheRevalidatableFunction {
         Ok(Box::new(RevalidatableProducer {
             schema: params.output_schema.clone(),
             nonce: next_nonce(),
+            if_none_match: None,
+            done: false,
+            meta: None,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cache_revalidation_policy(policy) -> {nonce: int64}
+// ---------------------------------------------------------------------------
+
+struct RevalidationPolicyProducer {
+    schema: SchemaRef,
+    nonce: i64,
+    policy: String,
+    call: u64,
+    if_none_match: Option<String>,
+    done: bool,
+    meta: Option<HashMap<String, String>>,
+}
+
+impl TableProducer for RevalidationPolicyProducer {
+    fn on_conditional_request(&mut self, request: &ConditionalRequest) {
+        self.if_none_match = request.if_none_match.clone();
+    }
+
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mode = self
+            .policy
+            .split([':', '|'])
+            .next()
+            .unwrap_or(self.policy.as_str());
+        let control = CacheControl::ttl(0)
+            .with_etag(REVALIDATABLE_ETAG)
+            .with_revalidatable()
+            .with_stale_if_error(60);
+
+        if mode == "revoke_then_error" {
+            if self.call == 2 && self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG) {
+                self.meta = Some(CacheControl::no_store().with_not_modified().to_metadata());
+                return Ok(Some(i64_batch(&self.schema, Vec::new())?));
+            }
+            if self.call >= 3 {
+                return Err(RpcError::runtime_error(
+                    "injected post-revocation worker failure",
+                ));
+            }
+        }
+
+        if mode == "rotate_then_error" {
+            const ROTATED_ETAG: &str = "\"rev-v2\"";
+            if self.call == 2 && self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG) {
+                self.meta = Some(
+                    CacheControl::ttl(0)
+                        .with_etag(ROTATED_ETAG)
+                        .with_revalidatable()
+                        .with_not_modified()
+                        .to_metadata(),
+                );
+                return Ok(Some(i64_batch(&self.schema, Vec::new())?));
+            }
+            if self.call >= 3 {
+                let detail = if self.if_none_match.as_deref() == Some(ROTATED_ETAG) {
+                    "injected conditional v2 failure".to_string()
+                } else {
+                    format!(
+                        "unexpected conditional validator after rotation: {:?}",
+                        self.if_none_match
+                    )
+                };
+                return Err(RpcError::runtime_error(detail));
+            }
+        }
+
+        if mode == "blocked_not_modified"
+            && self.call == 2
+            && self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG)
+        {
+            let mut parts = self.policy.split('|');
+            let _ = parts.next();
+            let entered = parts.next().ok_or_else(|| {
+                RpcError::runtime_error("blocked_not_modified requires an entered path")
+            })?;
+            let release = parts.next().ok_or_else(|| {
+                RpcError::runtime_error("blocked_not_modified requires a release path")
+            })?;
+            std::fs::write(entered, b"entered").map_err(|error| {
+                RpcError::runtime_error(format!("write revalidation entered marker: {error}"))
+            })?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !std::path::Path::new(release).exists() {
+                if Instant::now() >= deadline {
+                    return Err(RpcError::runtime_error(
+                        "timed out waiting for revalidation release marker",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.meta = Some(control.with_not_modified().to_metadata());
+            return Ok(Some(i64_batch(&self.schema, Vec::new())?));
+        }
+
+        if self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG) {
+            match mode {
+                "revoke" => {
+                    self.meta = Some(CacheControl::no_store().with_not_modified().to_metadata());
+                    return Ok(Some(i64_batch(&self.schema, Vec::new())?));
+                }
+                "stale_if_error" => {
+                    return Err(RpcError::runtime_error(
+                        "injected conditional revalidation failure",
+                    ));
+                }
+                _ => {
+                    self.meta = Some(control.with_not_modified().to_metadata());
+                    return Ok(Some(i64_batch(&self.schema, Vec::new())?));
+                }
+            }
+        }
+        self.meta = Some(control.to_metadata());
+        Ok(Some(i64_batch(&self.schema, vec![self.nonce])?))
+    }
+
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+
+    fn resume_supported(&self) -> bool {
+        false
+    }
+}
+
+pub struct CacheRevalidationPolicyFunction;
+
+impl TableFunction for CacheRevalidationPolicyFunction {
+    fn name(&self) -> &str {
+        "cache_revalidation_policy"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta("Durable conditional revalidation policy fixture")
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "policy",
+            0,
+            "varchar",
+            "not_modified, revoke, or stale_if_error",
+        )]
+    }
+
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        fixed_bind(single_i64_schema("nonce"))
+    }
+
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let policy = params
+            .arguments
+            .const_str(0)
+            .unwrap_or_else(|| "not_modified".to_string());
+        let call = {
+            let mut calls = REVALIDATION_POLICY_CALLS.lock().map_err(|error| {
+                RpcError::runtime_error(format!("revalidation fixture state poisoned: {error}"))
+            })?;
+            let call = calls.entry(policy.clone()).or_default();
+            *call += 1;
+            *call
+        };
+        Ok(Box::new(RevalidationPolicyProducer {
+            schema: params.output_schema.clone(),
+            nonce: next_nonce(),
+            policy,
+            call,
             if_none_match: None,
             done: false,
             meta: None,

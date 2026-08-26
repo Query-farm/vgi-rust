@@ -88,8 +88,8 @@ subtle cross-process state mismatch that is easy to create by assembling
 
 ## Persistent result storage
 
-The opt-in `disk-cache` feature provides bounded storage for complete, fresh
-producer results. A host supplies a durable `DiskCacheOptions::root`, byte and
+The opt-in `disk-cache` feature provides bounded storage for complete producer
+results. A host supplies a durable `DiskCacheOptions::root`, byte and
 entry bounds, and an Arrow IPC codec (`Zstd`, `Lz4`, or `None`). The root is
 application state; it must not be a query engine's temporary spill directory.
 
@@ -99,8 +99,15 @@ up front, so empty results and empty partitions remain typed. Each
 `DiskCache::commit` publishes the multipart result only after every file and
 the manifest are durable. Dropping or aborting an unfinished capture removes
 its temporary generation. `lookup` returns only fresh entries after validating
-their manifest, schema, sizes, and hashes; immediately stale/revalidatable and
-transaction-scoped results are deliberately not persisted.
+their manifest, schema, sizes, and hashes. A revalidatable result with an ETag
+or Last-Modified value may be persisted while immediately stale;
+`lookup_for_revalidation_expected_schema` validates and leases those bytes for
+a conditional request. `revalidate_freshness` slides only the observed durable
+generation after `not_modified` and atomically replaces its validator and grace
+policy, while `remove_hit` conditionally revokes that same generation. A
+positive retained stale-if-error window is available to callers without
+exposing validator values in diagnostics. Transaction-scoped results are
+deliberately not persisted.
 
 Objects use ref-last atomic publication, HMAC-obscured paths, private
 permissions, and cross-process operation, capture, and replay leases. Byte and
