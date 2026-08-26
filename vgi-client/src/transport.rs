@@ -61,6 +61,16 @@ pub trait ExchangeStream {
     /// stream — `None` is end of stream.
     fn exchange(&mut self, input: &RecordBatch) -> Result<Option<(RecordBatch, Metadata)>>;
 
+    /// Send an input batch with application metadata. Conditional cache
+    /// validators use this on the first exchange tick.
+    fn exchange_with_metadata(
+        &mut self,
+        input: &RecordBatch,
+        _metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.exchange(input)
+    }
+
     /// Signal input EOS and drain. Idempotent.
     fn close(&mut self) -> Result<()>;
 
@@ -142,6 +152,14 @@ impl ExchangeStream for StreamExchangeAdapter<'_> {
 
     fn exchange(&mut self, input: &RecordBatch) -> Result<Option<(RecordBatch, Metadata)>> {
         self.0.exchange(input, None)
+    }
+
+    fn exchange_with_metadata(
+        &mut self,
+        input: &RecordBatch,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.0.exchange(input, metadata)
     }
 
     fn close(&mut self) -> Result<()> {
@@ -242,6 +260,14 @@ mod http_impl {
 
         fn exchange(&mut self, input: &RecordBatch) -> Result<Option<(RecordBatch, Metadata)>> {
             self.0.exchange(input, None)
+        }
+
+        fn exchange_with_metadata(
+            &mut self,
+            input: &RecordBatch,
+            metadata: Option<&Metadata>,
+        ) -> Result<Option<(RecordBatch, Metadata)>> {
+            self.0.exchange(input, metadata)
         }
 
         fn close(&mut self) -> Result<()> {

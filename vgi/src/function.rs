@@ -726,6 +726,20 @@ pub trait ScalarFunction: Send + Sync {
         batch: &arrow_array::RecordBatch,
     ) -> Result<arrow_array::RecordBatch>;
 
+    /// Metadata-capable scalar execution. Override when cache control depends
+    /// on the input or on conditional validators. The default preserves the
+    /// original `process` + static `cache_control` behavior.
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &arrow_array::RecordBatch,
+    ) -> Result<(
+        arrow_array::RecordBatch,
+        Option<crate::cache_control::CacheControl>,
+    )> {
+        Ok((self.process(params, batch)?, self.cache_control()))
+    }
+
     /// Result-cache opt-in. When `Some`, the returned
     /// [`CacheControl`](crate::cache_control::CacheControl)'s `vgi.cache.*`
     /// keys ride every output batch's custom metadata, so the extension can

@@ -2021,55 +2021,119 @@ impl Dispatcher {
     /// [`global_functions`](catalog::CatalogModel::global_functions) — the
     /// protocol-1.3.0 `CatalogAttachResult.global_functions` column.
     ///
-    /// Each named function must also be registered on this worker: a global
-    /// function stays schema-resident (bind dispatch is keyed on
-    /// `(schema_name, name)`), so the record is advertised in the schema the
-    /// function is declared in and the client republishes it under
+    /// Each named function must also be registered on this worker. Every
+    /// overload is retained, and each stays schema-resident (bind dispatch is
+    /// keyed on `(schema_name, name)`), so its record is advertised in its own
+    /// source schema before the client republishes the set under
     /// `global_function_prefix`.
     fn global_function_infos(&self) -> Result<Vec<Bytes>> {
         if self.catalog.global_functions.is_empty() {
             return Ok(Vec::new());
         }
-        let home = |kind: FnKind, name: &str| {
-            self.homes_of(kind, name)
-                .first()
-                .map(|h| h.schema.clone())
-                .unwrap_or_else(|| catalog::MAIN_SCHEMA.to_string())
+        // A single global name becomes one host function set. Scalar,
+        // aggregate, and table functions occupy distinct host namespaces;
+        // producer, in-out, and buffering functions all share the table one.
+        let namespace = |kind| match kind {
+            FnKind::Scalar => "scalar",
+            FnKind::Aggregate => "aggregate",
+            FnKind::Table | FnKind::TableInOut | FnKind::Buffering => "table",
         };
+        let catalog_name = self.catalog_identity(&self.catalog);
         let mut infos = Vec::new();
         for name in &self.catalog.global_functions {
-            let info = if let Some(f) = self.scalars.get(name).and_then(|v| v.first()) {
-                Self::advertise_in(
-                    catalog::scalar_function_info(f.as_ref())?,
-                    &home(FnKind::Scalar, name),
-                )
-            } else if let Some(f) = self.tables.get(name).and_then(|v| v.first()) {
-                Self::advertise_in(
-                    catalog::table_function_info(f.as_ref())?,
-                    &home(FnKind::Table, name),
-                )
-            } else if let Some(f) = self.tableinouts.get(name).and_then(|v| v.first()) {
-                Self::advertise_in(
-                    catalog::table_in_out_function_info(f.as_ref())?,
-                    &home(FnKind::TableInOut, name),
-                )
-            } else if let Some(f) = self.buffering.get(name).and_then(|v| v.first()) {
-                Self::advertise_in(
-                    catalog::buffering_function_info(f.as_ref())?,
-                    &home(FnKind::Buffering, name),
-                )
-            } else if let Some(f) = self.aggregates.get(name).and_then(|v| v.first()) {
-                Self::advertise_in(
-                    catalog::aggregate_function_info(f.as_ref())?,
-                    &home(FnKind::Aggregate, name),
-                )
-            } else {
-                return Err(RpcError::value_error(format!(
-                    "catalog '{}' lists global function '{name}', which is not registered",
-                    self.catalog.name
-                )));
+            let mut matches = Vec::<(FnKind, FunctionScope, FunctionInfo)>::new();
+            let mut add = |kind: FnKind, index: usize, info: FunctionInfo| -> Result<()> {
+                let home = self
+                    .homes_of(kind, name)
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RpcError::runtime_error(format!(
+                            "global function registry for '{name}' has no home for {kind:?} overload {index}"
+                        ))
+                    })?;
+                if home.in_catalog(catalog_name) {
+                    let info = Self::advertise_in(info, &home.schema);
+                    matches.push((kind, home, info));
+                }
+                Ok(())
             };
-            infos.push(info);
+
+            if let Some(overloads) = self.scalars.get(name) {
+                for (index, function) in overloads.iter().enumerate() {
+                    add(
+                        FnKind::Scalar,
+                        index,
+                        catalog::scalar_function_info(function.as_ref())?,
+                    )?;
+                }
+            }
+            if let Some(overloads) = self.tables.get(name) {
+                for (index, function) in overloads.iter().enumerate() {
+                    add(
+                        FnKind::Table,
+                        index,
+                        catalog::table_function_info(function.as_ref())?,
+                    )?;
+                }
+            }
+            if let Some(overloads) = self.tableinouts.get(name) {
+                for (index, function) in overloads.iter().enumerate() {
+                    add(
+                        FnKind::TableInOut,
+                        index,
+                        catalog::table_in_out_function_info(function.as_ref())?,
+                    )?;
+                }
+            }
+            if let Some(overloads) = self.buffering.get(name) {
+                for (index, function) in overloads.iter().enumerate() {
+                    add(
+                        FnKind::Buffering,
+                        index,
+                        catalog::buffering_function_info(function.as_ref())?,
+                    )?;
+                }
+            }
+            if let Some(overloads) = self.aggregates.get(name) {
+                for (index, function) in overloads.iter().enumerate() {
+                    add(
+                        FnKind::Aggregate,
+                        index,
+                        catalog::aggregate_function_info(function.as_ref())?,
+                    )?;
+                }
+            }
+
+            if matches.is_empty() {
+                return Err(RpcError::value_error(format!(
+                    "catalog '{catalog_name}' lists global function '{name}', but no matching function is registered in that catalog"
+                )));
+            }
+
+            let expected_namespace = namespace(matches[0].0);
+            if matches
+                .iter()
+                .any(|(kind, _, _)| namespace(*kind) != expected_namespace)
+            {
+                let mut identities = matches
+                    .iter()
+                    .map(|(kind, home, _)| {
+                        format!("{}.{} ({})", home.catalog, home.schema, namespace(*kind))
+                    })
+                    .collect::<Vec<_>>();
+                identities.sort();
+                identities.dedup();
+                return Err(RpcError::value_error(format!(
+                    "catalog '{catalog_name}' lists ambiguous global function '{name}': it is registered in multiple incompatible function namespaces ({})",
+                    identities.join(", ")
+                )));
+            }
+
+            // Preserve the catalog's nomination order, and within one
+            // nomination preserve registry/overload order. FunctionInfo keeps
+            // the concrete VGI kind (including table-buffering) and schema.
+            infos.extend(matches.into_iter().map(|(_, _, info)| info));
         }
         catalog::serialize_items(infos)
     }
@@ -3814,12 +3878,16 @@ impl ExchangeState for ScalarExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
-        let result = self.func.process(&self.params, input)?;
+        self.params.if_none_match =
+            cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
+        self.params.if_modified_since =
+            cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
+        let (result, cache_control) = self.func.process_out(&self.params, input)?;
         // Result-cache opt-in: a scalar declaring cache_control() rides its
         // vgi.cache.* keys on the emit path's per-batch custom metadata (NOT
         // the schema — the IPC stream fixes the schema at open), so the
         // extension can memoize the output per distinct input value.
-        match self.func.cache_control() {
+        match cache_control {
             Some(cc) => out.emit_with_metadata(result, cc.to_metadata()),
             None => out.emit(result),
         }
@@ -4494,6 +4562,31 @@ mod scope_tests {
         }
     }
 
+    /// A scalar whose advertised description and argument type identify its
+    /// overload without executing it.
+    struct AdvertisedProbe {
+        name: &'static str,
+        tag: &'static str,
+        argument_type: &'static str,
+    }
+    impl ScalarFunction for AdvertisedProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata {
+                description: self.tag.to_string(),
+                ..Default::default()
+            }
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("value", 0, self.argument_type, "value")]
+        }
+        fn process(&self, _p: &ProcessParams, b: &RecordBatch) -> Result<RecordBatch> {
+            Ok(b.clone())
+        }
+    }
+
     /// A minimal named aggregate carrying a tag, used to prove the unary RPCs
     /// re-resolve by `(schema, name)` rather than by bare name (protocol 1.2.0).
     struct AggProbe {
@@ -4514,7 +4607,9 @@ mod scope_tests {
             &self,
             _p: &crate::aggregate::AggregateBindParams,
         ) -> Result<crate::function::BindResponse> {
-            unreachable!()
+            Err(RpcError::runtime_error(
+                "aggregate scope probe has no bind implementation",
+            ))
         }
         fn initial_state(&self) -> Vec<u8> {
             self.tag.as_bytes().to_vec()
@@ -4547,6 +4642,135 @@ mod scope_tests {
             ..Default::default()
         });
         d
+    }
+
+    fn decode_global_infos(dispatcher: &Dispatcher) -> Result<Vec<FunctionInfo>> {
+        dispatcher
+            .global_function_infos()?
+            .into_iter()
+            .map(|bytes| {
+                let batch = ipc::read_batch(&bytes.0)?;
+                wire::from_batch(&batch)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn global_function_nominations_publish_every_overload_in_order() {
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(AdvertisedProbe {
+            name: "overloaded",
+            tag: "int overload",
+            argument_type: "int64",
+        }));
+        d.register_scalar(Arc::new(AdvertisedProbe {
+            name: "after",
+            tag: "after",
+            argument_type: "int64",
+        }));
+        d.register_scalar_scoped(
+            Arc::new(AdvertisedProbe {
+                name: "overloaded",
+                tag: "string overload",
+                argument_type: "utf8",
+            }),
+            FunctionScope::new("cat", "data"),
+        );
+        d.register_scalar_scoped(
+            Arc::new(AdvertisedProbe {
+                name: "before",
+                tag: "before",
+                argument_type: "int64",
+            }),
+            FunctionScope::new("cat", "data"),
+        );
+        d.catalog.global_functions = vec![
+            "before".to_string(),
+            "overloaded".to_string(),
+            "after".to_string(),
+        ];
+
+        let infos = decode_global_infos(&d).expect("global function advertisement");
+        let identity = infos
+            .iter()
+            .map(|info| {
+                (
+                    info.name.as_str(),
+                    info.schema_name.as_str(),
+                    info.function_type.0.as_str(),
+                    info.description.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identity,
+            vec![
+                ("before", "data", "scalar", "before"),
+                ("overloaded", "main", "scalar", "int overload"),
+                ("overloaded", "data", "scalar", "string overload"),
+                ("after", "main", "scalar", "after"),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_global_function_nomination_is_a_clear_error() {
+        let mut d = dispatcher();
+        d.catalog.global_functions = vec!["missing".to_string()];
+        let error = d
+            .global_function_infos()
+            .expect_err("missing nomination must fail attach");
+        let message = error.to_string();
+        assert!(message.contains("catalog 'cat'"), "{message}");
+        assert!(message.contains("'missing'"), "{message}");
+        assert!(message.contains("no matching function"), "{message}");
+    }
+
+    #[test]
+    fn cross_schema_global_overloads_preserve_their_source_schema() {
+        let mut d = dispatcher();
+        d.register_scalar_scoped(
+            Arc::new(AdvertisedProbe {
+                name: "overloaded",
+                tag: "main overload",
+                argument_type: "int64",
+            }),
+            FunctionScope::new("cat", "main"),
+        );
+        d.register_scalar_scoped(
+            Arc::new(AdvertisedProbe {
+                name: "overloaded",
+                tag: "data overload",
+                argument_type: "utf8",
+            }),
+            FunctionScope::new("cat", "data"),
+        );
+        d.catalog.global_functions = vec!["overloaded".to_string()];
+
+        let infos = decode_global_infos(&d).expect("cross-schema overload advertisement");
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].schema_name, "main");
+        assert_eq!(infos[0].description, "main overload");
+        assert_eq!(infos[1].schema_name, "data");
+        assert_eq!(infos[1].description, "data overload");
+    }
+
+    #[test]
+    fn cross_kind_global_nomination_is_ambiguous() {
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(Probe("ambiguous")));
+        d.register_aggregate(Arc::new(AggProbe {
+            name: "ambiguous",
+            tag: "aggregate",
+        }));
+        d.catalog.global_functions = vec!["ambiguous".to_string()];
+        let error = d
+            .global_function_infos()
+            .expect_err("kind-ambiguous nomination must fail attach");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous global function"), "{message}");
+        assert!(message.contains("cat.main (aggregate)"), "{message}");
+        assert!(message.contains("cat.main (scalar)"), "{message}");
     }
 
     /// Registering without naming a home still yields exactly one — the

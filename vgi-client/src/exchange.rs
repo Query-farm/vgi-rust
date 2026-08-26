@@ -45,6 +45,7 @@ pub struct Exchange<'a> {
     schema: SchemaRef,
     parent_rows: Option<Vec<i32>>,
     last_cache_control: Option<CacheControl>,
+    first_input_metadata: Option<vgi_rpc::wire::Metadata>,
     connection_reusable: Arc<AtomicBool>,
     closed: bool,
 }
@@ -90,7 +91,8 @@ impl Exchange<'_> {
         if self.closed {
             return Err(RpcError::protocol_error("send after close"));
         }
-        let response = self.stream.exchange(input);
+        let metadata = self.first_input_metadata.take();
+        let response = self.stream.exchange_with_metadata(input, metadata.as_ref());
         if response.is_err() {
             self.connection_reusable.store(false, Ordering::Release);
         }
@@ -325,6 +327,22 @@ impl VgiClient {
             schema,
             parent_rows: None,
             last_cache_control: None,
+            first_input_metadata: {
+                let mut metadata = vgi_rpc::wire::Metadata::new();
+                if let Some(value) = &opts.if_none_match {
+                    metadata.insert(
+                        vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY.to_string(),
+                        value.clone(),
+                    );
+                }
+                if let Some(value) = &opts.if_modified_since {
+                    metadata.insert(
+                        vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY.to_string(),
+                        value.clone(),
+                    );
+                }
+                (!metadata.is_empty()).then_some(metadata)
+            },
             connection_reusable,
             closed: false,
         })
@@ -453,12 +471,14 @@ impl VgiClient {
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
         })?;
+        let connection_reusable = self.exchange_reuse_guard();
         Scan::open(
             self.transport_mut(),
             &params,
             None,
             bound.function_name(),
             bound.output_schema().clone(),
+            connection_reusable,
         )
     }
 }
@@ -499,6 +519,7 @@ pub(crate) fn encode_parent_rows(rows: &[i32]) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
     use vgi_rpc::wire::Metadata;
@@ -507,6 +528,7 @@ mod tests {
     struct StreamCalls {
         closes: AtomicUsize,
         cancels: AtomicUsize,
+        input_metadata: Mutex<Vec<Option<Metadata>>>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -532,6 +554,19 @@ mod tests {
                 return Err(RpcError::runtime_error("stub send failure"));
             }
             Ok(None)
+        }
+
+        fn exchange_with_metadata(
+            &mut self,
+            input: &RecordBatch,
+            metadata: Option<&Metadata>,
+        ) -> Result<Option<(RecordBatch, Metadata)>> {
+            self.calls
+                .input_metadata
+                .lock()
+                .unwrap()
+                .push(metadata.cloned());
+            self.exchange(input)
         }
 
         fn close(&mut self) -> Result<()> {
@@ -570,6 +605,7 @@ mod tests {
             schema: Arc::new(Schema::empty()),
             parent_rows: None,
             last_cache_control: None,
+            first_input_metadata: None,
             connection_reusable: Arc::clone(&connection_reusable),
             closed: false,
         };
@@ -583,6 +619,28 @@ mod tests {
 
         assert_eq!(calls.cancels.load(Ordering::SeqCst), 1);
         assert_eq!(calls.closes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn conditional_metadata_rides_only_the_first_input() {
+        let calls = Arc::new(StreamCalls::default());
+        let mut exchange = stub_exchange(Arc::clone(&calls));
+        exchange.first_input_metadata = Some(Metadata::from([(
+            vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY.to_string(),
+            "v1".to_string(),
+        )]));
+        let input = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        exchange.send(&input).unwrap();
+        exchange.send(&input).unwrap();
+        let metadata = calls.input_metadata.lock().unwrap();
+        assert_eq!(
+            metadata[0]
+                .as_ref()
+                .and_then(|values| values.get(vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY))
+                .map(String::as_str),
+            Some("v1")
+        );
+        assert!(metadata[1].is_none());
     }
 
     #[test]

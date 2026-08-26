@@ -37,6 +37,13 @@ impl ExchangeStream for HttpExchangeAdapter<'_> {
     fn exchange(&mut self, input: &RecordBatch) -> Result<Option<(RecordBatch, Metadata)>> {
         self.0.exchange(input, None)
     }
+    fn exchange_with_metadata(
+        &mut self,
+        input: &RecordBatch,
+        metadata: Option<&Metadata>,
+    ) -> Result<Option<(RecordBatch, Metadata)>> {
+        self.0.exchange(input, metadata)
+    }
     fn close(&mut self) -> Result<()> {
         self.0.close()
     }

@@ -443,15 +443,30 @@ impl ResultCache {
     /// What a 304 buys: the stored bytes stay, and only the clock moves.
     pub fn slide(&self, key: &CacheKey, ttl: Duration) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        inner.tick += 1;
+        let tick = inner.tick;
         match inner.map.get_mut(key) {
             Some(slot) => {
                 slot.entry.stored_at = Instant::now();
                 slot.entry.ttl = Some(ttl);
+                slot.last_used = tick;
                 inner.stats.revalidations += 1;
                 true
             }
             None => false,
         }
+    }
+
+    /// Remove one exact cache key. Used when a conditional response explicitly
+    /// revokes reuse (`no_store`, transaction scope, or otherwise ineligible).
+    pub fn remove(&self, key: &CacheKey) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(slot) = inner.map.remove(key) else {
+            return false;
+        };
+        inner.stats.total_bytes = inner.stats.total_bytes.saturating_sub(slot.entry.bytes);
+        inner.stats.entries = inner.stats.entries.saturating_sub(1);
+        true
     }
 
     /// Drop everything for one catalog identity.
@@ -849,6 +864,38 @@ mod tests {
             5,
             "a 304 reuses the stored bytes rather than refetching"
         );
+    }
+
+    #[test]
+    fn revalidation_refreshes_lru_and_explicit_removal_updates_accounting() {
+        let c = ResultCache::new(CacheLimits {
+            max_entries: 2,
+            ..Default::default()
+        });
+        let control = CacheControl::ttl(0).with_etag("v1").with_revalidatable();
+        let (a, b, d) = (key("s", "a"), key("s", "b"), key("s", "d"));
+        c.insert(a.clone(), vec![batch(1)], Duration::ZERO, Some(&control));
+        c.insert(
+            b.clone(),
+            vec![batch(1)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        assert!(c.slide(&a, Duration::from_secs(60)));
+        c.insert(
+            d.clone(),
+            vec![batch(1)],
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+        assert!(c.get(&a).is_some(), "revalidation refreshed a's LRU tick");
+        assert!(c.get(&b).is_none(), "b remained the least recently used");
+
+        let before = c.stats().total_bytes;
+        assert!(c.remove(&a));
+        assert_eq!(c.stats().entries, 1);
+        assert!(c.stats().total_bytes < before);
+        assert!(!c.remove(&a), "removal is idempotent");
     }
 
     #[test]

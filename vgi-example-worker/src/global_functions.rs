@@ -62,6 +62,7 @@ pub const PREFIX: &str = "vgi_example";
 /// Register the four global-registration probes.
 pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(GlobalScalarFunction);
+    w.register_scalar(GlobalScalarTextFunction);
     w.register_table(GlobalTableFunction);
     w.register_aggregate(GlobalAggFunction);
     w.register_buffering(GlobalBufferedFunction);
@@ -112,6 +113,51 @@ impl ScalarFunction for GlobalScalarFunction {
             vec![Arc::new(out) as ArrayRef],
         )
         .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
+
+/// String overload of [`GlobalScalarFunction`], proving clients retain the
+/// worker's complete overload set under the one globally published SQL name.
+pub struct GlobalScalarTextFunction;
+
+impl ScalarFunction for GlobalScalarTextFunction {
+    fn name(&self) -> &str {
+        "global_scalar"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Global-registration probe (string scalar overload)".to_string(),
+            categories: categories(),
+            return_type: Some(DataType::Utf8),
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column(
+            "value",
+            0,
+            "varchar",
+            "String value to label",
+        )]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let values = arrow_cast::cast(batch.column(0), &DataType::Utf8)
+            .map_err(|error| RpcError::type_error(error.to_string()))?;
+        let values = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| RpcError::type_error("global_scalar string overload expects Utf8"))?;
+        let out: StringArray = (0..values.len())
+            .map(|index| {
+                (!values.is_null(index))
+                    .then(|| format!("global_scalar_text:{}", values.value(index)))
+            })
+            .collect();
+        RecordBatch::try_new(
+            params.output_schema.clone(),
+            vec![Arc::new(out) as ArrayRef],
+        )
+        .map_err(|error| RpcError::runtime_error(error.to_string()))
     }
 }
 

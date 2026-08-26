@@ -24,6 +24,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(CachedExplodeFunction);
     w.register_table_in_out(CachedRevalidatingEchoFunction);
     w.register_table_in_out(CachedRevalidatingDoubleFunction);
+    w.register_table_in_out(CachedRevalidationPolicyFunction);
 }
 
 const CACHE_TTL: i64 = 300;
@@ -356,6 +357,7 @@ impl TableInOutFunction for CachedRevalidatingEchoFunction {
             .with_etag(etag.clone())
             .with_revalidatable();
         if params.if_none_match.as_deref() == Some(etag.as_str()) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
             // 304 Not Modified: the client's stored copy for this input is
             // still valid — answer with a 0-row batch of the same schema.
             return out.emit_with(
@@ -424,6 +426,88 @@ impl TableInOutFunction for CachedRevalidatingDoubleFunction {
             doubled_batch(params, batch)?,
             EmitOptions {
                 cache_control: Some(fresh),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// Conditional-cache policy fixture. The first call always stores an
+/// immediately-stale echo. A repeat can then exercise stale-if-error or an
+/// explicit worker revocation without relying on timing or mutable state.
+pub struct CachedRevalidationPolicyFunction;
+impl TableInOutFunction for CachedRevalidationPolicyFunction {
+    fn name(&self) -> &str {
+        "cached_reval_policy"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        cache_meta(
+            "Classic passthrough with selectable conditional cache policy",
+            &["cache", "test"],
+            false,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::column("data", 0, "table", "Input table"),
+            ArgSpec::const_arg("policy", 1, "varchar", "Conditional response policy"),
+        ]
+    }
+    fn process_out(
+        &self,
+        params: &ProcessParams,
+        batch: &RecordBatch,
+        out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        let batch = project_batch(batch, &params.output_schema)?;
+        let etag = content_etag(&batch)?;
+        let control = CacheControl::ttl(0)
+            .with_etag(etag.clone())
+            .with_revalidatable()
+            .with_stale_if_error(60);
+        if params.if_none_match.as_deref() == Some(etag.as_str()) {
+            return match params.arguments.const_str(1).unwrap_or_default().as_str() {
+                "error" => Err(RpcError::runtime_error(
+                    "intentional conditional cache failure",
+                )),
+                "not_modified_no_store" => out.emit_with(
+                    batch.slice(0, 0),
+                    EmitOptions {
+                        cache_control: Some(CacheControl::no_store().with_not_modified()),
+                        ..Default::default()
+                    },
+                ),
+                "fresh_no_store" => out.emit_with(
+                    batch,
+                    EmitOptions {
+                        cache_control: Some(CacheControl::no_store()),
+                        ..Default::default()
+                    },
+                ),
+                "transaction" => out.emit_with(
+                    batch.slice(0, 0),
+                    EmitOptions {
+                        cache_control: Some(
+                            CacheControl::ttl(60)
+                                .with_transaction_scope()
+                                .with_not_modified(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                _ => out.emit_with(
+                    batch.slice(0, 0),
+                    EmitOptions {
+                        cache_control: Some(control.with_not_modified()),
+                        ..Default::default()
+                    },
+                ),
+            };
+        }
+        out.emit_with(
+            batch,
+            EmitOptions {
+                cache_control: Some(control),
                 ..Default::default()
             },
         )

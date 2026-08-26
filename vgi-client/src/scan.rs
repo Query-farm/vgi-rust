@@ -14,6 +14,7 @@
 //! Pushdown (projection, filters, ORDER BY, TABLESAMPLE) rides the init
 //! request, so it is decided after bind and before the first row.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -453,6 +454,7 @@ pub struct Scan<'a> {
     /// column. Equal to `schema` unless those were added.
     emitted_schema: SchemaRef,
     last_cache_control: Option<CacheControl>,
+    connection_reusable: Arc<AtomicBool>,
     finished: bool,
 }
 
@@ -464,12 +466,27 @@ impl<'a> Scan<'a> {
         metadata: Option<vgi_rpc::wire::Metadata>,
         function: impl Into<String>,
         schema: SchemaRef,
+        connection_reusable: Arc<AtomicBool>,
     ) -> Result<Scan<'a>> {
-        let stream = transport.open_producer("init", params, metadata, true)?;
-        let header_batch = stream.header().ok_or_else(|| {
-            RpcError::type_error("init did not return a GlobalInitResponse header")
-        })?;
-        let header: GlobalInitResponse = wire::from_batch(header_batch)?;
+        let mut stream = match transport.open_producer("init", params, metadata, true) {
+            Ok(stream) => stream,
+            Err(error) => {
+                connection_reusable.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let header = stream
+            .header()
+            .ok_or_else(|| RpcError::type_error("init did not return a GlobalInitResponse header"))
+            .and_then(wire::from_batch);
+        let header: GlobalInitResponse = match header {
+            Ok(header) => header,
+            Err(error) => {
+                connection_reusable.store(false, Ordering::Release);
+                let _ = stream.cancel();
+                return Err(error);
+            }
+        };
         Ok(Scan {
             stream,
             header,
@@ -477,6 +494,7 @@ impl<'a> Scan<'a> {
             emitted_schema: Arc::clone(&schema),
             schema,
             last_cache_control: None,
+            connection_reusable,
             finished: false,
         })
     }
@@ -490,8 +508,16 @@ impl<'a> Scan<'a> {
         function: impl Into<String>,
         schema: SchemaRef,
         emitted_schema: SchemaRef,
+        connection_reusable: Arc<AtomicBool>,
     ) -> Result<Scan<'a>> {
-        let mut scan = Scan::open(transport, params, metadata, function, emitted_schema)?;
+        let mut scan = Scan::open(
+            transport,
+            params,
+            metadata,
+            function,
+            emitted_schema,
+            connection_reusable,
+        )?;
         // `open` points both at what the worker emits; narrow the caller-facing
         // one, which is the whole point of the trim.
         scan.schema = schema;
@@ -557,7 +583,11 @@ impl Scan<'_> {
             )])
         });
         loop {
-            match self.stream.tick_with_metadata(metadata.as_ref())? {
+            let next = self.stream.tick_with_metadata(metadata.as_ref());
+            if next.is_err() {
+                self.connection_reusable.store(false, Ordering::Release);
+            }
+            match next? {
                 None => {
                     self.finished = true;
                     return Ok(None);
@@ -573,8 +603,19 @@ impl Scan<'_> {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    check_batch_schema(&self.function, &self.emitted_schema, &batch)?;
-                    return Ok(Some(self.trim_to_projection(batch)?));
+                    if let Err(error) =
+                        check_batch_schema(&self.function, &self.emitted_schema, &batch)
+                    {
+                        self.connection_reusable.store(false, Ordering::Release);
+                        return Err(error);
+                    }
+                    return match self.trim_to_projection(batch) {
+                        Ok(batch) => Ok(Some(batch)),
+                        Err(error) => {
+                            self.connection_reusable.store(false, Ordering::Release);
+                            Err(error)
+                        }
+                    };
                 }
             }
         }
@@ -610,8 +651,30 @@ impl Scan<'_> {
 
     /// Ask the worker to stop early.
     pub fn cancel(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         self.finished = true;
-        self.stream.cancel()
+        let result = self.stream.cancel();
+        if result.is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+impl Drop for Scan<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // An unfinished producer still owns worker-side execution state. Match
+        // Exchange's cleanup contract: explicitly cancel once, and keep Drop
+        // best-effort because there is nowhere to report a cleanup failure.
+        self.finished = true;
+        if self.stream.cancel().is_err() {
+            self.connection_reusable.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -788,6 +851,7 @@ impl VgiClient {
                 value.clone(),
             );
         }
+        let connection_reusable = self.exchange_reuse_guard();
         Scan::open_projected(
             self.transport_mut(),
             &params,
@@ -795,6 +859,7 @@ impl VgiClient {
             bound.function_name(),
             schema,
             emitted,
+            connection_reusable,
         )
     }
 }
@@ -1276,6 +1341,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::atomic::AtomicUsize;
 
     fn schema(fields: &[(&str, DataType)]) -> Schema {
         Schema::new(
@@ -1351,6 +1417,247 @@ mod tests {
         let b = RecordBatch::try_new(Arc::new(emitted), vec![Arc::new(Int64Array::from(vec![1]))])
             .unwrap();
         assert!(check_batch_schema("f", &declared, &b).is_ok());
+    }
+
+    // --- producer cancellation ------------------------------------------
+
+    struct CountingCancelStream {
+        header: RecordBatch,
+        cancels: Arc<AtomicUsize>,
+        tick_error: bool,
+        cancel_error: bool,
+    }
+
+    impl ProducerStream for CountingCancelStream {
+        fn header(&self) -> Option<&RecordBatch> {
+            Some(&self.header)
+        }
+
+        fn tick(&mut self) -> Result<Option<(RecordBatch, vgi_rpc::wire::Metadata)>> {
+            if self.tick_error {
+                return Err(RpcError::runtime_error("tick failed"));
+            }
+            Ok(None)
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_error {
+                return Err(RpcError::runtime_error("cancel failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn counting_scan(cancels: Arc<AtomicUsize>) -> Scan<'static> {
+        counting_scan_with_failures(cancels, false, false).0
+    }
+
+    fn counting_scan_with_failures(
+        cancels: Arc<AtomicUsize>,
+        tick_error: bool,
+        cancel_error: bool,
+    ) -> (Scan<'static>, Arc<AtomicBool>) {
+        let connection_reusable = Arc::new(AtomicBool::new(true));
+        let scan = Scan {
+            stream: Box::new(CountingCancelStream {
+                header: wire::to_batch(GlobalInitResponse {
+                    execution_id: Bytes(b"cancel-test".to_vec()),
+                    max_workers: 1,
+                    opaque_data: None,
+                })
+                .unwrap(),
+                cancels,
+                tick_error,
+                cancel_error,
+            }),
+            header: GlobalInitResponse {
+                execution_id: Bytes(b"cancel-test".to_vec()),
+                max_workers: 1,
+                opaque_data: None,
+            },
+            function: "cancel_test".to_string(),
+            schema: Arc::new(Schema::empty()),
+            emitted_schema: Arc::new(Schema::empty()),
+            last_cache_control: None,
+            connection_reusable: Arc::clone(&connection_reusable),
+            finished: false,
+        };
+        (scan, connection_reusable)
+    }
+
+    #[test]
+    fn dropping_an_unfinished_scan_cancels_once() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        drop(counting_scan(Arc::clone(&cancels)));
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_cancel_is_idempotent_and_suppresses_drop_cleanup() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        {
+            let mut scan = counting_scan(Arc::clone(&cancels));
+            scan.cancel().unwrap();
+            scan.cancel().unwrap();
+        }
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_finished_scan_does_not_send_cancel() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let connection_reusable;
+        {
+            let pair = counting_scan_with_failures(Arc::clone(&cancels), false, false);
+            let mut scan = pair.0;
+            connection_reusable = pair.1;
+            assert!(scan.next_batch().unwrap().is_none());
+        }
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+        assert!(connection_reusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_tick_failure_makes_the_connection_unusable() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let (mut scan, connection_reusable) =
+            counting_scan_with_failures(Arc::clone(&cancels), true, false);
+        assert!(scan.next_batch().is_err());
+        assert!(!connection_reusable.load(Ordering::Acquire));
+        drop(scan);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_explicit_cancel_failure_makes_the_connection_unusable() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let (mut scan, connection_reusable) =
+            counting_scan_with_failures(Arc::clone(&cancels), false, true);
+        assert!(scan.cancel().is_err());
+        assert!(!connection_reusable.load(Ordering::Acquire));
+        drop(scan);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_drop_cancel_failure_makes_the_connection_unusable() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let (scan, connection_reusable) =
+            counting_scan_with_failures(Arc::clone(&cancels), false, true);
+        drop(scan);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert!(!connection_reusable.load(Ordering::Acquire));
+    }
+
+    #[derive(Clone, Copy)]
+    enum OpenFailure {
+        Open,
+        MissingHeader,
+        MalformedHeader,
+    }
+
+    struct HeaderFailureStream {
+        header: Option<RecordBatch>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl ProducerStream for HeaderFailureStream {
+        fn header(&self) -> Option<&RecordBatch> {
+            self.header.as_ref()
+        }
+
+        fn tick(&mut self) -> Result<Option<(RecordBatch, vgi_rpc::wire::Metadata)>> {
+            Ok(None)
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct OpenFailureTransport {
+        failure: OpenFailure,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl crate::transport::VgiTransport for OpenFailureTransport {
+        fn call_unary(&mut self, method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            Err(RpcError::runtime_error(format!("unexpected call {method}")))
+        }
+
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            if matches!(self.failure, OpenFailure::Open) {
+                return Err(RpcError::runtime_error("open failed"));
+            }
+            let header = match self.failure {
+                OpenFailure::Open => unreachable!(),
+                OpenFailure::MissingHeader => None,
+                OpenFailure::MalformedHeader => {
+                    Some(RecordBatch::new_empty(Arc::new(Schema::empty())))
+                }
+            };
+            Ok(Box::new(HeaderFailureStream {
+                header,
+                cancels: Arc::clone(&self.cancels),
+            }))
+        }
+
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn crate::transport::ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("unexpected exchange"))
+        }
+
+        fn label(&self) -> &str {
+            "open-failure"
+        }
+    }
+
+    fn assert_open_failure_poisoned(failure: OpenFailure, expected_cancels: usize) {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let mut transport = OpenFailureTransport {
+            failure,
+            cancels: Arc::clone(&cancels),
+        };
+        let params = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let connection_reusable = Arc::new(AtomicBool::new(true));
+        let result = Scan::open(
+            &mut transport,
+            &params,
+            None,
+            "open_failure",
+            Arc::new(Schema::empty()),
+            Arc::clone(&connection_reusable),
+        );
+        assert!(result.is_err());
+        assert!(!connection_reusable.load(Ordering::Acquire));
+        assert_eq!(cancels.load(Ordering::SeqCst), expected_cancels);
+    }
+
+    #[test]
+    fn an_open_failure_makes_the_connection_unusable() {
+        assert_open_failure_poisoned(OpenFailure::Open, 0);
+    }
+
+    #[test]
+    fn a_missing_header_makes_the_connection_unusable_and_cancels() {
+        assert_open_failure_poisoned(OpenFailure::MissingHeader, 1);
+    }
+
+    #[test]
+    fn a_malformed_header_makes_the_connection_unusable_and_cancels() {
+        assert_open_failure_poisoned(OpenFailure::MalformedHeader, 1);
     }
 
     // --- projection ∪ filter columns ------------------------------------
