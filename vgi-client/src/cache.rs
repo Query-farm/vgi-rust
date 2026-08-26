@@ -71,6 +71,12 @@ pub struct CacheKey {
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     batches: Vec<RecordBatch>,
+    /// Number of independent producer substreams captured into this entry.
+    ///
+    /// Most cache producers are single-stream. Split-capable integrations can
+    /// preserve their physical capture layout for truthful diagnostics while
+    /// still replaying the flattened batch sequence.
+    num_substreams: usize,
     rows: usize,
     bytes: usize,
     stored_at: Instant,
@@ -90,6 +96,11 @@ impl CachedEntry {
     /// The cached batches.
     pub fn batches(&self) -> &[RecordBatch] {
         &self.batches
+    }
+
+    /// Number of independent producer substreams captured for this entry.
+    pub fn num_substreams(&self) -> usize {
+        self.num_substreams
     }
 
     /// Total rows across every batch.
@@ -152,8 +163,14 @@ pub struct CacheEntryInfo {
     pub function: String,
     /// Stored result size.
     pub rows: usize,
+    /// Number of Arrow batches retained by the entry.
+    pub num_batches: usize,
+    /// Number of independent producer substreams captured into the entry.
+    pub num_substreams: usize,
     /// Approximate Arrow memory held by the result.
     pub bytes: usize,
+    /// Time-travel coordinate included in the cache identity, when present.
+    pub at: Option<(String, String)>,
     /// Age and freshness at snapshot time.
     pub age: Duration,
     /// Whether the freshness lifetime has elapsed.
@@ -403,6 +420,21 @@ impl ResultCache {
         ttl: Duration,
         control: Option<&CacheControl>,
     ) {
+        self.insert_with_substreams(key, batches, 1, ttl, control);
+    }
+
+    /// Store a result while retaining its physical producer-substream count.
+    ///
+    /// The count is diagnostic metadata only: replay remains a single coherent
+    /// sequence of Arrow batches and cache identity is unchanged.
+    pub fn insert_with_substreams(
+        &self,
+        key: CacheKey,
+        batches: Vec<RecordBatch>,
+        num_substreams: usize,
+        ttl: Duration,
+        control: Option<&CacheControl>,
+    ) {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let bytes = batches.iter().map(approx_bytes).sum();
         let limits = self.limits.read().unwrap();
@@ -414,6 +446,7 @@ impl ResultCache {
 
         let entry = CachedEntry {
             batches,
+            num_substreams: num_substreams.max(1),
             rows,
             bytes,
             stored_at: Instant::now(),
@@ -598,7 +631,10 @@ impl ResultCache {
                     catalog: key.catalog.clone(),
                     function: key.function.clone(),
                     rows: slot.entry.rows,
+                    num_batches: slot.entry.batches.len(),
+                    num_substreams: slot.entry.num_substreams,
                     bytes: slot.entry.bytes,
+                    at: key.at.clone(),
                     age: now.duration_since(slot.entry.stored_at),
                     stale: slot.entry.is_stale_at(now),
                     hits: slot.entry.hits,
@@ -710,6 +746,26 @@ mod tests {
         assert_eq!(hit.rows(), 10);
         assert_eq!(c.stats().hits, 1);
         assert_eq!(c.stats().misses, 1);
+    }
+
+    #[test]
+    fn entry_diagnostics_preserve_layout_and_time_travel_identity() {
+        let c = ResultCache::new(CacheLimits::default());
+        let mut k = key("s", "f");
+        k.at = Some(("version".into(), "42".into()));
+        c.insert_with_substreams(
+            k,
+            vec![batch(2), batch(3)],
+            2,
+            Duration::from_secs(60),
+            Some(&cc(60)),
+        );
+
+        let [entry] = c.entries().try_into().expect("one cache entry");
+        assert_eq!(entry.rows, 5);
+        assert_eq!(entry.num_batches, 2);
+        assert_eq!(entry.num_substreams, 2);
+        assert_eq!(entry.at, Some(("version".into(), "42".into())));
     }
 
     #[test]

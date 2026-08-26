@@ -20,14 +20,14 @@ repository = "https://github.com/Query-farm/vgi-rust"
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.23.1", default-features = false, features = ["macros", "stream-codec", "shm"] }
+vgi-rpc = { version = "0.23.2", default-features = false, features = ["macros", "stream-codec", "shm"] }
 # The direction-agnostic wire protocol (DTOs + Arrow codec + IPC helpers), shared
 # by the worker framework and any client. Kept feature-free and wasm-buildable.
 vgi-protocol = { version = "0.31.0", path = "vgi-protocol" }
 # The VGI protocol client (attach, discovery, function calls).
 vgi-client = { version = "0.31.0", path = "vgi-client" }
 # Transport-level RPC client the VGI client is built on.
-vgi-rpc-client = { version = "0.23.1", default-features = false }
+vgi-rpc-client = { version = "0.23.2", default-features = false }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
