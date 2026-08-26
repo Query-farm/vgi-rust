@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use vgi::cache_control::CacheControl;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
 use vgi_rpc::{Result, RpcError};
@@ -259,6 +260,12 @@ impl TableFunction for ProfilingDemoFunction {
             ArgSpec::const_arg("count", 0, "int64", "Number of rows to generate"),
             ArgSpec::const_arg("batch_size", -1, "int64", "Batch size for output"),
             ArgSpec::const_arg("increment", -1, "int64", "Step between values"),
+            ArgSpec::const_arg(
+                "cache_ttl",
+                -1,
+                "int64",
+                "Optional result-cache lifetime in seconds",
+            ),
         ]
     }
     fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
@@ -282,6 +289,10 @@ impl TableFunction for ProfilingDemoFunction {
             .named_i64("batch_size")
             .unwrap_or(2048)
             .max(1) as usize;
+        let cache_control = params
+            .arguments
+            .named_i64("cache_ttl")
+            .map(|ttl| CacheControl::ttl(ttl.max(0)));
         let values: Vec<i64> = (0..count).map(|i| i * increment).collect();
         Ok(Box::new(ProfilingProducer {
             values,
@@ -293,6 +304,8 @@ impl TableFunction for ProfilingDemoFunction {
             rows: 0,
             batches: 0,
             start_ns: now_nanos(),
+            cache_control,
+            meta: None,
         }))
     }
     fn dynamic_to_string(
@@ -301,6 +314,7 @@ impl TableFunction for ProfilingDemoFunction {
         storage: &dyn vgi::storage::FunctionStorage,
     ) -> Vec<(String, String)> {
         let snap = storage.kv_get(global_execution_id, b"profiling");
+        storage.kv_del(global_execution_id, b"profiling");
         let (rows, batches, start_ns) = match snap {
             Some(b) if b.len() >= 24 => (
                 u64::from_le_bytes(b[0..8].try_into().unwrap()),
@@ -328,6 +342,8 @@ struct ProfilingProducer {
     rows: u64,
     batches: u64,
     start_ns: u64,
+    cache_control: Option<CacheControl>,
+    meta: Option<std::collections::HashMap<String, String>>,
 }
 impl TableProducer for ProfilingProducer {
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
@@ -342,6 +358,11 @@ impl TableProducer for ProfilingProducer {
         self.rows += chunk.len() as u64;
         self.batches += 1;
         self.offset = end;
+        self.meta = if self.batches == 1 {
+            self.cache_control.as_ref().map(CacheControl::to_metadata)
+        } else {
+            None
+        };
         if let Some(store) = &self.store {
             let mut snap = Vec::with_capacity(24);
             snap.extend_from_slice(&self.rows.to_le_bytes());
@@ -350,6 +371,9 @@ impl TableProducer for ProfilingProducer {
             store.kv_put(&self.exec, b"profiling", &snap);
         }
         Ok(Some(batch))
+    }
+    fn last_metadata(&self) -> Option<std::collections::HashMap<String, String>> {
+        self.meta.clone()
     }
     // The EXPLAIN ANALYZE counters travel with the cursor. They accumulate in
     // the producer and are snapshotted to storage on every batch, so a rebuild
@@ -945,5 +969,28 @@ impl TableFunction for MakeSeriesFloat {
             emitted: false,
             schema: schema_value_f64(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+    use vgi::storage::{FunctionStorage, MemoryStorage};
+
+    #[test]
+    fn dynamic_profile_consumes_execution_scoped_state() {
+        let storage = MemoryStorage::new();
+        let execution_id = b"profile-execution";
+        let mut snapshot = Vec::new();
+        snapshot.extend_from_slice(&12_u64.to_le_bytes());
+        snapshot.extend_from_slice(&3_u64.to_le_bytes());
+        snapshot.extend_from_slice(&now_nanos().to_le_bytes());
+        storage.kv_put(execution_id, b"profiling", &snapshot);
+
+        let values = ProfilingDemoFunction.dynamic_to_string(execution_id, &storage);
+
+        assert_eq!(values[0], ("rows_produced".to_string(), "12".to_string()));
+        assert_eq!(values[1], ("batches_emitted".to_string(), "3".to_string()));
+        assert_eq!(storage.kv_get(execution_id, b"profiling"), None);
     }
 }
