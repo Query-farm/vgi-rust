@@ -22,13 +22,22 @@ http = ["vgi-rpc-client/http"]
 # AF_UNIX transport — connect to a worker started out of band or by a launcher.
 unix = ["vgi-rpc-client/unix"]
 # The `launch:` transport: spawn and share one warm worker system-wide.
-launcher = ["unix", "dep:sha2", "dep:libc"]
+launcher = ["unix", "dep:libc"]
 # POSIX shared-memory side-channel for large batches.
 shm = ["vgi-rpc-client/shm"]
 # OAuth: RFC 9728 discovery, device-code and refresh grants. Needs a sync HTTP
 # client of its own because discovery talks to the identity provider, not to
 # the VGI worker.
-oauth = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:sha2", "http"]
+oauth = ["dep:ureq", "dep:serde", "dep:serde_json", "http"]
+# Persistent, bounded Arrow IPC result storage. Kept opt-in so the base client
+# and its wasm build do not pull filesystem or compression dependencies.
+disk-cache = [
+    "dep:arrow-ipc",
+    "dep:getrandom",
+    "dep:hmac",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dependencies]
 vgi-protocol = { workspace = true }
@@ -47,11 +56,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10" }
 libc = { version = "0.2", optional = true }
+arrow-ipc = { workspace = true, optional = true, features = ["lz4", "zstd"] }
+getrandom = { version = "0.3", optional = true }
+hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]
-arrow-ipc = { workspace = true }
 vgi = { path = "../vgi" }
 # Only to prove the blocking HTTP path survives an ambient async runtime, which
 # is how every async consumer reaches this client.

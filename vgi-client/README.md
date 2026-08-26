@@ -86,6 +86,47 @@ plan's `execution_id` and `init_opaque_data` along with the tokens, avoiding a
 subtle cross-process state mismatch that is easy to create by assembling
 `ScanOptions` manually.
 
+## Persistent result storage
+
+The opt-in `disk-cache` feature provides bounded storage for complete, fresh
+producer results. A host supplies a durable `DiskCacheOptions::root`, byte and
+entry bounds, and an Arrow IPC codec (`Zstd`, `Lz4`, or `None`). The root is
+application state; it must not be a query engine's temporary spill directory.
+
+`DiskCache::begin_capture` takes the result schema and physical partition count
+up front, so empty results and empty partitions remain typed. Each
+`DiskCapture::push_batch` writes to that partition's Arrow IPC file, and
+`DiskCache::commit` publishes the multipart result only after every file and
+the manifest are durable. Dropping or aborting an unfinished capture removes
+its temporary generation. `lookup` returns only fresh entries after validating
+their manifest, schema, sizes, and hashes; immediately stale/revalidatable and
+transaction-scoped results are deliberately not persisted.
+
+Objects use ref-last atomic publication, HMAC-obscured paths, private
+permissions, and cross-process operation, capture, and replay leases. Byte and
+entry eviction, scoped flush, and reap are part of the same API. This is loose
+producer-result storage, not correlated/exchange memo packing.
+
+The durable root must be on a local filesystem with Unix advisory-lock and
+atomic-rename semantics; network filesystems are not a supported cache root.
+LRU touches are intentionally process-local to avoid a durable metadata write
+on every hit. After restart or across processes, eviction falls back to the
+generation's publication-metadata time, so the LRU order is approximate while byte/count
+bounds and entry integrity remain enforced cross-process.
+
+Entry listings and occupancy counters describe committed references, not
+temporary captures or old generations retained by an active replay lease.
+Those leased orphans still count against new admission bounds and are removed
+by reap after the final reader releases them; they are intentionally omitted
+from result diagnostics because they are not lookup-visible entries.
+The bounds cover encoded Arrow payload admission, not filesystem usage:
+metadata is excluded and each concurrent in-progress capture has its own byte
+cap. Processes sharing a root should therefore use the same options, which are
+host policy and are not persisted in the cache format.
+
+All capture, lookup, replay, flush, and reap filesystem work is blocking. Async
+engines must run it on a blocking executor such as Tokio's `spawn_blocking`.
+
 ## Blocking
 
 Every call blocks, matching the underlying transport client and both other VGI

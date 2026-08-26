@@ -25,6 +25,7 @@
 
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
 use vgi_rpc::errors::{Result, RpcError};
 
 /// A parsed `LOCATION`.
@@ -115,6 +116,80 @@ impl VgiLocation {
             }
         }
     }
+
+    /// Credential-safe stable identity of the complete worker location.
+    ///
+    /// The returned value is a SHA-256 fingerprint, never the raw endpoint or
+    /// command. Its tagged, length-prefixed input includes every subprocess or
+    /// launcher argument, the complete HTTP URL, Unix path, or TCP host/port,
+    /// so two locations that share a display label cannot share cached results.
+    pub fn cache_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        fingerprint_field(&mut digest, b"vgi-location-cache-fingerprint-v1");
+        match self {
+            Self::Subprocess(argv) => {
+                fingerprint_field(&mut digest, b"subprocess");
+                fingerprint_argv(&mut digest, argv);
+            }
+            Self::Http(url) => {
+                fingerprint_field(&mut digest, b"http");
+                fingerprint_field(&mut digest, url.as_bytes());
+            }
+            Self::Unix(path) => {
+                fingerprint_field(&mut digest, b"unix");
+                fingerprint_path(&mut digest, path);
+            }
+            Self::Tcp { host, port } => {
+                fingerprint_field(&mut digest, b"tcp");
+                fingerprint_field(&mut digest, host.as_bytes());
+                fingerprint_field(&mut digest, &port.to_le_bytes());
+            }
+            Self::Launch(argv) => {
+                fingerprint_field(&mut digest, b"launch");
+                fingerprint_argv(&mut digest, argv);
+            }
+        }
+        use std::fmt::Write;
+        let mut fingerprint = String::with_capacity(64);
+        for byte in digest.finalize() {
+            write!(&mut fingerprint, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        fingerprint
+    }
+}
+
+fn fingerprint_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+fn fingerprint_argv(digest: &mut Sha256, argv: &[String]) {
+    fingerprint_field(digest, &(argv.len() as u64).to_le_bytes());
+    for argument in argv {
+        fingerprint_field(digest, argument.as_bytes());
+    }
+}
+
+#[cfg(unix)]
+fn fingerprint_path(digest: &mut Sha256, path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    fingerprint_field(digest, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn fingerprint_path(digest: &mut Sha256, path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    fingerprint_field(digest, &encoded);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fingerprint_path(digest: &mut Sha256, path: &std::path::Path) {
+    fingerprint_field(digest, path.to_string_lossy().as_bytes());
 }
 
 /// Split a command line the way the extension's `ParseLaunchArgv` does.
@@ -253,6 +328,31 @@ mod tests {
             VgiLocation::parse("/usr/bin/worker --flag").unwrap(),
             VgiLocation::Subprocess(vec!["/usr/bin/worker".into(), "--flag".into()])
         );
+    }
+
+    #[test]
+    fn cache_fingerprint_covers_full_argv_not_only_the_display_label() {
+        let left = VgiLocation::Subprocess(vec!["worker".into(), "--tenant=a".into()]);
+        let right = VgiLocation::Subprocess(vec!["worker".into(), "--tenant=b".into()]);
+        assert_eq!(left.label(), right.label());
+        assert_ne!(left.cache_fingerprint(), right.cache_fingerprint());
+        assert_eq!(left.cache_fingerprint(), left.clone().cache_fingerprint());
+    }
+
+    #[test]
+    fn cache_fingerprint_is_credential_sensitive_without_leaking_credentials() {
+        let secret = "correct-horse-battery-staple";
+        let left = VgiLocation::Http(format!(
+            "https://user:{secret}@worker.example/vgi?token=first"
+        ));
+        let right = VgiLocation::Http(format!(
+            "https://user:{secret}@worker.example/vgi?token=second"
+        ));
+        let fingerprint = left.cache_fingerprint();
+        assert_ne!(fingerprint, right.cache_fingerprint());
+        assert!(!fingerprint.contains(secret));
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]

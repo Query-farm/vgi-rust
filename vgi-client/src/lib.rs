@@ -62,6 +62,8 @@ pub mod auth;
 pub mod cache;
 pub mod catalog;
 pub mod client;
+#[cfg(feature = "disk-cache")]
+pub mod disk_cache;
 pub mod exchange;
 #[cfg(feature = "launcher")]
 pub mod launcher;
@@ -77,7 +79,8 @@ pub use arg_spec::{ArgSpec, ArgSpecs};
 pub use args::{ArgValue, Arguments};
 pub use auth::{AuthReason, Unauthorized};
 pub use cache::{
-    CacheEntryInfo, CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible, ResultCache,
+    CacheEntryInfo, CacheFreshness, CacheKey, CacheLimits, CacheStats, CachedEntry, Ineligible,
+    ResultCache,
 };
 pub use catalog::{
     decode_attach_option_specs, decode_macro_defaults, decode_setting_specs, encode_attach_options,
@@ -85,6 +88,12 @@ pub use catalog::{
     MacroKind, ScanBranchesResolution, SettingSpec,
 };
 pub use client::{ConnectionOptions, VgiClient};
+#[cfg(feature = "disk-cache")]
+pub use disk_cache::{
+    DiskCache, DiskCacheCodec, DiskCacheCommit, DiskCacheEntryInfo, DiskCacheError, DiskCacheHit,
+    DiskCacheOptions, DiskCacheResult, DiskCacheSkip, DiskCacheStats, DiskCapture,
+    DiskPartitionReader,
+};
 pub use location::VgiLocation;
 pub use pool::{PoolConfig, PoolStats, PooledClient, WorkerPool};
 pub use retry::{

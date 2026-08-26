@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use arrow_array::RecordBatch;
 use vgi_protocol::cache_control::CacheControl;
@@ -65,6 +65,80 @@ pub struct CacheKey {
     pub sample: Option<Vec<u8>>,
     /// Stable planning/split shape when it affects the emitted result.
     pub plan: Option<Vec<u8>>,
+}
+
+impl CacheKey {
+    /// Encode this key in the stable, versioned format used by persistent
+    /// result caches.
+    ///
+    /// This is deliberately independent of Rust's [`std::hash::Hash`]
+    /// implementation and of any serde representation. Field order, option
+    /// tags, integer widths, and lengths are all explicit, so a cache written
+    /// by one process can be found safely after a restart or client upgrade.
+    pub fn stable_bytes(&self) -> Vec<u8> {
+        const DOMAIN: &[u8] = b"vgi-client-result-cache-key\0v1";
+
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        fn string(out: &mut Vec<u8>, value: &str) {
+            bytes(out, value.as_bytes());
+        }
+        fn optional_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
+            match value {
+                Some(value) => {
+                    out.push(1);
+                    bytes(out, value);
+                }
+                None => out.push(0),
+            }
+        }
+        fn optional_i64(out: &mut Vec<u8>, value: Option<i64>) {
+            match value {
+                Some(value) => {
+                    out.push(1);
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+
+        let mut out = Vec::with_capacity(DOMAIN.len() + 256);
+        out.extend_from_slice(DOMAIN);
+        string(&mut out, &self.catalog);
+        string(&mut out, &self.identity_scope);
+        string(&mut out, &self.worker_label);
+        string(&mut out, &self.function);
+        bytes(&mut out, &self.arguments);
+        match &self.projection {
+            Some(projection) => {
+                out.push(1);
+                out.extend_from_slice(&(projection.len() as u64).to_le_bytes());
+                for value in projection {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            None => out.push(0),
+        }
+        optional_bytes(&mut out, self.filters.as_deref());
+        out.extend_from_slice(&self.catalog_version.to_le_bytes());
+        match &self.at {
+            Some((unit, value)) => {
+                out.push(1);
+                string(&mut out, unit);
+                string(&mut out, value);
+            }
+            None => out.push(0),
+        }
+        bytes(&mut out, &self.settings);
+        bytes(&mut out, &self.attach_options);
+        optional_i64(&mut out, self.row_limit);
+        optional_bytes(&mut out, self.ordering.as_deref());
+        optional_bytes(&mut out, self.sample.as_deref());
+        optional_bytes(&mut out, self.plan.as_deref());
+        out
+    }
 }
 
 /// A stored result.
@@ -198,6 +272,58 @@ pub enum Ineligible {
     EntryTooLarge,
     /// The result is scoped to a transaction, which this cache does not hold.
     TransactionScoped,
+    /// The worker named a reuse scope this client does not understand.
+    UnsupportedScope,
+}
+
+/// One cache-admission decision anchored to result receipt time.
+///
+/// The wall-clock deadline is suitable for durable metadata. The monotonic
+/// deadline prevents serialization or lock contention from extending a TTL
+/// when the system wall clock moves backwards in the same process.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheFreshness {
+    expires_at: SystemTime,
+    received_at: Instant,
+    lifetime: Duration,
+}
+
+impl CacheFreshness {
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn from_lifetime(lifetime: Duration) -> Option<Self> {
+        Some(Self {
+            expires_at: SystemTime::now().checked_add(lifetime)?,
+            received_at: Instant::now(),
+            lifetime,
+        })
+    }
+
+    fn at(
+        received_wall: SystemTime,
+        received_monotonic: Instant,
+        lifetime: Duration,
+    ) -> Option<Self> {
+        Some(Self {
+            expires_at: received_wall.checked_add(lifetime)?,
+            received_at: received_monotonic,
+            lifetime,
+        })
+    }
+
+    /// Absolute wall-clock expiry persisted by a durable cache tier.
+    pub fn expires_at(self) -> SystemTime {
+        self.expires_at
+    }
+
+    /// Fresh lifetime left according to a monotonic clock.
+    pub fn remaining(self) -> Duration {
+        self.lifetime.saturating_sub(self.received_at.elapsed())
+    }
+
+    /// Whether the receipt-time fresh lifetime has elapsed.
+    pub fn is_expired(self) -> bool {
+        self.remaining().is_zero()
+    }
 }
 
 /// Caps.
@@ -325,10 +451,66 @@ impl ResultCache {
         if cc.scope == vgi_protocol::cache_control::CACHE_SCOPE_TRANSACTION {
             return Err(Ineligible::TransactionScoped);
         }
+        if cc.scope != vgi_protocol::cache_control::CACHE_SCOPE_CATALOG {
+            return Err(Ineligible::UnsupportedScope);
+        }
         let limits = self.limits.read().unwrap();
         if bytes > limits.max_entry_bytes {
             return Err(Ineligible::EntryTooLarge);
         }
+        self.freshness_lifetime_at(cc, SystemTime::now())
+    }
+
+    /// Resolve worker freshness to one receipt-time admission decision.
+    ///
+    /// Callers that write more than one cache tier should compute this once
+    /// when the complete result and its cache control are received. Each tier
+    /// can then derive its remaining lifetime from the same deadline rather
+    /// than accidentally granting a fresh TTL after serialization or lock
+    /// contention. Unlike [`Self::eligibility`], this does not apply the
+    /// in-memory per-entry byte cap.
+    pub fn freshness_deadline(
+        &self,
+        control: Option<&CacheControl>,
+        identity_scope: Option<&str>,
+        received_at_wall: SystemTime,
+    ) -> Result<CacheFreshness, Ineligible> {
+        self.freshness_at(control, identity_scope, received_at_wall, Instant::now())
+    }
+
+    fn freshness_at(
+        &self,
+        control: Option<&CacheControl>,
+        identity_scope: Option<&str>,
+        received_wall: SystemTime,
+        received_monotonic: Instant,
+    ) -> Result<CacheFreshness, Ineligible> {
+        if identity_scope.is_none() {
+            return Err(Ineligible::IdentityUnresolved);
+        }
+        let Some(control) = control else {
+            return Err(Ineligible::NotCacheable);
+        };
+        if control.no_store {
+            return Err(Ineligible::NotCacheable);
+        }
+        if control.scope == vgi_protocol::cache_control::CACHE_SCOPE_TRANSACTION {
+            return Err(Ineligible::TransactionScoped);
+        }
+        if control.scope != vgi_protocol::cache_control::CACHE_SCOPE_CATALOG {
+            return Err(Ineligible::UnsupportedScope);
+        }
+        let lifetime = self.freshness_lifetime_at(control, received_wall)?;
+        CacheFreshness::at(received_wall, received_monotonic, lifetime)
+            .ok_or(Ineligible::NoFreshness)
+    }
+
+    fn freshness_lifetime_at(
+        &self,
+        cc: &CacheControl,
+        received_at: SystemTime,
+    ) -> Result<Duration, Ineligible> {
+        let limits = self.limits.read().unwrap();
         let ttl = match cc.ttl_seconds {
             Some(s) if s > 0 => Duration::from_secs(s as u64),
             // `ttl = 0` with a validator is the HTTP "no-cache" semantic: store
@@ -349,7 +531,7 @@ impl ResultCache {
                 let Some(expires) = expires else {
                     return Err(Ineligible::NoFreshness);
                 };
-                let now = chrono::Utc::now();
+                let now = chrono::DateTime::<chrono::Utc>::from(received_at);
                 expires
                     .signed_duration_since(now)
                     .to_std()
@@ -362,6 +544,10 @@ impl ResultCache {
                 limits.default_ttl
             }
         };
+        if ttl.is_zero() && !(cc.revalidatable && (cc.etag.is_some() || cc.last_modified.is_some()))
+        {
+            return Err(Ineligible::NoFreshness);
+        }
         Ok(ttl)
     }
 
@@ -786,6 +972,65 @@ mod tests {
     }
 
     #[test]
+    fn persistent_key_encoding_is_versioned_and_covers_every_dimension() {
+        let base = key("alice", "f");
+        let encoded = base.stable_bytes();
+        assert!(encoded.starts_with(b"vgi-client-result-cache-key\0v1"));
+        assert_eq!(encoded, base.stable_bytes(), "encoding is deterministic");
+
+        let mut variants = Vec::new();
+        let mut k = base.clone();
+        k.catalog = "other".into();
+        variants.push(k);
+        let mut k = base.clone();
+        k.identity_scope = "bob".into();
+        variants.push(k);
+        let mut k = base.clone();
+        k.worker_label = "other".into();
+        variants.push(k);
+        let mut k = base.clone();
+        k.function = "g".into();
+        variants.push(k);
+        let mut k = base.clone();
+        k.arguments = vec![1];
+        variants.push(k);
+        let mut k = base.clone();
+        k.projection = Some(vec![1]);
+        variants.push(k);
+        let mut k = base.clone();
+        k.filters = Some(vec![2]);
+        variants.push(k);
+        let mut k = base.clone();
+        k.catalog_version = 2;
+        variants.push(k);
+        let mut k = base.clone();
+        k.at = Some(("version".into(), "42".into()));
+        variants.push(k);
+        let mut k = base.clone();
+        k.settings = vec![3];
+        variants.push(k);
+        let mut k = base.clone();
+        k.attach_options = vec![4];
+        variants.push(k);
+        let mut k = base.clone();
+        k.row_limit = Some(5);
+        variants.push(k);
+        let mut k = base.clone();
+        k.ordering = Some(vec![6]);
+        variants.push(k);
+        let mut k = base.clone();
+        k.sample = Some(vec![7]);
+        variants.push(k);
+        let mut k = base.clone();
+        k.plan = Some(vec![8]);
+        variants.push(k);
+
+        for variant in variants {
+            assert_ne!(encoded, variant.stable_bytes());
+        }
+    }
+
+    #[test]
     fn an_unresolved_identity_is_refused() {
         let c = ResultCache::new(CacheLimits::default());
         assert_eq!(
@@ -881,6 +1126,52 @@ mod tests {
             c.eligibility(Some(&txn), Some("s"), 100),
             Err(Ineligible::TransactionScoped)
         );
+    }
+
+    #[test]
+    fn unknown_cache_scopes_fail_closed_and_deadlines_are_receipt_based() {
+        let c = ResultCache::new(CacheLimits::default());
+        let mut unknown = CacheControl::ttl(60);
+        unknown.scope = "future-global-scope".into();
+        assert_eq!(
+            c.eligibility(Some(&unknown), Some("s"), 1),
+            Err(Ineligible::UnsupportedScope)
+        );
+
+        let received_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let freshness = c
+            .freshness_at(Some(&cc(60)), Some("s"), received_at, Instant::now())
+            .unwrap();
+        assert_eq!(
+            freshness.expires_at(),
+            received_at + Duration::from_secs(60)
+        );
+        assert!(freshness.remaining() <= Duration::from_secs(60));
+
+        let expired = CacheControl::default().with_expires("1970-01-01T00:00:01Z");
+        assert!(matches!(
+            c.freshness_at(Some(&expired), Some("s"), received_at, Instant::now()),
+            Err(Ineligible::NoFreshness)
+        ));
+        let expired_revalidatable = expired.with_etag("v1").with_revalidatable();
+        let freshness = c
+            .freshness_at(
+                Some(&expired_revalidatable),
+                Some("s"),
+                received_at,
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(freshness.is_expired());
+
+        let wall_clock_still_fresh = CacheFreshness::at(
+            SystemTime::now(),
+            Instant::now() - Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(wall_clock_still_fresh.expires_at() > SystemTime::now());
+        assert!(wall_clock_still_fresh.is_expired());
     }
 
     #[test]
@@ -1219,7 +1510,8 @@ mod tests {
             Duration::from_secs(60),
             Some(&cc(60)),
         );
-        let mutations: Vec<Box<dyn Fn(&mut CacheKey)>> = vec![
+        type KeyMutation = Box<dyn Fn(&mut CacheKey)>;
+        let mutations: Vec<KeyMutation> = vec![
             Box::new(|key| key.settings = vec![1]),
             Box::new(|key| key.attach_options = vec![2]),
             Box::new(|key| key.row_limit = Some(10)),
