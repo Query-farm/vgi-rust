@@ -140,6 +140,52 @@ pub fn decode_attach_option_specs(info: &CatalogInfo) -> Result<Vec<AttachOption
         .collect()
 }
 
+/// Decode the typed, one-row default-value batch attached to a macro.
+///
+/// Only parameters that actually have defaults appear as columns. Keeping the
+/// values as Arrow arrays lets engine adapters preserve temporal, decimal,
+/// binary, and null types instead of round-tripping them through strings.
+pub fn decode_macro_defaults(info: &MacroInfo) -> Result<Vec<(String, ArrayRef)>> {
+    let Some(bytes) = info
+        .parameter_default_values
+        .as_ref()
+        .filter(|bytes| !bytes.0.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
+    if batch.num_rows() != 1 {
+        return Err(RpcError::type_error(format!(
+            "MacroInfo.parameter_default_values must contain one row, found {}",
+            batch.num_rows()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut defaults = Vec::with_capacity(batch.num_columns());
+    for (field, value) in batch.schema().fields().iter().zip(batch.columns()) {
+        let parameter = info
+            .parameters
+            .iter()
+            .find(|parameter| parameter.eq_ignore_ascii_case(field.name()))
+            .ok_or_else(|| {
+                RpcError::type_error(format!(
+                    "macro {} default names unknown parameter {:?}",
+                    info.name,
+                    field.name()
+                ))
+            })?;
+        let key = parameter.to_ascii_lowercase();
+        if !seen.insert(key) {
+            return Err(RpcError::type_error(format!(
+                "macro {} declares duplicate default for parameter {:?}",
+                info.name, parameter
+            )));
+        }
+        defaults.push((parameter.clone(), value.clone()));
+    }
+    Ok(defaults)
+}
+
 /// Encode a one-row typed option batch for [`AttachOptions::options`].
 pub fn encode_attach_options(batch: &RecordBatch) -> Result<Bytes> {
     if batch.num_rows() != 1 {
@@ -690,5 +736,132 @@ mod attach_option_tests {
             ..Default::default()
         };
         assert!(!format!("{options:?}").contains("sentinel-secret"));
+    }
+}
+
+#[cfg(test)]
+mod macro_default_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    fn info(parameters: &[&str], defaults: Option<RecordBatch>) -> MacroInfo {
+        MacroInfo {
+            comment: None,
+            tags: Vec::new(),
+            name: "clamp".to_string(),
+            schema_name: "main".to_string(),
+            macro_type: DictString("scalar".to_string()),
+            parameters: parameters.iter().map(|value| value.to_string()).collect(),
+            parameter_default_values: defaults.map(|batch| {
+                Bytes::from(vgi_protocol::ipc::write_batch(&batch).expect("encode defaults"))
+            }),
+            definition: "val".to_string(),
+            arguments_schema: None,
+        }
+    }
+
+    fn defaults(fields: &[&str], columns: Vec<ArrayRef>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        RecordBatch::try_new(schema, columns).expect("defaults batch")
+    }
+
+    #[test]
+    fn decodes_named_typed_macro_defaults() {
+        let macro_info = info(
+            &["val", "lo", "hi"],
+            Some(defaults(
+                &["lo", "hi"],
+                vec![
+                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+                ],
+            )),
+        );
+        let decoded = decode_macro_defaults(&macro_info).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, "lo");
+        assert_eq!(
+            decoded[1]
+                .1
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            100
+        );
+    }
+
+    #[test]
+    fn empty_macro_defaults_are_absent() {
+        assert!(decode_macro_defaults(&info(&["x"], None))
+            .unwrap()
+            .is_empty());
+        let mut empty = info(&["x"], None);
+        empty.parameter_default_values = Some(Bytes::from(Vec::new()));
+        assert!(decode_macro_defaults(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn preserves_the_declared_type_of_a_null_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("lo", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![None])) as ArrayRef],
+        )
+        .unwrap();
+        let decoded = decode_macro_defaults(&info(&["lo"], Some(batch))).unwrap();
+        assert_eq!(decoded[0].1.data_type(), &DataType::Int64);
+        assert!(decoded[0].1.is_null(0));
+    }
+
+    #[test]
+    fn rejects_wrong_cardinality_unknown_and_duplicate_defaults() {
+        let two_rows = info(
+            &["lo"],
+            Some(defaults(
+                &["lo"],
+                vec![Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef],
+            )),
+        );
+        assert!(decode_macro_defaults(&two_rows)
+            .unwrap_err()
+            .message
+            .contains("one row"));
+
+        let unknown = info(
+            &["lo"],
+            Some(defaults(
+                &["other"],
+                vec![Arc::new(Int64Array::from(vec![0])) as ArrayRef],
+            )),
+        );
+        assert!(decode_macro_defaults(&unknown)
+            .unwrap_err()
+            .message
+            .contains("unknown parameter"));
+
+        let duplicate = info(
+            &["lo"],
+            Some(defaults(
+                &["lo", "LO"],
+                vec![
+                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                ],
+            )),
+        );
+        assert!(decode_macro_defaults(&duplicate)
+            .unwrap_err()
+            .message
+            .contains("duplicate default"));
     }
 }
