@@ -79,8 +79,10 @@ pub struct ConnectionOptions {
     pub launcher_idle_timeout: Option<Duration>,
     /// Override the state directory for a `launch:` worker.
     pub launcher_state_dir: Option<PathBuf>,
-    /// Optional per-request/read deadline. `None` disables the transport's
-    /// built-in default so the embedding query engine owns timeout policy.
+    /// Optional per-request/read deadline. For subprocess pipes this bounds
+    /// response reads and kills/poisons a timed-out child; `std` cannot
+    /// interrupt a blocked write to an anonymous pipe. `None` disables the
+    /// transport's built-in default so the embedding engine owns policy.
     pub rpc_timeout: Option<Duration>,
 }
 
@@ -208,7 +210,7 @@ impl VgiClient {
     }
 
     pub(crate) fn exchange_is_reusable(&self) -> bool {
-        self.exchange_reusable.load(Ordering::Acquire)
+        self.exchange_reusable.load(Ordering::Acquire) && self.transport.is_reusable()
     }
 
     /// Connect to wherever a `LOCATION` string points.
@@ -254,9 +256,11 @@ impl VgiClient {
         options: &ConnectionOptions,
     ) -> Result<Self> {
         match location {
-            VgiLocation::Subprocess(argv) => {
-                Self::connect_subprocess_with_debug(argv, options.worker_debug)
-            }
+            VgiLocation::Subprocess(argv) => Self::connect_subprocess_with_debug_and_timeout(
+                argv,
+                options.worker_debug,
+                options.rpc_timeout,
+            ),
             VgiLocation::Tcp { host, port } => {
                 let client = RpcClient::tcp_connect_with_timeout(host, *port, options.rpc_timeout)?;
                 Ok(Self::configured_stream(
@@ -323,6 +327,14 @@ impl VgiClient {
         cmd: &[S],
         worker_debug: bool,
     ) -> Result<Self> {
+        Self::connect_subprocess_with_debug_and_timeout(cmd, worker_debug, None)
+    }
+
+    fn connect_subprocess_with_debug_and_timeout<S: AsRef<OsStr>>(
+        cmd: &[S],
+        worker_debug: bool,
+        rpc_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let label = cmd
             .first()
             .map(|s| s.as_ref().to_string_lossy().into_owned())
@@ -332,7 +344,11 @@ impl VgiClient {
         } else {
             vgi_rpc_client::StderrMode::Null
         };
-        let transport = vgi_rpc_client::SubprocessTransport::spawn_with_stderr(cmd, stderr)?;
+        let transport = vgi_rpc_client::SubprocessTransport::spawn_with_stderr_and_timeout(
+            cmd,
+            stderr,
+            rpc_timeout,
+        )?;
         let client = RpcClient::from_transport(Box::new(transport));
         Ok(Self::configured_stream(client, label))
     }

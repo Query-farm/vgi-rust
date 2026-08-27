@@ -102,6 +102,11 @@ pub trait VgiTransport: Send {
 
     /// A short label for this connection, used in error messages.
     fn label(&self) -> &str;
+
+    /// Whether this connection remains safe to return to a pool.
+    fn is_reusable(&self) -> bool {
+        true
+    }
 }
 
 /// A byte-stream transport: subprocess, AF_UNIX, or TCP.
@@ -204,6 +209,10 @@ impl VgiTransport for StreamTransport {
 
     fn label(&self) -> &str {
         &self.label
+    }
+
+    fn is_reusable(&self) -> bool {
+        self.client.is_reusable()
     }
 }
 
