@@ -541,10 +541,13 @@ impl TableProducer for RevalidationPolicyProducer {
             .split([':', '|'])
             .next()
             .unwrap_or(self.policy.as_str());
-        let control = CacheControl::ttl(0)
+        let mut control = CacheControl::ttl(0)
             .with_etag(REVALIDATABLE_ETAG)
             .with_revalidatable()
             .with_stale_if_error(60);
+        if mode == "blocked_swr" {
+            control = control.with_stale_while_revalidate(60);
+        }
 
         if mode == "revoke_then_error" {
             if self.call == 2 && self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG) {
@@ -583,17 +586,17 @@ impl TableProducer for RevalidationPolicyProducer {
             }
         }
 
-        if mode == "blocked_not_modified"
+        if matches!(mode, "blocked_not_modified" | "blocked_swr")
             && self.call == 2
             && self.if_none_match.as_deref() == Some(REVALIDATABLE_ETAG)
         {
             let mut parts = self.policy.split('|');
             let _ = parts.next();
             let entered = parts.next().ok_or_else(|| {
-                RpcError::runtime_error("blocked_not_modified requires an entered path")
+                RpcError::runtime_error(format!("{mode} requires an entered path"))
             })?;
             let release = parts.next().ok_or_else(|| {
-                RpcError::runtime_error("blocked_not_modified requires a release path")
+                RpcError::runtime_error(format!("{mode} requires a release path"))
             })?;
             std::fs::write(entered, b"entered").map_err(|error| {
                 RpcError::runtime_error(format!("write revalidation entered marker: {error}"))
