@@ -1,19 +1,21 @@
-# VGI (Vector Gateway Interface) — Rust
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Query-farm/vgi-rust/main/docs/vgi-logo.png?v=2" alt="Vector Gateway Interface logo" width="320">
+</p>
+
+<h1 align="center">VGI for Rust</h1>
 
 <p align="center">
-  <img src="docs/vgi-logo.png" alt="VGI Logo" width="480">
+  Add your own functions and tables to DuckDB with Rust and Apache Arrow.<br>
+  Built by <a href="https://query.farm">🚜 Query.Farm</a>
 </p>
 
 <p align="center">
-  <strong>Add your own functions and tables to DuckDB — written in Rust, shipped as one binary.<br/>
-  No C++ extension to compile, no linking against DuckDB, no version coupling.</strong>
+  <a href="https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml"><img src="https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/vgi"><img src="https://img.shields.io/crates/v/vgi" alt="crates.io"></a>
+  <a href="https://crates.io/crates/vgi"><img src="https://img.shields.io/crates/d/vgi" alt="crates.io downloads"></a>
+  <a href="https://docs.rs/vgi"><img src="https://img.shields.io/docsrs/vgi" alt="docs.rs"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Query%20Farm%20Source--Available-blue" alt="License"></a>
 </p>
-
-<p align="center">
-  Created by <a href="https://query.farm">Query.Farm</a>
-</p>
-
----
 
 A **VGI worker** is a small Rust program that DuckDB talks to over Apache Arrow IPC.
 It can expose scalar / table / aggregate functions and whole catalogs (schemas,
