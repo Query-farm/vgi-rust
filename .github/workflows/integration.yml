@@ -25,7 +25,7 @@ concurrency:
 env:
   # One reviewed VGI revision is the authority for BOTH the suite and extension.
   # Update this full SHA deliberately; never point it at a moving branch.
-  VGI_REF: 486c6a1f815dd896884b526cd29c937a81abb344
+  VGI_REF: 507ae620d06cd4da0da1a6b1b9f937d9942e8e8f
   # VGI_REF pins Haybarn engine commit 105edd31b57fe7e6d32ee648efad562e45a9f908.
   # This release's unittest runner is built from that same engine revision, so
   # its extension ABI/platform metadata matches the source-built artifact.
