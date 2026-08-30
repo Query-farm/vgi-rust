@@ -1296,6 +1296,35 @@ impl Dispatcher {
 
         // Table-in-out (exchange) path.
         if self.tableinouts.contains_key(&bind_call.function_name) {
+            // FINALIZE flushes accumulated state as a producer stream, and
+            // legitimately carries no input schema (the bind_call is echoed
+            // verbatim from the original bind, but this dispatch never
+            // consults input_schema for FINALIZE -- see `finalize_table_in_out`
+            // in vgi-client/src/exchange.rs). Any other phase -- including a
+            // phase of `None`, which is exactly what a caller sends when it
+            // drives this function through the plain-producer call shape
+            // (`bind()` + `scan()`, no input schema) instead of the exchange
+            // shape (`bind_with_input()` + `open_exchange()`) -- requires a
+            // real input schema, because that is the ordinary INPUT-phase
+            // exchange. Checked immediately, before `resolve_table_in_out` or
+            // any user code runs, so the mismatch fails with a clear error
+            // naming the fix instead of silently falling through to
+            // `input_schema.unwrap_or_else(|| empty schema)` further below and
+            // leaving both sides waiting on each other forever: the worker for
+            // terminating input that never arrives (it thinks it opened an
+            // exchange), the client for a continuation token the worker never
+            // stops sending (it thinks it opened a plain scan). Confirmed live
+            // against real deployed workers in vgi-python and vgi-typescript;
+            // this is the mirror-image fix for this repo.
+            let phase = dto.phase.as_ref().map(|d| d.0.clone()).unwrap_or_default();
+            if phase != crate::protocol::enums::phase::FINALIZE && input_schema.is_none() {
+                return Err(RpcError::value_error(format!(
+                    "'{}' is a table-in-out function (it requires an input row stream) but no \
+                     input schema was supplied -- call it via `bind_with_input` + \
+                     `open_exchange`, not `bind` + `scan`.",
+                    bind_call.function_name
+                )));
+            }
             let f = self.resolve_table_in_out(
                 &bind_call.function_name,
                 &bp.arguments,
@@ -1306,7 +1335,6 @@ impl Dispatcher {
             let auto_apply = f.metadata().auto_apply_filters;
             let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
             // FINALIZE phase: flush accumulated state as a producer stream.
-            let phase = dto.phase.as_ref().map(|d| d.0.clone()).unwrap_or_default();
             if phase == crate::protocol::enums::phase::FINALIZE {
                 let header = wire::to_batch(GlobalInitResponse {
                     execution_id: Bytes::from(execution_id.clone()),
@@ -1409,6 +1437,25 @@ impl Dispatcher {
             || (!self.scalars.contains_key(&bind_call.function_name)
                 && self.tables.contains_key(&bind_call.function_name))
         {
+            // Mirror image of the table-in-out guard above: a plain producer
+            // takes no input row stream, so it never legitimately carries a
+            // table-in-out init phase or an input schema (see `scan.rs`'s
+            // producer bind, which always sends `input_schema: None` and no
+            // phase at all). Either signal here means the caller drove this
+            // function through the exchange call shape
+            // (`bind_with_input`/`open_exchange`) instead of a plain scan
+            // (`bind`/`scan`). Reject immediately, before `resolve_table` or
+            // any user code runs, rather than silently ignoring the phase/
+            // input schema and running as an ordinary producer while the
+            // caller sits feeding rows nobody reads.
+            if dto.phase.is_some() || input_schema.is_some() {
+                return Err(RpcError::value_error(format!(
+                    "'{}' is a plain table function (it takes no input row stream) but was \
+                     called with a table-in-out init phase and/or input schema set -- call it \
+                     via `bind` + `scan`, not `bind_with_input` + `open_exchange`.",
+                    bind_call.function_name
+                )));
+            }
             let f = self.resolve_table(
                 &bind_call.function_name,
                 &bp.arguments,

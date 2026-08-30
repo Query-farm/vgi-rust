@@ -170,6 +170,9 @@ pub use ::vgi_rpc::{Result, RpcError};
 #[cfg(test)]
 mod http_continuation_tests;
 
+#[cfg(test)]
+mod function_shape_dispatch_tests;
+
 pub use dispatch::FunctionScope;
 pub use function::{
     ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
