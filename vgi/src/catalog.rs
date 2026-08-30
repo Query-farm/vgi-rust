@@ -1171,11 +1171,21 @@ pub fn view_info(schema: &str, v: &CatView) -> crate::protocol::dtos::ViewInfo {
 /// The flat `ScanFunctionResult` batch for a function-backed table (used both
 /// for the inlined `TableInfo.scan_function` and the lazy
 /// `catalog_table_scan_function_get` RPC response).
-pub fn scan_function_result(t: &CatTable) -> Result<crate::protocol::dtos::ScanFunctionResult> {
+///
+/// `schema` is the table's own containing schema — a best-effort default,
+/// not a guaranteed-correct resolution: this level has no cross-schema
+/// function registry, so it cannot tell whether `t.scan_function` actually
+/// lives elsewhere (e.g. "tables in `data` are scanned by functions in
+/// `main`"). Right in the common case, not exhaustive.
+pub fn scan_function_result(
+    schema: &str,
+    t: &CatTable,
+) -> Result<crate::protocol::dtos::ScanFunctionResult> {
     Ok(crate::protocol::dtos::ScanFunctionResult {
         function_name: t.scan_function.clone(),
         arguments: Bytes::from(t.scan_arguments.clone()),
         required_extensions: Vec::new(),
+        schema_name: Some(schema.to_string()),
     })
 }
 
@@ -1211,12 +1221,27 @@ fn validate_required_filters(
     Ok(())
 }
 
-pub fn table_info(schema: &str, t: &CatTable) -> Result<crate::protocol::dtos::TableInfo> {
+pub fn table_info(
+    schema: &str,
+    t: &CatTable,
+    scan_function_schema: Option<&str>,
+) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
+    //
+    // `scan_function_schema` is the caller's real-registry resolution of which
+    // schema `t.scan_function` actually lives in (see
+    // `Dispatcher::resolve_table_function_schema`) — pass `None` only when the
+    // caller has no registry access, in which case this falls back to the
+    // table's own schema as a best-effort default (not a guaranteed-correct
+    // cross-schema resolution: a globally-registered function's real home may
+    // differ from the table's own schema).
     let scan = if t.inline_scan && !t.scan_function.is_empty() {
-        ipc::write_batch(&crate::wire::to_batch(scan_function_result(t)?)?)?
+        ipc::write_batch(&crate::wire::to_batch(scan_function_result(
+            scan_function_schema.unwrap_or(schema),
+            t,
+        )?)?)?
     } else {
         Vec::new()
     };
@@ -1738,7 +1763,7 @@ mod tests {
             vec!["a".to_string()],
             vec!["a".to_string(), "b".to_string()],
         ]);
-        let info = table_info("data", &t).expect("table_info");
+        let info = table_info("data", &t, None).expect("table_info");
         assert_eq!(
             info.required_filters,
             vec![
@@ -1780,21 +1805,21 @@ mod tests {
     #[test]
     fn test_required_filters_rejects_empty_group() {
         let t = ab_table(vec![vec![]]);
-        let err = table_info("data", &t).expect_err("empty group must be rejected");
+        let err = table_info("data", &t, None).expect_err("empty group must be rejected");
         assert!(err.to_string().contains("empty groups"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_empty_string() {
         let t = ab_table(vec![vec!["".to_string()]]);
-        let err = table_info("data", &t).expect_err("empty string must be rejected");
+        let err = table_info("data", &t, None).expect_err("empty string must be rejected");
         assert!(err.to_string().contains("empty strings"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_unknown_column() {
         let t = ab_table(vec![vec!["nope".to_string()]]);
-        let err = table_info("data", &t).expect_err("unknown column must be rejected");
+        let err = table_info("data", &t, None).expect_err("unknown column must be rejected");
         assert!(err.to_string().contains("unknown column"), "got: {err}");
     }
 
@@ -1803,7 +1828,7 @@ mod tests {
         // A dotted path's leading segment ('a') is a real column; the subfield
         // ('x') is left to DuckDB's binder — validation must accept it.
         let t = ab_table(vec![vec!["a.x".to_string()]]);
-        assert!(table_info("data", &t).is_ok());
+        assert!(table_info("data", &t, None).is_ok());
     }
 }
 

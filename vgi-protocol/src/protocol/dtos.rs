@@ -866,6 +866,16 @@ pub struct ScanBranch {
     /// arguments. A 1-row IPC batch whose COLUMN NAMES are the option names, the
     /// same shape `arguments` uses, because an option value may be any Arrow type.
     pub format_options: Option<Bytes>,
+    /// Function branch only — the catalog schema that registers `function_name`.
+    /// A function name is unique only within a schema, so a client can no
+    /// longer be forced to guess (table's own schema, then `default_schema`)
+    /// which implementation this branch's `function_name` refers to when the
+    /// same name is registered in more than one schema. `None` for a pre-1.5.0
+    /// worker, or when the function has no schema of its own to report.
+    /// Unrelated to `source_schema` above, which is a catalog-table branch's
+    /// *source table's* schema, not this function's own. Added in protocol
+    /// 1.5.0. Appended last for consistency with the reference wire contract.
+    pub schema_name: Option<String>,
 }
 
 /// Response for `catalog_table_scan_branches_get`. The `branches` list must be
@@ -1139,6 +1149,15 @@ pub struct ScanFunctionResult {
     pub function_name: String,
     pub arguments: Bytes,
     pub required_extensions: Vec<String>,
+    /// The catalog schema that registers `function_name`. A function name is
+    /// unique only within a schema, so a client can no longer be forced to
+    /// guess (table's own schema, then `default_schema`) which implementation
+    /// this response's `function_name` refers to when the same name is
+    /// registered in more than one schema. `None` for a pre-1.5.0 worker, or
+    /// when the function has no schema of its own to report. Added in
+    /// protocol 1.5.0. Appended last for consistency with the reference wire
+    /// contract.
+    pub schema_name: Option<String>,
 }
 
 /// `FunctionInfo` item — describes a function to DuckDB.
@@ -1433,6 +1452,7 @@ mod federation_tests {
             format_name: None,
             format_locations: None,
             format_options: None,
+            schema_name: None,
         };
         let batch = crate::wire::to_batch(b).unwrap();
         let back: ScanBranch = crate::wire::from_batch(&batch).unwrap();

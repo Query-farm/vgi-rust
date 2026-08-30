@@ -14,7 +14,8 @@
 
 use vgi_protocol::generated::protocol_schemas as gen;
 use vgi_protocol::protocol::dtos::{
-    CatalogInfo, FunctionInfo, MacroInfo, SchemaInfo, TableInfo, ViewInfo,
+    CatalogInfo, FunctionInfo, MacroInfo, ScanBranch, ScanFunctionResult, SchemaInfo, TableInfo,
+    ViewInfo,
 };
 use vgi_protocol::wire::flat_schema;
 
@@ -59,4 +60,20 @@ fn catalog_info_matches() {
     // the worker builds it by hand in `vgi::catalog::serialize_catalog_info`.
     // This is the check that the reader and that hand-builder agree.
     assert_eq!(flat_schema::<CatalogInfo>(), gen::catalog_info_schema());
+}
+
+#[test]
+fn scan_function_result_matches() {
+    // Nothing else in this suite covered `ScanFunctionResult` before protocol
+    // 1.5.0 added `schema_name` — that gap is exactly how a missed field here
+    // could have shipped silently. Pin it now like every other DTO above.
+    assert_eq!(
+        flat_schema::<ScanFunctionResult>(),
+        gen::scan_function_result_schema()
+    );
+}
+
+#[test]
+fn scan_branch_matches() {
+    assert_eq!(flat_schema::<ScanBranch>(), gen::scan_branch_schema());
 }

@@ -2378,7 +2378,10 @@ impl Dispatcher {
             Some(s) => s
                 .tables
                 .iter()
-                .map(|t| catalog::table_info(&name, t))
+                .map(|t| {
+                    let scan_schema = self.resolve_table_function_schema(&t.scan_function, &name);
+                    catalog::table_info(&name, t, scan_schema.as_deref())
+                })
                 .collect::<Result<_>>()?,
             None => Vec::new(),
         };
@@ -2397,7 +2400,8 @@ impl Dispatcher {
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .map(|t| {
                 let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
-                catalog::table_info(&schema_name, &tt)
+                let scan_schema = self.resolve_table_function_schema(&tt.scan_function, &schema_name);
+                catalog::table_info(&schema_name, &tt, scan_schema.as_deref())
             })
             .transpose()?
             .into_iter()
@@ -2405,6 +2409,29 @@ impl Dispatcher {
         Ok(Some(wire::to_result_batch(ItemsResult {
             items: catalog::serialize_items(infos)?,
         })?))
+    }
+
+    /// Resolve which schema `function_name` (a table function) actually lives
+    /// in, using the real registration registry (`homes_of`) rather than
+    /// assuming it shares the table's own schema. A table's backing function
+    /// is not necessarily registered in the table's own containing schema —
+    /// `register_table` (unscoped) homes a function in this catalog's default
+    /// schema regardless of which schema declares the table, exactly the
+    /// "tables in `data` are scanned by functions in `main`" case this
+    /// resolution exists to get right. Prefers the table's own schema when the
+    /// function IS registered there (the common case); falls back to the
+    /// function's one real home when it's registered exactly once elsewhere;
+    /// returns `None` (caller falls back to the table's own schema as a
+    /// best-effort default) when the registry has no unambiguous answer.
+    fn resolve_table_function_schema(&self, function_name: &str, table_schema: &str) -> Option<String> {
+        let homes = self.homes_of(FnKind::Table, function_name);
+        if homes.iter().any(|h| h.schema.eq_ignore_ascii_case(table_schema)) {
+            Some(table_schema.to_string())
+        } else if let [only] = homes {
+            Some(only.schema.clone())
+        } else {
+            None
+        }
     }
 
     /// Lazy scan-function resolution for non-inlined function-backed tables.
@@ -2421,7 +2448,11 @@ impl Dispatcher {
                 RpcError::value_error(format!("Unknown table: '{schema_name}.{table_name}'"))
             })?;
         let t = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
+        let resolved_schema = self
+            .resolve_table_function_schema(&t.scan_function, &schema_name)
+            .unwrap_or_else(|| schema_name.clone());
         Ok(Some(wire::to_result_batch(catalog::scan_function_result(
+            &resolved_schema,
             &t,
         )?)?))
     }
@@ -2798,11 +2829,21 @@ impl Dispatcher {
             Some(defs) => defs
                 .iter()
                 .map(|d| {
+                    // Function branch only — a catalog-table/format branch
+                    // never carries this field (its schema_name would be
+                    // the SOURCE table's schema, a different, older field:
+                    // source_schema).
+                    let branch_schema = (!d.function_name.is_empty())
+                        .then(|| {
+                            self.resolve_table_function_schema(&d.function_name, &schema_name)
+                                .unwrap_or_else(|| schema_name.clone())
+                        });
                     mk(ScanBranch {
                         function_name: d.function_name.clone(),
                         arguments: Bytes::from(d.scan_arguments.clone()),
                         branch_filter: d.branch_filter.clone(),
                         writable: d.writable,
+                        schema_name: branch_schema,
                         source_catalog: d.source_catalog.clone(),
                         source_schema: d.source_schema.clone(),
                         source_table: d.source_table.clone(),
@@ -2826,6 +2867,10 @@ impl Dispatcher {
                 arguments: Bytes::from(t.scan_arguments.clone()),
                 branch_filter: None,
                 writable: false,
+                schema_name: Some(
+                    self.resolve_table_function_schema(&t.scan_function, &schema_name)
+                        .unwrap_or_else(|| schema_name.clone()),
+                ),
                 source_catalog: None,
                 source_schema: None,
                 source_table: None,

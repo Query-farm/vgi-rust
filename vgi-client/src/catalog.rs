@@ -867,6 +867,7 @@ fn scan_branches_from_legacy(
             arguments: legacy.arguments,
             branch_filter: None,
             writable: false,
+            schema_name: legacy.schema_name,
             source_catalog: None,
             source_schema: None,
             source_table: None,
@@ -1030,6 +1031,7 @@ mod attach_option_tests {
                         function_name: "legacy_sequence".to_string(),
                         arguments: Bytes(vec![42]),
                         required_extensions: vec!["legacy_ext".to_string()],
+                        schema_name: Some("legacy_schema".to_string()),
                     })?;
                     let encoded = ipc::write_batch(&inner)?;
                     RecordBatch::try_from_iter(vec![(
@@ -1139,6 +1141,11 @@ mod attach_option_tests {
         );
         assert_eq!(first.branches.len(), 1);
         assert_eq!(first.branches[0].function_name, "legacy_sequence");
+        assert_eq!(
+            first.branches[0].schema_name.as_deref(),
+            Some("legacy_schema"),
+            "scan_branches_from_legacy must carry the legacy response's schema_name through, not drop it"
+        );
         assert_eq!(first.required_extensions, ["legacy_ext"]);
 
         let second = client.table_scan_branches(&cat, &table, None).unwrap();

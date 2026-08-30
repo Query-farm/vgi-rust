@@ -41,8 +41,12 @@
 /// function by name, so a name declared in two schemas cannot mis-route at
 /// runtime after binding correctly. 1.3.0 adds `global_functions` and
 /// `global_function_prefix` to `CatalogAttachResult` — functions a worker asks
-/// the client to publish into its global namespace.
-pub const VGI_PROTOCOL_VERSION: &str = "1.4.0";
+/// the client to publish into its global namespace. 1.5.0 adds `schema_name`
+/// to `ScanFunctionResult`/`ScanBranch` — the worker's own authoritative
+/// schema for the function it just resolved, so a client no longer has to
+/// guess (table's own schema, then `default_schema`) when the same function
+/// name is registered in more than one schema.
+pub const VGI_PROTOCOL_VERSION: &str = "1.5.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 

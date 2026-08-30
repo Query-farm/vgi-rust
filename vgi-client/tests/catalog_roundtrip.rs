@@ -285,6 +285,13 @@ fn decodes_and_validates_catalog_scan_branches() {
         .branches
         .iter()
         .all(|branch| branch.branch_filter.is_none()));
+    assert!(
+        numbers
+            .branches
+            .iter()
+            .all(|branch| branch.schema_name.as_deref() == Some("main")),
+        "worker must stamp the function's REAL registered schema (protocol 1.5.0) via the          registry, not the table's own schema — `sequence` is registered unscoped          (register_table), so its real home is the catalog's default schema (`main`), even          though `multi_branch_numbers` itself lives in `data`"
+    );
 
     let filtered = table(&mut client, "multi_branch_filtered_numbers");
     let filtered = client

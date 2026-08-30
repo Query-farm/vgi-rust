@@ -77,6 +77,7 @@ const TRANSFORM_NAME: &str = "test_same_name_transform";
 const BUFFERED_NAME: &str = "test_same_name_buffered";
 const AGG_NAME: &str = "test_same_name_agg";
 const CACHED_NAME: &str = "test_same_name_cached";
+const TABLE_SCAN_NAME: &str = "test_same_name_table_scan";
 
 /// Long enough that the cache TTL never lapses mid-test.
 const CACHE_TTL_SECONDS: i64 = 300;
@@ -446,13 +447,94 @@ impl TableProducer for CachedTagRow {
     }
 }
 
-/// Declare all four pairs, each implementation into its own schema of
-/// `example`. Only the primary catalog carries them.
+// ---------------------------------------------------------------------------
+// Declarative-table backing scan (table dispatch)
+// ---------------------------------------------------------------------------
+
+/// test_same_name_table_scan() -- backs the declarative test_same_name_table
+/// (see catalog_def.rs), registered under one name in BOTH schemas. Unlike the
+/// four pairs above (each reached by calling the function directly), this one
+/// is reached only via catalog_table_scan_function_get /
+/// catalog_table_scan_branches_get -- the RPC pair that tells a client which
+/// function backs a declarative table, and the end-to-end regression guard
+/// for protocol 1.5.0's ScanFunctionResult.schema_name /
+/// ScanBranch.schema_name. Driven by
+/// test/sql/integration/table/same_name_schemas.test.
+pub struct SameNameTableScan {
+    schema: &'static str,
+}
+
+impl TableFunction for SameNameTableScan {
+    fn name(&self) -> &str {
+        TABLE_SCAN_NAME
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: format!(
+                "Schema-disambiguation probe; the {}-schema table producer",
+                self.schema
+            ),
+            categories: vec!["generator".into(), "testing".into()],
+            examples: vec![FunctionExample {
+                sql: format!("SELECT * FROM example.{}.test_same_name_table", self.schema),
+                description: format!("One row tagged '{}'", self.schema),
+                expected_output: Some(self.schema.to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        Vec::new()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: tag_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(TaggedRow {
+            schema: params.output_schema.clone(),
+            tag: self.schema,
+            done: false,
+        }))
+    }
+}
+
+/// Emits the single schema-tagged row once -- no cache metadata, unlike
+/// CachedTagRow above; this probes plain scan dispatch, not the result cache.
+struct TaggedRow {
+    schema: SchemaRef,
+    tag: &'static str,
+    done: bool,
+}
+
+impl TableProducer for TaggedRow {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![Arc::new(StringArray::from(vec![self.tag])) as ArrayRef],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        false
+    }
+}
+
+/// Declare all five pairs, each implementation into its own schema of
+/// example. Only the primary catalog carries them.
 pub fn register(w: &mut vgi::Worker) {
     for schema in SCHEMAS {
         w.register_table_in_out_in(CATALOG, schema, SameNameTransform { schema });
         w.register_buffering_in(CATALOG, schema, SameNameBuffered { schema });
         w.register_aggregate_in(CATALOG, schema, SameNameAgg { schema });
         w.register_table_in(CATALOG, schema, SameNameCached { schema });
+        w.register_table_in(CATALOG, schema, SameNameTableScan { schema });
     }
 }

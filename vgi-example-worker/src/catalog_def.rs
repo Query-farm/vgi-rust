@@ -1173,6 +1173,20 @@ fn data_tables() -> Vec<CatTable> {
     }];
     tables.push(projects);
 
+    // Schema-disambiguation probe (table dispatch): same registered table
+    // name as the main-schema table below, backed by this schema's own
+    // scan-function implementation (test_same_name_table_scan, registered in
+    // BOTH schemas — see same_name.rs). Driven by
+    // test/sql/integration/table/same_name_schemas.test.
+    tables.push(fn_table(
+        "test_same_name_table",
+        &[("tag", Utf8)],
+        "test_same_name_table_scan",
+        vec![],
+        None,
+        "Schema-disambiguation probe; the data-schema table",
+    ));
+
     tables
 }
 
@@ -1412,7 +1426,22 @@ pub fn build() -> CatalogModel {
                         )
                     },
                 ],
-                tables: vec![],
+                tables: vec![
+                    // Schema-disambiguation probe (table dispatch): same
+                    // registered table name as the data-schema table, backed
+                    // by this schema's own scan-function implementation
+                    // (test_same_name_table_scan, registered in BOTH schemas
+                    // -- see same_name.rs). Driven by
+                    // test/sql/integration/table/same_name_schemas.test.
+                    fn_table(
+                        "test_same_name_table",
+                        &[("tag", DataType::Utf8)],
+                        "test_same_name_table_scan",
+                        vec![],
+                        None,
+                        "Schema-disambiguation probe; the main-schema table",
+                    ),
+                ],
             },
             CatSchema {
                 name: "data".to_string(),
