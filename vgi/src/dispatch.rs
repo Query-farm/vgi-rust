@@ -2400,7 +2400,8 @@ impl Dispatcher {
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .map(|t| {
                 let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
-                let scan_schema = self.resolve_table_function_schema(&tt.scan_function, &schema_name);
+                let scan_schema =
+                    self.resolve_table_function_schema(&tt.scan_function, &schema_name);
                 catalog::table_info(&schema_name, &tt, scan_schema.as_deref())
             })
             .transpose()?
@@ -2423,9 +2424,16 @@ impl Dispatcher {
     /// function's one real home when it's registered exactly once elsewhere;
     /// returns `None` (caller falls back to the table's own schema as a
     /// best-effort default) when the registry has no unambiguous answer.
-    fn resolve_table_function_schema(&self, function_name: &str, table_schema: &str) -> Option<String> {
+    fn resolve_table_function_schema(
+        &self,
+        function_name: &str,
+        table_schema: &str,
+    ) -> Option<String> {
         let homes = self.homes_of(FnKind::Table, function_name);
-        if homes.iter().any(|h| h.schema.eq_ignore_ascii_case(table_schema)) {
+        if homes
+            .iter()
+            .any(|h| h.schema.eq_ignore_ascii_case(table_schema))
+        {
             Some(table_schema.to_string())
         } else if let [only] = homes {
             Some(only.schema.clone())
@@ -2833,11 +2841,10 @@ impl Dispatcher {
                     // never carries this field (its schema_name would be
                     // the SOURCE table's schema, a different, older field:
                     // source_schema).
-                    let branch_schema = (!d.function_name.is_empty())
-                        .then(|| {
-                            self.resolve_table_function_schema(&d.function_name, &schema_name)
-                                .unwrap_or_else(|| schema_name.clone())
-                        });
+                    let branch_schema = (!d.function_name.is_empty()).then(|| {
+                        self.resolve_table_function_schema(&d.function_name, &schema_name)
+                            .unwrap_or_else(|| schema_name.clone())
+                    });
                     mk(ScanBranch {
                         function_name: d.function_name.clone(),
                         arguments: Bytes::from(d.scan_arguments.clone()),
