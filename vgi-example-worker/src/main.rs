@@ -45,7 +45,7 @@ fn main() {
     if catalog_name == datafusion_companion::ROOT_CATALOG {
         datafusion_companion::register(&mut worker);
         worker.set_catalog(datafusion_companion::root_catalog());
-        worker.run();
+        run_worker(worker);
         return;
     }
     scalar::register(&mut worker);
@@ -99,7 +99,49 @@ fn main() {
         global_functions::register(&mut worker);
     }
     worker.set_catalog(catalog);
-    worker.run();
+    run_worker(worker);
+}
+
+/// Serve the example catalog behind the local Iroh HTTP bridge used by the
+/// browser demo. This mode is deliberately explicit: ordinary `--http`
+/// retains its existing authentication configuration.
+fn run_worker(worker: Worker) {
+    if !std::env::args().any(|arg| arg == "--http-iroh-demo") {
+        worker.run();
+        return;
+    }
+
+    let provider = vgi_rpc::iroh_forwarded_header_provider(
+        vgi_rpc::IrohForwardedHeaderConfig::new("iroh:browser-demo", ["127.0.0.1"])
+            .expect("valid browser demo Iroh identity config"),
+    )
+    .expect("valid browser demo Iroh provider");
+    let state = vgi_rpc::http::HttpState::builder()
+        .server(std::sync::Arc::new(worker.build_server()))
+        .peer_identity_providers([provider])
+        .peer_authentication_policy(vgi_rpc::peer_identity_primary("iroh"))
+        .enable_sticky(true)
+        .producer_batch_limit(1)
+        .build();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind browser demo worker");
+        println!(
+            "PORT:{}",
+            listener.local_addr().expect("local address").port()
+        );
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+        vgi_rpc::http::serve_with_shutdown(state, listener)
+            .await
+            .expect("serve browser demo worker");
+    });
 }
 
 /// Register the `vgi_example` secret type and the custom settings the

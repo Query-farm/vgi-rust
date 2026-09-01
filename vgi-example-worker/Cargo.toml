@@ -39,6 +39,7 @@ arrow-select = { workspace = true }
 arrow-row = { workspace = true }
 ctrlc = "3"
 sha2 = { version = "0.10" }
+tokio = { version = "1", features = ["full"] }
 
 # `sha2`'s `asm` feature is what routes bulk hashing onto the ARMv8 SHA-2
 # instructions (~3.8x on Apple Silicon) — but `sha2-asm` fails to build under
