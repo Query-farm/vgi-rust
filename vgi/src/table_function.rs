@@ -22,13 +22,18 @@ pub struct TableCardinality {
 ///
 /// Returns the next batch, or `None` when the scan is exhausted. The dispatch
 /// adapter applies projection / auto-filter pushdown to each batch before
-/// emitting, so producers stay free of that concern. `out` is provided only
-/// for `client_log` — do NOT emit through it (the adapter emits the returned
-/// batch).
+/// emitting, so producers stay free of that concern. `out` is provided for
+/// `client_log` and the transport's response-budget snapshot — do NOT emit
+/// through it (the adapter emits the returned batch). HTTP-aware producers can
+/// size their next batch toward `out.preferred_response_bytes()` and must treat
+/// `out.response_limit_bytes()` as the hard decoded, uncompressed Arrow IPC
+/// response ceiling. Both are `None` on transports or deployments that
+/// supplied no budget.
 pub trait TableProducer: Send {
     /// Produce the next output batch, or `None` when the scan is exhausted.
-    /// Called repeatedly until it returns `None`. `out` is for `client_log`
-    /// only — return the batch, do not emit through `out`.
+    /// Called repeatedly until it returns `None`. `out` exposes client logging
+    /// plus immutable `response_limit_bytes()` / `preferred_response_bytes()`
+    /// snapshots for this turn; return the batch, do not emit through `out`.
     fn next_batch(
         &mut self,
         out: &mut vgi_rpc::OutputCollector,

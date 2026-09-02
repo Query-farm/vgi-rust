@@ -28,6 +28,9 @@ byte-for-byte wire-compatible with the canonical
 drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 [`vgi-rpc`](https://crates.io/crates/vgi-rpc); stock `arrow-rs` 59.x, **MSRV 1.97**.
 
+HTTP producer batching and worker-visible response budgets are covered in
+[`docs/response-budgets.md`](docs/response-budgets.md).
+
 ## Why a worker instead of a C++ extension?
 
 | Traditional DuckDB extension | VGI worker |

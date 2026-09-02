@@ -31,6 +31,18 @@ use crate::{ipc, wire};
 /// Rows per emitted batch for the test producers.
 const BATCH: i64 = 10;
 
+#[test]
+fn producer_can_read_the_transport_response_budget() {
+    fn snapshot(out: &OutputCollector) -> (Option<usize>, Option<usize>) {
+        (out.response_limit_bytes(), out.preferred_response_bytes())
+    }
+
+    // Keeping this as a typed function pointer makes the producer-facing API
+    // part of this crate's compile gate without needing to construct the
+    // transport-owned collector directly.
+    let _: fn(&OutputCollector) -> (Option<usize>, Option<usize>) = snapshot;
+}
+
 fn schema_n() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]))
 }
