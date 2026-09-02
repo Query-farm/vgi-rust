@@ -109,6 +109,20 @@ if ! ( cd "$INTEGRATION" || exit 1
   exit 1
 fi
 
+# The database-worker package tests intentionally package this executable by a
+# path relative to the unittest working directory.  Staging only the .test
+# files leaves that path unmatched, so copy the pinned fixture alongside them
+# and preserve its executable contract.  Keep this explicit rather than
+# copying all support files into every SDK lane.
+DATABASE_WORKER_FIXTURE="$VGI_SRC/test/support/database_worker_fixture.sh"
+if [ ! -f "$DATABASE_WORKER_FIXTURE" ]; then
+  echo "::error::pinned VGI suite is missing $DATABASE_WORKER_FIXTURE" >&2
+  exit 1
+fi
+mkdir -p "$STAGE/test/support" || exit 1
+install -m 0755 "$DATABASE_WORKER_FIXTURE" \
+  "$STAGE/test/support/database_worker_fixture.sh" || exit 1
+
 # Background worker processes (http servers) tracked here and killed on exit.
 BG_PIDS=()
 cleanup() { for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
