@@ -49,11 +49,11 @@ fi
 # version skew pulls two vgi-rpc copies into the example crate, so vgi_rpc's
 # error types stop matching vgi's trait bounds and every example fails to
 # compile. Derived, so a workspace bump can't silently break this lane.
-VGI_RPC_REQ="$(sed -n 's/^vgi-rpc = { version = "\([^"]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)"
-if [ -z "$VGI_RPC_REQ" ]; then
-  echo "could not read the vgi-rpc version from $REPO/Cargo.toml" >&2; exit 1
+VGI_RPC_DEP="$(sed -n 's/^vgi-rpc = //p' "$REPO/Cargo.toml" | head -1)"
+if [ -z "$VGI_RPC_DEP" ]; then
+  echo "could not read the vgi-rpc dependency from $REPO/Cargo.toml" >&2; exit 1
 fi
-echo "Using vgi-rpc $VGI_RPC_REQ (from the workspace Cargo.toml)"
+echo "Using workspace vgi-rpc dependency $VGI_RPC_DEP"
 
 cat > "$WORK/Cargo.toml" <<EOF
 [package]
@@ -64,7 +64,7 @@ publish = false
 
 [dependencies]
 vgi = { path = "$REPO/vgi" }
-vgi-rpc = "$VGI_RPC_REQ"
+vgi-rpc = $VGI_RPC_DEP
 arrow-array = "59"
 arrow-schema = "59"
 

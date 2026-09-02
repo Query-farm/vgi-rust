@@ -27,7 +27,7 @@ vgi-protocol = { version = "0.32.0", path = "vgi-protocol" }
 # The VGI protocol client (attach, discovery, function calls).
 vgi-client = { version = "0.32.0", path = "vgi-client" }
 # Transport-level RPC client the VGI client is built on.
-vgi-rpc-client = { version = "0.23.3", default-features = false }
+vgi-rpc-client = { version = "0.23.3", git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "945da96af34eb8f3d6fe1c90f8f3e9e739da9cd8", default-features = false }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
