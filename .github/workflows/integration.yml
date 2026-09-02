@@ -245,7 +245,10 @@ jobs:
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
           VGI_EXTENSION_PATH: ${{ github.workspace }}/vgi-extension/vgi.duckdb_extension
           TRANSPORT: stdio
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/stdio-%p-%m.profraw
+          # coverage.rs periodically rewrites a complete snapshot. Do not use
+          # %m (online merge): merging every cumulative snapshot into the same
+          # file double-counts until LLVM counters overflow.
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/stdio-%p.profraw
 
       - name: Run integration suite (launcher) with coverage
         shell: bash
@@ -255,7 +258,7 @@ jobs:
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
           VGI_EXTENSION_PATH: ${{ github.workspace }}/vgi-extension/vgi.duckdb_extension
           TRANSPORT: launch
-          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/launch-%p-%m.profraw
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/launch-%p.profraw
 
       - name: Merge + report coverage
         if: always()

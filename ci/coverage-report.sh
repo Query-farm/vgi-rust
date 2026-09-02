@@ -7,7 +7,7 @@
 # exercises. Untested code = a gap in the suite.
 #
 # Usage: coverage-report.sh <worker-binary> <profraw-dir> [out-dir]
-set -uo pipefail
+set -euo pipefail
 
 BIN="${1:?worker binary}"
 COVDIR="${2:?dir of .profraw files}"
@@ -24,13 +24,22 @@ mkdir -p "$OUT"
 : > "$COVDIR/list.txt"
 bad=0
 while IFS= read -r f; do
-  if "$TBIN/llvm-profdata" show "$f" >/dev/null 2>&1; then
+  # `show` can exit successfully for structurally readable data whose counters
+  # cannot actually be merged (for example an overflowed online-merge file).
+  # Validate with the same merge operation the final report requires.
+  if "$TBIN/llvm-profdata" merge -sparse "$f" \
+      -o "$COVDIR/validation.profdata" >/dev/null 2>&1; then
     printf '%s\n' "$f" >> "$COVDIR/list.txt"
   else
     bad=$((bad + 1))
   fi
 done < <(find "$COVDIR" -name '*.profraw' -size +0c)
-echo "Merging $(wc -l < "$COVDIR/list.txt" | tr -d ' ') profraw files ($bad skipped as corrupt) ..."
+valid="$(wc -l < "$COVDIR/list.txt" | tr -d ' ')"
+echo "Merging $valid profraw files ($bad skipped as corrupt) ..."
+if [ "$valid" -eq 0 ]; then
+  echo "::error::no valid LLVM coverage profiles were produced" >&2
+  exit 1
+fi
 "$TBIN/llvm-profdata" merge -sparse -f "$COVDIR/list.txt" -o "$COVDIR/merged.profdata"
 
 "$TBIN/llvm-cov" export "$BIN" -instr-profile="$COVDIR/merged.profdata" \
