@@ -222,6 +222,9 @@ scripts/run_http_tests.sh       # HTTP transport
 
 `cargo fmt` / `clippy` / `build` / `doc` run in CI.
 
+For native `iroh://` / `httpi://` clients and bridge-ready workers, see
+[Iroh operations](docs/iroh.md).
+
 ## Development
 
 `vgi` depends on the published `vgi-rpc` from crates.io. To develop against an

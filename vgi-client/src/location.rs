@@ -12,6 +12,8 @@
 //! | Prefix | Transport |
 //! |---|---|
 //! | `http://`, `https://` | HTTP |
+//! | `httpi://` | authenticated HTTP semantics over Iroh |
+//! | `iroh://` | stateful Arrow-mux over authenticated Iroh |
 //! | `unix://` | AF_UNIX, worker started out of band |
 //! | `launch:` | AF_UNIX, worker spawned and shared by the launcher |
 //! | `tcp://` | TCP |
@@ -35,6 +37,10 @@ pub enum VgiLocation {
     Subprocess(Vec<String>),
     /// A worker serving VGI over HTTP.
     Http(String),
+    /// A worker serving stateless VGI HTTP exchanges over Iroh.
+    Httpi(String),
+    /// A worker serving stateful Arrow-mux over Iroh.
+    Iroh(String),
     /// A worker listening on an AF_UNIX socket, started out of band.
     Unix(PathBuf),
     /// A worker listening on TCP.
@@ -61,6 +67,12 @@ impl VgiLocation {
         }
         if s.starts_with("http://") || s.starts_with("https://") {
             return Ok(Self::Http(s.to_string()));
+        }
+        if s.starts_with("httpi://") {
+            return Ok(Self::Httpi(s.to_string()));
+        }
+        if s.starts_with("iroh://") {
+            return Ok(Self::Iroh(s.to_string()));
         }
         if let Some(path) = s.strip_prefix("unix://") {
             if path.is_empty() {
@@ -109,6 +121,8 @@ impl VgiLocation {
         match self {
             Self::Subprocess(argv) => argv.first().cloned().unwrap_or_else(|| "worker".into()),
             Self::Http(url) => url.clone(),
+            Self::Httpi(url) => url.clone(),
+            Self::Iroh(url) => url.clone(),
             Self::Unix(p) => format!("unix://{}", p.display()),
             Self::Tcp { host, port } => format!("tcp://{host}:{port}"),
             Self::Launch(argv) => {
@@ -133,6 +147,14 @@ impl VgiLocation {
             }
             Self::Http(url) => {
                 fingerprint_field(&mut digest, b"http");
+                fingerprint_field(&mut digest, url.as_bytes());
+            }
+            Self::Httpi(url) => {
+                fingerprint_field(&mut digest, b"httpi");
+                fingerprint_field(&mut digest, url.as_bytes());
+            }
+            Self::Iroh(url) => {
+                fingerprint_field(&mut digest, b"iroh");
                 fingerprint_field(&mut digest, url.as_bytes());
             }
             Self::Unix(path) => {
@@ -308,6 +330,14 @@ mod tests {
         assert!(matches!(
             VgiLocation::parse("https://h/v").unwrap(),
             VgiLocation::Http(_)
+        ));
+        assert!(matches!(
+            VgiLocation::parse(&format!("httpi://{}/vgi", "01".repeat(32))).unwrap(),
+            VgiLocation::Httpi(_)
+        ));
+        assert!(matches!(
+            VgiLocation::parse(&format!("iroh://{}", "02".repeat(32))).unwrap(),
+            VgiLocation::Iroh(_)
         ));
         assert_eq!(
             VgiLocation::parse("unix:///tmp/w.sock").unwrap(),

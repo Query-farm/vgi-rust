@@ -19,6 +19,9 @@ all-features = true
 default = ["http", "oauth"]
 # HTTP transport (reqwest-blocking under the hood, via vgi-rpc-client).
 http = ["vgi-rpc-client/http"]
+# Native authenticated HTTP semantics over Iroh. Kept opt-in because it adds
+# the Iroh/QUIC runtime to native builds.
+iroh = ["http", "vgi-rpc-client/iroh", "dep:vgi-rpc-iroh", "dep:iroh", "dep:tokio"]
 # AF_UNIX transport — connect to a worker started out of band or by a launcher.
 unix = ["vgi-rpc-client/unix"]
 # The `launch:` transport: spawn and share one warm worker system-wide.
@@ -43,6 +46,9 @@ disk-cache = [
 vgi-protocol = { workspace = true }
 vgi-rpc = { workspace = true }
 vgi-rpc-client = { workspace = true }
+vgi-rpc-iroh = { version = "0.24.3", git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "50b3a1c7b2e4ffa1b230e82079ae483bc31ea49e", optional = true }
+iroh = { version = "1.1.0", default-features = false, features = ["tls-ring"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 # The `log` facade, not `tracing`: it is what the rest of this workspace and

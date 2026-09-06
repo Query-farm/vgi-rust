@@ -113,6 +113,9 @@ pub trait VgiTransport: Send {
 pub struct StreamTransport {
     client: RpcClient,
     label: String,
+    // Keeps transport runtimes/endpoints alive for adapters whose blocking
+    // RpcClient is backed by an asynchronous networking engine (Iroh).
+    _owner: Option<Box<dyn Send>>,
 }
 
 impl StreamTransport {
@@ -121,6 +124,20 @@ impl StreamTransport {
         Self {
             client,
             label: label.into(),
+            _owner: None,
+        }
+    }
+
+    /// Wrap a client while retaining the runtime resources that drive it.
+    pub(crate) fn new_owned(
+        client: RpcClient,
+        label: impl Into<String>,
+        owner: Box<dyn Send>,
+    ) -> Self {
+        Self {
+            client,
+            label: label.into(),
+            _owner: Some(owner),
         }
     }
 }
