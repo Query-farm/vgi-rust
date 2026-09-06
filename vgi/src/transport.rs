@@ -277,7 +277,25 @@ pub fn serve_http(
     authenticate: Option<vgi_rpc::Authenticate>,
     landing_info: Option<vgi_rpc::http::LandingInfo>,
 ) {
-    serve_http_inner(server, authenticate, landing_info, None);
+    serve_http_inner(server, authenticate, landing_info, None, None);
+}
+
+/// Serve HTTP at an explicit address while preserving the standard HTTP state machine.
+#[cfg(feature = "transport-http")]
+pub fn serve_http_at(
+    server: Arc<RpcServer>,
+    authenticate: Option<vgi_rpc::Authenticate>,
+    landing_info: Option<vgi_rpc::http::LandingInfo>,
+    host: &str,
+    port: u16,
+) {
+    serve_http_inner(
+        server,
+        authenticate,
+        landing_info,
+        None,
+        Some(format_http_bind(host, port)),
+    );
 }
 
 /// Serve HTTP behind `vgi-iroh-bridge`, retaining the authenticated EndpointId.
@@ -288,7 +306,46 @@ pub fn serve_http_behind_iroh(
     landing_info: Option<vgi_rpc::http::LandingInfo>,
     bridge: IrohBridgeOptions,
 ) {
-    serve_http_inner(server, authenticate, landing_info, Some(bridge));
+    serve_http_inner(server, authenticate, landing_info, Some(bridge), None);
+}
+
+/// Serve an Iroh bridge's HTTP upstream at an explicit loopback address.
+#[cfg(feature = "transport-http")]
+pub fn serve_http_behind_iroh_at(
+    server: Arc<RpcServer>,
+    authenticate: Option<vgi_rpc::Authenticate>,
+    landing_info: Option<vgi_rpc::http::LandingInfo>,
+    bridge: IrohBridgeOptions,
+    host: &str,
+    port: u16,
+) {
+    let bind_ip = host.parse::<std::net::IpAddr>().unwrap_or_else(|_| {
+        if host == "localhost" {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            panic!("Iroh HTTP bridge upstream host must be a loopback IP")
+        }
+    });
+    assert!(
+        bind_ip.is_loopback(),
+        "Iroh HTTP bridge upstream must bind loopback"
+    );
+    serve_http_inner(
+        server,
+        authenticate,
+        landing_info,
+        Some(bridge),
+        Some(format_http_bind(host, port)),
+    );
+}
+
+#[cfg(feature = "transport-http")]
+fn format_http_bind(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(feature = "transport-http")]
@@ -297,6 +354,7 @@ fn serve_http_inner(
     authenticate: Option<vgi_rpc::Authenticate>,
     landing_info: Option<vgi_rpc::http::LandingInfo>,
     bridge: Option<IrohBridgeOptions>,
+    explicit_bind: Option<String>,
 ) {
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();
@@ -352,7 +410,9 @@ fn serve_http_inner(
         // Default to loopback + ephemeral port (the local test harness reads the
         // `PORT:` line). A deployed worker (e.g. on fly.io, reached by remote
         // DuckDB clients) sets `VGI_HTTP_BIND=0.0.0.0:8080`.
-        let bind = std::env::var("VGI_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_string());
+        let bind = explicit_bind.unwrap_or_else(|| {
+            std::env::var("VGI_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_string())
+        });
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
             .unwrap_or_else(|e| panic!("bind {bind}: {e}"));

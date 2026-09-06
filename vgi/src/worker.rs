@@ -311,8 +311,9 @@ impl Worker {
     /// - `--tcp [<host>:]<port>` — **TCP** launcher transport (raw Arrow-IPC
     ///   framing, no auth/TLS; host defaults to `127.0.0.1`, port `0`
     ///   auto-selects; `--idle-timeout <secs>` optional).
-    /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Bearer auth is
-    ///   enabled by setting `VGI_BEARER_TOKENS` (`token=principal,…`).
+    /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Optional
+    ///   `--host` / `--port` select the bind address. Bearer auth is enabled by
+    ///   setting `VGI_BEARER_TOKENS` (`token=principal,…`).
     /// - `--iroh-raw-upstream [<host>:]<port> --iroh-issuer <namespace>` —
     ///   loopback raw upstream for `vgi-iroh-bridge`. Add `--iroh-observe` to
     ///   expose peer evidence without making it the application principal.
@@ -363,12 +364,51 @@ impl Worker {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             };
             let _ = &disp;
+            let explicit_bind = args.iter().any(|arg| arg == "--host" || arg == "--port");
+            let host = args
+                .iter()
+                .position(|arg| arg == "--host")
+                .map(|index| {
+                    args.get(index + 1)
+                        .expect("--host requires a value")
+                        .as_str()
+                })
+                .unwrap_or("127.0.0.1");
+            let port = args
+                .iter()
+                .position(|arg| arg == "--port")
+                .map(|index| {
+                    args.get(index + 1)
+                        .expect("--port requires a value")
+                        .parse::<u16>()
+                        .expect("--port must be in 0..65535")
+                })
+                .unwrap_or(0);
             if let Some(bridge) = iroh_bridge.clone() {
-                crate::transport::serve_http_behind_iroh(
+                if explicit_bind {
+                    crate::transport::serve_http_behind_iroh_at(
+                        server,
+                        build_authenticate(),
+                        Some(info),
+                        bridge,
+                        host,
+                        port,
+                    );
+                } else {
+                    crate::transport::serve_http_behind_iroh(
+                        server,
+                        build_authenticate(),
+                        Some(info),
+                        bridge,
+                    );
+                }
+            } else if explicit_bind {
+                crate::transport::serve_http_at(
                     server,
                     build_authenticate(),
                     Some(info),
-                    bridge,
+                    host,
+                    port,
                 );
             } else {
                 crate::transport::serve_http(server, build_authenticate(), Some(info));

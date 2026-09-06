@@ -22,7 +22,7 @@ the same portable shape through `Worker::run`:
 
 ```console
 worker --iroh-raw-upstream 127.0.0.1:9400 --iroh-issuer production
-worker --http --iroh-issuer production
+worker --http --host 127.0.0.1 --port 9401 --iroh-issuer production
 ```
 
 The raw listener requires the bridge's identity-bearing PROXY v2 preamble.
