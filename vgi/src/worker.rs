@@ -313,6 +313,9 @@ impl Worker {
     ///   auto-selects; `--idle-timeout <secs>` optional).
     /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Bearer auth is
     ///   enabled by setting `VGI_BEARER_TOKENS` (`token=principal,…`).
+    /// - `--iroh-raw-upstream [<host>:]<port> --iroh-issuer <namespace>` —
+    ///   loopback raw upstream for `vgi-iroh-bridge`. Add `--iroh-observe` to
+    ///   expose peer evidence without making it the application principal.
     pub fn run(self) {
         let args: Vec<String> = std::env::args().collect();
         // Capture the worker's display name / doc from the primary catalog
@@ -323,6 +326,35 @@ impl Worker {
         let (server, disp) = self.build_parts();
         let server = Arc::new(server);
 
+        let iroh_bridge = args
+            .iter()
+            .position(|arg| arg == "--iroh-issuer")
+            .map(|index| {
+                let issuer = args
+                    .get(index + 1)
+                    .expect("--iroh-issuer requires a value")
+                    .clone();
+                let trusted_proxy_addresses = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arg)| *arg == "--iroh-trusted-proxy")
+                    .map(|(index, _)| {
+                        args.get(index + 1)
+                            .expect("--iroh-trusted-proxy requires an exact IP")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                crate::transport::IrohBridgeOptions {
+                    issuer,
+                    trusted_proxy_addresses: if trusted_proxy_addresses.is_empty() {
+                        vec!["127.0.0.1".to_string()]
+                    } else {
+                        trusted_proxy_addresses
+                    },
+                    authenticate: !args.iter().any(|arg| arg == "--iroh-observe"),
+                }
+            });
+
         #[cfg(feature = "transport-http")]
         if args.iter().any(|a| a == "--http") {
             let info = vgi_rpc::http::LandingInfo {
@@ -331,11 +363,38 @@ impl Worker {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             };
             let _ = &disp;
-            crate::transport::serve_http(server, build_authenticate(), Some(info));
+            if let Some(bridge) = iroh_bridge.clone() {
+                crate::transport::serve_http_behind_iroh(
+                    server,
+                    build_authenticate(),
+                    Some(info),
+                    bridge,
+                );
+            } else {
+                crate::transport::serve_http(server, build_authenticate(), Some(info));
+            }
             return;
         }
         // The dispatcher handle is only needed by the HTTP landing contract.
         let _ = (&disp, &worker_name, &worker_doc);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(i) = args.iter().position(|arg| arg == "--iroh-raw-upstream") {
+            let spec = args
+                .get(i + 1)
+                .expect("--iroh-raw-upstream requires [HOST:]PORT")
+                .clone();
+            let bridge = iroh_bridge.expect("--iroh-raw-upstream requires --iroh-issuer");
+            let (host, port) = parse_tcp_spec(&spec);
+            let idle = args
+                .iter()
+                .position(|a| a == "--idle-timeout")
+                .and_then(|j| args.get(j + 1))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            crate::transport::serve_iroh_tcp_upstream(server, &host, port, idle, bridge);
+            return;
+        }
 
         // Native thread-per-connection TCP. (A wasm single-thread serve_tcp is
         // wired separately for the wasip2 shared-worker path.)

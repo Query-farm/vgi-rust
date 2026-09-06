@@ -13,6 +13,24 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
+/// Trust boundary between a loopback VGI worker and `vgi-iroh-bridge`.
+#[derive(Clone, Debug)]
+pub struct IrohBridgeOptions {
+    pub issuer: String,
+    pub trusted_proxy_addresses: Vec<String>,
+    pub authenticate: bool,
+}
+
+impl IrohBridgeOptions {
+    pub fn loopback(issuer: impl Into<String>) -> Self {
+        Self {
+            issuer: issuer.into(),
+            trusted_proxy_addresses: vec!["127.0.0.1".to_string()],
+            authenticate: true,
+        }
+    }
+}
+
 use vgi_rpc::{RpcServer, TransportCapabilities, TransportKind};
 
 /// Serve a single sequential Arrow-IPC stream over stdin/stdout until EOF.
@@ -184,6 +202,71 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
     }
 }
 
+/// Serve the identity-preserving raw upstream consumed by `vgi-iroh-bridge`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_iroh_tcp_upstream(
+    server: Arc<RpcServer>,
+    host: &str,
+    port: u16,
+    idle_timeout: f64,
+    bridge: IrohBridgeOptions,
+) {
+    use std::collections::BTreeSet;
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let bind_ip = host.parse::<IpAddr>().unwrap_or_else(|_| {
+        if host == "localhost" {
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            panic!("Iroh bridge upstream host must be a loopback IP")
+        }
+    });
+    assert!(
+        bind_ip.is_loopback(),
+        "Iroh bridge upstream must bind loopback"
+    );
+    let trusted_proxy_addresses = bridge
+        .trusted_proxy_addresses
+        .iter()
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .expect("trusted Iroh proxy must be an exact IP")
+        })
+        .collect::<BTreeSet<_>>();
+    let identity = vgi_rpc::tcp::TcpIdentityOptions {
+        proxy_protocol_v2_required: true,
+        trusted_proxy_addresses,
+        iroh_proxy_issuer: Some(bridge.issuer),
+        policy: Some(if bridge.authenticate {
+            vgi_rpc::peer_identity_primary("iroh")
+        } else {
+            vgi_rpc::observe_peer_identity()
+        }),
+        ..Default::default()
+    };
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        let _ = ctrlc::try_set_handler(move || shutdown.store(true, Ordering::Relaxed));
+    }
+    let idle = (idle_timeout > 0.0).then(|| std::time::Duration::from_secs_f64(idle_timeout));
+    vgi_rpc::tcp::serve_tcp_with_identity(
+        server,
+        host,
+        port,
+        idle,
+        shutdown,
+        identity,
+        |bound_host, bound_port| {
+            println!("TCP:{bound_host}:{bound_port}");
+            io::stdout().flush().ok();
+        },
+    )
+    .expect("serve Iroh bridge upstream");
+}
+
 /// Serve over HTTP: bind a TCP port, announce it with `PORT:<n>`, and serve
 /// the axum router. An optional `authenticate` callback enables bearer auth.
 ///
@@ -193,6 +276,27 @@ pub fn serve_http(
     server: Arc<RpcServer>,
     authenticate: Option<vgi_rpc::Authenticate>,
     landing_info: Option<vgi_rpc::http::LandingInfo>,
+) {
+    serve_http_inner(server, authenticate, landing_info, None);
+}
+
+/// Serve HTTP behind `vgi-iroh-bridge`, retaining the authenticated EndpointId.
+#[cfg(feature = "transport-http")]
+pub fn serve_http_behind_iroh(
+    server: Arc<RpcServer>,
+    authenticate: Option<vgi_rpc::Authenticate>,
+    landing_info: Option<vgi_rpc::http::LandingInfo>,
+    bridge: IrohBridgeOptions,
+) {
+    serve_http_inner(server, authenticate, landing_info, Some(bridge));
+}
+
+#[cfg(feature = "transport-http")]
+fn serve_http_inner(
+    server: Arc<RpcServer>,
+    authenticate: Option<vgi_rpc::Authenticate>,
+    landing_info: Option<vgi_rpc::http::LandingInfo>,
+    bridge: Option<IrohBridgeOptions>,
 ) {
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();
@@ -220,6 +324,23 @@ pub fn serve_http(
             .producer_batch_limit(1);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
+        }
+        if let Some(bridge) = bridge {
+            let provider = vgi_rpc::iroh_forwarded_header_provider(
+                vgi_rpc::IrohForwardedHeaderConfig::new(
+                    bridge.issuer,
+                    bridge.trusted_proxy_addresses,
+                )
+                .expect("valid Iroh HTTP bridge trust"),
+            )
+            .expect("valid Iroh HTTP identity provider");
+            builder = builder
+                .peer_identity_providers([provider])
+                .peer_authentication_policy(if bridge.authenticate {
+                    vgi_rpc::peer_identity_primary("iroh")
+                } else {
+                    vgi_rpc::observe_peer_identity()
+                });
         }
         // Standardized landing surface: the shared page plus the browser client
         // build it reads the catalog with. Only the worker's identity is

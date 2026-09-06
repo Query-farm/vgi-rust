@@ -176,6 +176,16 @@ impl VgiClient {
         Self::with_worker_log_router(Box::new(StreamTransport::new(client, label)), worker_logs)
     }
 
+    #[cfg(feature = "iroh")]
+    fn configured_owned_stream(client: RpcClient, label: String, owner: Box<dyn Send>) -> Self {
+        let worker_logs = WorkerLogRouter::default();
+        let client = configure(client, &worker_logs);
+        Self::with_worker_log_router(
+            Box::new(StreamTransport::new_owned(client, label, owner)),
+            worker_logs,
+        )
+    }
+
     pub(crate) fn with_worker_log_router(
         transport: Box<dyn VgiTransport>,
         worker_logs: WorkerLogRouter,
@@ -229,6 +239,18 @@ impl VgiClient {
             VgiLocation::Http(_) => Err(vgi_rpc::errors::RpcError::value_error(
                 "http:// LOCATIONs need the `http` feature",
             )),
+            #[cfg(feature = "iroh")]
+            VgiLocation::Httpi(url) => Self::connect_httpi(url),
+            #[cfg(not(feature = "iroh"))]
+            VgiLocation::Httpi(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "httpi:// LOCATIONs need the `iroh` feature",
+            )),
+            #[cfg(feature = "iroh")]
+            VgiLocation::Iroh(url) => Self::connect_iroh(url),
+            #[cfg(not(feature = "iroh"))]
+            VgiLocation::Iroh(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "iroh:// LOCATIONs need the `iroh` feature",
+            )),
             #[cfg(feature = "unix")]
             VgiLocation::Unix(path) => Self::connect_unix(path),
             #[cfg(not(feature = "unix"))]
@@ -277,6 +299,18 @@ impl VgiClient {
             #[cfg(not(feature = "http"))]
             VgiLocation::Http(_) => Err(vgi_rpc::errors::RpcError::value_error(
                 "http:// LOCATIONs need the `http` feature",
+            )),
+            #[cfg(feature = "iroh")]
+            VgiLocation::Httpi(url) => Self::connect_httpi_with_timeout(url, options.rpc_timeout),
+            #[cfg(not(feature = "iroh"))]
+            VgiLocation::Httpi(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "httpi:// LOCATIONs need the `iroh` feature",
+            )),
+            #[cfg(feature = "iroh")]
+            VgiLocation::Iroh(url) => Self::connect_iroh_with_timeout(url, options.rpc_timeout),
+            #[cfg(not(feature = "iroh"))]
+            VgiLocation::Iroh(_) => Err(vgi_rpc::errors::RpcError::value_error(
+                "iroh:// LOCATIONs need the `iroh` feature",
             )),
             #[cfg(feature = "unix")]
             VgiLocation::Unix(path) => {
@@ -408,6 +442,103 @@ impl VgiClient {
         let http = Box::new(HttpTransport::new(client, base_url.to_string()));
         Ok(Self::with_worker_log_router(
             Box::new(crate::retry::RetryTransport::new(http, policy)),
+            worker_logs,
+        ))
+    }
+
+    /// Connect to `iroh://<endpoint-id>` using Iroh's default discovery and relay set.
+    #[cfg(feature = "iroh")]
+    pub fn connect_iroh(target: &str) -> Result<Self> {
+        Self::connect_iroh_with_timeout(target, Some(Duration::from_secs(30)))
+    }
+
+    /// Connect to raw stateful Arrow-mux over Iroh with an optional RPC deadline.
+    #[cfg(feature = "iroh")]
+    pub fn connect_iroh_with_timeout(target: &str, timeout: Option<Duration>) -> Result<Self> {
+        use std::str::FromStr;
+
+        let endpoint_id = target
+            .strip_prefix("iroh://")
+            .filter(|value| !value.is_empty() && !value.contains('/'))
+            .ok_or_else(|| {
+                vgi_rpc::errors::RpcError::value_error(
+                    "raw Iroh endpoint must be iroh:// followed by one EndpointId",
+                )
+            })?;
+        let remote = iroh::EndpointId::from_str(endpoint_id).map_err(|_| {
+            vgi_rpc::errors::RpcError::value_error(
+                "Iroh EndpointId must be 64 lowercase hexadecimal characters",
+            )
+        })?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| vgi_rpc::errors::RpcError::runtime_error(error.to_string()))?;
+        let endpoint = runtime
+            .block_on(iroh::Endpoint::bind(iroh::endpoint::presets::N0))
+            .map_err(|error| vgi_rpc::errors::RpcError::runtime_error(error.to_string()))?;
+        let mut options = vgi_rpc_iroh::IrohClientOptions::default();
+        if let Some(timeout) = timeout {
+            options.connect_timeout = timeout;
+            options = options.with_rpc_timeout(timeout);
+        }
+        Self::connect_iroh_with_endpoint(
+            target,
+            runtime,
+            endpoint,
+            iroh::EndpointAddr::from(remote),
+            options,
+        )
+    }
+
+    /// Advanced raw-Iroh entry point. Build `endpoint` with a private relay,
+    /// direct addresses, or a stable secret key, then transfer its runtime and
+    /// ownership here so the blocking VGI client keeps the network engine alive.
+    #[cfg(feature = "iroh")]
+    pub fn connect_iroh_with_endpoint(
+        label: &str,
+        runtime: tokio::runtime::Runtime,
+        endpoint: iroh::Endpoint,
+        remote: iroh::EndpointAddr,
+        options: vgi_rpc_iroh::IrohClientOptions,
+    ) -> Result<Self> {
+        let transport = runtime
+            .block_on(vgi_rpc_iroh::IrohTransport::connect_addr(
+                endpoint.clone(),
+                remote,
+                options,
+            ))
+            .map_err(|error| vgi_rpc::errors::RpcError::runtime_error(error.to_string()))?;
+        let client = transport.into_client();
+        Ok(Self::configured_owned_stream(
+            client,
+            label.to_string(),
+            Box::new((endpoint, runtime)),
+        ))
+    }
+
+    /// Connect to a canonical `httpi://<endpoint-id>[/base-path]` worker.
+    #[cfg(feature = "iroh")]
+    pub fn connect_httpi(target: &str) -> Result<Self> {
+        Self::connect_httpi_with_timeout(target, Some(Duration::from_secs(30)))
+    }
+
+    /// Connect over HTTP-over-Iroh with an explicit request/I/O timeout.
+    #[cfg(feature = "iroh")]
+    pub fn connect_httpi_with_timeout(target: &str, timeout: Option<Duration>) -> Result<Self> {
+        use crate::transport::HttpTransport;
+        let worker_logs = WorkerLogRouter::default();
+        let client = vgi_rpc_client::HttpClient::connect_httpi(target)?
+            .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
+            .on_log(worker_logs.callback())
+            .timeout(timeout)
+            .build()?;
+        let http = Box::new(HttpTransport::new(client, target.to_string()));
+        Ok(Self::with_worker_log_router(
+            Box::new(crate::retry::RetryTransport::new(
+                http,
+                crate::retry::RetryPolicy::default(),
+            )),
             worker_logs,
         ))
     }
