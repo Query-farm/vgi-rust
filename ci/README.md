@@ -6,17 +6,23 @@ PR, across all three public transports on Linux.
 
 ## How it works
 
-The workflow pins one full `Query-farm/vgi` commit as the authority for both
-the C++ extension and `.test` corpus. A Linux producer job checks out that exact
-revision, builds `vgi.duckdb_extension` once, records its SHA-256 and source
-revision, and uploads it as a one-day workflow artifact. Every integration and
-coverage lane downloads and verifies that same artifact. The tests therefore
-cannot silently move ahead of the client implementation, which happened when
-the workflow tracked VGI main while loading an older community release.
+The workflow always tests against `Query-farm/vgi` **main**. A Linux producer
+job checks out main, resolves it to a full commit SHA once, and publishes that
+SHA as the `vgi_sha` job output — from there on nothing references the branch
+name. It builds `vgi.duckdb_extension` from that revision, records its SHA-256
+and source revision, and uploads it as a one-day workflow artifact. Every
+integration and coverage lane checks out the `.test` corpus at the *same*
+resolved SHA and downloads and verifies that same artifact.
+
+Resolving once is what makes tracking a moving branch safe. One commit stays
+the authority for both the extension and the corpus within a run, so the tests
+cannot silently move ahead of the client implementation — which happened when
+the workflow tracked main while loading an older community release — and a push
+to VGI mid-run cannot hand the producer and the lanes different commits.
 
 The suite still drives a prebuilt standalone `haybarn-unittest`. Its Haybarn
-release is pinned to the engine revision used by the VGI source checkout, so
-the local extension's ABI/platform metadata matches the runner. VGI loads by
+release is pinned to the engine revision the VGI source expects, so the local
+extension's ABI/platform metadata matches the runner. VGI loads by
 absolute artifact path; `httpfs`/`json`/`parquet`/`spatial` remain signed core
 extensions. Because recursive Actions checkouts are shallow and carry no
 submodule tags, the producer also sets `OVERRIDE_GIT_DESCRIBE=v1.5.5` and the
@@ -104,8 +110,13 @@ input would otherwise abort the whole merge).
 
 ## Version pinning
 
-`integration.yml` pins `VGI_REF` to a full commit SHA and `HAYBARN_RELEASE` to
-the runner built from the same Haybarn engine revision. The producer verifies
-its checkout before building; consumers verify the artifact's recorded source
-revision and SHA-256. Bump the two pins deliberately and together whenever the
-VGI corpus or Haybarn ABI advances.
+`VGI_REF` is deliberately **not** pinned — it is `main`, and the producer job
+resolves it to a SHA per run. Do not replace it with a commit: a pin here is
+what let vgi-rust drift out of step with the VGI corpus, and pinning is the
+thing this workflow is designed to avoid. Consumers still verify the artifact's
+recorded source revision and SHA-256, so provenance is unchanged.
+
+`HAYBARN_RELEASE` *is* pinned, to the runner built from the Haybarn engine
+revision the extension's ABI/platform metadata must match. Bump it deliberately
+when that ABI advances. If a VGI main commit requires a newer engine, the warm
+load fails loudly rather than silently mispairing.

@@ -2,9 +2,11 @@
 #
 # Runs the canonical Query-farm/vgi integration sqllogictest suite against the
 # Rust example worker across all three transports (subprocess / launcher / http).
-# A producer job builds the C++ extension from the exact same pinned VGI source
-# as the tests, then every lane downloads that immutable workflow artifact. This
-# deliberately avoids pairing tests from VGI main with an older community build.
+# A producer job resolves Query-farm/vgi main to a concrete SHA, builds the C++
+# extension from it, and every lane downloads that immutable workflow artifact
+# and checks out the suite at the SAME resolved SHA. This deliberately avoids
+# pairing tests from VGI main with an older community build, and avoids the
+# race where a push mid-run gives the producer and the lanes different commits.
 # See ci/README.md.
 name: Integration suite
 
@@ -23,25 +25,28 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # One reviewed VGI revision is the authority for BOTH the suite and extension.
-  # Update this full SHA deliberately; never point it at a moving branch.
-  VGI_REF: 507ae620d06cd4da0da1a6b1b9f937d9942e8e8f
-  # VGI_REF pins Haybarn engine commit 105edd31b57fe7e6d32ee648efad562e45a9f908.
-  # This release's unittest runner is built from that same engine revision, so
-  # its extension ABI/platform metadata matches the source-built artifact.
+  # vgi-rust always tests against Query-farm/vgi main. The producer job resolves
+  # this to a SHA once (`vgi_sha` output); every consumer uses that SHA, so a
+  # single run is still internally consistent even if main moves under it.
+  VGI_REF: main
+  # The standalone unittest runner. Pinned independently of VGI_REF: its engine
+  # revision fixes the extension ABI/platform metadata that the source-built
+  # artifact must match, so it moves only when that ABI does.
   HAYBARN_RELEASE: haybarn-v1.5.5-rc1
 
 jobs:
   build-vgi-extension:
-    name: Build pinned VGI extension (Linux)
+    name: Build VGI extension from main (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      vgi_sha: ${{ steps.resolve.outputs.sha }}
     env:
       GEN: ninja
       USE_MERGED_VCPKG_MANIFEST: "1"
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
-      - name: Checkout pinned VGI source
+      - name: Checkout VGI source (${{ env.VGI_REF }})
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi
@@ -49,10 +54,16 @@ jobs:
           path: vgi-source
           submodules: recursive
 
-      - name: Verify exact VGI revision
+      # Pin the rest of the run to whatever main was at this instant. Everything
+      # downstream consumes this SHA, never the branch name.
+      - name: Resolve VGI revision
+        id: resolve
         working-directory: vgi-source
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "$VGI_REF"
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Query-farm/vgi $VGI_REF resolved to $sha" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install build toolchain
         run: |
@@ -93,12 +104,12 @@ jobs:
           mkdir -p vgi-extension-artifact
           cp vgi-source/build/release/extension/vgi/vgi.duckdb_extension vgi-extension-artifact/
           (cd vgi-extension-artifact && sha256sum vgi.duckdb_extension > SHA256SUMS)
-          printf '%s\n' "$VGI_REF" > vgi-extension-artifact/VGI_REF
+          printf '%s\n' "${{ steps.resolve.outputs.sha }}" > vgi-extension-artifact/VGI_SHA
 
-      - name: Upload pinned extension
+      - name: Upload extension
         uses: actions/upload-artifact@v4
         with:
-          name: vgi-extension-linux-amd64-${{ env.VGI_REF }}
+          name: vgi-extension-linux-amd64-${{ steps.resolve.outputs.sha }}
           path: vgi-extension-artifact/
           if-no-files-found: error
           retention-days: 1
@@ -108,8 +119,10 @@ jobs:
     needs: build-vgi-extension
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      VGI_SHA: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
     strategy:
-      # All three public transports execute the same pinned suite and extension.
+      # All three public transports execute the same resolved suite + extension.
       fail-fast: true
       matrix:
         transport: [stdio, launch, http]
@@ -117,16 +130,16 @@ jobs:
       - name: Checkout vgi-rust
         uses: actions/checkout@v5
 
-      - name: Checkout pinned vgi test suite
+      - name: Checkout vgi test suite at the resolved revision
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi
-          ref: ${{ env.VGI_REF }}
+          ref: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
           path: vgi-upstream
 
       - name: Verify exact VGI test revision
         shell: bash
-        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_REF"
+        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_SHA"
 
       - name: Install Rust toolchain (MSRV 1.97)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -151,13 +164,13 @@ jobs:
       - name: Download exact VGI extension
         uses: actions/download-artifact@v4
         with:
-          name: vgi-extension-linux-amd64-${{ env.VGI_REF }}
+          name: vgi-extension-linux-amd64-${{ needs.build-vgi-extension.outputs.vgi_sha }}
           path: vgi-extension
 
       - name: Verify extension provenance and digest
         shell: bash
         run: |
-          test "$(cat vgi-extension/VGI_REF)" = "$VGI_REF"
+          test "$(cat vgi-extension/VGI_SHA)" = "$VGI_SHA"
           (cd vgi-extension && sha256sum --check SHA256SUMS)
 
       - name: Run integration suite (${{ matrix.transport }})
@@ -185,19 +198,21 @@ jobs:
     needs: build-vgi-extension
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      VGI_SHA: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Checkout pinned vgi test suite
+      - name: Checkout vgi test suite at the resolved revision
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi
-          ref: ${{ env.VGI_REF }}
+          ref: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
           path: vgi-upstream
 
       - name: Verify exact VGI test revision
         shell: bash
-        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_REF"
+        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_SHA"
 
       - name: Install Rust toolchain (MSRV 1.97) + llvm-tools
         uses: dtolnay/rust-toolchain@1.97.0
@@ -228,13 +243,13 @@ jobs:
       - name: Download exact VGI extension
         uses: actions/download-artifact@v4
         with:
-          name: vgi-extension-linux-amd64-${{ env.VGI_REF }}
+          name: vgi-extension-linux-amd64-${{ needs.build-vgi-extension.outputs.vgi_sha }}
           path: vgi-extension
 
       - name: Verify extension provenance and digest
         shell: bash
         run: |
-          test "$(cat vgi-extension/VGI_REF)" = "$VGI_REF"
+          test "$(cat vgi-extension/VGI_SHA)" = "$VGI_SHA"
           (cd vgi-extension && sha256sum --check SHA256SUMS)
 
       - name: Run integration suite (stdio) with coverage
