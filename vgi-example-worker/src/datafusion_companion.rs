@@ -33,7 +33,7 @@ fn events_schema() -> SchemaRef {
 fn source_branch(table: &str, filter: Option<&str>) -> CatBranch {
     CatBranch {
         source_catalog: Some(SOURCE_CATALOG.to_string()),
-        source_schema: Some("main".to_string()),
+        source_schema_path: Some(vec!["main".to_string()]),
         source_table: Some(table.to_string()),
         branch_filter: filter.map(str::to_string),
         ..Default::default()
@@ -43,7 +43,7 @@ fn source_branch(table: &str, filter: Option<&str>) -> CatBranch {
 fn root_branch(table: &str) -> CatBranch {
     CatBranch {
         source_catalog: Some(ROOT_CATALOG.to_string()),
-        source_schema: Some("main".to_string()),
+        source_schema_path: Some(vec!["main".to_string()]),
         source_table: Some(table.to_string()),
         ..Default::default()
     }
@@ -67,6 +67,7 @@ pub fn root_catalog() -> CatalogModel {
         name: ROOT_CATALOG.to_string(),
         comment: Some("DataFusion companion-catalog integration fixture".to_string()),
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             tables: vec![
                 branch_table(
@@ -102,6 +103,7 @@ fn source_catalog() -> CatalogModel {
         name: SOURCE_CATALOG.to_string(),
         comment: Some("Read-only source catalog for DataFusion federation tests".to_string()),
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             tables: vec![
                 events,

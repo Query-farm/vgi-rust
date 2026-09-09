@@ -65,10 +65,10 @@ fn worker_log_batches_reach_the_log_facade() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("logging_generator")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(3i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");

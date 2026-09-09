@@ -90,6 +90,7 @@ fn catalog_model(name: &str) -> CatalogModel {
         name: name.to_string(),
         comment: Some(format!("Catalog-disambiguation twin ({name})")),
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: SCHEMA_NAME.to_string(),
             comment: Some(format!("Colliding function name served by {name}")),
             tags: Vec::new(),

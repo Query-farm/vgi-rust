@@ -65,7 +65,7 @@ fn catalog_info_matches() {
 #[test]
 fn scan_function_result_matches() {
     // Nothing else in this suite covered `ScanFunctionResult` before protocol
-    // 1.5.0 added `schema_name` — that gap is exactly how a missed field here
+    // 1.5.0 added `schema_path` — that gap is exactly how a missed field here
     // could have shipped silently. Pin it now like every other DTO above.
     assert_eq!(
         flat_schema::<ScanFunctionResult>(),

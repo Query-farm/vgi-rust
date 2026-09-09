@@ -697,6 +697,7 @@ pub fn catalog() -> CatalogModel {
         ),
         supports_time_travel: false,
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             comment: Some("Stateful row accumulation functions".to_string()),
             tags: Vec::new(),

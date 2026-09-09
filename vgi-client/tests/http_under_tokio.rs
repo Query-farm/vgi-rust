@@ -84,9 +84,9 @@ fn scan_rows(client: &mut VgiClient) -> usize {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(5i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");

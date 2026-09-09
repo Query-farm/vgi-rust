@@ -439,11 +439,11 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         name: name.to_string(),
         // Placeholder. The advertising site overwrites this with the schema the
         // function is actually being listed in — see `Dispatcher::advertise_in`.
-        // It must be right: the extension parses `schema_name` straight off this
+        // It must be right: the extension parses `schema_path` straight off this
         // record (`ParseFunctionInfo`) and threads it back as the bind's
-        // `schema_name`, so a wrong value here silently routes every call to
+        // `schema_path`, so a wrong value here silently routes every call to
         // whatever schema was claimed.
-        schema_name: MAIN_SCHEMA.to_string(),
+        schema_path: vec![MAIN_SCHEMA.to_string()],
         function_type: enums::dict(function_type),
         arguments: Bytes::from(Vec::new()),
         output_schema: Bytes::from(Vec::new()),
@@ -636,19 +636,23 @@ pub fn aggregate_function_info(
 /// The default `SchemaInfo` for the `main` schema.
 pub fn main_schema_info(attach_opaque_data: &[u8]) -> SchemaInfo {
     schema_info(
-        MAIN_SCHEMA,
+        &[MAIN_SCHEMA.to_string()],
         Some("Default schema containing all registered functions"),
         attach_opaque_data,
     )
 }
 
 /// Build a `SchemaInfo` for an arbitrary schema.
-pub fn schema_info(name: &str, comment: Option<&str>, attach_opaque_data: &[u8]) -> SchemaInfo {
+pub fn schema_info(
+    path: &[String],
+    comment: Option<&str>,
+    attach_opaque_data: &[u8],
+) -> SchemaInfo {
     SchemaInfo {
         comment: comment.map(|s| s.to_string()),
         tags: Vec::new(),
         attach_opaque_data: Bytes::from(attach_opaque_data.to_vec()),
-        name: name.to_string(),
+        path: path.to_vec(),
         estimated_object_count: None,
     }
 }
@@ -702,7 +706,7 @@ pub struct CatalogModel {
     /// the protocol-1.3.0 `CatalogAttachResult.global_functions` column as
     /// IPC-serialized `FunctionInfo` records. Each name must also be registered
     /// on the worker — a global function stays schema-resident, because bind
-    /// dispatch is keyed on `(schema_name, name)`.
+    /// dispatch is keyed on `(schema_path, name)`.
     pub global_functions: Vec<String>,
     /// Prefix applied to every [`global_functions`](Self::global_functions)
     /// entry when the client publishes it (e.g. `vgi_example` →
@@ -799,7 +803,10 @@ pub fn resolve_version_npm(
 
 #[derive(Default, Clone)]
 pub struct CatSchema {
+    /// Legacy one-level schema name. Used when `path` is empty.
     pub name: String,
+    /// Raw nested schema components. When present this is authoritative.
+    pub path: Vec<String>,
     pub comment: Option<String>,
     /// Schema-level tags (surfaced via `duckdb_schemas().tags`), e.g.
     /// `vgi.description_llm` / `vgi.description_md`.
@@ -1007,7 +1014,7 @@ impl CatTable {
 ///
 /// A *function* branch sets `function_name` (+ `scan_arguments`); a
 /// *catalog-table* branch leaves `function_name` empty and sets
-/// `source_catalog`/`source_schema`/`source_table` to scan a companion-catalog
+/// `source_catalog`/`source_schema_path`/`source_table` to scan a companion-catalog
 /// base table; a *format* branch leaves both empty and sets `format_name` +
 /// `format_locations`, letting the client resolve the format to its reader.
 ///
@@ -1021,7 +1028,7 @@ pub struct CatBranch {
     pub branch_filter: Option<String>,
     pub writable: bool,
     pub source_catalog: Option<String>,
-    pub source_schema: Option<String>,
+    pub source_schema_path: Option<Vec<String>>,
     pub source_table: Option<String>,
     /// Format branch only — the format to read (`parquet`, `csv`, `iceberg`, …).
     ///
@@ -1047,43 +1054,22 @@ pub struct ForeignKey {
     pub columns: Vec<String>,
     pub referenced_table: String,
     pub referenced_columns: Vec<String>,
+    /// Referenced schema; defaults to the owning table's schema path.
+    pub referenced_schema_path: Option<Vec<String>>,
 }
 
 /// Serialize a foreign key to its IPC `foreign_key_constraints` entry.
-pub fn serialize_foreign_key(schema: &str, fk: &ForeignKey) -> Result<Vec<u8>> {
-    use arrow_array::builder::{ListBuilder, StringBuilder};
-    use arrow_array::{ArrayRef, RecordBatch, StringArray};
-    let list_of = |items: &[String]| -> ArrayRef {
-        let mut b = ListBuilder::new(StringBuilder::new());
-        for s in items {
-            b.values().append_value(s);
-        }
-        b.append(true);
-        Arc::new(b.finish())
+pub fn serialize_foreign_key(schema_path: &[String], fk: &ForeignKey) -> Result<Vec<u8>> {
+    let info = crate::protocol::dtos::ForeignKeyInfo {
+        fk_columns: fk.columns.clone(),
+        pk_columns: fk.referenced_columns.clone(),
+        referenced_table: fk.referenced_table.clone(),
+        referenced_schema_path: fk
+            .referenced_schema_path
+            .clone()
+            .unwrap_or_else(|| schema_path.to_vec()),
     };
-    let fields = vec![
-        Field::new(
-            "fk_columns",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ),
-        Field::new(
-            "pk_columns",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ),
-        Field::new("referenced_table", DataType::Utf8, true),
-        Field::new("referenced_schema", DataType::Utf8, true),
-    ];
-    let cols: Vec<ArrayRef> = vec![
-        list_of(&fk.columns),
-        list_of(&fk.referenced_columns),
-        Arc::new(StringArray::from(vec![fk.referenced_table.clone()])),
-        Arc::new(StringArray::from(vec![schema.to_string()])),
-    ];
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
-        .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
-    ipc::write_batch(&batch)
+    ipc::write_batch(&crate::wire::to_batch(info)?)
 }
 
 impl CatTable {
@@ -1150,17 +1136,34 @@ impl CatTable {
 
 impl CatalogModel {
     pub fn schema(&self, name: &str) -> Option<&CatSchema> {
-        self.schemas.iter().find(|s| s.name == name)
+        self.schema_path(&[name.to_string()])
+    }
+
+    pub fn schema_path(&self, path: &[String]) -> Option<&CatSchema> {
+        self.schemas
+            .iter()
+            .find(|schema| schema.effective_path() == path)
+    }
+}
+
+impl CatSchema {
+    /// Raw schema path, falling back to the legacy one-level `name` field.
+    pub fn effective_path(&self) -> Vec<String> {
+        if self.path.is_empty() {
+            vec![self.name.clone()]
+        } else {
+            self.path.clone()
+        }
     }
 }
 
 /// Build a `ViewInfo` DTO.
-pub fn view_info(schema: &str, v: &CatView) -> crate::protocol::dtos::ViewInfo {
+pub fn view_info(schema_path: &[String], v: &CatView) -> crate::protocol::dtos::ViewInfo {
     crate::protocol::dtos::ViewInfo {
         comment: v.comment.clone(),
         tags: v.tags.clone(),
         name: v.name.clone(),
-        schema_name: schema.to_string(),
+        schema_path: schema_path.to_vec(),
         definition: v.definition.clone(),
         column_comments: v.column_comments.clone(),
     }
@@ -1178,14 +1181,14 @@ pub fn view_info(schema: &str, v: &CatView) -> crate::protocol::dtos::ViewInfo {
 /// lives elsewhere (e.g. "tables in `data` are scanned by functions in
 /// `main`"). Right in the common case, not exhaustive.
 pub fn scan_function_result(
-    schema: &str,
+    schema_path: &[String],
     t: &CatTable,
 ) -> Result<crate::protocol::dtos::ScanFunctionResult> {
     Ok(crate::protocol::dtos::ScanFunctionResult {
         function_name: t.scan_function.clone(),
         arguments: Bytes::from(t.scan_arguments.clone()),
         required_extensions: Vec::new(),
-        schema_name: Some(schema.to_string()),
+        schema_path: Some(schema_path.to_vec()),
     })
 }
 
@@ -1222,9 +1225,9 @@ fn validate_required_filters(
 }
 
 pub fn table_info(
-    schema: &str,
+    schema_path: &[String],
     t: &CatTable,
-    scan_function_schema: Option<&str>,
+    scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
     // Inline the scan function only for tables that opt in; otherwise the C++
@@ -1239,7 +1242,7 @@ pub fn table_info(
     // differ from the table's own schema).
     let scan = if t.inline_scan && !t.scan_function.is_empty() {
         ipc::write_batch(&crate::wire::to_batch(scan_function_result(
-            scan_function_schema.unwrap_or(schema),
+            scan_function_schema.unwrap_or(schema_path),
             t,
         )?)?)?
     } else {
@@ -1250,7 +1253,7 @@ pub fn table_info(
         comment: t.comment.clone(),
         tags: t.tags.clone(),
         name: t.name.clone(),
-        schema_name: schema.to_string(),
+        schema_path: schema_path.to_vec(),
         columns: Bytes::from(ipc::write_schema_ref(&t.columns)?),
         not_null_constraints: t.not_null.clone(),
         unique_constraints: t.unique.clone(),
@@ -1259,7 +1262,7 @@ pub fn table_info(
         foreign_key_constraints: t
             .foreign_keys
             .iter()
-            .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema, fk)?)))
+            .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema_path, fk)?)))
             .collect::<Result<Vec<_>>>()?,
         supports_insert: false,
         supports_update: false,
@@ -1279,12 +1282,12 @@ pub fn table_info(
 }
 
 /// Build a `MacroInfo` DTO.
-pub fn macro_info(schema: &str, m: &CatMacro) -> crate::protocol::dtos::MacroInfo {
+pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos::MacroInfo {
     crate::protocol::dtos::MacroInfo {
         comment: m.comment.clone(),
         tags: Vec::new(),
         name: m.name.clone(),
-        schema_name: schema.to_string(),
+        schema_path: schema_path.to_vec(),
         macro_type: DictString(if m.table_macro {
             "table".into()
         } else {
@@ -1416,6 +1419,10 @@ mod tests {
     use crate::function::{ArgSpec, FunctionExample, ProcessParams};
     use arrow_array::RecordBatch;
     use vgi_rpc::VgiArrow;
+
+    fn path(name: &str) -> Vec<String> {
+        vec![name.to_string()]
+    }
 
     /// A minimal scalar whose `metadata()` advertises SQL examples.
     struct ExampleScalar;
@@ -1697,7 +1704,7 @@ mod tests {
 
     #[test]
     fn test_macro_info_appends_arguments_schema_with_docs() {
-        let info = macro_info("main", &macro_with_docs());
+        let info = macro_info(&path("main"), &macro_with_docs());
         // arguments_schema is populated for a documented macro.
         let arguments_schema = info
             .arguments_schema
@@ -1734,7 +1741,7 @@ mod tests {
             "macro with no parameters and no docs emits empty arguments_schema",
         );
         // And the DTO carries empty bytes (older readers unaffected).
-        let info = macro_info("main", &m);
+        let info = macro_info(&path("main"), &m);
         assert!(info
             .arguments_schema
             .as_ref()
@@ -1763,7 +1770,7 @@ mod tests {
             vec!["a".to_string()],
             vec!["a".to_string(), "b".to_string()],
         ]);
-        let info = table_info("data", &t, None).expect("table_info");
+        let info = table_info(&path("data"), &t, None).expect("table_info");
         assert_eq!(
             info.required_filters,
             vec![
@@ -1805,21 +1812,21 @@ mod tests {
     #[test]
     fn test_required_filters_rejects_empty_group() {
         let t = ab_table(vec![vec![]]);
-        let err = table_info("data", &t, None).expect_err("empty group must be rejected");
+        let err = table_info(&path("data"), &t, None).expect_err("empty group must be rejected");
         assert!(err.to_string().contains("empty groups"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_empty_string() {
         let t = ab_table(vec![vec!["".to_string()]]);
-        let err = table_info("data", &t, None).expect_err("empty string must be rejected");
+        let err = table_info(&path("data"), &t, None).expect_err("empty string must be rejected");
         assert!(err.to_string().contains("empty strings"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_unknown_column() {
         let t = ab_table(vec![vec!["nope".to_string()]]);
-        let err = table_info("data", &t, None).expect_err("unknown column must be rejected");
+        let err = table_info(&path("data"), &t, None).expect_err("unknown column must be rejected");
         assert!(err.to_string().contains("unknown column"), "got: {err}");
     }
 
@@ -1828,7 +1835,7 @@ mod tests {
         // A dotted path's leading segment ('a') is a real column; the subfield
         // ('x') is left to DuckDB's binder — validation must accept it.
         let t = ab_table(vec![vec!["a.x".to_string()]]);
-        assert!(table_info("data", &t, None).is_ok());
+        assert!(table_info(&path("data"), &t, None).is_ok());
     }
 }
 

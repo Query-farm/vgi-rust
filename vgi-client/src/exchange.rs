@@ -282,7 +282,7 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
         let bind_call = envelope(request)?;
         let response: BindResponse = call(
@@ -392,7 +392,7 @@ impl VgiClient {
             attach_opaque_data: Some(cat.handle().clone()),
             transaction_id: cat.transaction().cloned(),
             batch_index,
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
         let response: TableBufferingProcessResponse = call(
             self.transport_mut(),
@@ -418,7 +418,7 @@ impl VgiClient {
             state_ids,
             attach_opaque_data: Some(cat.handle().clone()),
             transaction_id: cat.transaction().cloned(),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
         let response: TableBufferingCombineResponse = call(
             self.transport_mut(),

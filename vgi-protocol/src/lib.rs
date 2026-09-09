@@ -36,17 +36,10 @@
 ///
 /// Enforced as an exact major+minor match at the dispatch boundary (carried in
 /// `vgi_rpc.protocol_version` custom metadata), so this must track
-/// `VgiProtocol.protocol_version` in vgi-python. 1.1.0 added `schema_name` to
-/// `BindRequest`; 1.2.0 adds it to the 15 unary requests that re-resolve the
-/// function by name, so a name declared in two schemas cannot mis-route at
-/// runtime after binding correctly. 1.3.0 adds `global_functions` and
-/// `global_function_prefix` to `CatalogAttachResult` — functions a worker asks
-/// the client to publish into its global namespace. 1.5.0 adds `schema_name`
-/// to `ScanFunctionResult`/`ScanBranch` — the worker's own authoritative
-/// schema for the function it just resolved, so a client no longer has to
-/// guess (table's own schema, then `default_schema`) when the same function
-/// name is registered in more than one schema.
-pub const VGI_PROTOCOL_VERSION: &str = "1.5.0";
+/// `VgiProtocol.protocol_version` in vgi-python. Protocol 2.0 replaces scalar
+/// schema names with ordered schema paths, allowing arbitrary nesting without
+/// losing identifier boundaries.
+pub const VGI_PROTOCOL_VERSION: &str = "2.0.0";
 /// RPC protocol name; must match the Python `VgiProtocol`.
 pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
 

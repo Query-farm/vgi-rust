@@ -102,7 +102,7 @@ fn attached_catalog_preserves_every_global_scalar_overload() {
         .global_functions()
         .expect("decode global function nominations")
         .into_iter()
-        .filter(|function| function.schema_name == "main" && function.name == "global_scalar")
+        .filter(|function| function.schema_path == ["main"] && function.name == "global_scalar")
         .map(|function| {
             let arguments = ArgSpecs::parse(&function.arguments.0)
                 .expect("decode global_scalar argument schema");
@@ -146,17 +146,20 @@ fn walks_the_whole_discovery_surface() {
     let mut total_tables = 0usize;
     let mut total_functions = 0usize;
     for schema in &schemas {
+        let schema_name = schema.path.first().expect("non-empty schema path");
         // Every listed schema must also resolve individually.
         let one = client
-            .schema_get(&cat, &schema.name)
+            .schema_get(&cat, schema_name)
             .expect("catalog_schema_get")
-            .unwrap_or_else(|| panic!("schema `{}` was listed but does not resolve", schema.name));
-        assert_eq!(one.name, schema.name);
+            .unwrap_or_else(|| {
+                panic!("schema `{:?}` was listed but does not resolve", schema.path)
+            });
+        assert_eq!(one.path, schema.path);
 
-        total_tables += client.tables(&cat, &schema.name).expect("tables").len();
-        client.views(&cat, &schema.name).expect("views");
+        total_tables += client.tables(&cat, schema_name).expect("tables").len();
+        client.views(&cat, schema_name).expect("views");
         client
-            .macros(&cat, &schema.name, MacroKind::Scalar)
+            .macros(&cat, schema_name, MacroKind::Scalar)
             .expect("macros");
 
         // Three kinds, not five: `SchemaObjectType` has a single
@@ -169,7 +172,7 @@ fn walks_the_whole_discovery_surface() {
             FunctionKind::Aggregate,
         ] {
             total_functions += client
-                .functions(&cat, &schema.name, kind)
+                .functions(&cat, schema_name, kind)
                 .unwrap_or_else(|e| panic!("functions({kind:?}) failed: {e}"))
                 .len();
         }
@@ -235,7 +238,7 @@ fn reads_one_table_back_by_name() {
         .expect("catalog_table_get")
         .expect("a listed table must resolve by name");
     assert_eq!(fetched.name, first.name);
-    assert_eq!(fetched.schema_name, first.schema_name);
+    assert_eq!(fetched.schema_path, first.schema_path);
 
     assert!(
         client
@@ -289,7 +292,7 @@ fn decodes_and_validates_catalog_scan_branches() {
         numbers
             .branches
             .iter()
-            .all(|branch| branch.schema_name.as_deref() == Some("main")),
+            .all(|branch| branch.schema_path.as_deref() == Some(["main".to_string()].as_slice())),
         "worker must stamp the function's REAL registered schema (protocol 1.5.0) via the          registry, not the table's own schema — `sequence` is registered unscoped          (register_table), so its real home is the catalog's default schema (`main`), even          though `multi_branch_numbers` itself lives in `data`"
     );
 

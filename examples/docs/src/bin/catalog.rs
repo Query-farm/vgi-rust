@@ -166,6 +166,7 @@ fn main() {
         name: "cat".to_string(),
         comment: Some("Documentation example: a worker presented as a database".to_string()),
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "data".to_string(),
             tables: vec![cities],
             views: vec![big_cities],

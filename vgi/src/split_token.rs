@@ -112,7 +112,7 @@ pub fn identity_tail(auth: Option<(&str, &str)>) -> Vec<u8> {
 /// forgery resistance comes from the seal where a key exists, and from the uid
 /// trust boundary where one does not.
 pub fn bind_fingerprint(
-    schema_name: &str,
+    schema_path: &[String],
     function_name: &str,
     arguments: &[u8],
     settings: &[u8],
@@ -126,7 +126,9 @@ pub fn bind_fingerprint(
         h.update(value);
         h.update([0u8]);
     };
-    feed(b"schema_name", schema_name.as_bytes());
+    for component in schema_path {
+        feed(b"schema_path_component", component.as_bytes());
+    }
     feed(b"function_name", function_name.as_bytes());
     feed(b"arguments", arguments);
     feed(b"settings", settings);

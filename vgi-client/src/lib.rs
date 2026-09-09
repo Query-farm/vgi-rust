@@ -22,10 +22,10 @@
 //!
 //! let cat = client.attach("my_catalog", AttachOptions::default())?;
 //! for schema in client.schemas(&cat)? {
-//!     for table in client.tables(&cat, &schema.name)? {
-//!         println!("{}.{}", schema.name, table.name);
+//!     for table in client.tables_path(&cat, &schema.path)? {
+//!         println!("{}.{}", schema.path.join("."), table.name);
 //!     }
-//!     for f in client.functions(&cat, &schema.name, FunctionKind::Table)? {
+//!     for f in client.functions_path(&cat, &schema.path, FunctionKind::Table)? {
 //!         println!("{}()", f.name);
 //!     }
 //! }

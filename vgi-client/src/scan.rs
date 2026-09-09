@@ -84,7 +84,7 @@ pub struct BindSpec {
     pub function_type: FunctionType,
     /// The schema that owns it. Resolution dispatches on `(schema, name)`, so a
     /// name declared in two schemas of one catalog needs this to disambiguate.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<Vec<String>>,
     /// Call arguments.
     pub arguments: Arguments,
     /// Pre-serialized call arguments, used in place of [`Self::arguments`].
@@ -106,7 +106,7 @@ impl BindSpec {
         Self {
             function_name: function_name.into(),
             function_type: FunctionType::Table,
-            schema_name: None,
+            schema_path: None,
             arguments: Arguments::new(),
             raw_arguments: None,
             settings: None,
@@ -126,7 +126,17 @@ impl BindSpec {
     /// Set the owning schema.
     #[must_use]
     pub fn in_schema(mut self, schema: impl Into<String>) -> Self {
-        self.schema_name = Some(schema.into());
+        self.schema_path = Some(vec![schema.into()]);
+        self
+    }
+
+    /// Set an arbitrarily nested owning schema path.
+    #[must_use]
+    pub fn in_schema_path(
+        mut self,
+        schema_path: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.schema_path = Some(schema_path.into_iter().map(Into::into).collect());
         self
     }
 
@@ -820,7 +830,7 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
 
         // `init` echoes the whole bind call back, so keep the exact bytes we

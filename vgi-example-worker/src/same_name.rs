@@ -21,7 +21,7 @@
 //!   bind-time connection directly rather than through
 //!   `AcquireAndBindConnection`. It originally never named the schema on that
 //!   request, so every exchange-mode bind reached the worker with no
-//!   `BindRequest.schema_name` and was unresolvable across two schemas.
+//!   `BindRequest.schema_path` and was unresolvable across two schemas.
 //! - The buffered pair shares that bind site but acquires its runtime
 //!   connections through the buffering operator's own `BuildAcquireParams`, so
 //!   the Sink phase is independent coverage. It tags in `process` (the Sink),
@@ -29,7 +29,7 @@
 //! - The aggregate is the widest surface: every aggregate RPC re-resolves the
 //!   function by name over `InvokePooledUnaryRpc`, which is stateless and holds
 //!   no bound connection, so the request is the only carrier of the schema —
-//!   the reason protocol 1.2.0 puts `schema_name` on all of them. The tag is
+//!   the reason protocol 1.2.0 puts `schema_path` on all of them. The tag is
 //!   stamped at finalize while accumulation happens in update, so a *partial*
 //!   mis-route (bind one implementation, update/finalize another) is visible.
 //! - The cacheable producer probes a *different layer* — the C++ result cache,
@@ -91,12 +91,12 @@ fn tag_schema() -> SchemaRef {
 }
 
 /// Render `<schema>:<value>` for every row of the first input column.
-fn tag_batch(schema_name: &str, batch: &RecordBatch) -> Result<RecordBatch> {
+fn tag_batch(schema_path: &str, batch: &RecordBatch) -> Result<RecordBatch> {
     let cast = arrow_cast::cast(batch.column(0), &DataType::Int64)
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
     let v = cast.as_primitive::<Int64Type>();
     let out: StringArray = (0..v.len())
-        .map(|i| (!v.is_null(i)).then(|| format!("{schema_name}:{}", v.value(i))))
+        .map(|i| (!v.is_null(i)).then(|| format!("{schema_path}:{}", v.value(i))))
         .collect();
     RecordBatch::try_new(tag_schema(), vec![Arc::new(out) as ArrayRef])
         .map_err(|e| RpcError::runtime_error(e.to_string()))
@@ -457,8 +457,8 @@ impl TableProducer for CachedTagRow {
 /// is reached only via catalog_table_scan_function_get /
 /// catalog_table_scan_branches_get -- the RPC pair that tells a client which
 /// function backs a declarative table, and the end-to-end regression guard
-/// for protocol 1.5.0's ScanFunctionResult.schema_name /
-/// ScanBranch.schema_name. Driven by
+/// for protocol 1.5.0's ScanFunctionResult.schema_path /
+/// ScanBranch.schema_path. Driven by
 /// test/sql/integration/table/same_name_schemas.test.
 pub struct SameNameTableScan {
     schema: &'static str,

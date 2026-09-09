@@ -162,6 +162,7 @@ pub fn catalog() -> CatalogModel {
         name: CATALOG_NAME.to_string(),
         comment: Some("narrow-bind reproducer catalog".to_string()),
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             comment: Some("narrow-bind reproducer catalog".to_string()),
             tags: Vec::new(),

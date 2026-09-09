@@ -219,6 +219,7 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
         attach_options_default_batch: default,
         comment: Some("Catalog exercising every ATTACH option type".to_string()),
         schemas: vec![vgi::catalog::CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             comment: None,
             tags: Vec::new(),
@@ -263,6 +264,7 @@ pub fn required_catalog() -> vgi::catalog::CatalogModel {
         attach_option_specs: vec![api_key, region],
         comment: Some("Catalog that refuses an ATTACH without its required option".to_string()),
         schemas: vec![vgi::catalog::CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             comment: None,
             tags: Vec::new(),

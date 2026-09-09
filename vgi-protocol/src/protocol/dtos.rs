@@ -16,6 +16,8 @@ use vgi_rpc::{Bytes, DictString, LargeBytes, Result, RpcError, UtcTimestamp, Vgi
 pub type StrMap = Vec<(String, String)>;
 /// `map<utf8, int64>` payload.
 pub type IntMap = Vec<(String, i64)>;
+/// Raw schema identifier components, ordered outermost to innermost.
+pub type SchemaPath = Vec<String>;
 
 /// An optionally-inlined `int64`: NULL means "not inlined". The extension reads
 /// it via `row[...].as<int64_t>()`, which yields `nullopt` for NULL — its signal
@@ -127,7 +129,7 @@ pub struct BindRequest {
     /// no schema to name — COPY handler binds are advertised at catalog level,
     /// and a scan whose function resolved to a built-in carries none either.
     /// Additive nullable column; the C++ always emits it as of protocol 1.1.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
     // NOTE: the `copy_from` / `copy_to` struct columns are intentionally NOT
     // derived fields here. The C++ extension only appends them to the
     // BindRequest schema for a COPY ... FROM / COPY ... TO scan (omitting them
@@ -142,7 +144,7 @@ pub struct BindRequest {
 ///
 /// The derived decoder resolves fields by name and errors on a missing column,
 /// but the canonical Python `BindRequest` is a dataclass with defaults: a field
-/// the client omits simply takes its default. `schema_name` (protocol 1.1.0) is
+/// the client omits simply takes its default. `schema_path` (protocol 1.1.0) is
 /// such a field — an extension built before it never emits the column. Append a
 /// null one so the by-name decode yields `None`, which resolution already treats
 /// as "the caller named no schema".
@@ -153,25 +155,25 @@ pub struct BindRequest {
 pub fn backfill_bind_request(
     batch: arrow_array::RecordBatch,
 ) -> Result<(arrow_array::RecordBatch, bool)> {
-    ensure_schema_name(batch)
+    ensure_schema_path(batch)
 }
 
-/// Append a null `schema_name` column when the request batch lacks one, so a
+/// Append a null `schema_path` column when the request batch lacks one, so a
 /// request from a peer that predates the field still decodes (the `VgiArrow`
 /// derive resolves fields by name and errors on a missing column, while the
 /// canonical Python request dataclasses default it to `None`).
 ///
-/// Every request that gained `schema_name` did so as an *additive nullable*
+/// Every request that gained `schema_path` did so as an *additive nullable*
 /// column: `BindRequest` in protocol 1.1.0, the 15 unary requests that
 /// re-resolve by name in 1.2.0. A pre-1.1.0 peer omits it from `BindRequest`; a
 /// pre-1.2.0 peer omits it from the unary requests — the same shape, so one
 /// helper serves both. Returns whether the column had to be synthesised, which
 /// distinguishes a peer that predates the field (absent) from one that sent it
 /// null (present) — a statement about the peer, not about this call.
-pub fn ensure_schema_name(
+pub fn ensure_schema_path(
     batch: arrow_array::RecordBatch,
 ) -> Result<(arrow_array::RecordBatch, bool)> {
-    if batch.column_by_name("schema_name").is_some() {
+    if batch.column_by_name("schema_path").is_some() {
         return Ok((batch, false));
     }
     let rows = batch.num_rows();
@@ -182,15 +184,20 @@ pub fn ensure_schema_name(
         .map(|f| f.as_ref().clone())
         .collect();
     let mut columns = batch.columns().to_vec();
-    fields.push(arrow_schema::Field::new(
-        "schema_name",
+    let schema_path_type = arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+        "item",
         arrow_schema::DataType::Utf8,
         true,
+    )));
+    fields.push(arrow_schema::Field::new(
+        "schema_path",
+        schema_path_type.clone(),
+        true,
     ));
-    columns.push(Arc::new(arrow_array::StringArray::new_null(rows)));
+    columns.push(arrow_array::new_null_array(&schema_path_type, rows));
     let batch =
         arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-            .map_err(|e| RpcError::type_error(format!("backfill schema_name: {e}")))?;
+            .map_err(|e| RpcError::type_error(format!("backfill schema_path: {e}")))?;
     Ok((batch, true))
 }
 
@@ -356,12 +363,17 @@ mod backfill_tests {
     use arrow_array::{Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
-    fn batch(with_schema_name: bool) -> RecordBatch {
+    fn batch(with_schema_path: bool) -> RecordBatch {
         let mut fields = vec![Field::new("function_name", DataType::Utf8, false)];
         let mut cols: Vec<arrow_array::ArrayRef> = vec![Arc::new(StringArray::from(vec!["f"]))];
-        if with_schema_name {
-            fields.push(Field::new("schema_name", DataType::Utf8, true));
-            cols.push(Arc::new(StringArray::from(vec![Some("data")])));
+        if with_schema_path {
+            let item = Arc::new(Field::new("item", DataType::Utf8, true));
+            fields.push(Field::new(
+                "schema_path",
+                DataType::List(item.clone()),
+                true,
+            ));
+            cols.push(arrow_array::new_null_array(&DataType::List(item), 1));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
     }
@@ -372,7 +384,7 @@ mod backfill_tests {
     fn absent_column_is_synthesised_and_reported() {
         let (out, legacy) = backfill_bind_request(batch(false)).expect("backfill");
         assert!(legacy, "an absent column means a pre-1.1.0 peer");
-        let col = out.column_by_name("schema_name").expect("column added");
+        let col = out.column_by_name("schema_path").expect("column added");
         assert_eq!(col.len(), 1);
         assert!(col.is_null(0));
     }
@@ -677,6 +689,18 @@ pub struct CatalogAttachRequest {
     pub options: Option<Bytes>,
     pub data_version_spec: Option<String>,
     pub implementation_version: Option<String>,
+    /// IPC-serialized [`ClientCapabilities`] record.
+    pub client_capabilities: Option<Bytes>,
+}
+
+/// Engine capabilities advertised while attaching a catalog.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct ClientCapabilities {
+    pub engine: String,
+    pub native_formats: Vec<String>,
+    pub catalogs: Vec<String>,
+    pub can_stream: bool,
+    pub filter_encodings: Vec<String>,
 }
 
 /// Request for `table_function_cardinality` / `table_function_statistics`
@@ -710,7 +734,7 @@ pub struct AggregateWindowInitRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `aggregate_window` — evaluate one output row over its sub-frames.
@@ -726,7 +750,7 @@ pub struct AggregateWindowRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `aggregate_window_batch` — evaluate `count` consecutive output rows.
@@ -744,7 +768,7 @@ pub struct AggregateWindowBatchRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `aggregate_window` / `aggregate_window_batch` result.
@@ -763,7 +787,7 @@ pub struct AggregateWindowDestructorRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `table_function_dynamic_to_string` — post-execution profiling info.
@@ -798,7 +822,7 @@ pub struct AggregateStreamingOpenRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `aggregate_streaming_open` result — the session token.
@@ -818,7 +842,7 @@ pub struct AggregateStreamingChunkRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `aggregate_streaming_chunk` result — a same-length output batch.
@@ -837,14 +861,14 @@ pub struct AggregateStreamingCloseRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// One physical source backing a (possibly multi-branch) table scan.
 ///
 /// A branch is either a *function* branch (`function_name` names a table
 /// function) or a *catalog-table* branch (`function_name` is empty and
-/// `source_table` is set — it scans `source_catalog.source_schema.source_table`
+/// `source_table` is set — it scans `source_catalog.source_schema_path.source_table`
 /// in a companion catalog).
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranch {
@@ -853,7 +877,7 @@ pub struct ScanBranch {
     pub branch_filter: Option<String>,
     pub writable: bool,
     pub source_catalog: Option<String>,
-    pub source_schema: Option<String>,
+    pub source_schema_path: Option<SchemaPath>,
     pub source_table: Option<String>,
     /// Format branch only — the format to read (`parquet`, `csv`, `iceberg`, …).
     /// The CLIENT resolves it to that format's reader, so a worker says what the
@@ -872,10 +896,10 @@ pub struct ScanBranch {
     /// which implementation this branch's `function_name` refers to when the
     /// same name is registered in more than one schema. `None` for a pre-1.5.0
     /// worker, or when the function has no schema of its own to report.
-    /// Unrelated to `source_schema` above, which is a catalog-table branch's
+    /// Unrelated to `source_schema_path` above, which is a catalog-table branch's
     /// *source table's* schema, not this function's own. Added in protocol
     /// 1.5.0. Appended last for consistency with the reference wire contract.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// Response for `catalog_table_scan_branches_get`. The `branches` list must be
@@ -994,7 +1018,7 @@ pub struct CatalogSchemasParams {
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CatalogSchemaNameParams {
     pub attach_opaque_data: Bytes,
-    pub name: String,
+    pub path: SchemaPath,
     pub transaction_opaque_data: Option<Bytes>,
 }
 
@@ -1002,7 +1026,7 @@ pub struct CatalogSchemaNameParams {
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CatalogSchemaContentsFunctionsParams {
     pub attach_opaque_data: Bytes,
-    pub name: String,
+    pub path: SchemaPath,
     #[allow(non_snake_case)]
     pub r#type: DictString,
     pub transaction_opaque_data: Option<Bytes>,
@@ -1050,7 +1074,7 @@ pub struct SchemaInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub attach_opaque_data: Bytes,
-    pub name: String,
+    pub path: SchemaPath,
     pub estimated_object_count: Option<IntMap>,
 }
 
@@ -1070,13 +1094,22 @@ pub struct RequiredSecret {
     pub secret_name: Option<String>,
 }
 
+/// Serialized foreign-key constraint carried inside [`TableInfo`].
+#[derive(Debug, Clone, VgiArrow)]
+pub struct ForeignKeyInfo {
+    pub fk_columns: Vec<String>,
+    pub pk_columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_schema_path: SchemaPath,
+}
+
 /// `TableInfo` item — describes a catalog table to DuckDB.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct TableInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub name: String,
-    pub schema_name: String,
+    pub schema_path: SchemaPath,
     /// IPC-serialized Arrow schema of the table columns.
     pub columns: Bytes,
     pub not_null_constraints: Vec<i32>,
@@ -1116,7 +1149,7 @@ pub struct ViewInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub name: String,
-    pub schema_name: String,
+    pub schema_path: SchemaPath,
     pub definition: String,
     pub column_comments: StrMap,
 }
@@ -1127,7 +1160,7 @@ pub struct MacroInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub name: String,
-    pub schema_name: String,
+    pub schema_path: SchemaPath,
     pub macro_type: DictString,
     pub parameters: Vec<String>,
     pub parameter_default_values: Option<Bytes>,
@@ -1157,7 +1190,7 @@ pub struct ScanFunctionResult {
     /// when the function has no schema of its own to report. Added in
     /// protocol 1.5.0. Appended last for consistency with the reference wire
     /// contract.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `FunctionInfo` item — describes a function to DuckDB.
@@ -1166,7 +1199,7 @@ pub struct FunctionInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
     pub name: String,
-    pub schema_name: String,
+    pub schema_path: SchemaPath,
     pub function_type: DictString,
     pub arguments: Bytes,
     pub output_schema: Bytes,
@@ -1271,7 +1304,7 @@ pub struct TableBufferingProcessRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `TableBufferingProcessResponse`.
@@ -1292,7 +1325,7 @@ pub struct TableBufferingCombineRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `TableBufferingCombineResponse`.
@@ -1310,7 +1343,7 @@ pub struct TableBufferingDestructorRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,7 +1363,7 @@ pub struct AggregateBindRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `AggregateBindResponse`.
@@ -1351,7 +1384,7 @@ pub struct AggregateUpdateRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `AggregateCombineRequest`.
@@ -1365,7 +1398,7 @@ pub struct AggregateCombineRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `AggregateFinalizeRequest`.
@@ -1380,7 +1413,7 @@ pub struct AggregateFinalizeRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 /// `AggregateFinalizeResponse`.
@@ -1407,7 +1440,7 @@ pub struct AggregateDestructorRequest {
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
-    pub schema_name: Option<String>,
+    pub schema_path: Option<SchemaPath>,
 }
 
 #[cfg(test)]
@@ -1447,19 +1480,22 @@ mod federation_tests {
             branch_filter: Some("id < 100".to_string()),
             writable: false,
             source_catalog: Some("acme_lake".to_string()),
-            source_schema: Some("main".to_string()),
+            source_schema_path: Some(vec!["main".to_string()]),
             source_table: Some("events".to_string()),
             format_name: None,
             format_locations: None,
             format_options: None,
-            schema_name: None,
+            schema_path: None,
         };
         let batch = crate::wire::to_batch(b).unwrap();
         let back: ScanBranch = crate::wire::from_batch(&batch).unwrap();
         assert_eq!(back.function_name, "");
         assert_eq!(back.branch_filter.as_deref(), Some("id < 100"));
         assert_eq!(back.source_catalog.as_deref(), Some("acme_lake"));
-        assert_eq!(back.source_schema.as_deref(), Some("main"));
+        assert_eq!(
+            back.source_schema_path.as_deref(),
+            Some(["main".to_string()].as_slice())
+        );
         assert_eq!(back.source_table.as_deref(), Some("events"));
     }
 

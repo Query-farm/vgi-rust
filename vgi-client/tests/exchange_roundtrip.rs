@@ -64,11 +64,11 @@ fn a_scalar_function_maps_a_batch() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     // `double(value)` takes its argument as a column, so the argument slot
     // carries a typed placeholder and the values arrive in the input batch.
-    let mut spec = BindSpec::table("double").in_schema(&schema_name);
+    let mut spec = BindSpec::table("double").in_schema(&schema_path);
     spec.function_type = FunctionType::Scalar;
     spec.arguments = Arguments::new().positional(ArgValue::Placeholder(DataType::Int64));
 
@@ -104,9 +104,9 @@ fn a_scalar_exchange_refuses_sends_after_close() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let mut spec = BindSpec::table("double").in_schema(&schema_name);
+    let mut spec = BindSpec::table("double").in_schema(&schema_path);
     spec.function_type = FunctionType::Scalar;
     spec.arguments = Arguments::new().positional(ArgValue::Placeholder(DataType::Int64));
 
@@ -133,9 +133,9 @@ fn a_streaming_table_in_out_echoes_its_input() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let mut spec = BindSpec::table("echo").in_schema(&schema_name);
+    let mut spec = BindSpec::table("echo").in_schema(&schema_path);
     spec.function_type = FunctionType::TableInOut;
 
     let input_schema = i64_schema("n");
@@ -166,11 +166,11 @@ fn a_one_to_n_transform_reports_row_provenance() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     // `repeat_inputs` emits each input row more than once, which is exactly
     // when a worker must say which input row each output row came from.
-    let mut spec = BindSpec::table("repeat_inputs").in_schema(&schema_name);
+    let mut spec = BindSpec::table("repeat_inputs").in_schema(&schema_path);
     spec.function_type = FunctionType::TableInOut;
 
     // Bind failure here means the fixture was renamed or removed — that should
@@ -218,9 +218,9 @@ fn a_buffered_function_sinks_then_sources() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let mut spec = BindSpec::table("buffer_input").in_schema(&schema_name);
+    let mut spec = BindSpec::table("buffer_input").in_schema(&schema_path);
     spec.function_type = FunctionType::TableBuffering;
 
     let input_schema = i64_schema("n");

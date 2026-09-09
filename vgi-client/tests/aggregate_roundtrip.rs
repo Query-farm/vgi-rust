@@ -54,8 +54,8 @@ fn values(n: &[i64]) -> RecordBatch {
 }
 
 /// `vgi_sum(value)` — the simplest grouped aggregate in the example catalog.
-fn sum_spec(schema_name: &str) -> BindSpec {
-    let mut spec = BindSpec::table("vgi_sum").in_schema(schema_name);
+fn sum_spec(schema_path: &str) -> BindSpec {
+    let mut spec = BindSpec::table("vgi_sum").in_schema(schema_path);
     spec.function_type = FunctionType::Aggregate;
     spec.arguments = Arguments::new().positional(ArgValue::Placeholder(DataType::Int64));
     spec
@@ -68,9 +68,9 @@ fn sums_one_group() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = sum_spec(&schema_name);
+    let spec = sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("aggregate_bind");
@@ -100,9 +100,9 @@ fn keeps_groups_apart() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = sum_spec(&schema_name);
+    let spec = sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");
@@ -144,9 +144,9 @@ fn finalize_answers_in_the_order_asked() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = sum_spec(&schema_name);
+    let spec = sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");
@@ -181,9 +181,9 @@ fn a_batch_without_group_ids_is_refused_before_the_rpc() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = sum_spec(&schema_name);
+    let spec = sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");
@@ -208,8 +208,8 @@ fn two_executions_aggregate_independently() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
-    let spec = sum_spec(&schema_name);
+    let schema_path = cat.default_schema().to_string();
+    let spec = sum_spec(&schema_path);
 
     // Each bind mints its own execution; folding into one must not disturb the
     // other. This is the property parallel aggregation rests on.
@@ -246,8 +246,8 @@ fn two_executions_aggregate_independently() {
 }
 
 /// `vgi_window_sum(value)` — a windowed aggregate over a materialised partition.
-fn window_sum_spec(schema_name: &str) -> BindSpec {
-    let mut spec = BindSpec::table("vgi_window_sum").in_schema(schema_name);
+fn window_sum_spec(schema_path: &str) -> BindSpec {
+    let mut spec = BindSpec::table("vgi_window_sum").in_schema(schema_path);
     spec.function_type = FunctionType::Aggregate;
     spec.arguments = Arguments::new().positional(ArgValue::Placeholder(DataType::Int64));
     spec
@@ -260,9 +260,9 @@ fn evaluates_a_window_frame_over_a_shipped_partition() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = window_sum_spec(&schema_name);
+    let spec = window_sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");
@@ -297,9 +297,9 @@ fn evaluates_several_window_rows_in_one_call() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = window_sum_spec(&schema_name);
+    let spec = window_sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");
@@ -330,9 +330,9 @@ fn a_frame_count_that_disagrees_with_the_frame_list_is_refused() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = window_sum_spec(&schema_name);
+    let spec = window_sum_spec(&schema_path);
     let agg = client
         .aggregate_bind(&cat, &spec, &value_schema())
         .expect("bind");

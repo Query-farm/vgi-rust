@@ -61,13 +61,13 @@ fn legacy_params_schema_for(method: &str) -> SchemaRef {
         ])),
         "catalog_table_column_statistics_get" => Arc::new(Schema::new(vec![
             Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("schema_path", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("transaction_opaque_data", DataType::Binary, true),
         ])),
         "catalog_table_get" => Arc::new(Schema::new(vec![
             Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("schema_path", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("at_unit", DataType::Utf8, true),
             Field::new("at_value", DataType::Utf8, true),
@@ -75,7 +75,7 @@ fn legacy_params_schema_for(method: &str) -> SchemaRef {
         ])),
         "catalog_table_scan_branches_get" => Arc::new(Schema::new(vec![
             Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("schema_path", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("at_unit", DataType::Utf8, true),
             Field::new("at_value", DataType::Utf8, true),
@@ -83,7 +83,7 @@ fn legacy_params_schema_for(method: &str) -> SchemaRef {
         ])),
         "catalog_table_scan_function_get" => Arc::new(Schema::new(vec![
             Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("schema_path", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("at_unit", DataType::Utf8, true),
             Field::new("at_value", DataType::Utf8, true),
@@ -103,17 +103,10 @@ fn legacy_params_schema_for(method: &str) -> SchemaRef {
     }
 }
 
-/// Methods the old table named and got right — the generated table must agree.
+/// Methods whose parameter shapes are unchanged by protocol 2.0.
 const UNCHANGED: &[&str] = &[
     "catalog_copy_from_formats",
-    "catalog_schema_contents_tables",
-    "catalog_schema_contents_views",
-    "catalog_schema_get",
     "catalog_schemas",
-    "catalog_table_column_statistics_get",
-    "catalog_table_get",
-    "catalog_table_scan_branches_get",
-    "catalog_table_scan_function_get",
     "catalog_transaction_begin",
     "catalog_version",
 ];

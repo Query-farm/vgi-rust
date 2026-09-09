@@ -213,7 +213,7 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
-        schema_name: Some(crate::catalog::MAIN_SCHEMA.to_string()),
+        schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {

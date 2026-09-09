@@ -49,10 +49,10 @@ fn scans_a_table_function_end_to_end() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(5i64));
     let bound = client.bind(&cat, &spec).expect("bind");
 
@@ -79,11 +79,11 @@ fn a_large_scan_drains_every_row_in_order() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     const N: i64 = 5000;
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(N));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");
@@ -116,9 +116,9 @@ fn planned_split_metadata_and_redemption_context_round_trip() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
     let spec = BindSpec::table("split_partitioned")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().named("rows_per_country", 3i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let plan = client
@@ -161,10 +161,10 @@ fn a_zero_row_scan_ends_cleanly() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(0i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");
@@ -181,10 +181,10 @@ fn projection_narrows_both_the_schema_and_the_batches() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(3i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let full_width = bound.output_schema().fields().len();
@@ -222,10 +222,10 @@ fn an_out_of_range_projection_is_rejected_before_any_rpc() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("rowid_sequence")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(1i64));
     let bound = client.bind(&cat, &spec).expect("bind");
 
@@ -246,11 +246,11 @@ fn named_arguments_reach_the_worker() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     // `cacheable_numbers(n, ttl)` takes both arguments by name.
     let spec = BindSpec::table("cacheable_numbers")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().named("n", 4i64).named("ttl", 300i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");
@@ -275,10 +275,10 @@ fn a_cacheable_result_advertises_its_directives() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("cacheable_numbers")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().named("n", 2i64).named("ttl", 300i64));
     let bound = client.bind(&cat, &spec).expect("bind");
     let mut scan = client.scan(&bound, &ScanOptions::default()).expect("init");
@@ -309,9 +309,9 @@ fn a_no_store_result_says_so() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
-    let spec = BindSpec::table("cache_no_store").in_schema(&schema_name);
+    let spec = BindSpec::table("cache_no_store").in_schema(&schema_path);
     let Ok(bound) = client.bind(&cat, &spec) else {
         return; // fixture not present in this catalog build
     };
@@ -345,10 +345,10 @@ fn parallel_connections_share_one_scan_and_partition_the_rows() {
     let cat = primary
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_name = cat.default_schema().to_string();
+    let schema_path = cat.default_schema().to_string();
 
     let spec = BindSpec::table("partitioned_batch_index")
-        .in_schema(&schema_name)
+        .in_schema(&schema_path)
         .with_arguments(Arguments::new().positional(N));
     let bound = primary.bind(&cat, &spec).expect("bind");
 

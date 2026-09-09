@@ -54,7 +54,7 @@ pub struct BoundAggregate {
     output_schema: SchemaRef,
     raw_output_schema: Bytes,
     function_name: String,
-    schema_name: Option<String>,
+    schema_path: Option<Vec<String>>,
 }
 
 impl BoundAggregate {
@@ -159,7 +159,7 @@ impl VgiClient {
             settings: spec.settings.clone(),
             secrets: secrets.map(Bytes),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
         let response: AggregateBindResponse = call(
             self.transport_mut(),
@@ -176,7 +176,7 @@ impl VgiClient {
             output_schema,
             raw_output_schema: response.output_schema,
             function_name: spec.function_name.clone(),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         })
     }
 
@@ -200,7 +200,7 @@ impl VgiClient {
             execution_id: agg.execution_id.clone(),
             input_batch: Bytes(ipc::write_batch(batch)?),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),
@@ -226,7 +226,7 @@ impl VgiClient {
             execution_id: agg.execution_id.clone(),
             merge_batch: Bytes(ipc::write_batch(merge_batch)?),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),
@@ -252,7 +252,7 @@ impl VgiClient {
             group_ids_batch: Bytes(ipc::write_batch(&group_ids_batch(group_ids)?)?),
             output_schema: agg.raw_output_schema.clone(),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         };
         let response: AggregateFinalizeResponse = call(
             self.transport_mut(),
@@ -289,7 +289,7 @@ impl VgiClient {
             execution_id: agg.execution_id.clone(),
             group_ids_batch: Bytes(ipc::write_batch(&group_ids_batch(group_ids)?)?),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),
@@ -354,7 +354,7 @@ pub struct WindowPartition {
     execution_id: Bytes,
     partition_id: i64,
     function_name: String,
-    schema_name: Option<String>,
+    schema_path: Option<Vec<String>>,
 }
 
 impl WindowPartition {
@@ -384,7 +384,7 @@ impl VgiClient {
             filter_mask: None,
             frame_stats: None,
             all_valid: None,
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),
@@ -397,7 +397,7 @@ impl VgiClient {
             execution_id: agg.execution_id.clone(),
             partition_id,
             function_name: agg.function_name.clone(),
-            schema_name: agg.schema_name.clone(),
+            schema_path: agg.schema_path.clone(),
         })
     }
 
@@ -419,7 +419,7 @@ impl VgiClient {
             rid: row,
             frame_starts: frames.iter().map(|f| f.0).collect(),
             frame_ends: frames.iter().map(|f| f.1).collect(),
-            schema_name: part.schema_name.clone(),
+            schema_path: part.schema_path.clone(),
         };
         let response: AggregateWindowResponse = call(
             self.transport_mut(),
@@ -459,7 +459,7 @@ impl VgiClient {
             frames_per_row: frames_per_row.to_vec(),
             frame_starts: frames.iter().map(|f| f.0).collect(),
             frame_ends: frames.iter().map(|f| f.1).collect(),
-            schema_name: part.schema_name.clone(),
+            schema_path: part.schema_path.clone(),
         };
         let response: AggregateWindowResponse = call(
             self.transport_mut(),
@@ -477,7 +477,7 @@ impl VgiClient {
             function_name: part.function_name.clone(),
             execution_id: part.execution_id.clone(),
             partition_id: part.partition_id,
-            schema_name: part.schema_name.clone(),
+            schema_path: part.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),
@@ -502,7 +502,7 @@ impl VgiClient {
 pub struct StreamingAggregate {
     execution_id: Bytes,
     function_name: String,
-    schema_name: Option<String>,
+    schema_path: Option<Vec<String>>,
 }
 
 impl StreamingAggregate {
@@ -538,7 +538,7 @@ impl VgiClient {
             settings: spec.settings.clone(),
             secrets: None,
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         };
         let response: AggregateStreamingOpenResponse = call(
             self.transport_mut(),
@@ -550,7 +550,7 @@ impl VgiClient {
         Ok(StreamingAggregate {
             execution_id: response.execution_id,
             function_name: spec.function_name.clone(),
-            schema_name: spec.schema_name.clone(),
+            schema_path: spec.schema_path.clone(),
         })
     }
 
@@ -566,7 +566,7 @@ impl VgiClient {
             execution_id: session.execution_id.clone(),
             input_batch: Bytes(ipc::write_batch(input)?),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: session.schema_name.clone(),
+            schema_path: session.schema_path.clone(),
         };
         let response: AggregateStreamingChunkResponse = call(
             self.transport_mut(),
@@ -597,7 +597,7 @@ impl VgiClient {
             function_name: session.function_name.clone(),
             execution_id: session.execution_id.clone(),
             attach_opaque_data: Some(cat.handle().clone()),
-            schema_name: session.schema_name.clone(),
+            schema_path: session.schema_path.clone(),
         };
         call_unit(
             self.transport_mut(),

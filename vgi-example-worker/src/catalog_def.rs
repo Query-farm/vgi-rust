@@ -642,6 +642,7 @@ fn data_tables() -> Vec<CatTable> {
             t.primary_key = vec![vec![0]];
             t.unique = vec![vec![2]];
             t.foreign_keys = vec![vgi::catalog::ForeignKey {
+                referenced_schema_path: None,
                 columns: vec!["department_id".to_string()],
                 referenced_table: "departments".to_string(),
                 referenced_columns: vec!["id".to_string()],
@@ -1147,6 +1148,7 @@ fn data_tables() -> Vec<CatTable> {
     employees.not_null = vec![0, 1, 2];
     employees.unique = vec![vec![2]];
     employees.foreign_keys = vec![vgi::catalog::ForeignKey {
+        referenced_schema_path: None,
         columns: vec!["department_id".to_string()],
         referenced_table: "departments".to_string(),
         referenced_columns: vec!["id".to_string()],
@@ -1167,6 +1169,7 @@ fn data_tables() -> Vec<CatTable> {
     projects.primary_key = vec![vec![0, 1]];
     projects.not_null = vec![0, 1, 2];
     projects.foreign_keys = vec![vgi::catalog::ForeignKey {
+        referenced_schema_path: None,
         columns: vec!["department_id".to_string()],
         referenced_table: "departments".to_string(),
         referenced_columns: vec!["id".to_string()],
@@ -1220,6 +1223,7 @@ pub fn versioned() -> CatalogModel {
         source_url: None,
         supports_time_travel: false,
         schemas: vec![CatSchema {
+            path: Vec::new(),
             name: "main".to_string(),
             comment: None,
             tags: Vec::new(),
@@ -1236,6 +1240,7 @@ pub fn versioned_tables() -> CatalogModel {
     use arrow_schema::DataType::{Float64, Int64, Utf8};
     use std::collections::HashMap;
     let main = |tables: Vec<CatTable>| CatSchema {
+        path: Vec::new(),
         name: "main".to_string(),
         comment: None,
         tags: Vec::new(),
@@ -1356,6 +1361,7 @@ pub fn build() -> CatalogModel {
         supports_time_travel: true,
         schemas: vec![
             CatSchema {
+                path: Vec::new(),
                 name: "main".to_string(),
                 comment: Some("Example functions for testing VGI".to_string()),
                 tags: Vec::new(),
@@ -1444,6 +1450,7 @@ pub fn build() -> CatalogModel {
                 ],
             },
             CatSchema {
+                path: Vec::new(),
                 name: "data".to_string(),
                 comment: Some("Example tables backed by functions".to_string()),
                 tags: Vec::new(),

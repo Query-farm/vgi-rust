@@ -12,8 +12,8 @@ use arrow_schema::DataType;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogInfo,
-    CatalogTransactionBeginResult, CatalogVersionResult, FunctionInfo, MacroInfo, ScanBranch,
-    ScanBranchesResult, ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
+    CatalogTransactionBeginResult, CatalogVersionResult, ClientCapabilities, FunctionInfo,
+    MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
 };
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
@@ -540,11 +540,21 @@ impl VgiClient {
 
     /// Attach a catalog by name, returning the handle every later call needs.
     pub fn attach(&mut self, name: &str, options: AttachOptions) -> Result<AttachedCatalog> {
+        let capabilities = ClientCapabilities {
+            engine: "vgi-rust".to_string(),
+            native_formats: Vec::new(),
+            catalogs: Vec::new(),
+            can_stream: true,
+            filter_encodings: vec!["vgi.filters.v1".to_string()],
+        };
         let request = envelope(CatalogAttachRequest {
             name: name.to_string(),
             options: options.options,
             data_version_spec: options.data_version_spec,
             implementation_version: options.implementation_version,
+            client_capabilities: Some(Bytes::from(vgi_protocol::ipc::write_batch(
+                &vgi_protocol::wire::to_batch(capabilities)?,
+            )?)),
         })?;
         let info: CatalogAttachResult = call(
             self.transport_mut(),
@@ -597,12 +607,21 @@ impl VgiClient {
 
     /// One schema by name, or `None` when the catalog has no such schema.
     pub fn schema_get(&mut self, cat: &AttachedCatalog, name: &str) -> Result<Option<SchemaInfo>> {
+        self.schema_get_path(cat, &[name.to_string()])
+    }
+
+    /// One schema by its raw nested path.
+    pub fn schema_get_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        path: &[String],
+    ) -> Result<Option<SchemaInfo>> {
         let items: Vec<SchemaInfo> = call_items(
             self.transport_mut(),
             "catalog_schema_get",
             p::CatalogSchemaGetParams {
                 attach_opaque_data: cat.handle.clone(),
-                name: name.to_string(),
+                path: path.to_vec(),
                 transaction_opaque_data: cat.txn(),
             },
         )?;
@@ -611,12 +630,21 @@ impl VgiClient {
 
     /// Tables in a schema.
     pub fn tables(&mut self, cat: &AttachedCatalog, schema: &str) -> Result<Vec<TableInfo>> {
+        self.tables_path(cat, &[schema.to_string()])
+    }
+
+    /// Tables in an arbitrarily nested schema path.
+    pub fn tables_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        path: &[String],
+    ) -> Result<Vec<TableInfo>> {
         call_items(
             self.transport_mut(),
             "catalog_schema_contents_tables",
             p::CatalogSchemaContentsTablesParams {
                 attach_opaque_data: cat.handle.clone(),
-                name: schema.to_string(),
+                path: path.to_vec(),
                 transaction_opaque_data: cat.txn(),
             },
         )
@@ -624,12 +652,17 @@ impl VgiClient {
 
     /// Views in a schema.
     pub fn views(&mut self, cat: &AttachedCatalog, schema: &str) -> Result<Vec<ViewInfo>> {
+        self.views_path(cat, &[schema.to_string()])
+    }
+
+    /// Views in an arbitrarily nested schema path.
+    pub fn views_path(&mut self, cat: &AttachedCatalog, path: &[String]) -> Result<Vec<ViewInfo>> {
         call_items(
             self.transport_mut(),
             "catalog_schema_contents_views",
             p::CatalogSchemaContentsViewsParams {
                 attach_opaque_data: cat.handle.clone(),
-                name: schema.to_string(),
+                path: path.to_vec(),
                 transaction_opaque_data: cat.txn(),
             },
         )
@@ -642,12 +675,22 @@ impl VgiClient {
         schema: &str,
         kind: FunctionKind,
     ) -> Result<Vec<FunctionInfo>> {
+        self.functions_path(cat, &[schema.to_string()], kind)
+    }
+
+    /// Functions of one kind in an arbitrarily nested schema path.
+    pub fn functions_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        path: &[String],
+        kind: FunctionKind,
+    ) -> Result<Vec<FunctionInfo>> {
         call_items(
             self.transport_mut(),
             "catalog_schema_contents_functions",
             p::CatalogSchemaContentsFunctionsParams {
                 attach_opaque_data: cat.handle.clone(),
-                name: schema.to_string(),
+                path: path.to_vec(),
                 r#type: kind.dict(),
                 transaction_opaque_data: cat.txn(),
             },
@@ -661,12 +704,22 @@ impl VgiClient {
         schema: &str,
         kind: MacroKind,
     ) -> Result<Vec<MacroInfo>> {
+        self.macros_path(cat, &[schema.to_string()], kind)
+    }
+
+    /// Macros of one kind in an arbitrarily nested schema path.
+    pub fn macros_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        path: &[String],
+        kind: MacroKind,
+    ) -> Result<Vec<MacroInfo>> {
         call_items(
             self.transport_mut(),
             "catalog_schema_contents_macros",
             p::CatalogSchemaContentsMacrosParams {
                 attach_opaque_data: cat.handle.clone(),
-                name: schema.to_string(),
+                path: path.to_vec(),
                 r#type: kind.dict(),
                 transaction_opaque_data: cat.txn(),
             },
@@ -681,12 +734,23 @@ impl VgiClient {
         name: &str,
         at: Option<&At>,
     ) -> Result<Option<TableInfo>> {
+        self.table_get_path(cat, &[schema.to_string()], name, at)
+    }
+
+    /// One table in an arbitrarily nested schema path.
+    pub fn table_get_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        at: Option<&At>,
+    ) -> Result<Option<TableInfo>> {
         let items: Vec<TableInfo> = call_items(
             self.transport_mut(),
             "catalog_table_get",
             p::CatalogTableGetParams {
                 attach_opaque_data: cat.handle.clone(),
-                schema_name: schema.to_string(),
+                schema_path: schema_path.to_vec(),
                 name: name.to_string(),
                 at_unit: at.map(|a| a.unit.clone()),
                 at_value: at.map(|a| a.value.clone()),
@@ -725,7 +789,7 @@ impl VgiClient {
             "catalog_table_scan_function_get",
             p::CatalogTableScanFunctionGetParams {
                 attach_opaque_data: cat.handle.clone(),
-                schema_name: table.schema_name.clone(),
+                schema_path: table.schema_path.clone(),
                 name: table.name.clone(),
                 at_unit: at.map(|a| a.unit.clone()),
                 at_value: at.map(|a| a.value.clone()),
@@ -763,7 +827,7 @@ impl VgiClient {
             "catalog_table_scan_branches_get",
             p::CatalogTableScanBranchesGetParams {
                 attach_opaque_data: cat.handle.clone(),
-                schema_name: table.schema_name.clone(),
+                schema_path: table.schema_path.clone(),
                 name: table.name.clone(),
                 at_unit: at.map(|a| a.unit.clone()),
                 at_value: at.map(|a| a.value.clone()),
@@ -803,12 +867,22 @@ impl VgiClient {
         schema: &str,
         name: &str,
     ) -> Result<RecordBatch> {
+        self.table_column_statistics_path(cat, &[schema.to_string()], name)
+    }
+
+    /// Optimizer statistics for a table in an arbitrarily nested schema path.
+    pub fn table_column_statistics_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+    ) -> Result<RecordBatch> {
         call_batch(
             self.transport_mut(),
             "catalog_table_column_statistics_get",
             p::CatalogTableColumnStatisticsGetParams {
                 attach_opaque_data: cat.handle.clone(),
-                schema_name: schema.to_string(),
+                schema_path: schema_path.to_vec(),
                 name: name.to_string(),
                 transaction_opaque_data: cat.txn(),
             },
@@ -867,9 +941,9 @@ fn scan_branches_from_legacy(
             arguments: legacy.arguments,
             branch_filter: None,
             writable: false,
-            schema_name: legacy.schema_name,
+            schema_path: legacy.schema_path,
             source_catalog: None,
-            source_schema: None,
+            source_schema_path: None,
             source_table: None,
             format_name: None,
             format_locations: None,
@@ -1031,7 +1105,7 @@ mod attach_option_tests {
                         function_name: "legacy_sequence".to_string(),
                         arguments: Bytes(vec![42]),
                         required_extensions: vec!["legacy_ext".to_string()],
-                        schema_name: Some("legacy_schema".to_string()),
+                        schema_path: Some(vec!["legacy_schema".to_string()]),
                     })?;
                     let encoded = ipc::write_batch(&inner)?;
                     RecordBatch::try_from_iter(vec![(
@@ -1101,7 +1175,7 @@ mod attach_option_tests {
             comment: None,
             tags: Vec::new(),
             name: "numbers".to_string(),
-            schema_name: "data".to_string(),
+            schema_path: vec!["data".to_string()],
             columns: Bytes(Vec::new()),
             not_null_constraints: Vec::new(),
             unique_constraints: Vec::new(),
@@ -1142,9 +1216,9 @@ mod attach_option_tests {
         assert_eq!(first.branches.len(), 1);
         assert_eq!(first.branches[0].function_name, "legacy_sequence");
         assert_eq!(
-            first.branches[0].schema_name.as_deref(),
-            Some("legacy_schema"),
-            "scan_branches_from_legacy must carry the legacy response's schema_name through, not drop it"
+            first.branches[0].schema_path.as_deref(),
+            Some(["legacy_schema".to_string()].as_slice()),
+            "scan_branches_from_legacy must carry the legacy response's schema_path through, not drop it"
         );
         assert_eq!(first.required_extensions, ["legacy_ext"]);
 
@@ -1290,7 +1364,7 @@ mod macro_default_tests {
             comment: None,
             tags: Vec::new(),
             name: "clamp".to_string(),
-            schema_name: "main".to_string(),
+            schema_path: vec!["main".to_string()],
             macro_type: DictString("scalar".to_string()),
             parameters: parameters.iter().map(|value| value.to_string()).collect(),
             parameter_default_values: defaults.map(|batch| {
