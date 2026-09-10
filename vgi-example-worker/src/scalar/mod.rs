@@ -131,7 +131,7 @@ impl ScalarFunction for ArgumentNamesProbeFunction {
         vec![
             ArgSpec::column("left", 0, "int64", "Left value"),
             ArgSpec::column("right", 1, "int64", "Right value"),
-            ArgSpec::const_arg("scale", 2, "int64", "Scale factor"),
+            ArgSpec::const_arg("scale", 2, "int64", "Scale factor").with_default(2),
         ]
     }
 
