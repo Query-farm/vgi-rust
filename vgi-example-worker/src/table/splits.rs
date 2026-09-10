@@ -1998,6 +1998,12 @@ struct DynFilterProducer {
 }
 
 impl TableProducer for DynFilterProducer {
+    fn on_dynamic_filters(&mut self, filters: Option<&vgi::pushdown::PushdownFilters>) {
+        if let Some(filters) = filters {
+            self.rendered = render_filters(filters);
+        }
+    }
+
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         const MAX_BATCH: i64 = 4;
         while self.idx < self.ranges.len() {

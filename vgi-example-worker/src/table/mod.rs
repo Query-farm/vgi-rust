@@ -403,9 +403,8 @@ fn late_mat_schema() -> SchemaRef {
 }
 
 /// Summarize the pushed rowid filter as the `pushed` witness string.
-fn rowid_witness(params: &ProcessParams) -> String {
-    let pf = params.current_pushdown_filters.as_ref();
-    match pf {
+fn rowid_witness(filters: Option<&vgi::pushdown::PushdownFilters>) -> String {
+    match filters {
         Some(pf) => {
             let (n, lo, hi) = pf.column_summary("row_id");
             let rng = if lo.is_some() || hi.is_some() {
@@ -486,7 +485,7 @@ impl TableFunction for LateMaterializationFunction {
             batch_size,
             dup,
             stride,
-            witness: rowid_witness(params),
+            witness: rowid_witness(params.current_pushdown_filters.as_ref()),
             offset: 0,
         }))
     }
@@ -502,6 +501,12 @@ struct LateMatProducer {
     offset: i64,
 }
 impl TableProducer for LateMatProducer {
+    fn on_dynamic_filters(&mut self, filters: Option<&vgi::pushdown::PushdownFilters>) {
+        if filters.is_some() {
+            self.witness = rowid_witness(filters);
+        }
+    }
+
     fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
         use arrow_array::StringArray;
         if self.offset >= self.count {
