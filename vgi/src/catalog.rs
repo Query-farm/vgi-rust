@@ -447,6 +447,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         function_type: enums::dict(function_type),
         arguments: Bytes::from(Vec::new()),
         output_schema: Bytes::from(Vec::new()),
+        parameter_default_values: None,
         stability: None,
         null_handling: None,
         description: String::new(),
@@ -543,6 +544,47 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> 
     Ok(())
 }
 
+fn apply_parameter_defaults(
+    fi: &mut FunctionInfo,
+    meta: &FunctionMetadata,
+    arguments: &Schema,
+) -> Result<()> {
+    let Some(defaults) = &meta.parameter_default_values else {
+        return Ok(());
+    };
+    if defaults.num_rows() != 1 {
+        return Err(vgi_rpc::RpcError::value_error(format!(
+            "parameter_default_values must contain exactly one row, got {}",
+            defaults.num_rows()
+        )));
+    }
+    let mut argument_index = 0;
+    for field in defaults.schema().fields() {
+        while argument_index < arguments.fields().len()
+            && arguments.field(argument_index).name() != field.name()
+        {
+            argument_index += 1;
+        }
+        if argument_index == arguments.fields().len() {
+            return Err(vgi_rpc::RpcError::value_error(format!(
+                "parameter_default_values field '{}' is not in argument signature order",
+                field.name()
+            )));
+        }
+        if arguments.field(argument_index).data_type() != field.data_type() {
+            return Err(vgi_rpc::RpcError::type_error(format!(
+                "parameter_default_values field '{}' has type {:?}, expected {:?}",
+                field.name(),
+                field.data_type(),
+                arguments.field(argument_index).data_type()
+            )));
+        }
+        argument_index += 1;
+    }
+    fi.parameter_default_values = Some(Bytes::from(ipc::write_batch(defaults)?));
+    Ok(())
+}
+
 /// Build the `FunctionInfo` for a scalar function.
 pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
     let meta = f.metadata();
@@ -551,6 +593,7 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
 
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
 
     // Scalar functions need a 1-field output schema for DuckDB. Use the fixed
     // return type if declared, else a `result: null` placeholder carrying the
@@ -576,6 +619,7 @@ pub fn table_function_info(f: &dyn crate::table_function::TableFunction) -> Resu
     apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     // Output schema is resolved at bind time; advertise an empty schema.
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
     Ok(fi)
@@ -595,6 +639,7 @@ pub fn table_in_out_function_info(
     fi.input_from_args = meta.input_from_args;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
     Ok(fi)
 }
@@ -609,6 +654,7 @@ pub fn buffering_function_info(
     fi.has_finalize = true;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
     Ok(fi)
 }
@@ -624,8 +670,10 @@ pub fn aggregate_function_info(
     apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     let params = crate::aggregate::AggregateBindParams {
         arguments: crate::arguments::Arguments::default(),
+        argument_names: None,
         input_schema: None,
         settings: crate::settings::Settings::default(),
         secrets: crate::secrets::Secrets::default(),

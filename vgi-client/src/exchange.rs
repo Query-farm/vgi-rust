@@ -194,7 +194,9 @@ fn parse_parent_rows(md: &vgi_rpc::wire::Metadata) -> Result<Option<Vec<i32>>> {
         )));
     }
     Ok(Some(
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     ))
@@ -283,6 +285,7 @@ impl VgiClient {
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
             schema_path: spec.schema_path.clone(),
+            argument_names: spec.argument_names.clone(),
         };
         let bind_call = envelope(request)?;
         let response: BindResponse = call(

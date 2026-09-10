@@ -849,6 +849,7 @@ impl Dispatcher {
         Ok(BindParams {
             input_schema: opt_schema(&dto.input_schema)?,
             arguments: crate::arguments::Arguments::parse(&dto.arguments.0)?,
+            argument_names: dto.argument_names.clone(),
             settings: parse_settings(&dto.settings)?,
             secrets: parse_secrets(&dto.secrets)?,
             resolved_secrets_provided: dto.resolved_secrets_provided,
@@ -3577,6 +3578,7 @@ impl Dispatcher {
         let _ = ctx;
         let params = AggregateBindParams {
             arguments: args,
+            argument_names: dto.argument_names,
             input_schema,
             settings: parse_settings(&dto.settings)?,
             // The C++ pre-resolves any advertised required secret and delivers
@@ -4506,6 +4508,13 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
     // (`row_limit`) the DuckDB extension never sends at all.
     let batch = if req.method == "init" {
         crate::protocol::dtos::backfill_init_request(batch)?
+    } else if req.method == "aggregate_bind" {
+        let names_type = arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::Utf8,
+            true,
+        )));
+        crate::protocol::dtos::ensure_nullable_columns(batch, &[("argument_names", names_type)])?
     } else {
         batch
     };

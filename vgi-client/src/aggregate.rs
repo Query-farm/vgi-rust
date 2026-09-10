@@ -160,6 +160,7 @@ impl VgiClient {
             secrets: secrets.map(Bytes),
             attach_opaque_data: Some(cat.handle().clone()),
             schema_path: spec.schema_path.clone(),
+            argument_names: spec.argument_names.clone(),
         };
         let response: AggregateBindResponse = call(
             self.transport_mut(),

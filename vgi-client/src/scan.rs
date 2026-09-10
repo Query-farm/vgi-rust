@@ -87,6 +87,9 @@ pub struct BindSpec {
     pub schema_path: Option<Vec<String>>,
     /// Call arguments.
     pub arguments: Arguments,
+    /// Full logical argument names. Inner `None` denotes an unnamed vararg;
+    /// outer `None` means names are unavailable.
+    pub argument_names: Option<Vec<Option<String>>>,
     /// Pre-serialized call arguments, used in place of [`Self::arguments`].
     ///
     /// A catalog table's scan arguments arrive from the worker already IPC
@@ -108,6 +111,7 @@ impl BindSpec {
             function_type: FunctionType::Table,
             schema_path: None,
             arguments: Arguments::new(),
+            argument_names: None,
             raw_arguments: None,
             settings: None,
             at: None,
@@ -144,6 +148,17 @@ impl BindSpec {
     #[must_use]
     pub fn with_arguments(mut self, args: Arguments) -> Self {
         self.arguments = args;
+        self
+    }
+
+    /// Set the names corresponding to the logical call arguments.
+    #[must_use]
+    pub fn with_argument_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = Option<S>>,
+        S: Into<String>,
+    {
+        self.argument_names = Some(names.into_iter().map(|name| name.map(Into::into)).collect());
         self
     }
 }
@@ -831,6 +846,7 @@ impl VgiClient {
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
             schema_path: spec.schema_path.clone(),
+            argument_names: spec.argument_names.clone(),
         };
 
         // `init` echoes the whole bind call back, so keep the exact bytes we

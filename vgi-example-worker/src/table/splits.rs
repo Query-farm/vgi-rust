@@ -1923,7 +1923,7 @@ impl TableFunction for SplitDynamicFilter {
         let rendered = params
             .current_pushdown_filters
             .as_ref()
-            .map(|pf| render_filters(&pf))
+            .map(render_filters)
             .unwrap_or_else(|| "(none)".to_string());
         Ok(Box::new(DynFilterProducer {
             schema: Self::schema(),

@@ -399,6 +399,9 @@ pub struct FunctionMetadata {
     pub tags: Vec<(String, String)>,
     /// Fixed scalar return type, when not computed dynamically at bind.
     pub return_type: Option<DataType>,
+    /// Authoritative typed defaults. Exactly one row containing only defaulted
+    /// parameters in signature order; a present null is an explicit NULL.
+    pub parameter_default_values: Option<arrow_array::RecordBatch>,
     pub projection_pushdown: bool,
     pub filter_pushdown: bool,
     pub sampling_pushdown: bool,
@@ -484,6 +487,7 @@ impl Default for FunctionMetadata {
             examples: Vec::new(),
             tags: Vec::new(),
             return_type: None,
+            parameter_default_values: None,
             projection_pushdown: false,
             filter_pushdown: false,
             sampling_pushdown: false,
@@ -520,6 +524,9 @@ pub struct BindParams {
     pub input_schema: Option<SchemaRef>,
     /// Parsed call arguments (const values + positional types).
     pub arguments: crate::arguments::Arguments,
+    /// One entry per logical call argument. Inner `None` is an unnamed vararg;
+    /// outer `None` means the client could not provide names.
+    pub argument_names: Option<Vec<Option<String>>>,
     /// Parsed session settings.
     pub settings: crate::settings::Settings,
     /// Resolved secrets, when provided in a second-phase bind.

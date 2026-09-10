@@ -24,6 +24,9 @@ pub const GROUP_COLUMN_NAME: &str = "__vgi_group_id";
 /// Parameters for `aggregate_bind`.
 pub struct AggregateBindParams {
     pub arguments: Arguments,
+    /// One entry per logical call argument. Inner `None` is an unnamed vararg;
+    /// outer `None` means the client could not provide names.
+    pub argument_names: Option<Vec<Option<String>>>,
     pub input_schema: Option<SchemaRef>,
     pub settings: Settings,
     /// Statically pre-resolved secrets, delivered on `AggregateBindRequest.secrets`

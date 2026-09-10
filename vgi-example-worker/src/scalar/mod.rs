@@ -13,8 +13,9 @@ use arrow_array::{
     Array, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
     StructArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use util::*;
 use vgi::cache_control::CacheControl;
 use vgi::function::{
@@ -45,6 +46,7 @@ fn hex_of(bytes: &[u8]) -> String {
 pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(DoubleFunction);
     w.register_scalar(AddValuesFunction);
+    w.register_scalar(ArgumentNamesProbeFunction);
     w.register_scalar(MultiplyFunction);
     w.register_scalar(PassthruFunction);
     w.register_scalar(CollatzStepsFunction);
@@ -96,6 +98,73 @@ fn meta_ret(desc: &str, ret: DataType) -> FunctionMetadata {
         description: desc.to_string(),
         return_type: Some(ret),
         ..Default::default()
+    }
+}
+
+/// Verifies that bind receives the complete resolved VGI 2 function signature.
+pub struct ArgumentNamesProbeFunction;
+impl ScalarFunction for ArgumentNamesProbeFunction {
+    fn name(&self) -> &str {
+        "argument_names_probe"
+    }
+
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            description: "Checks VGI 2.0 bind-time argument names".to_string(),
+            return_type: Some(DataType::Int64),
+            parameter_default_values: Some(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "scale",
+                        DataType::Int64,
+                        false,
+                    )])),
+                    vec![Arc::new(Int64Array::from(vec![2]))],
+                )
+                .expect("valid argument_names_probe defaults"),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::column("left", 0, "int64", "Left value"),
+            ArgSpec::column("right", 1, "int64", "Right value"),
+            ArgSpec::const_arg("scale", 2, "int64", "Scale factor"),
+        ]
+    }
+
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let expected = Some(vec![
+            Some("left".to_string()),
+            Some("right".to_string()),
+            Some("scale".to_string()),
+        ]);
+        if params.argument_names != expected {
+            return Err(RpcError::value_error(format!(
+                "argument_names_probe expected {expected:?}, got {:?}",
+                params.argument_names
+            )));
+        }
+        Ok(BindResponse::result(DataType::Int64))
+    }
+
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let left = arrow_cast::cast(batch.column(0), &DataType::Int64)
+            .map_err(|error| RpcError::runtime_error(error.to_string()))?;
+        let right = arrow_cast::cast(batch.column(1), &DataType::Int64)
+            .map_err(|error| RpcError::runtime_error(error.to_string()))?;
+        let left = left.as_primitive::<arrow_array::types::Int64Type>();
+        let right = right.as_primitive::<arrow_array::types::Int64Type>();
+        let scale = params.arguments.const_i64(2).unwrap_or(2);
+        let output: Int64Array = (0..batch.num_rows())
+            .map(|index| {
+                (!left.is_null(index) && !right.is_null(index))
+                    .then(|| (left.value(index) + right.value(index)) * scale)
+            })
+            .collect();
+        result(params, arc(output))
     }
 }
 
