@@ -534,7 +534,14 @@ impl PushdownFilters {
         if self.predicates.is_empty() {
             "(none)".into()
         } else {
-            format!("PushdownFilters([{}])", self.format_pushed())
+            format!(
+                "PushdownFilters([{}])",
+                self.predicates
+                    .iter()
+                    .map(|predicate| format_filter_repr(&predicate.expression))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
     }
 
@@ -589,15 +596,17 @@ impl PushdownFilters {
     }
     pub fn column_summary(&self, column: &str) -> (usize, Option<i64>, Option<i64>) {
         let values = self.get_column_values_i64(column).unwrap_or_default();
-        (
-            values.len(),
-            values.iter().copied().min(),
-            values.iter().copied().max(),
-        )
+        let bounds = self.get_column_bounds(column);
+        let (min, max) = bounds
+            .map(|bounds| (bounds.min, bounds.max))
+            .unwrap_or((None, None));
+        (values.len(), min, max)
     }
     pub fn get_column_bounds(&self, column: &str) -> Option<ColumnBounds> {
-        let (count, min, max) = self.column_summary(column);
-        (count > 0).then_some(ColumnBounds { min, max })
+        self.predicates
+            .iter()
+            .filter_map(|predicate| bounds_for(&predicate.expression, column))
+            .reduce(intersect_bounds)
     }
 }
 
@@ -729,7 +738,12 @@ impl Parser<'_> {
                 }
                 let left = child!(*left);
                 let right = child!(*right);
-                if self.expression_type(&left) != self.expression_type(&right) {
+                if self.expression_type(&left).as_ref().map(logical_value_type)
+                    != self
+                        .expression_type(&right)
+                        .as_ref()
+                        .map(logical_value_type)
+                {
                     return Err(value_error("comparison operands have incompatible types"));
                 }
                 Expr::Comparison {
@@ -834,7 +848,12 @@ impl Parser<'_> {
                         batch.column(index).clone()
                     }
                 };
-                if self.expression_type(&expression).as_ref() != Some(values.data_type()) {
+                if self
+                    .expression_type(&expression)
+                    .as_ref()
+                    .map(logical_value_type)
+                    != Some(logical_value_type(values.data_type()))
+                {
                     return Err(value_error("IN expression and set have incompatible types"));
                 }
                 Expr::In {
@@ -1296,7 +1315,9 @@ fn fold_bool(children: &[Expr], batch: &RecordBatch, and: bool) -> Result<Boolea
 }
 
 fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result<BooleanArray> {
-    let (left, right) = broadcast(left, right)?;
+    let left = dictionary_values(left)?;
+    let right = dictionary_values(right)?;
+    let (left, right) = broadcast(&left, &right)?;
     let result = match op {
         "eq" => arrow_ord::cmp::eq(&left, &right),
         "ne" => arrow_ord::cmp::neq(&left, &right),
@@ -1417,18 +1438,34 @@ fn eval_call(function: &str, arguments: &[Expr], batch: &RecordBatch) -> Result<
 }
 
 fn in_list(column: &ArrayRef, values: &ArrayRef) -> Result<BooleanArray> {
+    let column = dictionary_values(column)?;
+    let values = dictionary_values(values)?;
     let mut result = all_false(column.len());
     for index in 0..values.len() {
         result = or_kleene(
             &result,
             &arrow_ord::cmp::eq(
-                column,
+                &column,
                 &repeat_scalar(&values.slice(index, 1), column.len())?,
             )
             .map_err(cvt)?,
         )?;
     }
     Ok(result)
+}
+
+fn logical_value_type(data_type: &DataType) -> &DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => logical_value_type(value_type),
+        value => value,
+    }
+}
+
+fn dictionary_values(array: &ArrayRef) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Dictionary(_, value_type) => arrow_cast::cast(array, value_type).map_err(cvt),
+        _ => Ok(array.clone()),
+    }
 }
 
 fn expr_type(expression: &Expr) -> Option<DataType> {
@@ -1608,7 +1645,137 @@ fn in_values_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
     }
 }
 fn values_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
-    constant_for(expression, column).or_else(|| in_values_for(expression, column))
+    match expression {
+        Expr::And(children) => children.iter().find_map(|child| values_for(child, column)),
+        Expr::Or(children) => {
+            let arrays = children
+                .iter()
+                .map(|child| values_for(child, column))
+                .collect::<Option<Vec<_>>>()?;
+            let refs = arrays
+                .iter()
+                .map(|array| array.as_ref())
+                .collect::<Vec<_>>();
+            arrow_select::concat::concat(&refs).ok()
+        }
+        _ => constant_for(expression, column).or_else(|| in_values_for(expression, column)),
+    }
+}
+
+fn bounds_for(expression: &Expr, column: &str) -> Option<ColumnBounds> {
+    match expression {
+        Expr::Comparison { op, left, right } => {
+            if root_column(left) == Some(column) {
+                return literal_bound(op, right, false);
+            }
+            if root_column(right) == Some(column) {
+                return literal_bound(op, left, true);
+            }
+            None
+        }
+        Expr::In {
+            expression,
+            values,
+            negated: false,
+        } if root_column(expression) == Some(column) => array_bounds_i64(values),
+        Expr::And(children) => children
+            .iter()
+            .filter_map(|child| bounds_for(child, column))
+            .reduce(intersect_bounds),
+        Expr::Or(children) => children
+            .iter()
+            .map(|child| bounds_for(child, column))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .reduce(union_bounds),
+        _ => None,
+    }
+}
+
+fn literal_bound(op: &str, expression: &Expr, reversed: bool) -> Option<ColumnBounds> {
+    let Expr::Literal(value) = expression else {
+        return None;
+    };
+    let value = array_values_i64(value)?.into_iter().next()?;
+    let op = if reversed {
+        match op {
+            "gt" => "lt",
+            "ge" => "le",
+            "lt" => "gt",
+            "le" => "ge",
+            value => value,
+        }
+    } else {
+        op
+    };
+    Some(match op {
+        "eq" => ColumnBounds {
+            min: Some(value),
+            max: Some(value),
+        },
+        "gt" => ColumnBounds {
+            min: Some(value.saturating_add(1)),
+            max: None,
+        },
+        "ge" => ColumnBounds {
+            min: Some(value),
+            max: None,
+        },
+        "lt" => ColumnBounds {
+            min: None,
+            max: Some(value.saturating_sub(1)),
+        },
+        "le" => ColumnBounds {
+            min: None,
+            max: Some(value),
+        },
+        _ => return None,
+    })
+}
+
+fn array_values_i64(values: &ArrayRef) -> Option<Vec<i64>> {
+    let casted = arrow_cast::cast(values, &DataType::Int64).ok()?;
+    let values = casted.as_primitive::<arrow_array::types::Int64Type>();
+    Some(
+        (0..values.len())
+            .filter(|index| values.is_valid(*index))
+            .map(|index| values.value(index))
+            .collect(),
+    )
+}
+
+fn array_bounds_i64(values: &ArrayRef) -> Option<ColumnBounds> {
+    let values = array_values_i64(values)?;
+    (!values.is_empty()).then(|| ColumnBounds {
+        min: values.iter().copied().min(),
+        max: values.iter().copied().max(),
+    })
+}
+
+fn intersect_bounds(left: ColumnBounds, right: ColumnBounds) -> ColumnBounds {
+    ColumnBounds {
+        min: match (left.min, right.min) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        },
+        max: match (left.max, right.max) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        },
+    }
+}
+
+fn union_bounds(left: ColumnBounds, right: ColumnBounds) -> ColumnBounds {
+    ColumnBounds {
+        min: match (left.min, right.min) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        },
+        max: match (left.max, right.max) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            _ => None,
+        },
+    }
 }
 
 fn format_expr(expression: &Expr) -> String {
@@ -1659,13 +1826,47 @@ fn format_expr(expression: &Expr) -> String {
             expression,
             values,
             negated,
-        } => format!(
-            "{} {}IN ({} values)",
-            format_expr(expression),
-            if *negated { "NOT " } else { "" },
-            values.len()
-        ),
+        } => {
+            let values = (0..values.len())
+                .map(|index| fmt_scalar(values, index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} {}IN ({})",
+                format_expr(expression),
+                if *negated { "NOT " } else { "" },
+                values
+            )
+        }
         _ => "(expression)".into(),
+    }
+}
+
+fn format_filter_repr(expression: &Expr) -> String {
+    match expression {
+        Expr::Comparison { op, left, right } => format!(
+            "ConstantFilter({} {} {})",
+            format_expr(left),
+            op_symbol(op),
+            format_expr(right)
+        ),
+        Expr::And(children) => format!(
+            "AndFilter([{}])",
+            children
+                .iter()
+                .map(format_filter_repr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Or(children) => format!(
+            "OrFilter([{}])",
+            children
+                .iter()
+                .map(format_filter_repr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => format_expr(expression),
     }
 }
 
@@ -1768,7 +1969,8 @@ fn b64_decode(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, ListArray};
+    use arrow_array::types::Int8Type;
+    use arrow_array::{DictionaryArray, Int64Array, Int8Array, ListArray};
     use arrow_buffer::OffsetBuffer;
 
     fn metadata() -> HashMap<String, String> {
@@ -1810,6 +2012,17 @@ mod tests {
         .unwrap();
         assert_eq!(state.apply(&batch).unwrap().num_rows(), 1);
         assert_eq!(state.filtered_columns(), HashSet::from(["n".to_string()]));
+        assert_eq!(
+            state.get_column_bounds("n"),
+            Some(ColumnBounds {
+                min: Some(3),
+                max: None,
+            })
+        );
+        assert_eq!(
+            state.format_repr(),
+            "PushdownFilters([ConstantFilter(n > 2)])"
+        );
     }
 
     #[test]
@@ -1878,5 +2091,72 @@ mod tests {
         assert!(PushdownFilters::parse(&bytes).is_err());
         let bad = json.replacen(r#""field_name":"leaf""#, r#""field_name":"wrong""#, 1);
         assert!(PushdownFilters::parse_with_schema(&encode(&bad, vec![], vec![]), schema).is_err());
+    }
+
+    #[test]
+    fn dictionary_values_compare_with_their_logical_type() {
+        let dictionary = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![0, 1, 0]),
+                Arc::new(StringArray::from(vec!["red", "green"])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let literal = Arc::new(StringArray::from(vec!["green"])) as ArrayRef;
+        let result = compare_arrays(&dictionary, &literal, "eq").unwrap();
+        assert_eq!(result, BooleanArray::from(vec![false, true, false]));
+    }
+
+    #[test]
+    fn discrete_values_descend_through_and_union_complete_or() {
+        let column = || Expr::Column {
+            index: 0,
+            name: "n".into(),
+            data_type: DataType::Int64,
+        };
+        let equality = |value| Expr::Comparison {
+            op: "eq".into(),
+            left: Box::new(column()),
+            right: Box::new(Expr::Literal(Arc::new(Int64Array::from(vec![value])))),
+        };
+        let expression = Expr::And(vec![
+            Expr::Or(vec![equality(2), equality(7)]),
+            Expr::Comparison {
+                op: "ge".into(),
+                left: Box::new(column()),
+                right: Box::new(Expr::Literal(Arc::new(Int64Array::from(vec![0])))),
+            },
+        ]);
+        let values = values_for(&expression, "n").unwrap();
+        assert_eq!(
+            values
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[2, 7]
+        );
+        assert_eq!(
+            bounds_for(&expression, "n"),
+            Some(ColumnBounds {
+                min: Some(2),
+                max: Some(7),
+            })
+        );
+
+        let incomplete = Expr::Or(vec![
+            equality(2),
+            Expr::Comparison {
+                op: "gt".into(),
+                left: Box::new(column()),
+                right: Box::new(Expr::Literal(Arc::new(Int64Array::from(vec![7])))),
+            },
+        ]);
+        assert!(values_for(&incomplete, "n").is_none());
+        assert_eq!(
+            bounds_for(&incomplete, "n"),
+            Some(ColumnBounds {
+                min: Some(2),
+                max: None,
+            })
+        );
     }
 }
