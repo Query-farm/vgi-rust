@@ -166,6 +166,7 @@ boot_http_worker() {
 }
 
 export VGI_WORKER_BIN
+export VGI_DATABASE_PACKAGE_WORKER="$VGI_WORKER_BIN"
 # NOT exported here. bearer_auth/bearer_token.test gates on this variable
 # (`require-env VGI_TEST_BEARER_TOKEN`) and its very first statement is an
 # ATTACH carrying the `bearer_token` option — which the client rejects at bind
