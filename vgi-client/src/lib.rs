@@ -87,6 +87,8 @@ pub use catalog::{
     At, AttachOptionSpec, AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind,
     MacroKind, ScanBranchesResolution, SettingSpec,
 };
+#[cfg(feature = "iroh")]
+pub use client::IrohHttpOptions;
 pub use client::{ConnectionOptions, VgiClient, WorkerLogSink};
 #[cfg(feature = "disk-cache")]
 pub use disk_cache::{

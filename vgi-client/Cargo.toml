@@ -46,7 +46,7 @@ disk-cache = [
 vgi-protocol = { workspace = true }
 vgi-rpc = { workspace = true }
 vgi-rpc-client = { workspace = true }
-vgi-rpc-iroh = { version = "0.24.2", git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "58343de608355bc595ca53fb82473531ae9f4121", optional = true }
+vgi-rpc-iroh = { version = "0.24.3", git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "50b3a1c7b2e4ffa1b230e82079ae483bc31ea49e", optional = true }
 iroh = { version = "1.1.0", default-features = false, features = ["tls-ring"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 arrow-array = { workspace = true }

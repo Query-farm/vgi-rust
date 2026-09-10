@@ -63,8 +63,8 @@ fi
 # WKT differently under the prebuilt binary's DuckDB/spatial build than the
 # locally-built unittest the worker is developed against — a plan-text rendering
 # difference, not a worker behaviour difference; covered by the local suite).
-# The http lane drops one file (see HTTP_SKIP below); Windows drops the fixtures
-# that read parquet/csv from POSIX /tmp paths.
+# The http lane drops transport-inapplicable files (see HTTP_SKIP below);
+# Windows drops the fixtures that read parquet/csv from POSIX /tmp paths.
 #
 # bool_in_union.test is NO LONGER excluded here (removed 2026-08-21). It does not
 # need a per-SDK exclusion: the file disables itself centrally with `mode skip`
@@ -84,7 +84,13 @@ if [ "$TRANSPORT" = "http" ]; then
   # reached the worker. Fixed in vgi-rpc-rust 52b702d, which the committed
   # [patch.crates-io] in Cargo.toml picks up. Verified 2026-08-21 against this
   # SDK's own http worker: 52/52 assertions pass. Exclusion removed.
-  HTTP_SKIP=(-not -name 'projection_pushdown_repro.test')
+  # database_worker/package.test packages an executable wrapper around
+  # VGI_TEST_WORKER. On this lane that value is an HTTP URL, not an executable;
+  # the direct-exec lifecycle is covered by the stdio and launch lanes.
+  HTTP_SKIP=(
+    -not -name 'projection_pushdown_repro.test'
+    -not -path './database_worker/package.test'
+  )
 fi
 # The native-branch fixtures (multi_branch_*, required_filters_native)
 # used to stage and read parquet/csv from POSIX `/tmp/...` paths the worker's
@@ -108,6 +114,20 @@ if ! ( cd "$INTEGRATION" || exit 1
   echo "::error::failed to stage the pinned VGI test corpus" >&2
   exit 1
 fi
+
+# The database-worker package tests intentionally package this executable by a
+# path relative to the unittest working directory.  Staging only the .test
+# files leaves that path unmatched, so copy the pinned fixture alongside them
+# and preserve its executable contract.  Keep this explicit rather than
+# copying all support files into every SDK lane.
+DATABASE_WORKER_FIXTURE="$VGI_SRC/test/support/database_worker_fixture.sh"
+if [ ! -f "$DATABASE_WORKER_FIXTURE" ]; then
+  echo "::error::pinned VGI suite is missing $DATABASE_WORKER_FIXTURE" >&2
+  exit 1
+fi
+mkdir -p "$STAGE/test/support" || exit 1
+install -m 0755 "$DATABASE_WORKER_FIXTURE" \
+  "$STAGE/test/support/database_worker_fixture.sh" || exit 1
 
 # Background worker processes (http servers) tracked here and killed on exit.
 BG_PIDS=()

@@ -86,6 +86,55 @@ pub struct ConnectionOptions {
     pub rpc_timeout: Option<Duration>,
 }
 
+/// Native HTTP-over-Iroh connection settings for [`VgiClient::connect_httpi_with_options`].
+///
+/// Defaults match the Python framework: Iroh's public discovery/relay set, a
+/// process-stable ephemeral client identity, a 30-second connection deadline,
+/// and a five-minute request/I/O deadline.
+#[cfg(feature = "iroh")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohHttpOptions {
+    /// Persistent Iroh secret key in Iroh's textual encoding.
+    pub secret_key: Option<String>,
+    /// Replacement relay set. Mutually exclusive with [`Self::no_relay`].
+    pub relay_urls: Option<Vec<String>>,
+    /// Disable relays and require a direct path.
+    pub no_relay: bool,
+    /// Already-discovered relay hint for the remote endpoint.
+    pub remote_relay_url: Option<String>,
+    /// Already-discovered direct socket-address hints for the remote endpoint.
+    pub direct_addresses: Vec<String>,
+    /// Total endpoint bind/connect deadline.
+    pub connect_timeout: Duration,
+    /// Complete per-request I/O deadline.
+    pub io_timeout: Duration,
+    /// High-level HTTP request deadline. `None` leaves deadline ownership to
+    /// the embedding caller while retaining the native I/O safety bound.
+    pub request_timeout: Option<Duration>,
+    /// Optional bearer credential carried by every HTTP request.
+    pub bearer_token: Option<String>,
+    /// Largest decoded response this client advertises it can accept.
+    pub accepted_max_response_bytes: Option<usize>,
+}
+
+#[cfg(feature = "iroh")]
+impl Default for IrohHttpOptions {
+    fn default() -> Self {
+        Self {
+            secret_key: None,
+            relay_urls: None,
+            no_relay: false,
+            remote_relay_url: None,
+            direct_addresses: Vec::new(),
+            connect_timeout: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(300),
+            request_timeout: Some(Duration::from_secs(300)),
+            bearer_token: None,
+            accepted_max_response_bytes: Some(256 * 1024 * 1024),
+        }
+    }
+}
+
 /// Apply the settings every VGI connection needs, whatever the transport.
 ///
 /// Two of them, and both are contracts with the worker rather than tuning:
@@ -520,19 +569,50 @@ impl VgiClient {
     /// Connect to a canonical `httpi://<endpoint-id>[/base-path]` worker.
     #[cfg(feature = "iroh")]
     pub fn connect_httpi(target: &str) -> Result<Self> {
-        Self::connect_httpi_with_timeout(target, Some(Duration::from_secs(30)))
+        Self::connect_httpi_with_options(target, IrohHttpOptions::default())
     }
 
     /// Connect over HTTP-over-Iroh with an explicit request/I/O timeout.
     #[cfg(feature = "iroh")]
     pub fn connect_httpi_with_timeout(target: &str, timeout: Option<Duration>) -> Result<Self> {
+        let mut options = IrohHttpOptions::default();
+        if let Some(timeout) = timeout {
+            options.io_timeout = timeout;
+        }
+        options.request_timeout = timeout;
+        Self::connect_httpi_with_options(target, options)
+    }
+
+    /// Connect over HTTP-over-Iroh with stable identity, relay/discovery,
+    /// authentication, timeout, and response-budget controls.
+    #[cfg(feature = "iroh")]
+    pub fn connect_httpi_with_options(target: &str, options: IrohHttpOptions) -> Result<Self> {
         use crate::transport::HttpTransport;
         let worker_logs = WorkerLogRouter::default();
-        let client = vgi_rpc_client::HttpClient::connect_httpi(target)?
+        let mut builder = vgi_rpc_client::HttpClient::connect_httpi(target)?
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .on_log(worker_logs.callback())
-            .timeout(timeout)
-            .build()?;
+            .connect_timeout(options.connect_timeout)
+            .io_timeout(options.io_timeout)
+            .timeout(options.request_timeout)
+            .no_relay(options.no_relay)
+            .direct_addresses(options.direct_addresses);
+        if let Some(secret_key) = options.secret_key {
+            builder = builder.secret_key(&secret_key)?;
+        }
+        if let Some(relay_urls) = options.relay_urls {
+            builder = builder.relay_urls(relay_urls);
+        }
+        if let Some(remote_relay_url) = options.remote_relay_url {
+            builder = builder.remote_relay_url(remote_relay_url);
+        }
+        if let Some(bearer_token) = options.bearer_token {
+            builder = builder.header("Authorization", &format!("Bearer {bearer_token}"))?;
+        }
+        if let Some(bytes) = options.accepted_max_response_bytes {
+            builder = builder.accepted_max_response_bytes(bytes);
+        }
+        let client = builder.build()?;
         let http = Box::new(HttpTransport::new(client, target.to_string()));
         Ok(Self::with_worker_log_router(
             Box::new(crate::retry::RetryTransport::new(
