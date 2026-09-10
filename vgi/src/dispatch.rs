@@ -1083,10 +1083,9 @@ impl Dispatcher {
         bp.copy_to = copy_to.clone();
         // Projection pushdown: the C++ sends the full bind output schema plus
         // projection_ids; narrow the schema the worker emits to those columns.
-        let output_schema = crate::table_function::project_schema(
-            &ipc::read_schema(&dto.output_schema.0)?,
-            &dto.projection_ids,
-        );
+        let bind_output_schema = ipc::read_schema(&dto.output_schema.0)?;
+        let output_schema =
+            crate::table_function::project_schema(&bind_output_schema, &dto.projection_ids);
         let input_schema = bp.input_schema.clone();
         let execution_id = dto
             .execution_id
@@ -1136,6 +1135,8 @@ impl Dispatcher {
         let build_params =
             |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
                 output_schema: output_schema.clone(),
+                bind_output_schema: bind_output_schema.clone(),
+                current_pushdown_filters: None,
                 input_schema: input_schema.clone(),
                 execution_id: execution_id.clone(),
                 substream_id: dto.substream_id.clone().map(|b| b.into()),
@@ -1211,14 +1212,23 @@ impl Dispatcher {
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
                 let auto_apply = f.metadata().auto_apply_filters;
-                let filters = if auto_apply {
-                    dto.pushdown_filters
-                        .as_ref()
-                        .map(|b| crate::pushdown::PushdownFilters::parse(&b.0))
-                        .transpose()?
-                } else {
-                    None
-                };
+                let join_keys: Vec<Vec<u8>> = dto
+                    .join_keys
+                    .as_ref()
+                    .map(|batches| batches.iter().map(|batch| batch.0.clone()).collect())
+                    .unwrap_or_default();
+                let current_filters = dto
+                    .pushdown_filters
+                    .as_ref()
+                    .map(|b| {
+                        crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                            &b.0,
+                            &join_keys,
+                            Some(bind_output_schema.clone()),
+                        )
+                    })
+                    .transpose()?;
+                let filters = auto_apply.then(|| current_filters.clone()).flatten();
                 let producer = f.finalize_producer(&bparams, fsid)?;
                 // A buffering source drains a possibly multi-batch result, and
                 // over HTTP each batch is its own lock-step turn — so it needs
@@ -1240,10 +1250,12 @@ impl Dispatcher {
                 )?);
                 let state = TableProducerState {
                     inner: producer,
+                    current_filters,
                     filters,
                     project_to: None,
                     resume_blob,
                     conditional_checked: false,
+                    filter_deltas: Vec::new(),
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
@@ -1312,9 +1324,11 @@ impl Dispatcher {
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
+                current_filters: None,
                 project_to: None,
                 resume_blob: None,
                 conditional_checked: false,
+                filter_deltas: Vec::new(),
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -1358,7 +1372,19 @@ impl Dispatcher {
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let auto_apply = f.metadata().auto_apply_filters;
-            let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let parsed_filters = params
+                .pushdown_filters
+                .as_ref()
+                .map(|b| {
+                    crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                        b,
+                        &params.join_keys,
+                        Some(bind_output_schema.clone()),
+                    )
+                })
+                .transpose()?;
+            params.current_pushdown_filters = parsed_filters.clone();
             // FINALIZE phase: flush accumulated state as a producer stream.
             if phase == crate::protocol::enums::phase::FINALIZE {
                 let header = wire::to_batch(GlobalInitResponse {
@@ -1409,25 +1435,17 @@ impl Dispatcher {
                 let state = TableProducerState {
                     inner: Box::new(VecProducer { batches, pos: 0 }),
                     filters: None,
+                    current_filters: None,
                     project_to: None,
                     resume_blob,
                     conditional_checked: false,
+                    filter_deltas: Vec::new(),
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
                 );
             }
-            let filters = if auto_apply {
-                params
-                    .pushdown_filters
-                    .as_ref()
-                    .map(|b| {
-                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+            let filters = auto_apply.then(|| parsed_filters.clone()).flatten();
             let header = wire::to_batch(GlobalInitResponse {
                 execution_id: Bytes::from(execution_id.clone()),
                 max_workers: 1,
@@ -1450,6 +1468,7 @@ impl Dispatcher {
                 params,
                 filters,
                 blob,
+                filter_deltas: Vec::new(),
             };
             return Ok(
                 StreamResult::exchange(output_schema, in_schema, Box::new(state))
@@ -1490,23 +1509,25 @@ impl Dispatcher {
             bp.arguments.remap_positional(&f.argument_specs());
             let max_workers = f.max_workers(&bp);
             let auto_apply = f.metadata().auto_apply_filters;
-            let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let parsed_filters = params
+                .pushdown_filters
+                .as_ref()
+                .map(|b| {
+                    crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                        b,
+                        &params.join_keys,
+                        Some(bind_output_schema.clone()),
+                    )
+                })
+                .transpose()?;
+            params.current_pushdown_filters = parsed_filters.clone();
             // Primary init (no execution_id on the request) runs the global
             // OnInit hook once — e.g. to push a parallel-scan work queue.
             if dto.execution_id.is_none() {
                 f.on_init(&params)?;
             }
-            let filters = if auto_apply {
-                params
-                    .pushdown_filters
-                    .as_ref()
-                    .map(|b| {
-                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+            let filters = auto_apply.then(|| parsed_filters.clone()).flatten();
             // Always narrow each emitted batch to the wire output schema by
             // name: producers may emit their full natural schema (so an
             // auto-applied filter can reference a projected-out column, e.g.
@@ -1544,10 +1565,12 @@ impl Dispatcher {
             })?;
             let state = TableProducerState {
                 inner: producer,
+                current_filters: parsed_filters,
                 filters,
                 project_to,
                 resume_blob,
                 conditional_checked: false,
+                filter_deltas: Vec::new(),
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -1608,6 +1631,7 @@ impl Dispatcher {
             kind: kind.to_string(),
             function_name,
             output_schema: ipc::write_schema_ref(output_schema)?,
+            filter_schema: dto.output_schema.0.clone(),
             input_schema: match input_schema {
                 Some(s) => ipc::write_schema_ref(s)?,
                 None => Vec::new(),
@@ -1663,6 +1687,7 @@ impl Dispatcher {
                 )
                 .to_string(),
             schema_path: bind_call.schema_path.clone().unwrap_or_default(),
+            filter_deltas: Vec::new(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -1673,6 +1698,11 @@ impl Dispatcher {
     pub fn decode_init_state(&self, bytes: &[u8]) -> Result<vgi_rpc::stream::StreamStateKind> {
         let blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
         let output_schema = ipc::read_schema(&blob.output_schema)?;
+        let filter_schema = if blob.filter_schema.is_empty() {
+            output_schema.clone()
+        } else {
+            ipc::read_schema(&blob.filter_schema)?
+        };
         let input_schema = if blob.input_schema.is_empty() {
             None
         } else {
@@ -1696,6 +1726,8 @@ impl Dispatcher {
         let mut args = crate::arguments::Arguments::parse(&blob.arguments)?;
         let make_params = |args: crate::arguments::Arguments| ProcessParams {
             output_schema: output_schema.clone(),
+            bind_output_schema: filter_schema.clone(),
+            current_pushdown_filters: None,
             input_schema: input_schema.clone(),
             execution_id: blob.execution_id.clone(),
             // Folded into the blob so a rehydrated HTTP tick keeps the client's
@@ -1776,21 +1808,34 @@ impl Dispatcher {
             };
             let mut producer = f.finalize_producer(&bparams, blob.finalize_state_id.clone())?;
             producer.restore_resume(&blob.inner_resume);
-            let filters = if blob.auto_apply {
-                pushdown
-                    .as_ref()
-                    .map(|b| crate::pushdown::PushdownFilters::parse(b))
-                    .transpose()?
-            } else {
-                None
-            };
+            let mut current_filters = pushdown
+                .as_ref()
+                .map(|b| {
+                    crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                        b,
+                        &blob.join_keys,
+                        Some(filter_schema.clone()),
+                    )
+                })
+                .transpose()?;
+            for delta in &blob.filter_deltas {
+                current_filters
+                    .as_mut()
+                    .ok_or_else(|| {
+                        RpcError::value_error("filter delta requires an initial snapshot")
+                    })?
+                    .apply_delta_b64(delta)?;
+            }
+            let filters = blob.auto_apply.then(|| current_filters.clone()).flatten();
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
                 TableProducerState {
                     inner: producer,
+                    current_filters,
                     filters,
                     project_to: None,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
+                    filter_deltas: blob.filter_deltas.clone(),
                 },
             )));
         }
@@ -1820,27 +1865,39 @@ impl Dispatcher {
                 TableProducerState {
                     inner: Box::new(producer),
                     filters: None,
+                    current_filters: None,
                     project_to: None,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
+                    filter_deltas: Vec::new(),
                 },
             )));
         }
         if blob.kind == "table" {
             let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
-            let params = make_params(args);
-            let filters = if blob.auto_apply {
-                params
-                    .pushdown_filters
-                    .as_ref()
-                    .map(|b| {
-                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+            let mut params = make_params(args);
+            let mut parsed_filters = params
+                .pushdown_filters
+                .as_ref()
+                .map(|b| {
+                    crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                        b,
+                        &params.join_keys,
+                        Some(filter_schema.clone()),
+                    )
+                })
+                .transpose()?;
+            for delta in &blob.filter_deltas {
+                parsed_filters
+                    .as_mut()
+                    .ok_or_else(|| {
+                        RpcError::value_error("filter delta requires an initial snapshot")
+                    })?
+                    .apply_delta_b64(delta)?;
+            }
+            params.current_pushdown_filters = parsed_filters.clone();
+            let filters = blob.auto_apply.then(|| parsed_filters.clone()).flatten();
             let project_to = Some(output_schema.clone());
             let mut producer = f.producer(&params)?;
             // Restore the partial-chunk cursor so the producer resumes mid-chunk
@@ -1850,10 +1907,12 @@ impl Dispatcher {
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
                 TableProducerState {
                     inner: producer,
+                    current_filters: parsed_filters,
                     filters,
                     project_to,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
+                    filter_deltas: blob.filter_deltas.clone(),
                 },
             )));
         }
@@ -1861,24 +1920,35 @@ impl Dispatcher {
             let f =
                 self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
-            let params = make_params(args);
-            let filters = if blob.auto_apply {
-                params
-                    .pushdown_filters
-                    .as_ref()
-                    .map(|b| {
-                        crate::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+            let mut params = make_params(args);
+            let mut parsed_filters = params
+                .pushdown_filters
+                .as_ref()
+                .map(|b| {
+                    crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
+                        b,
+                        &params.join_keys,
+                        Some(filter_schema.clone()),
+                    )
+                })
+                .transpose()?;
+            for delta in &blob.filter_deltas {
+                parsed_filters
+                    .as_mut()
+                    .ok_or_else(|| {
+                        RpcError::value_error("filter delta requires an initial snapshot")
+                    })?
+                    .apply_delta_b64(delta)?;
+            }
+            params.current_pushdown_filters = parsed_filters.clone();
+            let filters = blob.auto_apply.then_some(parsed_filters).flatten();
             Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
                 TableInOutExchangeState {
                     func: f,
                     params,
                     filters,
                     blob: bytes.to_vec(),
+                    filter_deltas: blob.filter_deltas.clone(),
                 },
             )))
         } else {
@@ -3948,6 +4018,8 @@ pub struct ExchangeBlob {
     pub kind: String, // "scalar" | "table_in_out"
     pub function_name: String,
     pub output_schema: Vec<u8>,
+    #[serde(default)]
+    pub filter_schema: Vec<u8>,
     pub input_schema: Vec<u8>, // empty = none
     pub arguments: Vec<u8>,
     pub settings: Vec<u8>,
@@ -4010,6 +4082,10 @@ pub struct ExchangeBlob {
     /// bind-scoped state and is retained for continuation-token compatibility.
     #[serde(default)]
     pub plan_init_opaque: Vec<u8>,
+    /// Successfully applied v2 filter deltas, replayed in order when an HTTP
+    /// continuation reconstructs the stream on another worker.
+    #[serde(default)]
+    pub filter_deltas: Vec<String>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -4134,6 +4210,7 @@ struct TableInOutExchangeState {
     params: ProcessParams,
     filters: Option<crate::pushdown::PushdownFilters>,
     blob: Vec<u8>,
+    filter_deltas: Vec<String>,
 }
 
 impl ExchangeState for TableInOutExchangeState {
@@ -4144,6 +4221,20 @@ impl ExchangeState for TableInOutExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
+        if let Some(encoded) = ctx.tick_metadata("vgi_pushdown_filters") {
+            let current = self
+                .params
+                .current_pushdown_filters
+                .as_mut()
+                .ok_or_else(|| {
+                    RpcError::value_error("filter delta requires an initial snapshot")
+                })?;
+            current.apply_delta_b64(&encoded)?;
+            if self.filters.is_some() {
+                self.filters = Some(current.clone());
+            }
+            self.filter_deltas.push(encoded);
+        }
         // Conditional-revalidation validators (exchange-mode result cache): the
         // client holds a stale cached result for THIS input unit and asks the
         // worker to confirm freshness cheaply. They ride the input batch's
@@ -4176,7 +4267,9 @@ impl ExchangeState for TableInOutExchangeState {
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
-        Ok(self.blob.clone())
+        let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(&self.blob)?;
+        blob.filter_deltas = self.filter_deltas.clone();
+        vgi_rpc::stream_codec::bincode_encode(&blob)
     }
 }
 
@@ -4193,6 +4286,9 @@ fn cond_validator(ctx: &CallContext, key: &str) -> Option<String> {
 /// auto-filter pushdown to each batch before emitting.
 struct TableProducerState {
     inner: Box<dyn TableProducer>,
+    /// Current v2 state exposed to the producer, whether or not rows are
+    /// automatically filtered by the framework.
+    current_filters: Option<crate::pushdown::PushdownFilters>,
     filters: Option<crate::pushdown::PushdownFilters>,
     /// When set, narrow each (post-filter) batch to this projected schema —
     /// the producer emitted the full schema so filters could see all columns.
@@ -4205,6 +4301,7 @@ struct TableProducerState {
     /// They only ever ride the first tick, so checking once keeps the per-batch
     /// hot path free of the two `tick_metadata` mutex acquisitions.
     conditional_checked: bool,
+    filter_deltas: Vec<String>,
 }
 
 impl TableProducerState {
@@ -4234,17 +4331,12 @@ impl TableProducerState {
 
     /// Pull one batch from the inner producer and emit it (post filter +
     /// projection). Returns `false` once the scan is exhausted.
-    fn emit_next(
-        &mut self,
-        out: &mut OutputCollector,
-        dynamic: Option<&crate::pushdown::PushdownFilters>,
-    ) -> Result<bool> {
+    fn emit_next(&mut self, out: &mut OutputCollector) -> Result<bool> {
         let Some(batch) = self.inner.next_batch(out)? else {
             return Ok(false);
         };
         let meta = self.inner.last_metadata();
-        let active = dynamic.or(self.filters.as_ref());
-        let batch = match active {
+        let batch = match self.filters.as_ref() {
             Some(f) => f.apply(&batch)?,
             None => batch,
         };
@@ -4264,10 +4356,17 @@ impl vgi_rpc::ProducerState for TableProducerState {
     fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
         // Per-tick dynamic filter (e.g. a tightening Top-N) arrives in the
         // request metadata; surface it to the producer and auto-apply it.
-        let dynamic = ctx
-            .tick_metadata("vgi_pushdown_filters")
-            .and_then(|enc| crate::pushdown::PushdownFilters::parse_b64(&enc, &[]));
-        self.inner.on_dynamic_filters(dynamic.as_ref());
+        if let Some(encoded) = ctx.tick_metadata("vgi_pushdown_filters") {
+            let current = self.current_filters.as_mut().ok_or_else(|| {
+                RpcError::value_error("filter delta requires an initial snapshot")
+            })?;
+            current.apply_delta_b64(&encoded)?;
+            if self.filters.is_some() {
+                self.filters = Some(current.clone());
+            }
+            self.filter_deltas.push(encoded);
+        }
+        self.inner.on_dynamic_filters(self.current_filters.as_ref());
         // Conditional-revalidation validators. The client sends them on the
         // FIRST producer tick over subprocess, and folds them into the `init`
         // request over HTTP (where there is no tick before the first batch) — so
@@ -4302,7 +4401,7 @@ impl vgi_rpc::ProducerState for TableProducerState {
         // says so here rather than surfacing the framework's opaque
         // "only one data batch may be emitted per stream turn".
         if self.drains_in_one_turn() && ctx.kind == Some(vgi_rpc::transport::TransportKind::Http) {
-            if self.emit_next(out, dynamic.as_ref())? && self.inner.next_batch(out)?.is_some() {
+            if self.emit_next(out)? && self.inner.next_batch(out)?.is_some() {
                 return Err(RpcError::runtime_error(format!(
                     "producer for '{}' emits more than one batch but cannot serve an \
                      HTTP continuation: it does not serialize a scan position, so \
@@ -4317,7 +4416,7 @@ impl vgi_rpc::ProducerState for TableProducerState {
             out.finish();
             return Ok(());
         }
-        if !self.emit_next(out, dynamic.as_ref())? {
+        if !self.emit_next(out)? {
             out.finish();
         }
         Ok(())
@@ -4362,6 +4461,7 @@ impl vgi_rpc::ProducerState for TableProducerState {
                 // partial-chunk cursor so the continuation resumes mid-chunk.
                 let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
                 blob.inner_resume = self.inner.encode_resume();
+                blob.filter_deltas = self.filter_deltas.clone();
                 vgi_rpc::stream_codec::bincode_encode(&blob)
             }
         }

@@ -404,9 +404,7 @@ fn late_mat_schema() -> SchemaRef {
 
 /// Summarize the pushed rowid filter as the `pushed` witness string.
 fn rowid_witness(params: &ProcessParams) -> String {
-    let pf = params.pushdown_filters.as_ref().and_then(|b| {
-        vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-    });
+    let pf = params.current_pushdown_filters.as_ref();
     match pf {
         Some(pf) => {
             let (n, lo, hi) = pf.column_summary("row_id");

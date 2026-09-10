@@ -456,7 +456,10 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         filter_pushdown: None,
         sampling_pushdown: None,
         late_materialization: None,
-        supported_expression_filters: Vec::new(),
+        filter_semantic_profiles: Vec::new(),
+        additional_filter_functions: Vec::new(),
+        runtime_filter_algorithms: Vec::new(),
+        filter_evaluation_contexts: Vec::new(),
         order_preservation: None,
         max_workers: Some(0),
         supports_batch_index: false,
@@ -480,7 +483,15 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
 }
 
 /// Apply common metadata fields onto a `FunctionInfo`.
-fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
+fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> {
+    if !meta.additional_filter_functions.is_empty()
+        || !meta.runtime_filter_algorithms.is_empty()
+        || !meta.filter_evaluation_contexts.is_empty()
+    {
+        return Err(vgi_rpc::RpcError::value_error(
+            "filter capability advertised without a registered Rust evaluator",
+        ));
+    }
     fi.description = meta.description.clone();
     fi.stability = meta.stability.as_deref().map(enums::dict);
     fi.null_handling = meta.null_handling.as_deref().map(enums::dict);
@@ -493,6 +504,13 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
     if meta.filter_pushdown {
         fi.filter_pushdown = Some(true);
     }
+    fi.filter_semantic_profiles = meta.filter_semantic_profiles.clone();
+    if meta.filter_pushdown && fi.filter_semantic_profiles.is_empty() {
+        fi.filter_semantic_profiles = vec!["vgi.duckdb.standard.v1".to_string()];
+    }
+    fi.additional_filter_functions = meta.additional_filter_functions.clone();
+    fi.runtime_filter_algorithms = meta.runtime_filter_algorithms.clone();
+    fi.filter_evaluation_contexts = meta.filter_evaluation_contexts.clone();
     if meta.sampling_pushdown {
         fi.sampling_pushdown = Some(true);
     }
@@ -522,13 +540,14 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) {
             secret_name: s.name.clone(),
         })
         .collect();
+    Ok(())
 }
 
 /// Build the `FunctionInfo` for a scalar function.
 pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::SCALAR);
-    apply_metadata(&mut fi, &meta);
+    apply_metadata(&mut fi, &meta)?;
 
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
@@ -554,7 +573,7 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
 pub fn table_function_info(f: &dyn crate::table_function::TableFunction) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::TABLE);
-    apply_metadata(&mut fi, &meta);
+    apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     // Output schema is resolved at bind time; advertise an empty schema.
@@ -568,7 +587,7 @@ pub fn table_in_out_function_info(
 ) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::TABLE);
-    apply_metadata(&mut fi, &meta);
+    apply_metadata(&mut fi, &meta)?;
     fi.has_finalize = f.has_finish();
     // Blended ("UNNEST-style"): the C++ extension reads this to enter the
     // in-out registration branch with real-typed args and drive the literal
@@ -586,7 +605,7 @@ pub fn buffering_function_info(
 ) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::TABLE_BUFFERING);
-    apply_metadata(&mut fi, &meta);
+    apply_metadata(&mut fi, &meta)?;
     fi.has_finalize = true;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
@@ -602,7 +621,7 @@ pub fn aggregate_function_info(
 ) -> Result<FunctionInfo> {
     let meta = f.metadata();
     let mut fi = default_function_info(f.name(), enums::function_type::AGGREGATE);
-    apply_metadata(&mut fi, &meta);
+    apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     let params = crate::aggregate::AggregateBindParams {
@@ -1422,6 +1441,46 @@ mod tests {
 
     fn path(name: &str) -> Vec<String> {
         vec![name.to_string()]
+    }
+
+    #[test]
+    fn filtering_defaults_to_the_standard_v1_semantic_profile_only() {
+        let mut filtering = default_function_info("f", "table");
+        apply_metadata(
+            &mut filtering,
+            &FunctionMetadata {
+                filter_pushdown: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            filtering.filter_semantic_profiles,
+            vec!["vgi.duckdb.standard.v1"]
+        );
+
+        let mut plain = default_function_info("f", "table");
+        apply_metadata(&mut plain, &FunctionMetadata::default()).unwrap();
+        assert!(plain.filter_semantic_profiles.is_empty());
+    }
+
+    #[test]
+    fn unsupported_filter_capability_advertisements_are_rejected() {
+        let mut info = default_function_info("f", "table");
+        let err = apply_metadata(
+            &mut info,
+            &FunctionMetadata {
+                filter_evaluation_contexts: vec![crate::function::EvaluationContextCapability {
+                    profile: "vgi.duckdb.session.v1".to_string(),
+                    provider_fingerprint: Some("unregistered".to_string()),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("without a registered Rust evaluator"));
     }
 
     /// A minimal scalar whose `metadata()` advertises SQL examples.

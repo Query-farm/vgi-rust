@@ -9,7 +9,10 @@ use std::sync::Arc;
 use arrow_schema::{DataType, SchemaRef};
 use vgi_rpc::Result;
 
-pub use crate::protocol::dtos::FunctionExample;
+pub use crate::protocol::dtos::{
+    EvaluationContextCapability, FilterFunctionCapability, FunctionExample,
+    RuntimeFilterAlgorithmCapability,
+};
 use crate::protocol::enums;
 
 /// A named type-bound predicate for ANY-typed arguments. Checked at bind:
@@ -401,6 +404,14 @@ pub struct FunctionMetadata {
     pub sampling_pushdown: bool,
     /// Worker-side: auto-apply pushed-down filters to emitted batches.
     pub auto_apply_filters: bool,
+    /// Filter Encoding v2 semantic profiles implemented by this function.
+    pub filter_semantic_profiles: Vec<String>,
+    /// Capability-gated extension filter functions.
+    pub additional_filter_functions: Vec<FilterFunctionCapability>,
+    /// Capability-gated runtime-filter artifact algorithms.
+    pub runtime_filter_algorithms: Vec<RuntimeFilterAlgorithmCapability>,
+    /// Reproducible evaluation-context profiles available to the evaluator.
+    pub filter_evaluation_contexts: Vec<EvaluationContextCapability>,
     pub supports_batch_index: bool,
     /// Declares that this table function divides its scan into named,
     /// independently redeemable splits (see
@@ -477,6 +488,10 @@ impl Default for FunctionMetadata {
             filter_pushdown: false,
             sampling_pushdown: false,
             auto_apply_filters: false,
+            filter_semantic_profiles: Vec::new(),
+            additional_filter_functions: Vec::new(),
+            runtime_filter_algorithms: Vec::new(),
+            filter_evaluation_contexts: Vec::new(),
             supports_batch_index: false,
             supports_splits: false,
             filters_exactly_applied: false,
@@ -551,6 +566,13 @@ impl BindResponse {
 #[derive(Clone)]
 pub struct ProcessParams {
     pub output_schema: SchemaRef,
+    /// Authoritative unprojected bind output schema for Filter Encoding v2.
+    pub bind_output_schema: SchemaRef,
+    /// Strictly decoded current Filter Encoding v2 state, validated against
+    /// `bind_output_schema` and updated atomically as tick deltas arrive. This
+    /// is the application-facing filter API, including when automatic row
+    /// filtering is disabled.
+    pub current_pushdown_filters: Option<crate::pushdown::PushdownFilters>,
     pub input_schema: Option<SchemaRef>,
     pub execution_id: Vec<u8>,
     /// Stable client-minted id for this streaming table-in-out substream.
@@ -578,7 +600,9 @@ pub struct ProcessParams {
     pub auth_principal: Option<String>,
     /// Projection pushdown: output column indices to emit (None = all).
     pub projection_ids: Option<Vec<i64>>,
-    /// Serialized pushdown filters (large_binary), if any.
+    /// Original serialized snapshot bytes, retained for transport/debugging.
+    /// Applications should use `current_pushdown_filters`; reparsing these
+    /// bytes lacks the authoritative schema and omits subsequent tick deltas.
     pub pushdown_filters: Option<Vec<u8>>,
     /// Side join-keys IPC batches referenced by `join_keys` filters.
     pub join_keys: Vec<Vec<u8>>,

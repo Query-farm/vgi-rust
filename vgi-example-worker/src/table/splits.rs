@@ -1921,11 +1921,8 @@ impl TableFunction for SplitDynamicFilter {
             .collect::<Result<Vec<_>>>()?;
         let cur = ranges.first().map(|r| r.lo).unwrap_or(0);
         let rendered = params
-            .pushdown_filters
+            .current_pushdown_filters
             .as_ref()
-            .and_then(|b| {
-                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-            })
             .map(|pf| render_filters(&pf))
             .unwrap_or_else(|| "(none)".to_string());
         Ok(Box::new(DynFilterProducer {

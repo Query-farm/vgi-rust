@@ -251,21 +251,32 @@ fn init_body_with_filter(
 }
 
 fn join_key_filter(values: &[i64]) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let filter_schema = Arc::new(Schema::new(vec![Field::new(
-        "filter_spec",
-        DataType::Utf8,
-        false,
-    )
-    .with_metadata(
-        [("vgi_filter_version".to_string(), "1".to_string())]
+    join_key_filter_named(values, "n")
+}
+
+fn join_key_filter_named(values: &[i64], column_name: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let filter_schema = Arc::new(
+        Schema::new(vec![Field::new("filter_spec", DataType::Utf8, false)]).with_metadata(
+            [
+                (
+                    "vgi_filter_encoding".to_string(),
+                    "vgi.filters.v2".to_string(),
+                ),
+                ("vgi_filter_version".to_string(), "2".to_string()),
+                (
+                    "vgi_evaluation_context".to_string(),
+                    "vgi.none.v1".to_string(),
+                ),
+            ]
             .into_iter()
             .collect(),
-    )]));
+        ),
+    );
     let filter = RecordBatch::try_new(
         filter_schema,
-        vec![Arc::new(StringArray::from(vec![
-            r#"[{"type":"join_keys","column_name":"n","column_index":0,"keys_column":"n"}]"#,
-        ])) as ArrayRef],
+        vec![Arc::new(StringArray::from(vec![format!(
+            r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{{"id":"join-n","revision":0,"mode":"required","source":"join","expression":{{"node":"in","expression":{{"node":"column_ref","column_index":0,"column_name":"{column_name}"}},"set":{{"kind":"external","batch_index":0,"column_index":0,"column_name":"n"}},"negated":false}}}}]}}"#,
+        )])) as ArrayRef],
     )
     .unwrap();
 
@@ -432,6 +443,26 @@ fn join_key_filter_survives_http_continuations() {
 
     assert_eq!(all, expected);
     assert!(responses > 1, "the filtered scan did not exercise resume");
+}
+
+/// Worker init must bind every v2 column reference against the unprojected
+/// bind output schema. A matching numeric index with a mismatched name is not
+/// allowed to reach user code or wait until the first produced batch.
+#[test]
+fn worker_init_rejects_filter_column_name_mismatch() {
+    let port = start_server();
+    let (filter, join_keys) = join_key_filter_named(&[1], "not_n");
+
+    let raw = post(
+        port,
+        "init/init",
+        init_body_with_filter("test_seq", 5, Some(filter), Some(join_keys)),
+    );
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("column_ref name does not match authoritative index"),
+        "expected strict bind-schema rejection, got: {text}"
+    );
 }
 
 /// A non-resumable producer with ONE batch still completes over HTTP, in a

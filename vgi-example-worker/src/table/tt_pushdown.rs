@@ -83,12 +83,8 @@ pub fn resolve_tt_version(at_unit: Option<&str>, at_value: Option<&str>) -> Resu
 
 /// The SQL-like string of whatever DuckDB pushed down ("(none)" if nothing).
 fn pushed_filter_str(params: &ProcessParams) -> String {
-    match &params.pushdown_filters {
-        Some(bytes) => {
-            vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
-                .map(|f| f.format_pushed())
-                .unwrap_or_else(|_| "(none)".to_string())
-        }
+    match &params.current_pushdown_filters {
+        Some(filters) => filters.format_pushed(),
         None => "(none)".to_string(),
     }
 }

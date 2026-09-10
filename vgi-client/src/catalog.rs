@@ -545,7 +545,7 @@ impl VgiClient {
             native_formats: Vec::new(),
             catalogs: Vec::new(),
             can_stream: true,
-            filter_encodings: vec!["vgi.filters.v1".to_string()],
+            filter_encodings: vec!["vgi.filters.v2".to_string()],
         };
         let request = envelope(CatalogAttachRequest {
             name: name.to_string(),

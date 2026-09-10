@@ -1195,6 +1195,27 @@ pub struct ScanFunctionResult {
 
 /// `FunctionInfo` item — describes a function to DuckDB.
 #[derive(Debug, Clone, VgiArrow)]
+pub struct FilterFunctionCapability {
+    pub namespace: String,
+    pub name: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, VgiArrow)]
+pub struct RuntimeFilterAlgorithmCapability {
+    pub namespace: String,
+    pub name: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, VgiArrow)]
+pub struct EvaluationContextCapability {
+    pub profile: String,
+    pub provider_fingerprint: Option<String>,
+}
+
+/// `FunctionInfo` item — describes a function to DuckDB.
+#[derive(Debug, Clone, VgiArrow)]
 pub struct FunctionInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
@@ -1212,7 +1233,10 @@ pub struct FunctionInfo {
     pub filter_pushdown: Option<bool>,
     pub sampling_pushdown: Option<bool>,
     pub late_materialization: Option<bool>,
-    pub supported_expression_filters: Vec<String>,
+    pub filter_semantic_profiles: Vec<String>,
+    pub additional_filter_functions: Vec<FilterFunctionCapability>,
+    pub runtime_filter_algorithms: Vec<RuntimeFilterAlgorithmCapability>,
+    pub filter_evaluation_contexts: Vec<EvaluationContextCapability>,
     pub order_preservation: Option<DictString>,
     pub max_workers: Option<i32>,
     pub supports_batch_index: bool,

@@ -72,11 +72,8 @@ impl TableFunction for FilterEchoTableScan {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let pushed = params
-            .pushdown_filters
+            .current_pushdown_filters
             .as_ref()
-            .and_then(|b| {
-                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-            })
             .map(|f| f.format_pushed())
             .unwrap_or_else(|| "(none)".to_string());
         let ns: Int64Array = (0..100).collect();
@@ -420,11 +417,8 @@ impl TableFunction for DynamicFilterEchoFunction {
             .max(1);
         // Init witness from the static filter (if any).
         let witness = params
-            .pushdown_filters
+            .current_pushdown_filters
             .as_ref()
-            .and_then(|b| {
-                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-            })
             .map(|f| f.format_repr())
             .unwrap_or_default();
         Ok(Box::new(DynFilterEchoProducer {
@@ -742,12 +736,8 @@ fn meta(desc: &str) -> FunctionMetadata {
 
 /// The SQL-like string of whatever DuckDB pushed down ("(none)" if nothing).
 fn pushed_filter_str(params: &ProcessParams) -> String {
-    match &params.pushdown_filters {
-        Some(bytes) => {
-            vgi::pushdown::PushdownFilters::parse_with_join_keys(bytes, &params.join_keys)
-                .map(|f| f.format_pushed())
-                .unwrap_or_else(|_| "(none)".to_string())
-        }
+    match &params.current_pushdown_filters {
+        Some(filters) => filters.format_pushed(),
         None => "(none)".to_string(),
     }
 }
@@ -934,11 +924,8 @@ impl TableFunction for ValuePruneFunction {
             .unwrap_or(2048)
             .max(1) as usize;
         let discrete = params
-            .pushdown_filters
+            .current_pushdown_filters
             .as_ref()
-            .and_then(|b| {
-                vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-            })
             .and_then(|f| f.get_column_values_i64("n"));
         let (values, resolved) = match discrete {
             Some(mut vs) => {
@@ -1075,9 +1062,7 @@ impl TableFunction for FilteredColumnsEchoFunction {
     }
     fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
         let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
-        let pf = params.pushdown_filters.as_ref().and_then(|b| {
-            vgi::pushdown::PushdownFilters::parse_with_join_keys(b, &params.join_keys).ok()
-        });
+        let pf = params.current_pushdown_filters.as_ref();
         let (filtered_cols, has_n, has_tag, tag_values) = match pf {
             Some(f) => {
                 let mut cols: Vec<String> = f.filtered_columns().into_iter().collect();
