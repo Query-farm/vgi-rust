@@ -502,7 +502,9 @@ fn pct_push(state: &[u8], v: f64) -> Vec<u8> {
 }
 fn pct_vals(state: &[u8]) -> Vec<f64> {
     state
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| {
             let mut a = [0u8; 8];
             a.copy_from_slice(c);

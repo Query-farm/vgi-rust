@@ -213,6 +213,7 @@ fn init_body_with_filter(
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
+        argument_names: Some(vec![Some("count".to_string())]),
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
@@ -629,6 +630,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
+        argument_names: Some(vec![Some("path".to_string())]),
     };
     let inner = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let req_schema = Arc::new(Schema::new(vec![Field::new(
@@ -770,6 +772,7 @@ fn finalize_init_body(function: &str) -> Vec<u8> {
         at_unit: None,
         at_value: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
+        argument_names: Some(vec![Some("count".to_string())]),
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {

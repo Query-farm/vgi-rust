@@ -130,6 +130,10 @@ pub struct BindRequest {
     /// and a scan whose function resolved to a built-in carries none either.
     /// Additive nullable column; the C++ always emits it as of protocol 1.1.0.
     pub schema_path: Option<SchemaPath>,
+    /// One entry per logical call argument. Fixed arguments retain their
+    /// declared name, unnamed varargs are `None`, and named varargs retain the
+    /// caller-provided name. Outer `None` means names are unavailable.
+    pub argument_names: Option<Vec<Option<String>>>,
     // NOTE: the `copy_from` / `copy_to` struct columns are intentionally NOT
     // derived fields here. The C++ extension only appends them to the
     // BindRequest schema for a COPY ... FROM / COPY ... TO scan (omitting them
@@ -155,7 +159,14 @@ pub struct BindRequest {
 pub fn backfill_bind_request(
     batch: arrow_array::RecordBatch,
 ) -> Result<(arrow_array::RecordBatch, bool)> {
-    ensure_schema_path(batch)
+    let (batch, legacy_peer) = ensure_schema_path(batch)?;
+    let names_type = arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+        "item",
+        arrow_schema::DataType::Utf8,
+        true,
+    )));
+    let batch = ensure_nullable_columns(batch, &[("argument_names", names_type)])?;
+    Ok((batch, legacy_peer))
 }
 
 /// Append a null `schema_path` column when the request batch lacks one, so a
@@ -293,6 +304,16 @@ pub fn backfill_function_info(batch: arrow_array::RecordBatch) -> Result<arrow_a
     let mut columns = batch.columns().to_vec();
     let mut appended = false;
 
+    if batch.column_by_name("parameter_default_values").is_none() {
+        appended = true;
+        fields.push(arrow_schema::Field::new(
+            "parameter_default_values",
+            arrow_schema::DataType::Binary,
+            true,
+        ));
+        columns.push(Arc::new(arrow_array::BinaryArray::new_null(rows)));
+    }
+
     for name in [
         "supports_splits",
         "filters_exactly_applied",
@@ -389,13 +410,17 @@ mod backfill_tests {
         assert!(col.is_null(0));
     }
 
-    /// A 1.1.0 peer already sends the column; nothing is synthesised and the
-    /// batch is handed back untouched.
+    /// A 1.1.0 peer already sends schema_path; only the newer argument-names
+    /// column is synthesized, without changing the legacy-peer classification.
     #[test]
     fn present_column_is_left_alone() {
         let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
         assert!(!legacy);
-        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.num_columns(), 3);
+        assert!(out
+            .column_by_name("argument_names")
+            .expect("column added")
+            .is_null(0));
     }
 
     #[test]
@@ -1224,6 +1249,9 @@ pub struct FunctionInfo {
     pub function_type: DictString,
     pub arguments: Bytes,
     pub output_schema: Bytes,
+    /// Authoritative typed defaults: exactly one row containing only defaulted
+    /// parameters in signature order. A present null is an explicit NULL.
+    pub parameter_default_values: Option<Bytes>,
     pub stability: Option<DictString>,
     pub null_handling: Option<DictString>,
     pub description: String,
@@ -1388,6 +1416,8 @@ pub struct AggregateBindRequest {
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
     pub schema_path: Option<SchemaPath>,
+    /// Full logical argument order; inner `None` denotes an unnamed vararg.
+    pub argument_names: Option<Vec<Option<String>>>,
 }
 
 /// `AggregateBindResponse`.

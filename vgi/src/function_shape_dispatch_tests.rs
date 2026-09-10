@@ -214,6 +214,7 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
         at_unit: None,
         at_value: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
+        argument_names: Some(vec![Some("value".to_string())]),
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
