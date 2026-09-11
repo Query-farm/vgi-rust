@@ -450,6 +450,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         parameter_default_values: None,
         stability: None,
         null_handling: None,
+        argument_monotonicity: None,
         description: String::new(),
         examples: Vec::new(),
         categories: Vec::new(),
@@ -585,6 +586,36 @@ fn apply_parameter_defaults(
     Ok(())
 }
 
+fn apply_argument_monotonicity(
+    fi: &mut FunctionInfo,
+    meta: &FunctionMetadata,
+    arguments: &Schema,
+    scalar: bool,
+) -> Result<()> {
+    let Some(values) = &meta.argument_monotonicity else {
+        return Ok(());
+    };
+    if !scalar {
+        return Err(vgi_rpc::RpcError::value_error(
+            "argument_monotonicity is only valid for scalar functions",
+        ));
+    }
+    if values.len() != arguments.fields().len() {
+        return Err(vgi_rpc::RpcError::value_error(format!(
+            "argument_monotonicity has {} entries, expected {} declaration slots",
+            values.len(),
+            arguments.fields().len()
+        )));
+    }
+    fi.argument_monotonicity = Some(
+        values
+            .iter()
+            .map(|value| value.wire_name().to_string())
+            .collect(),
+    );
+    Ok(())
+}
+
 /// Build the `FunctionInfo` for a scalar function.
 pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
     let meta = f.metadata();
@@ -593,6 +624,7 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
 
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_argument_monotonicity(&mut fi, &meta, &arg_schema, true)?;
     apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
 
     // Scalar functions need a 1-field output schema for DuckDB. Use the fixed
@@ -619,6 +651,7 @@ pub fn table_function_info(f: &dyn crate::table_function::TableFunction) -> Resu
     apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
     apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     // Output schema is resolved at bind time; advertise an empty schema.
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
@@ -639,6 +672,7 @@ pub fn table_in_out_function_info(
     fi.input_from_args = meta.input_from_args;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
     apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
     Ok(fi)
@@ -654,6 +688,7 @@ pub fn buffering_function_info(
     fi.has_finalize = true;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
     apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     fi.output_schema = Bytes::from(ipc::write_schema(&Schema::empty())?);
     Ok(fi)
@@ -670,6 +705,7 @@ pub fn aggregate_function_info(
     apply_metadata(&mut fi, &meta)?;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
+    apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
     apply_parameter_defaults(&mut fi, &meta, &arg_schema)?;
     let params = crate::aggregate::AggregateBindParams {
         arguments: crate::arguments::Arguments::default(),
@@ -1483,7 +1519,7 @@ pub fn arc(schema: Schema) -> Arc<Schema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::{ArgSpec, FunctionExample, ProcessParams};
+    use crate::function::{ArgSpec, ArgumentMonotonicity, FunctionExample, ProcessParams};
     use arrow_array::RecordBatch;
     use vgi_rpc::VgiArrow;
 
@@ -1563,6 +1599,61 @@ mod tests {
         fn process(&self, _params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
             Ok(batch.clone())
         }
+    }
+
+    #[test]
+    fn scalar_argument_monotonicity_uses_declaration_order() {
+        struct MonotoneScalar;
+        impl ScalarFunction for MonotoneScalar {
+            fn name(&self) -> &str {
+                "monotone"
+            }
+            fn metadata(&self) -> FunctionMetadata {
+                FunctionMetadata {
+                    argument_monotonicity: Some(vec![
+                        ArgumentMonotonicity::StrictlyIncreasing,
+                        ArgumentMonotonicity::Constant,
+                    ]),
+                    return_type: Some(DataType::Int64),
+                    ..Default::default()
+                }
+            }
+            fn argument_specs(&self) -> Vec<ArgSpec> {
+                vec![
+                    ArgSpec::column("value", 0, "int64", "input"),
+                    ArgSpec::const_arg("offset", 1, "int64", "constant"),
+                ]
+            }
+            fn process(&self, _params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+                Ok(batch.clone())
+            }
+        }
+
+        let info = scalar_function_info(&MonotoneScalar).unwrap();
+        assert_eq!(
+            info.argument_monotonicity,
+            Some(vec!["STRICTLY_INCREASING".into(), "CONSTANT".into()])
+        );
+    }
+
+    #[test]
+    fn argument_monotonicity_rejects_wrong_shape_and_non_scalar() {
+        let args = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let wrong_shape = FunctionMetadata {
+            argument_monotonicity: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut scalar = default_function_info("bad", enums::function_type::SCALAR);
+        let err = apply_argument_monotonicity(&mut scalar, &wrong_shape, &args, true).unwrap_err();
+        assert!(err.to_string().contains("expected 1 declaration slots"));
+
+        let declared = FunctionMetadata {
+            argument_monotonicity: Some(vec![ArgumentMonotonicity::Unknown]),
+            ..Default::default()
+        };
+        let mut table = default_function_info("bad", enums::function_type::TABLE);
+        let err = apply_argument_monotonicity(&mut table, &declared, &args, false).unwrap_err();
+        assert!(err.to_string().contains("only valid for scalar"));
     }
 
     #[test]

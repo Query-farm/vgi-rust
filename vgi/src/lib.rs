@@ -175,7 +175,7 @@ mod function_shape_dispatch_tests;
 
 pub use dispatch::FunctionScope;
 pub use function::{
-    ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
-    ScalarFunction,
+    ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FunctionExample, FunctionMetadata,
+    ProcessParams, ScalarFunction,
 };
 pub use worker::Worker;

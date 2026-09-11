@@ -15,6 +15,31 @@ pub use crate::protocol::dtos::{
 };
 use crate::protocol::enums;
 
+/// Monotonicity of a scalar function in one argument while all other
+/// arguments are held constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentMonotonicity {
+    Unknown,
+    Constant,
+    NonDecreasing,
+    StrictlyIncreasing,
+    NonIncreasing,
+    StrictlyDecreasing,
+}
+
+impl ArgumentMonotonicity {
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Constant => "CONSTANT",
+            Self::NonDecreasing => "NON_DECREASING",
+            Self::StrictlyIncreasing => "STRICTLY_INCREASING",
+            Self::NonIncreasing => "NON_INCREASING",
+            Self::StrictlyDecreasing => "STRICTLY_DECREASING",
+        }
+    }
+}
+
 /// A named type-bound predicate for ANY-typed arguments. Checked at bind:
 /// the input field type must satisfy the predicate or bind errors with the
 /// bound's `name` (mirrors Python's `type_bound=<predicate>`).
@@ -390,6 +415,9 @@ pub struct FunctionMetadata {
     pub description: String,
     pub stability: Option<String>,
     pub null_handling: Option<String>,
+    /// Scalar-only claims in argument declaration order. `None` makes no
+    /// claims; a vararg declaration occupies one slot.
+    pub argument_monotonicity: Option<Vec<ArgumentMonotonicity>>,
     pub categories: Vec<String>,
     /// SQL usage examples surfaced in `FunctionInfo` for discovery.
     pub examples: Vec<FunctionExample>,
@@ -483,6 +511,7 @@ impl Default for FunctionMetadata {
             description: String::new(),
             stability: Some(enums::stability::CONSISTENT.to_string()),
             null_handling: None,
+            argument_monotonicity: None,
             categories: Vec::new(),
             examples: Vec::new(),
             tags: Vec::new(),

@@ -1254,6 +1254,8 @@ pub struct FunctionInfo {
     pub parameter_default_values: Option<Bytes>,
     pub stability: Option<DictString>,
     pub null_handling: Option<DictString>,
+    /// Scalar-only uppercase claims aligned with `arguments` declaration slots.
+    pub argument_monotonicity: Option<Vec<String>>,
     pub description: String,
     pub examples: Vec<FunctionExample>,
     pub categories: Vec<String>,

@@ -65,7 +65,7 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::DataType;
-use vgi::{ArgSpec, FunctionMetadata, ProcessParams, ScalarFunction, Worker};
+use vgi::{ArgumentMonotonicity, ArgSpec, FunctionMetadata, ProcessParams, ScalarFunction, Worker};
 use vgi_rpc::{Result, RpcError};
 
 /// `upper_case(s)` — uppercase a string column.
@@ -80,6 +80,7 @@ impl ScalarFunction for UpperCase {
         FunctionMetadata {
             description: "Convert string values to uppercase".into(),
             return_type: Some(DataType::Utf8),
+            argument_monotonicity: Some(vec![ArgumentMonotonicity::Unknown]),
             ..Default::default()
         }
     }
@@ -103,6 +104,11 @@ fn main() {
     worker.run(); // serves stdio (default), --unix <path>, or --http
 }
 ```
+
+`argument_monotonicity` is optional and scalar-only. A present vector has one
+entry per ordered argument declaration. Fixed, defaulted, and constant
+arguments each occupy one slot; a vararg declaration occupies one slot even
+when a call expands it. Named call syntax does not change this order.
 
 **3. Build it** (`cargo build --release`), **then call it from a DuckDB engine
 that has the `vgi` extension.** The `vgi` extension currently ships with Query

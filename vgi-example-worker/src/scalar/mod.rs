@@ -601,6 +601,9 @@ impl ScalarFunction for NullHandlingFunction {
     fn metadata(&self) -> FunctionMetadata {
         let mut m = meta_ret("Returns value or -5000 if null", DataType::Int64);
         m.null_handling = Some(vgi::protocol::enums::null_handling::SPECIAL.to_string());
+        m.argument_monotonicity = Some(vec![
+            vgi::function::ArgumentMonotonicity::StrictlyIncreasing,
+        ]);
         m
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
