@@ -1142,10 +1142,9 @@ pub struct TableInfo {
     pub check_constraints: Vec<String>,
     pub primary_key_constraints: Vec<Vec<i32>>,
     pub foreign_key_constraints: Vec<Bytes>,
-    pub supports_insert: bool,
-    pub supports_update: bool,
-    pub supports_delete: bool,
-    pub supports_returning: bool,
+    /// Maximum result mode for each supported operation. Missing means unsupported;
+    /// values are ordered `count < rows < changes`.
+    pub write_result_modes: StrMap,
     pub supports_column_statistics: bool,
     /// IPC `ScanFunctionResult`, empty if not inlined.
     pub scan_function: Option<Bytes>,
