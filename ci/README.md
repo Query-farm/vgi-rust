@@ -64,8 +64,10 @@ prints against the parent's counters, invisible to the exit code) stays.
 
 ## Worker coverage
 
-The `coverage` job (Linux only) measures **what the integration suite actually
-exercises in the worker** — untested code is a gap in the suite. It builds the
+The manual-only `.github/workflows/coverage.yml` workflow measures **what the
+integration suite actually exercises in the worker** — untested code is a gap
+in the suite. It is deliberately excluded from push and pull-request CI because
+profile collection and report generation take about 20 minutes. It builds the
 worker with `-Cinstrument-coverage` + the `coverage` feature, runs the suite,
 merges the per-worker `.profraw` files, and reports `vgi`-SDK coverage
 (`ci/coverage-report.sh`); the `lcov` + text report upload as the
