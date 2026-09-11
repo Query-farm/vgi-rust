@@ -1367,10 +1367,7 @@ pub fn table_info(
             .iter()
             .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema_path, fk)?)))
             .collect::<Result<Vec<_>>>()?,
-        supports_insert: false,
-        supports_update: false,
-        supports_delete: false,
-        supports_returning: false,
+        write_result_modes: Vec::new(),
         supports_column_statistics: !t.statistics.is_empty(),
         scan_function: Some(Bytes::from(scan)),
         insert_function: Some(Bytes::from(Vec::new())),
