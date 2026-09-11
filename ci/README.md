@@ -6,33 +6,17 @@ PR, across all three public transports on Linux.
 
 ## How it works
 
-The workflow always tests against `Query-farm/vgi` **main**. A Linux producer
-job checks out main, resolves it to a full commit SHA once, and publishes that
-SHA as the `vgi_sha` job output — from there on nothing references the branch
-name. It builds `vgi.duckdb_extension` from that revision, records its SHA-256
-and source revision, and uploads it as a one-day workflow artifact. Every
-integration and coverage lane checks out the `.test` corpus at the *same*
-resolved SHA and downloads and verifies that same artifact.
-
-Resolving once is what makes tracking a moving branch safe. One commit stays
-the authority for both the extension and the corpus within a run, so the tests
-cannot silently move ahead of the client implementation — which happened when
-the workflow tracked main while loading an older community release — and a push
-to VGI mid-run cannot hand the producer and the lanes different commits.
-
-The suite still drives a prebuilt standalone `haybarn-unittest`. Its Haybarn
-release is pinned to the engine revision the VGI source expects, so the local
-extension's ABI/platform metadata matches the runner. VGI loads by
-absolute artifact path; `httpfs`/`json`/`parquet`/`spatial` remain signed core
-extensions. Because recursive Actions checkouts are shallow and carry no
-submodule tags, the producer also sets `OVERRIDE_GIT_DESCRIBE=v1.5.5` and the
-pinned `HAYBARN_GIT_DESCRIBE` explicitly; otherwise CMake stamps the extension
-with its `v0.0.1` fallback and the strict warm-load check correctly rejects it.
+The workflow always tests against `Query-farm/vgi` **main**, using the signed
+VGI extension that users install from the Haybarn community channel. Framework
+CI builds only the Rust worker; extension compilation and publication belong to
+the VGI extension repository. The standalone `haybarn-unittest` runner is
+downloaded from the latest Haybarn release so its ABI matches the current
+community artifact. `httpfs`/`json`/`parquet`/`spatial` come from core.
 
 - [`run-integration.sh`](run-integration.sh) — the driver: stages the suite,
   boots the worker(s), and runs `haybarn-unittest` for one transport lane.
 - [`preprocess-require.awk`](preprocess-require.awk) — rewrites `require vgi`
-  into an absolute load of the verified local artifact, rewrites other
+  into a signed community install, rewrites other
   `require <ext>` gates into core `INSTALL`+`LOAD`, and injects `LOAD httpfs`
   on the http lane.
 - [`wrappers/`](wrappers) — the single `vgi-example-worker` binary is routed
@@ -45,11 +29,9 @@ with its `v0.0.1` fallback and the strict warm-load check correctly rejects it.
 |----|:------------------:|:----------------:|:----:|
 | Linux | ✅ | ✅ | ✅ |
 
-The artifact is a Linux-amd64 native library, so every consumer job runs on
-Linux. Building additional native artifacts would require one producer per OS,
-which would violate this workflow's build-once invariant. Platform packaging
-remains covered by VGI's extension-distribution pipeline; this workflow owns
-Rust worker protocol/integration compatibility across the three transports.
+Platform packaging remains covered by VGI's extension-distribution pipeline;
+this workflow owns Rust worker protocol/integration compatibility across the
+three transports.
 
 ## Out of scope / known standalone-runner differences
 
@@ -70,7 +52,7 @@ mis-wired env var all read as green while the suite quietly tested nothing.
 `run_unittest` accumulates the executed count (staged cases minus skips) across
 every invocation, and the run fails if it collapses below a per-lane
 `MIN_EXECUTED` (stdio 250, launch 255, http 245 — conservative floors below
-the current pinned suite, leaving room for environment-dependent skips).
+the current suite, leaving room for environment-dependent skips).
 A collapse in that number is the tell of a suite-wide silent skip; it is a floor,
 not an equality, so **do not lower it to make a run pass** — find what stopped
 running. An empty stage (`No test cases matched`) fails outright.
@@ -110,13 +92,7 @@ input would otherwise abort the whole merge).
 
 ## Version pinning
 
-`VGI_REF` is deliberately **not** pinned — it is `main`, and the producer job
-resolves it to a SHA per run. Do not replace it with a commit: a pin here is
-what let vgi-rust drift out of step with the VGI corpus, and pinning is the
-thing this workflow is designed to avoid. Consumers still verify the artifact's
-recorded source revision and SHA-256, so provenance is unchanged.
-
-`HAYBARN_RELEASE` *is* pinned, to the runner built from the Haybarn engine
-revision the extension's ABI/platform metadata must match. Bump it deliberately
-when that ABI advances. If a VGI main commit requires a newer engine, the warm
-load fails loudly rather than silently mispairing.
+`VGI_REF` is deliberately **not** pinned — it is `main`. Do not replace it with
+a commit: CI should expose any lag between the shared corpus and the published
+community artifact. `HAYBARN_RELEASE` is resolved to the latest release at run
+time so the runner stays ABI-compatible with that artifact.

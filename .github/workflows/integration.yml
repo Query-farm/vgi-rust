@@ -2,11 +2,8 @@
 #
 # Runs the canonical Query-farm/vgi integration sqllogictest suite against the
 # Rust example worker across all three transports (subprocess / launcher / http).
-# A producer job resolves Query-farm/vgi main to a concrete SHA, builds the C++
-# extension from it, and every lane downloads that immutable workflow artifact
-# and checks out the suite at the SAME resolved SHA. This deliberately avoids
-# pairing tests from VGI main with an older community build, and avoids the
-# race where a push mid-run gives the producer and the lanes different commits.
+# The framework builds only its Rust worker. The standalone runner installs the
+# signed VGI extension from the Haybarn community channel, as end users do.
 # See ci/README.md.
 name: Integration suite
 
@@ -25,104 +22,17 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # vgi-rust always tests against Query-farm/vgi main. The producer job resolves
-  # this to a SHA once (`vgi_sha` output); every consumer uses that SHA, so a
-  # single run is still internally consistent even if main moves under it.
+  # Track the shared implementation directly. There is deliberately no commit
+  # pin or fallback: CI should expose any lag in the published artifact.
   VGI_REF: main
-  # The standalone unittest runner. Pinned independently of VGI_REF: its engine
-  # revision fixes the extension ABI/platform metadata that the source-built
-  # artifact must match, so it moves only when that ABI does.
-  HAYBARN_RELEASE: haybarn-v1.5.5-rc1
 
 jobs:
-  build-vgi-extension:
-    name: Build VGI extension from main (Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    outputs:
-      vgi_sha: ${{ steps.resolve.outputs.sha }}
-    env:
-      GEN: ninja
-      USE_MERGED_VCPKG_MANIFEST: "1"
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-    steps:
-      - name: Checkout VGI source (${{ env.VGI_REF }})
-        uses: actions/checkout@v5
-        with:
-          repository: Query-farm/vgi
-          ref: ${{ env.VGI_REF }}
-          path: vgi-source
-          submodules: recursive
-
-      # Pin the rest of the run to whatever main was at this instant. Everything
-      # downstream consumes this SHA, never the branch name.
-      - name: Resolve VGI revision
-        id: resolve
-        working-directory: vgi-source
-        shell: bash
-        run: |
-          sha="$(git rev-parse HEAD)"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Query-farm/vgi $VGI_REF resolved to $sha" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Install build toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
-
-      - uses: hendrikmuhs/ccache-action@v1
-        with:
-          key: vgi-rust-source-extension-${{ env.VGI_REF }}
-
-      - name: Export vcpkg cache credentials
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Bootstrap vcpkg
-        working-directory: vgi-source
-        run: |
-          git clone https://github.com/microsoft/vcpkg.git
-          ./vcpkg/bootstrap-vcpkg.sh
-
-      - name: Build release extension
-        working-directory: vgi-source
-        env:
-          # Recursive action checkouts are intentionally shallow and the
-          # Haybarn/DuckDB submodule therefore has no release tags available
-          # to `git describe`. Stamp the exact ABI version used by the pinned
-          # standalone runner instead of accepting CMake's v0.0.1 fallback.
-          OVERRIDE_GIT_DESCRIBE: v1.5.5
-          HAYBARN_GIT_DESCRIBE: ${{ env.HAYBARN_RELEASE }}
-        run: make release
-
-      - name: Stage exact extension artifact
-        shell: bash
-        run: |
-          mkdir -p vgi-extension-artifact
-          cp vgi-source/build/release/extension/vgi/vgi.duckdb_extension vgi-extension-artifact/
-          (cd vgi-extension-artifact && sha256sum vgi.duckdb_extension > SHA256SUMS)
-          printf '%s\n' "${{ steps.resolve.outputs.sha }}" > vgi-extension-artifact/VGI_SHA
-
-      - name: Upload extension
-        uses: actions/upload-artifact@v4
-        with:
-          name: vgi-extension-linux-amd64-${{ steps.resolve.outputs.sha }}
-          path: vgi-extension-artifact/
-          if-no-files-found: error
-          retention-days: 1
-
   integration:
     name: Linux / ${{ matrix.transport }}
-    needs: build-vgi-extension
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      VGI_SHA: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
     strategy:
-      # All three public transports execute the same resolved suite + extension.
+      # All three public transports execute the current suite + community extension.
       fail-fast: true
       matrix:
         transport: [stdio, launch, http]
@@ -130,16 +40,12 @@ jobs:
       - name: Checkout vgi-rust
         uses: actions/checkout@v5
 
-      - name: Checkout vgi test suite at the resolved revision
+      - name: Checkout current vgi test suite
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi
-          ref: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
+          ref: ${{ env.VGI_REF }}
           path: vgi-upstream
-
-      - name: Verify exact VGI test revision
-        shell: bash
-        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_SHA"
 
       - name: Install Rust toolchain (MSRV 1.97)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -148,6 +54,14 @@ jobs:
 
       - name: Build example worker
         run: cargo build --release -p vgi-example-worker
+
+      - name: Resolve latest haybarn release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)"
+          echo "HAYBARN_RELEASE=$release" >> "$GITHUB_ENV"
 
       - name: Download + extract haybarn-unittest
         shell: bash
@@ -161,25 +75,12 @@ jobs:
           chmod +x "$ut"
           echo "HAYBARN_UNITTEST=$(cd "$(dirname "$ut")" && pwd)/$(basename "$ut")" >> "$GITHUB_ENV"
 
-      - name: Download exact VGI extension
-        uses: actions/download-artifact@v4
-        with:
-          name: vgi-extension-linux-amd64-${{ needs.build-vgi-extension.outputs.vgi_sha }}
-          path: vgi-extension
-
-      - name: Verify extension provenance and digest
-        shell: bash
-        run: |
-          test "$(cat vgi-extension/VGI_SHA)" = "$VGI_SHA"
-          (cd vgi-extension && sha256sum --check SHA256SUMS)
-
       - name: Run integration suite (${{ matrix.transport }})
         shell: bash
         run: ci/run-integration.sh
         env:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
-          VGI_EXTENSION_PATH: ${{ github.workspace }}/vgi-extension/vgi.duckdb_extension
           TRANSPORT: ${{ matrix.transport }}
 
   # Measure what the VGI integration suite exercises in the worker. Linux only.
@@ -195,24 +96,17 @@ jobs:
   # code paths stdio never exercises. Together they give a trustworthy picture.
   coverage:
     name: coverage (worker / Linux stdio+launch)
-    needs: build-vgi-extension
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      VGI_SHA: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Checkout vgi test suite at the resolved revision
+      - name: Checkout current vgi test suite
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi
-          ref: ${{ needs.build-vgi-extension.outputs.vgi_sha }}
+          ref: ${{ env.VGI_REF }}
           path: vgi-upstream
-
-      - name: Verify exact VGI test revision
-        shell: bash
-        run: test "$(git -C vgi-upstream rev-parse HEAD)" = "$VGI_SHA"
 
       - name: Install Rust toolchain (MSRV 1.97) + llvm-tools
         uses: dtolnay/rust-toolchain@1.97.0
@@ -228,6 +122,14 @@ jobs:
         env:
           RUSTFLAGS: -Cinstrument-coverage
 
+      - name: Resolve latest haybarn release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)"
+          echo "HAYBARN_RELEASE=$release" >> "$GITHUB_ENV"
+
       - name: Download + extract haybarn-unittest
         shell: bash
         env:
@@ -240,25 +142,12 @@ jobs:
           chmod +x "$ut"
           echo "HAYBARN_UNITTEST=$(cd "$(dirname "$ut")" && pwd)/$(basename "$ut")" >> "$GITHUB_ENV"
 
-      - name: Download exact VGI extension
-        uses: actions/download-artifact@v4
-        with:
-          name: vgi-extension-linux-amd64-${{ needs.build-vgi-extension.outputs.vgi_sha }}
-          path: vgi-extension
-
-      - name: Verify extension provenance and digest
-        shell: bash
-        run: |
-          test "$(cat vgi-extension/VGI_SHA)" = "$VGI_SHA"
-          (cd vgi-extension && sha256sum --check SHA256SUMS)
-
       - name: Run integration suite (stdio) with coverage
         shell: bash
         run: ci/run-integration.sh
         env:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
-          VGI_EXTENSION_PATH: ${{ github.workspace }}/vgi-extension/vgi.duckdb_extension
           TRANSPORT: stdio
           # coverage.rs periodically rewrites a complete snapshot. Do not use
           # %m (online merge): merging every cumulative snapshot into the same
@@ -271,7 +160,6 @@ jobs:
         env:
           VGI_SRC: ${{ github.workspace }}/vgi-upstream
           VGI_WORKER_BIN: ${{ github.workspace }}/target/release/vgi-example-worker
-          VGI_EXTENSION_PATH: ${{ github.workspace }}/vgi-extension/vgi.duckdb_extension
           TRANSPORT: launch
           LLVM_PROFILE_FILE: ${{ github.workspace }}/covdata/launch-%p.profraw
 
