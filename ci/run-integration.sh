@@ -3,8 +3,7 @@
 #
 # Run the canonical Query-farm/vgi integration sqllogictest suite against the
 # Rust example worker, using a prebuilt standalone `haybarn-unittest` and the
-# exact source-built VGI extension artifact selected by the workflow. See
-# ci/README.md.
+# signed community VGI extension selected by the runner. See ci/README.md.
 #
 # The single `vgi-example-worker` binary is routed into each catalog by the
 # ci/wrappers/* scripts (which set VGI_WORKER_CATALOG_NAME); on Windows, which
@@ -16,7 +15,6 @@
 #   VGI_SRC          path to a Query-farm/vgi checkout (contains test/sql/integration)
 #   HAYBARN_UNITTEST path to the haybarn-unittest binary
 #   VGI_WORKER_BIN   path to the built vgi-example-worker
-#   VGI_EXTENSION_PATH path to the matching local vgi.duckdb_extension artifact
 # Optional:
 #   TRANSPORT        stdio | launch | http   (default stdio)
 #   STAGE            scratch dir for the preprocessed test tree (default: mktemp)
@@ -25,18 +23,6 @@ set -uo pipefail  # not -e: the suite exit code is managed explicitly (`|| rc=$?
 : "${VGI_SRC:?path to a Query-farm/vgi checkout}"
 : "${HAYBARN_UNITTEST:?path to the haybarn-unittest binary}"
 : "${VGI_WORKER_BIN:?path to the built vgi-example-worker}"
-: "${VGI_EXTENSION_PATH:?path to the pinned vgi.duckdb_extension artifact}"
-[ -f "$VGI_EXTENSION_PATH" ] || {
-  echo "::error::VGI extension artifact does not exist: $VGI_EXTENSION_PATH" >&2
-  exit 1
-}
-VGI_EXTENSION_DIR="$(cd "$(dirname "$VGI_EXTENSION_PATH")" && pwd)" || {
-  echo "::error::cannot resolve VGI extension directory: $VGI_EXTENSION_PATH" >&2
-  exit 1
-}
-VGI_EXTENSION_PATH="$VGI_EXTENSION_DIR/$(basename "$VGI_EXTENSION_PATH")"
-export VGI_EXTENSION_PATH
-
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STAGE="${STAGE:-$(mktemp -d)}"
 TRANSPORT="${TRANSPORT:-stdio}"
@@ -108,21 +94,21 @@ if ! ( cd "$INTEGRATION" || exit 1
        -not -name 'expression_filter.test' \
        ${HTTP_SKIP[@]+"${HTTP_SKIP[@]}"} ${WIN_SKIP[@]+"${WIN_SKIP[@]}"} | while read -r f; do
     mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")" || exit 1
-    awk -v http="$AWK_HTTP" -v vgi_extension="$VGI_EXTENSION_PATH" \
-        -f "$HERE/preprocess-require.awk" "$f" > "$STAGE/test/sql/integration/$f" || exit 1
+    awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" \
+        > "$STAGE/test/sql/integration/$f" || exit 1
   done ); then
-  echo "::error::failed to stage the pinned VGI test corpus" >&2
+  echo "::error::failed to stage the VGI test corpus" >&2
   exit 1
 fi
 
 # The database-worker package tests intentionally package this executable by a
 # path relative to the unittest working directory.  Staging only the .test
-# files leaves that path unmatched, so copy the pinned fixture alongside them
+# files leaves that path unmatched, so copy the fixture alongside them
 # and preserve its executable contract.  Keep this explicit rather than
 # copying all support files into every SDK lane.
 DATABASE_WORKER_FIXTURE="$VGI_SRC/test/support/database_worker_fixture.sh"
 if [ ! -f "$DATABASE_WORKER_FIXTURE" ]; then
-  echo "::error::pinned VGI suite is missing $DATABASE_WORKER_FIXTURE" >&2
+  echo "::error::VGI suite is missing $DATABASE_WORKER_FIXTURE" >&2
   exit 1
 fi
 mkdir -p "$STAGE/test/support" || exit 1
@@ -265,24 +251,14 @@ cd "$STAGE" || {
   exit 1
 }
 
-echo "Validating pinned local VGI extension and warming core dependencies ..."
+echo "Warming the extension cache (vgi from community, dependencies from core) ..."
 mkdir -p "$STAGE/test" || exit 1
-VGI_EXTENSION_SQL_PATH="${VGI_EXTENSION_PATH//\'/\'\'}"
-cat > "$STAGE/test/_warm_vgi.test" <<EOF
-# name: test/_warm_vgi.test
-# group: [warm_vgi]
+cat > "$STAGE/test/_warm.test" <<'EOF'
+# name: test/_warm.test
+# group: [warm]
 statement ok
-LOAD '$VGI_EXTENSION_SQL_PATH';
-EOF
-if ! "$HAYBARN_UNITTEST" "test/_warm_vgi.test"; then
-  echo "::error::pinned local VGI extension failed to load" >&2
-  exit 1
-fi
-rm -f "$STAGE/test/_warm_vgi.test"
+FORCE INSTALL vgi FROM community;
 
-cat > "$STAGE/test/_warm_core.test" <<'EOF'
-# name: test/_warm_core.test
-# group: [warm_core]
 statement ok
 INSTALL httpfs FROM core;
 
@@ -295,9 +271,9 @@ INSTALL parquet FROM core;
 statement ok
 INSTALL spatial FROM core;
 EOF
-"$HAYBARN_UNITTEST" "test/_warm_core.test" >/dev/null 2>&1 || \
-  echo "::warning::core extension warm-up did not fully succeed; individual require gates remain authoritative"
-rm -f "$STAGE/test/_warm_core.test"
+"$HAYBARN_UNITTEST" "test/_warm.test" >/dev/null 2>&1 || \
+  echo "::warning::extension warm-up did not fully succeed; individual require gates remain authoritative"
+rm -f "$STAGE/test/_warm.test"
 
 # Run the suite in one invocation, streaming the native sqllogictest report.
 # bearer_auth/* runs separately on the http lane against a bearer-protected
@@ -318,7 +294,7 @@ rc=0
 # the whole-suite collapses that are the real risk. The existing fatal-signal
 # scan in run_unittest stays.)
 #
-# The Linux floors are deliberately conservative relative to the pinned suite;
+# The Linux floors are deliberately conservative relative to the current suite;
 # the lower Windows-http value remains for local use of this portable driver.
 TOTAL_EXECUTED=0
 case "$TRANSPORT" in
