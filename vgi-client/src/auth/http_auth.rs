@@ -103,6 +103,7 @@ impl AuthenticatedHttpTransport {
         let token = self.auth.bearer_token();
         if self.client.is_none() || self.built_with != token {
             let mut builder = HttpClient::connect(self.base_url.clone())
+                .protocol(vgi_protocol::VGI_PROTOCOL_NAME)
                 .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
                 .on_log(self.worker_logs.callback())
                 .timeout(self.timeout);

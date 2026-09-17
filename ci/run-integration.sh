@@ -67,8 +67,8 @@ if [ "$TRANSPORT" = "http" ]; then
   # dynamic_filter.test used to be dropped here too, blamed on the prebuilt
   # binary. That was wrong: this SDK's HTTP server discarded a continuation
   # turn's Arrow custom_metadata, so DuckDB's tightening Top-N filter never
-  # reached the worker. Fixed in vgi-rpc-rust 52b702d, which the committed
-  # [patch.crates-io] in Cargo.toml picks up. Verified 2026-08-21 against this
+  # reached the worker. Fixed in vgi-rpc-rust 52b702d, which is contained in
+  # the published vgi-rpc the workspace pins. Verified 2026-08-21 against this
   # SDK's own http worker: 52/52 assertions pass. Exclusion removed.
   # database_worker/package.test packages an executable wrapper around
   # VGI_TEST_WORKER. On this lane that value is an HTTP URL, not an executable;

@@ -292,7 +292,10 @@ impl Worker {
             .server_id(server_id)
             .protocol_name(VGI_PROTOCOL_NAME)
             .protocol_version(protocol_version)
-            .enable_describe(true)
+            // No `enable_describe` knob since vgi-rpc 0.25.0: the hardcoded
+            // `__describe__` method was retired in favour of the co-hosted
+            // `vgi_rpc.Reflection.v1` protocol, which every server hosts
+            // unconditionally and addresses through the ordinary routing key.
             .build();
         let disp = Arc::new(self.disp);
         register::register(&mut srv, disp.clone());

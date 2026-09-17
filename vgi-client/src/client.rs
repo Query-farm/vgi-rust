@@ -139,6 +139,11 @@ impl Default for IrohHttpOptions {
 ///
 /// Two of them, and both are contracts with the worker rather than tuning:
 ///
+/// * **`protocol`** — the `vgi_rpc.protocol` routing key, required on every
+///   request since vgi-rpc 0.25.0 even against a single-protocol server. A
+///   worker now co-hosts `vgi_rpc.Reflection.v1` alongside `VgiProtocol`, so
+///   "whichever protocol was registered first" is no longer a safe default and
+///   an unbound client is refused outright.
 /// * **`protocol_version`** — a VGI worker rejects a request that does not
 ///   declare `vgi_rpc.protocol_version`, matching major+minor exactly at the
 ///   dispatch boundary. Omitting it is not a lenient default; the Python
@@ -154,6 +159,7 @@ impl Default for IrohHttpOptions {
 /// both instead of rediscovering them.
 fn configure(client: RpcClient, worker_logs: &WorkerLogRouter) -> RpcClient {
     client
+        .protocol(vgi_protocol::VGI_PROTOCOL_NAME)
         .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
         .relax_nullability(true)
         .on_log(worker_logs.callback())
@@ -484,6 +490,7 @@ impl VgiClient {
         use crate::transport::HttpTransport;
         let worker_logs = WorkerLogRouter::default();
         let client = vgi_rpc_client::HttpClient::connect(base_url.to_string())
+            .protocol(vgi_protocol::VGI_PROTOCOL_NAME)
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .on_log(worker_logs.callback())
             .timeout(timeout)
@@ -589,6 +596,15 @@ impl VgiClient {
     pub fn connect_httpi_with_options(target: &str, options: IrohHttpOptions) -> Result<Self> {
         use crate::transport::HttpTransport;
         let worker_logs = WorkerLogRouter::default();
+        // NOTE: the `vgi_rpc.protocol` routing key is NOT bound here, unlike
+        // every other transport, because vgi-rpc-client 0.25.0's
+        // `HttpiClientBuilder` forwards `protocol_version` to the inner
+        // `HttpClientBuilder` but has no `protocol` forwarder, and the inner
+        // builder is a private field. Since 0.25.0 makes the routing key
+        // mandatory server-side, this lane is refused with "Request carries no
+        // 'vgi_rpc.protocol' routing key" until the forwarder is added
+        // upstream. Add `.protocol(vgi_protocol::VGI_PROTOCOL_NAME)` here the
+        // moment it exists.
         let mut builder = vgi_rpc_client::HttpClient::connect_httpi(target)?
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .on_log(worker_logs.callback())
