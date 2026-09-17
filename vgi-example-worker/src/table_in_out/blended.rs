@@ -25,6 +25,8 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(RowSumFunction);
     w.register_table_in_out(BlendedDropFunction);
     w.register_table_in_out(BlendedExplodeFunction);
+    w.register_table_in_out(BlendedAnyFunction);
+    w.register_table_in_out(BlendedAnyVarargsFunction);
     w.register_table_in_out(ProjectableBlendedFunction);
     w.register_table_in_out(HostileProvenanceFunction);
 }
@@ -354,6 +356,112 @@ impl TableInOutFunction for BlendedExplodeFunction {
                 ..Default::default()
             },
         )
+    }
+}
+
+/// The bind-time input schema of a blended call (the client always sends one:
+/// it is built from the call's positional args).
+fn blended_input_schema(params: &BindParams, func: &str) -> Result<Arc<Schema>> {
+    params
+        .input_schema
+        .clone()
+        .ok_or_else(|| RpcError::value_error(format!("{func} requires an input schema")))
+}
+
+/// Re-label the input columns under the bound output schema, untouched (same
+/// arrays, so row count and every validity bitmap — top-level AND nested —
+/// survive as-is).
+fn echo_batch(params: &ProcessParams, columns: Vec<ArrayRef>) -> Result<Vec<RecordBatch>> {
+    let out = RecordBatch::try_new(params.output_schema.clone(), columns)
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+    Ok(vec![out])
+}
+
+/// `blended_any(value ANY)` — blended 1→1 echo of a single ANY-typed input
+/// column.
+///
+/// Proves a blended positional arg may be declared ANY: the declared type
+/// names no concrete Arrow type, so the client must build the worker's input
+/// schema from the type DuckDB actually resolved for the call (a STRUCT built
+/// per row, a whole-row struct, a LIST, a plain VARCHAR ...) rather than from
+/// the declaration. The output column `value` is bound to that resolved input
+/// type at bind time and the column is passed through untouched, so a test
+/// asserts on DuckDB's own `typeof(value)` and on the round-tripped values.
+pub struct BlendedAnyFunction;
+impl TableInOutFunction for BlendedAnyFunction {
+    fn name(&self) -> &str {
+        "blended_any"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        blended_meta(
+            "Blended 1->1 echo of one ANY-typed input column (output typed from the input)",
+            &["blended", "test"],
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::any_column(
+            "value",
+            0,
+            "Input column of any type (echoed back unchanged)",
+        )]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = blended_input_schema(params, "blended_any")?;
+        let field = input
+            .fields()
+            .first()
+            .ok_or_else(|| RpcError::value_error("blended_any requires one input column"))?;
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new(
+                "value",
+                field.data_type().clone(),
+                true,
+            )])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        echo_batch(params, vec![named_col(batch, "value", 0)?.clone()])
+    }
+}
+
+/// `blended_any_varargs(values ANY...)` — blended 1→1 echo of N ANY-typed
+/// VARARGS input columns.
+///
+/// The varargs counterpart of `blended_any`: every runtime column may resolve
+/// to a different concrete type, so the client must take each column's type
+/// from the call rather than from the (ANY) vararg element type. Output
+/// columns are `col0..colN-1` — the names the client generates for varargs
+/// blended input — each bound to its own resolved input type.
+pub struct BlendedAnyVarargsFunction;
+impl TableInOutFunction for BlendedAnyVarargsFunction {
+    fn name(&self) -> &str {
+        "blended_any_varargs"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        blended_meta(
+            "Blended 1->1 echo of N ANY-typed varargs input columns (col0..colN-1)",
+            &["blended", "test"],
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::any_column("values", 0, "Input columns of any types (echoed back)").varargs()]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = blended_input_schema(params, "blended_any_varargs")?;
+        let fields: Vec<Field> = input
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Field::new(format!("col{i}"), f.data_type().clone(), true))
+            .collect();
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(fields)),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        echo_batch(params, batch.columns().to_vec())
     }
 }
 
