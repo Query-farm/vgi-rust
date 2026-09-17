@@ -63,6 +63,20 @@ pub trait FunctionStorage: Send + Sync {
 
     /// Append `value` under `(scope, ns, key)`; returns its monotonic id.
     fn append(&self, scope: &[u8], ns: &[u8], key: &[u8], value: Vec<u8>) -> i64;
+    /// Append several values under `(scope, ns, key)` in order, returning their
+    /// monotonic ids. Defaults to one [`append`](Self::append) per value.
+    ///
+    /// Worth overriding wherever a write carries fixed per-statement cost:
+    /// SQLite commits a WAL frame per statement, so a few thousand appends
+    /// outside a transaction cost far more than the same rows inside one. The
+    /// table-in-out FINALIZE flush writes one row per batch and a flush of
+    /// several thousand batches is exactly the case that made this worth having.
+    fn append_many(&self, scope: &[u8], ns: &[u8], key: &[u8], values: Vec<Vec<u8>>) -> Vec<i64> {
+        values
+            .into_iter()
+            .map(|v| self.append(scope, ns, key, v))
+            .collect()
+    }
     /// Scan log entries under `(scope, ns, key)` with `id > after_id`, in id
     /// order, up to `limit` entries.
     fn scan(

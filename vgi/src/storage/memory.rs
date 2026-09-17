@@ -78,12 +78,16 @@ impl FunctionStorage for MemoryStorage {
     ) -> Vec<(i64, Vec<u8>)> {
         let g = self.inner.lock().unwrap();
         match g.log.get(&(scope.to_vec(), ns.to_vec(), key.to_vec())) {
-            Some(entries) => entries
-                .iter()
-                .filter(|(id, _)| *id > after_id)
-                .take(limit)
-                .cloned()
-                .collect(),
+            // Entries are pushed with strictly increasing ids, so the cursor
+            // position is a binary search rather than a walk from the front.
+            // It matters because the FINALIZE flush drain scans once per turn
+            // with `limit = 1`: filtering from the front would make the drain
+            // O(N^2) in id comparisons, which is the very shape this backend is
+            // used to test for.
+            Some(entries) => {
+                let start = entries.partition_point(|(id, _)| *id <= after_id);
+                entries[start..].iter().take(limit).cloned().collect()
+            }
             None => Vec::new(),
         }
     }

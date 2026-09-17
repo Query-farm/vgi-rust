@@ -17,7 +17,7 @@ use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
 use vgi_rpc::metadata::{
-    REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
+    CALL_STATE_KEY, REQUEST_ID_KEY, REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY, STATE_KEY,
 };
 use vgi_rpc::wire::{md_get, StreamReader, StreamWriter};
 use vgi_rpc::{Bytes, DictString, LargeBytes, OutputCollector, Result, RpcError};
@@ -305,6 +305,31 @@ fn exchange_body(token: &str) -> Vec<u8> {
     frame(&empty, "init", Some(token))
 }
 
+/// A continuation carrying the stream's call token as well as its state token,
+/// the way a real client does. Only needed when the continuation may land on an
+/// instance other than the one that minted it — the minting instance answers
+/// from its own call cache, an instance that never saw the stream cannot.
+fn exchange_body_with_call(token: &str, call_state: Option<&str>) -> Vec<u8> {
+    let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
+    let schema = empty.schema();
+    let mut md = std::collections::HashMap::<String, String>::from([
+        (RPC_METHOD_KEY.to_string(), "init".to_string()),
+        (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+        (REQUEST_ID_KEY.to_string(), "test".to_string()),
+        (STATE_KEY.to_string(), token.to_string()),
+    ]);
+    if let Some(call) = call_state {
+        md.insert(CALL_STATE_KEY.to_string(), call.to_string());
+    }
+    let mut buf = Vec::new();
+    {
+        let mut w = StreamWriter::new(&mut buf, schema.as_ref()).unwrap();
+        w.write(&empty, Some(&md)).unwrap();
+        w.finish().unwrap();
+    }
+    buf
+}
+
 fn post(port: u16, path: &str, body: Vec<u8>) -> Vec<u8> {
     let url = format!("http://127.0.0.1:{port}/{path}");
     match ureq::post(&url)
@@ -325,6 +350,10 @@ struct Parsed {
     values: Vec<i64>,
     token: Option<String>,
     max_batch_rows: usize,
+    /// The stream's call token. A continuation carries it alongside the state
+    /// token; a server that did not mint it has no cached call to resolve
+    /// without it, which is what makes a cross-instance resume possible.
+    call_state: Option<String>,
 }
 
 /// Parse a producer response body. The body is *concatenated* Arrow IPC streams
@@ -335,6 +364,7 @@ fn parse(body: &[u8]) -> Parsed {
     let mut cursor = std::io::Cursor::new(body);
     let mut values = Vec::new();
     let mut token = None;
+    let mut call_state = None;
     let mut max_batch_rows = 0;
     while (cursor.position() as usize) < body.len() {
         let mut r = match StreamReader::new(&mut cursor) {
@@ -344,6 +374,9 @@ fn parse(body: &[u8]) -> Parsed {
         while let Some((rb, md)) = r.read_next().unwrap() {
             if let Some(t) = md_get(&md, STATE_KEY) {
                 token = Some(t.to_string());
+            }
+            if let Some(t) = md_get(&md, CALL_STATE_KEY) {
+                call_state = Some(t.to_string());
             }
             if let Some(col) = rb
                 .schema()
@@ -362,6 +395,7 @@ fn parse(body: &[u8]) -> Parsed {
         values,
         token,
         max_batch_rows,
+        call_state,
     }
 }
 
@@ -753,8 +787,15 @@ const FINISH_BATCHES: i64 = 4;
 
 /// The `init` body for a FINALIZE-phase call on a table-in-out function.
 fn finalize_init_body(function: &str) -> Vec<u8> {
+    finalize_init_body_sized(function, FINISH_BATCHES, b"finalize-exec")
+}
+
+/// As [`finalize_init_body`], but with the flush size and the execution id
+/// spelled out. Two streams sharing one execution id is the parallel-query
+/// shape; a big flush is what separates a linear drain from a quadratic one.
+fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8]) -> Vec<u8> {
     let args = crate::arguments::Arguments::serialize_positional(&[
-        Arc::new(Int64Array::from(vec![FINISH_BATCHES])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![n_batches])) as ArrayRef,
     ])
     .unwrap();
     let bind = BindRequest {
@@ -785,7 +826,7 @@ fn finalize_init_body(function: &str) -> Vec<u8> {
         phase: Some(DictString(
             crate::protocol::enums::phase::FINALIZE.to_string(),
         )),
-        execution_id: Some(Bytes::from(b"finalize-exec".to_vec())),
+        execution_id: Some(Bytes::from(execution_id.to_vec())),
         init_opaque_data: None,
         substream_id: None,
         order_by_column_name: None,
@@ -860,5 +901,346 @@ fn multi_batch_finalize_paginates_over_http() {
     assert!(
         responses > 1,
         "finalize did not paginate (drained in one response)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The FINALIZE flush must cost the same on turn 5000 as on turn 1
+// ---------------------------------------------------------------------------
+//
+// Over HTTP a producer is strictly lock-step: one batch per response, and the
+// next turn rebuilds the producer from a continuation token. A flush of N
+// batches therefore takes N turns — so anything a turn does in proportion to
+// the FLUSH SIZE is paid N times, and the drain is O(N^2).
+//
+// That is not hypothetical. Storing the flush as one blob and decoding all of
+// it to emit the batch at the cursor cost 51.3s for a 5000-row flush and 97.4s
+// for 6400 — growth per doubling 4.6x, quadratic — against 2.6s and 3.4s once a
+// turn read only the row at its cursor, and 8.7s for the Python reference
+// (which scans exactly one state-log row per tick, and grew at 2.00x). The
+// byte-stream transports never serialize a token, so only HTTP paid.
+//
+// These tests pin the cost SHAPE rather than a wall-clock number, so they are
+// cheap and not load-sensitive: a couple of hundred batches already separate
+// linear from quadratic by two orders of magnitude, and there is no reason to
+// make the suite drain five thousand.
+
+/// Read/write totals observed by [`CountingStorage`].
+#[derive(Default)]
+struct StorageCounts {
+    read_calls: std::sync::atomic::AtomicU64,
+    read_bytes: std::sync::atomic::AtomicU64,
+    written_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl StorageCounts {
+    fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn read_calls(&self) -> u64 {
+        self.read_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn written_bytes(&self) -> u64 {
+        self.written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A [`FunctionStorage`](crate::storage::FunctionStorage) that counts the bytes
+/// a drain reads back. Wall-clock timing would be the flaky way to ask the same
+/// question; bytes-read is exact, and it is the quantity that actually grew.
+struct CountingStorage {
+    inner: crate::storage::MemoryStorage,
+    counts: Arc<StorageCounts>,
+}
+
+impl CountingStorage {
+    fn new() -> (Arc<Self>, Arc<StorageCounts>) {
+        let counts = Arc::new(StorageCounts::default());
+        (
+            Arc::new(CountingStorage {
+                inner: crate::storage::MemoryStorage::new(),
+                counts: counts.clone(),
+            }),
+            counts,
+        )
+    }
+}
+
+impl crate::storage::FunctionStorage for CountingStorage {
+    fn kv_get(&self, scope: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let v = self.inner.kv_get(scope, key);
+        self.counts.read_calls.fetch_add(1, Relaxed);
+        self.counts
+            .read_bytes
+            .fetch_add(v.as_ref().map_or(0, |b| b.len()) as u64, Relaxed);
+        v
+    }
+    fn kv_put(&self, scope: &[u8], key: &[u8], value: &[u8]) {
+        self.counts
+            .written_bytes
+            .fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.kv_put(scope, key, value)
+    }
+    fn kv_del(&self, scope: &[u8], key: &[u8]) {
+        self.inner.kv_del(scope, key)
+    }
+    fn append(&self, scope: &[u8], ns: &[u8], key: &[u8], value: Vec<u8>) -> i64 {
+        self.counts
+            .written_bytes
+            .fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.append(scope, ns, key, value)
+    }
+    fn scan(
+        &self,
+        scope: &[u8],
+        ns: &[u8],
+        key: &[u8],
+        after_id: i64,
+        limit: usize,
+    ) -> Vec<(i64, Vec<u8>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let rows = self.inner.scan(scope, ns, key, after_id, limit);
+        self.counts.read_calls.fetch_add(1, Relaxed);
+        self.counts.read_bytes.fetch_add(
+            rows.iter().map(|(_, v)| v.len() as u64).sum::<u64>(),
+            Relaxed,
+        );
+        rows
+    }
+    fn queue_push(&self, scope: &[u8], items: &[Vec<u8>]) {
+        self.inner.queue_push(scope, items)
+    }
+    fn queue_pop(&self, scope: &[u8]) -> Option<Vec<u8>> {
+        self.inner.queue_pop(scope)
+    }
+    fn clear(&self, scope: &[u8]) {
+        self.inner.clear(scope)
+    }
+}
+
+/// A fixed token key, so two independently built servers can open each other's
+/// continuation tokens — the cold-worker test needs that, and the default is a
+/// per-process ephemeral key.
+const TEST_TOKEN_KEY: &[u8; 32] = b"vgi-finalize-flush-test-key-0123";
+
+/// Boot a worker carrying only the multi-batch finalize fixture, on the given
+/// store, with the production producer batch limit (one batch per response).
+fn start_finalize_server(store: crate::storage::SharedStorage) -> u16 {
+    let mut w = Worker::new();
+    w.set_storage(store);
+    w.register_table_in_out(MultiBatchFinishFunction);
+    let server = Arc::new(w.build_server());
+    let state = HttpState::builder()
+        .server(server)
+        .producer_batch_limit(1)
+        .token_key(TEST_TOKEN_KEY)
+        .build();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        rt.block_on(vgi_rpc::http::serve_with_shutdown(state, listener))
+            .ok();
+    });
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    port
+}
+
+/// Drain a whole finalize flush over HTTP, following continuations to the end.
+/// Returns every `n` value in arrival order and the number of responses.
+fn drain_finalize(port: u16, n_batches: i64, execution_id: &[u8]) -> (Vec<i64>, usize) {
+    let first = parse(&post(
+        port,
+        "init/init",
+        finalize_init_body_sized("test_multi_finish", n_batches, execution_id),
+    ));
+    let mut all = first.values;
+    let mut token = first.token;
+    let mut responses = 1usize;
+    while let Some(t) = token.take() {
+        let r = parse(&post(port, "init/exchange", exchange_body(&t)));
+        all.extend(r.values);
+        token = r.token;
+        responses += 1;
+        assert!(
+            responses <= n_batches as usize + 5,
+            "finalize continuation did not terminate"
+        );
+    }
+    (all, responses)
+}
+
+/// Drain one flush and report what the whole drain cost in storage reads.
+fn drain_cost(n_batches: i64) -> (Arc<StorageCounts>, usize) {
+    let (store, counts) = CountingStorage::new();
+    let port = start_finalize_server(store);
+    let (values, responses) = drain_finalize(port, n_batches, b"cost-exec");
+    assert_eq!(
+        values,
+        (0..n_batches).collect::<Vec<_>>(),
+        "a {n_batches}-batch flush drained wrong rows"
+    );
+    (counts, responses)
+}
+
+/// THE regression guard. Quadrupling the flush must roughly quadruple the work,
+/// not multiply it by sixteen.
+///
+/// Reading the whole flush on each of its N turns is O(N^2): 4x the batches
+/// means 4x the turns each reading 4x the bytes. Reading only the batch at the
+/// cursor is O(N). The two are far enough apart that a loose threshold still
+/// separates them decisively — no timing, no tuning.
+#[test]
+fn finalize_flush_drain_is_linear_in_flush_size() {
+    let (small, _) = drain_cost(64);
+    let (large, _) = drain_cost(256);
+
+    let ratio = large.read_bytes() as f64 / small.read_bytes().max(1) as f64;
+    assert!(
+        ratio < 8.0,
+        "quadrupling the finalize flush multiplied storage reads by {ratio:.1}x \
+         (64 batches -> {} bytes, 256 -> {} bytes). Linear is ~4x and quadratic is ~16x: \
+         a drain turn must read only the batch at its cursor, not the whole flush. \
+         Over a 5000-batch flush that difference was 51.3s against 2.6s.",
+        small.read_bytes(),
+        large.read_bytes()
+    );
+}
+
+/// The other half of the same property, stated absolutely rather than as a
+/// growth rate: draining a flush reads it ONCE, not once per turn.
+#[test]
+fn finalize_flush_drain_reads_each_batch_once() {
+    let (counts, responses) = drain_cost(256);
+    let written = counts.written_bytes();
+    assert!(written > 0, "the flush was never persisted");
+    assert!(
+        counts.read_bytes() < written * 4,
+        "draining a {written}-byte flush read {} bytes back — the drain re-reads the \
+         whole flush on every one of its {responses} turns instead of reading the \
+         batch at its cursor",
+        counts.read_bytes()
+    );
+    // One read per turn, plus the init turn's own. Anything proportional to the
+    // flush size per turn would blow past this.
+    assert!(
+        counts.read_calls() <= responses as u64 + 4,
+        "{} storage reads across {responses} turns: a turn must take one",
+        counts.read_calls()
+    );
+}
+
+/// Two finalize substreams under ONE execution id must not drain each other.
+///
+/// This is the parallel-query shape: DuckDB opens a finalize substream per
+/// thread and they share the execution id. A flush stored under a key that is
+/// only execution-scoped means the second stream's flush overwrites the first's,
+/// and the first then drains the second's rows — a wrong COUNT(*), which is
+/// exactly what the integration fixture watches for.
+#[test]
+fn concurrent_finalize_flushes_do_not_drain_each_other() {
+    let (store, _) = CountingStorage::new();
+    let port = start_finalize_server(store);
+    let exec = b"shared-exec";
+
+    // Open both streams BEFORE draining either, so a shared key has already
+    // clobbered the first stream's flush by the time it is read.
+    let a = parse(&post(
+        port,
+        "init/init",
+        finalize_init_body_sized("test_multi_finish", 3, exec),
+    ));
+    let b = parse(&post(
+        port,
+        "init/init",
+        finalize_init_body_sized("test_multi_finish", 7, exec),
+    ));
+
+    fn finish(port: u16, first: Parsed) -> Vec<i64> {
+        let mut all = first.values;
+        let mut token = first.token;
+        let mut turns = 0;
+        while let Some(t) = token.take() {
+            let r = parse(&post(port, "init/exchange", exchange_body(&t)));
+            all.extend(r.values);
+            token = r.token;
+            turns += 1;
+            assert!(turns < 64, "finalize continuation did not terminate");
+        }
+        all
+    }
+
+    // Interleaved: finish the SECOND one first, then the first.
+    let vals_b = finish(port, b);
+    let vals_a = finish(port, a);
+    assert_eq!(
+        vals_b,
+        (0..7).collect::<Vec<_>>(),
+        "the 7-batch stream drained the wrong rows"
+    );
+    assert_eq!(
+        vals_a,
+        (0..3).collect::<Vec<_>>(),
+        "the 3-batch stream drained the other stream's rows: the flush must be keyed \
+         per STREAM, not per execution id"
+    );
+}
+
+/// Stateless resume, which the offload must not cost us: a continuation may
+/// arrive at a worker process that has never seen this stream, and must work
+/// from the token plus the shared store alone.
+///
+/// Here a SECOND, independently built worker — its own dispatcher, holding none
+/// of the first's state — finishes draining a flush the first one started. It
+/// works because the batches live in `FunctionStorage` rather than in process
+/// memory.
+#[test]
+fn finalize_flush_resumes_on_a_second_worker() {
+    let (store, _) = CountingStorage::new();
+    let port_a = start_finalize_server(store.clone());
+    let port_b = start_finalize_server(store);
+
+    let first = parse(&post(
+        port_a,
+        "init/init",
+        finalize_init_body_sized("test_multi_finish", 8, b"cold-exec"),
+    ));
+    let mut all = first.values;
+    let mut token = first.token;
+    let mut call = first.call_state;
+    assert!(token.is_some(), "an 8-batch flush must paginate");
+
+    // Every continuation goes to the OTHER worker.
+    let mut turns = 0;
+    while let Some(t) = token.take() {
+        let r = parse(&post(
+            port_b,
+            "init/exchange",
+            exchange_body_with_call(&t, call.as_deref()),
+        ));
+        all.extend(r.values);
+        token = r.token;
+        call = r.call_state.or(call);
+        turns += 1;
+        assert!(turns < 32, "finalize continuation did not terminate");
+    }
+    assert_eq!(
+        all,
+        (0..8).collect::<Vec<_>>(),
+        "a worker that never saw this stream could not finish it: resume must depend \
+         only on the token and the shared store"
     );
 }

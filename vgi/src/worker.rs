@@ -131,6 +131,21 @@ impl Worker {
         self.disp.hide_function(name);
     }
 
+    /// Replace the shared cross-process state store.
+    ///
+    /// The default comes from [`crate::storage::default_storage`], selected by
+    /// `VGI_WORKER_SHARED_STORAGE`. Override it to embed a worker with a store
+    /// the host already owns — or, in a test, to observe what the framework
+    /// reads and writes.
+    ///
+    /// Whatever is installed must be shared by every worker instance behind an
+    /// HTTP endpoint and must outlive a single request: a continuation is
+    /// served by whichever instance receives it, and buffering, aggregate and
+    /// FINALIZE-flush state all live here.
+    pub fn set_storage(&mut self, store: crate::storage::SharedStorage) {
+        self.disp.store = store;
+    }
+
     /// Register a table-in-out function.
     pub fn register_table_in_out(
         &mut self,

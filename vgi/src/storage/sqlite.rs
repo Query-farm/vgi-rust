@@ -148,6 +148,50 @@ impl FunctionStorage for SqliteStorage {
         }
     }
 
+    /// One transaction for the whole batch. Outside one, SQLite commits a WAL
+    /// frame per `INSERT` (plus the `scope_touch` upsert), which turns a
+    /// several-thousand-row FINALIZE flush into several thousand commits.
+    fn append_many(&self, scope: &[u8], ns: &[u8], key: &[u8], values: Vec<Vec<u8>>) -> Vec<i64> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("vgi sqlite append_many tx: {e}");
+                return Vec::new();
+            }
+        };
+        let mut ids = Vec::with_capacity(values.len());
+        {
+            let mut stmt = match tx
+                .prepare("INSERT INTO function_log (scope, ns, key, value) VALUES (?1, ?2, ?3, ?4)")
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("vgi sqlite append_many prepare: {e}");
+                    return Vec::new();
+                }
+            };
+            for value in &values {
+                match stmt.execute(params![scope, ns, key, value]) {
+                    Ok(_) => ids.push(tx.last_insert_rowid()),
+                    Err(e) => {
+                        log::warn!("vgi sqlite append_many: {e}");
+                        ids.push(-1);
+                    }
+                }
+            }
+        }
+        Self::touch(&tx, scope);
+        if let Err(e) = tx.commit() {
+            log::warn!("vgi sqlite append_many commit: {e}");
+            return Vec::new();
+        }
+        ids
+    }
+
     fn scan(
         &self,
         scope: &[u8],
