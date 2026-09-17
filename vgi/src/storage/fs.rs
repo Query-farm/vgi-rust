@@ -148,6 +148,47 @@ impl FunctionStorage for FsStorage {
         }
     }
 
+    /// One directory listing for the whole batch. `append` re-reads the log
+    /// directory to find the next id, so appending N values one at a time costs
+    /// O(N^2) directory entries — which a table-in-out FINALIZE flush, one row
+    /// per batch, would pay in full at init.
+    fn append_many(&self, scope: &[u8], ns: &[u8], key: &[u8], values: Vec<Vec<u8>>) -> Vec<i64> {
+        use std::io::Write;
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let dir = self.log_dir(scope, ns, key);
+        let _ = std::fs::create_dir_all(&dir);
+        let mut id = self.max_id(&dir) + 1;
+        let mut ids = Vec::with_capacity(values.len());
+        for value in &values {
+            loop {
+                let path = dir.join(format!("{id:020}.bin"));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut f) => {
+                        let _ = f.write_all(value);
+                        ids.push(id);
+                        id += 1;
+                        break;
+                    }
+                    // Another writer took this id. The contract is single-writer
+                    // per key, so this is belt-and-braces — step over it.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id += 1,
+                    Err(_) => {
+                        ids.push(id);
+                        id += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        ids
+    }
+
     fn scan(
         &self,
         scope: &[u8],

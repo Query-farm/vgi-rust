@@ -37,6 +37,61 @@ fn check_log(store: &dyn FunctionStorage) {
     assert!(store.scan(b"e1", b"other", b"", -1, usize::MAX).is_empty());
 }
 
+/// `append_many` must be indistinguishable from the same `append` calls made
+/// one at a time — same order, same monotonic ids, same interleaving with
+/// single appends. Three backends override it for speed, so the three must be
+/// pinned to the one contract.
+fn check_append_many(store: &dyn FunctionStorage) {
+    let first = store.append(b"am", b"ns", b"k", b"0".to_vec());
+    let ids = store.append_many(
+        b"am",
+        b"ns",
+        b"k",
+        vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()],
+    );
+    assert_eq!(ids.len(), 3, "append_many returns one id per value");
+    assert!(
+        ids[0] > first && ids[1] > ids[0] && ids[2] > ids[1],
+        "append_many ids must be monotonic and follow prior appends: {first} then {ids:?}"
+    );
+    let last = store.append(b"am", b"ns", b"k", b"4".to_vec());
+    assert!(last > ids[2], "a later append must follow the batch");
+
+    let all = store.scan(b"am", b"ns", b"k", -1, usize::MAX);
+    assert_eq!(
+        all.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        vec![
+            b"0".to_vec(),
+            b"1".to_vec(),
+            b"2".to_vec(),
+            b"3".to_vec(),
+            b"4".to_vec()
+        ],
+        "append_many must preserve the order it was given"
+    );
+    // The cursor walk the FINALIZE flush drain does: one row per turn, never
+    // repeating and never skipping.
+    let mut cursor = -1i64;
+    let mut walked = Vec::new();
+    while let Some((id, v)) = store.scan(b"am", b"ns", b"k", cursor, 1).into_iter().next() {
+        cursor = id;
+        walked.push(v);
+    }
+    assert_eq!(
+        walked,
+        all.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        "a one-row-at-a-time cursor walk must see exactly what a full scan sees"
+    );
+    // Empty input writes nothing.
+    assert!(store
+        .append_many(b"am", b"ns", b"empty", Vec::new())
+        .is_empty());
+    assert!(store
+        .scan(b"am", b"ns", b"empty", -1, usize::MAX)
+        .is_empty());
+    store.clear(b"am");
+}
+
 fn check_queue(store: &dyn FunctionStorage) {
     store.queue_push(b"q", &[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
     // FIFO order, each item claimed exactly once.
@@ -61,6 +116,7 @@ fn check_clear(store: &dyn FunctionStorage) {
 fn run_all(store: &dyn FunctionStorage) {
     check_kv(store);
     check_log(store);
+    check_append_many(store);
     check_queue(store);
     check_clear(store);
 }
