@@ -141,7 +141,7 @@ impl Default for IrohHttpOptions {
 ///
 /// * **`protocol`** — the `vgi_rpc.protocol` routing key, required on every
 ///   request since vgi-rpc 0.25.0 even against a single-protocol server. A
-///   worker now co-hosts `vgi_rpc.Reflection.v1` alongside `VgiProtocol`, so
+///   worker now co-hosts `vgi_rpc.Reflection.v1` alongside `vgi.v2`, so
 ///   "whichever protocol was registered first" is no longer a safe default and
 ///   an unbound client is refused outright.
 /// * **`protocol_version`** — a VGI worker rejects a request that does not

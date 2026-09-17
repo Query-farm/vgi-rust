@@ -40,8 +40,20 @@
 /// schema names with ordered schema paths, allowing arbitrary nesting without
 /// losing identifier boundaries.
 pub const VGI_PROTOCOL_VERSION: &str = "2.0.0";
-/// RPC protocol name; must match the Python `VgiProtocol`.
-pub const VGI_PROTOCOL_NAME: &str = "VgiProtocol";
+/// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
+/// carries, and the name this worker advertises as hosting.
+///
+/// Declared explicitly rather than derived from any local type name: the six
+/// implementations each defaulted to whatever their own protocol type happened
+/// to be called (`VgiProtocol`, `VgiService`, `Service`, `vgi`), so no client
+/// could address them all. `vgi.v2` is the canonical wire name across every
+/// port.
+///
+/// The major version is part of the name on purpose. An incompatible major
+/// becomes a *different* name — and therefore an honest 404 rather than a
+/// confusing mid-stream failure — and `vgi.v2` can be served beside a future
+/// `vgi.v3` while clients migrate.
+pub const VGI_PROTOCOL_NAME: &str = "vgi.v2";
 
 pub mod cache_control;
 pub mod generated;
