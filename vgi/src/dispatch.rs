@@ -32,6 +32,54 @@ use crate::wire;
 const PROJ_REPRO_APP: &str = "projection_repro";
 const PROJ_REPRO_PREFIX: &str = "proj_repro";
 
+/// Cap on the number of function listings [`Dispatcher::function_listing`]
+/// keeps. Far above any real catalog's `schemas x listing types`; it exists so
+/// that no sequence of requests can grow the cache without bound.
+const MAX_CACHED_FUNCTION_LISTINGS: usize = 1024;
+
+/// The function kinds one `catalog_schema_contents_functions` request type
+/// lists. A TABLE listing also carries the table-in-out and table-buffering
+/// functions; an unfiltered request is all three, in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ListingKind {
+    Scalar,
+    Table,
+    Aggregate,
+}
+
+/// Everything a function listing's items depend on besides registration-time
+/// state: the catalog the request resolved to, whether it is the
+/// `projection_repro` app, the schema being listed (each item is stamped with
+/// it verbatim) and the kind.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FunctionListingKey {
+    /// `None` for the primary catalog, else the index into `secondary`.
+    catalog: Option<usize>,
+    proj_repro: bool,
+    schema_path: Vec<String>,
+    kind: ListingKind,
+}
+
+/// One function listing, built and encoded once (see
+/// [`Dispatcher::function_listing`]).
+struct FunctionListing {
+    /// The encoded `FunctionInfo` items, from which an unfiltered listing is
+    /// composed.
+    items: Vec<Bytes>,
+    /// The whole `catalog_schema_contents_functions` result for a request of
+    /// this one kind.
+    response: RecordBatch,
+}
+
+/// Lock the function-listing cache. A panic while holding it cannot leave a
+/// half-written entry (entries are inserted whole), so a poisoned lock is safe
+/// to keep using.
+fn lock_listings<T>(listings: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    listings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Which registry a function instance lives in. Part of the key of
 /// [`Dispatcher::scopes`], because the by-name registries are per kind and a
 /// name may exist in more than one of them.
@@ -281,6 +329,9 @@ pub struct Dispatcher {
     /// registered as a table-buffering function in `buffering` (under its handler
     /// name) by `Worker::register_copy_to`.
     pub copy_to_formats: Vec<Arc<dyn crate::copy_to::CopyToFunction>>,
+    /// Built `catalog_schema_contents_functions` listings, per listing. See
+    /// [`Dispatcher::function_listing`]; cleared by every registration.
+    function_listings: std::sync::Mutex<HashMap<FunctionListingKey, Arc<FunctionListing>>>,
     exec_counter: AtomicU64,
 }
 
@@ -304,6 +355,7 @@ impl Dispatcher {
             attach_catalogs: Vec::new(),
             copy_from_formats: Vec::new(),
             copy_to_formats: Vec::new(),
+            function_listings: std::sync::Mutex::new(HashMap::new()),
             exec_counter: AtomicU64::new(1),
         }
     }
@@ -325,6 +377,7 @@ impl Dispatcher {
             }
         }
         self.catalog = model;
+        self.function_listings_changed();
     }
 
     /// Add a secondary catalog (served alongside the primary, MetaWorker-style),
@@ -362,6 +415,7 @@ impl Dispatcher {
         }
         self.secondary.push(model);
         self.secondary_functions.push(functions);
+        self.function_listings_changed();
     }
 
     pub fn register_secret_type(&mut self, spec: catalog::SecretTypeSpec) {
@@ -402,6 +456,7 @@ impl Dispatcher {
             .entry((kind, name.to_string()))
             .or_default()
             .push(scope);
+        self.function_listings_changed();
     }
 
     /// The primary catalog's name. [`set_catalog`](Self::set_catalog) may
@@ -509,6 +564,7 @@ impl Dispatcher {
     /// for it, so the table is the only entry point.
     pub fn hide_function(&mut self, name: impl Into<String>) {
         self.hidden_functions.insert(name.into());
+        self.function_listings_changed();
     }
 
     /// Register `f` only if no table function with its name is registered yet.
@@ -3125,16 +3181,89 @@ impl Dispatcher {
         let type_filter = read_string_col(req, "type").unwrap_or_default();
         // The `projection_repro` app's functions are advertised only for that
         // catalog; every other catalog hides them (they share this binary).
-        let is_proj_repro = read_binary_col(req, "attach_opaque_data")
+        let proj_repro = read_binary_col(req, "attach_opaque_data")
             .map(|b| b == PROJ_REPRO_APP.as_bytes())
             .unwrap_or(false);
         // Scope functions to the active catalog: a secondary advertises only the
-        // functions it owns; the primary hides every secondary's functions.
+        // functions it owns; the primary hides every secondary's.
         let active = self.active_catalog(req);
-        let active_sec_fns: Option<&[String]> = self
-            .secondary
-            .iter()
-            .position(|c| std::ptr::eq(c, active))
+        let catalog = self.secondary.iter().position(|c| std::ptr::eq(c, active));
+        // An unfiltered listing is the three typed listings, in this order.
+        // Table-buffering functions also surface under a TABLE request.
+        let kinds: &[ListingKind] = match normalize_function_type(&type_filter).as_deref() {
+            None => &[
+                ListingKind::Scalar,
+                ListingKind::Table,
+                ListingKind::Aggregate,
+            ],
+            Some("scalar") => &[ListingKind::Scalar],
+            Some("table") | Some("table_buffering") => &[ListingKind::Table],
+            Some("aggregate") => &[ListingKind::Aggregate],
+            Some(_) => &[],
+        };
+        let key = |kind| FunctionListingKey {
+            catalog,
+            proj_repro,
+            schema_path: schema_path.clone(),
+            kind,
+        };
+        // The extension asks for one kind at a time: that response is served
+        // whole, as built the first time.
+        if let [kind] = kinds {
+            return Ok(Some(self.function_listing(key(*kind))?.response.clone()));
+        }
+        let mut items = Vec::new();
+        for &kind in kinds {
+            items.extend(self.function_listing(key(kind))?.items.iter().cloned());
+        }
+        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+    }
+
+    /// One function listing — its encoded items and its whole response —
+    /// built and encoded on the first request for it and served from
+    /// [`Self::function_listings`] after.
+    ///
+    /// A listing depends only on registration-time state — the registries, the
+    /// functions' static metadata, their homes, which names are hidden and which
+    /// catalog owns them — and on the request's [`FunctionListingKey`]. Building
+    /// one turns every function of the schema into a `FunctionInfo` (argument and
+    /// output schemas IPC-encoded) and then IPC-encodes each item, which cost the
+    /// example worker tens of milliseconds per listing, paid again on every
+    /// ATTACH.
+    fn function_listing(&self, key: FunctionListingKey) -> Result<Arc<FunctionListing>> {
+        if let Some(listing) = lock_listings(&self.function_listings).get(&key) {
+            return Ok(listing.clone());
+        }
+        let items = catalog::serialize_items(self.build_function_listing(&key)?)?;
+        let listing = Arc::new(FunctionListing {
+            response: wire::to_result_batch(ItemsResult {
+                items: items.clone(),
+            })?,
+            items,
+        });
+        // Only a listing that names something is kept: every non-empty key
+        // corresponds to a registered function home (times the case variants
+        // of its spelling), while a client naming arbitrary schemas would
+        // otherwise grow the map without bound. The cap backs that up.
+        if listing.items.is_empty() {
+            return Ok(listing);
+        }
+        let mut listings = lock_listings(&self.function_listings);
+        if listings.len() >= MAX_CACHED_FUNCTION_LISTINGS && !listings.contains_key(&key) {
+            return Ok(listing);
+        }
+        // Concurrent first requests may both build it; keep whichever landed first.
+        Ok(listings.entry(key).or_insert(listing).clone())
+    }
+
+    /// Build the `FunctionInfo`s of one listing, in advertisement order.
+    fn build_function_listing(&self, key: &FunctionListingKey) -> Result<Vec<FunctionInfo>> {
+        let active = match key.catalog {
+            Some(i) => &self.secondary[i],
+            None => &self.catalog,
+        };
+        let active_sec_fns: Option<&[String]> = key
+            .catalog
             .and_then(|i| self.secondary_functions.get(i))
             .map(|v| v.as_slice());
         let all_sec_fns: std::collections::HashSet<&str> = self
@@ -3147,7 +3276,7 @@ impl Dispatcher {
             if self.hidden_functions.contains(name) {
                 return false;
             }
-            if name.starts_with(PROJ_REPRO_PREFIX) != is_proj_repro {
+            if name.starts_with(PROJ_REPRO_PREFIX) != key.proj_repro {
                 return false;
             }
             match active_sec_fns {
@@ -3161,13 +3290,13 @@ impl Dispatcher {
         // Unscoped functions keep the historical placement — the `main` schema
         // of whatever catalog is attached.
         let active_identity = self.catalog_identity(active);
+        let schema_path = key.schema_path.as_slice();
         let in_schema = |kind: FnKind, name: &str, i: usize| {
-            self.declared_in(kind, name, i, active_identity, &schema_path)
+            self.declared_in(kind, name, i, active_identity, schema_path)
         };
         let mut infos = Vec::new();
-        {
-            let want = normalize_function_type(&type_filter);
-            if want.as_deref() == Some("scalar") || want.is_none() {
+        match key.kind {
+            ListingKind::Scalar => {
                 let mut names: Vec<&String> = self.scalars.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
@@ -3175,15 +3304,13 @@ impl Dispatcher {
                         if in_schema(FnKind::Scalar, name, i) {
                             infos.push(Self::advertise_in(
                                 catalog::scalar_function_info(f.as_ref())?,
-                                &schema_path,
+                                schema_path,
                             ));
                         }
                     }
                 }
             }
-            // Table-buffering functions also surface under a TABLE request.
-            if matches!(want.as_deref(), Some("table") | Some("table_buffering")) || want.is_none()
-            {
+            ListingKind::Table => {
                 let mut names: Vec<&String> = self.tables.keys().filter(|n| visible(n)).collect();
                 names.sort();
                 for name in names {
@@ -3191,7 +3318,7 @@ impl Dispatcher {
                         if in_schema(FnKind::Table, name, i) {
                             infos.push(Self::advertise_in(
                                 catalog::table_function_info(f.as_ref())?,
-                                &schema_path,
+                                schema_path,
                             ));
                         }
                     }
@@ -3204,7 +3331,7 @@ impl Dispatcher {
                         if in_schema(FnKind::TableInOut, name, i) {
                             infos.push(Self::advertise_in(
                                 catalog::table_in_out_function_info(f.as_ref())?,
-                                &schema_path,
+                                schema_path,
                             ));
                         }
                     }
@@ -3216,13 +3343,13 @@ impl Dispatcher {
                         if in_schema(FnKind::Buffering, name, i) {
                             infos.push(Self::advertise_in(
                                 catalog::buffering_function_info(f.as_ref())?,
-                                &schema_path,
+                                schema_path,
                             ));
                         }
                     }
                 }
             }
-            if matches!(want.as_deref(), Some("aggregate")) || want.is_none() {
+            ListingKind::Aggregate => {
                 let mut agg: Vec<&String> = self.aggregates.keys().filter(|n| visible(n)).collect();
                 agg.sort();
                 for name in agg {
@@ -3230,15 +3357,25 @@ impl Dispatcher {
                         if in_schema(FnKind::Aggregate, name, i) {
                             infos.push(Self::advertise_in(
                                 catalog::aggregate_function_info(f.as_ref())?,
-                                &schema_path,
+                                schema_path,
                             ));
                         }
                     }
                 }
             }
         }
-        let items = catalog::serialize_items(infos)?;
-        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+        Ok(infos)
+    }
+
+    /// Drop every cached function listing. Called by each `&mut self` method
+    /// that changes what a listing contains (registration, hiding, catalog
+    /// installation), so a listing requested before a registration never
+    /// outlives it.
+    fn function_listings_changed(&mut self) {
+        match self.function_listings.get_mut() {
+            Ok(listings) => listings.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
     }
 
     /// `catalog_copy_from_formats` — advertise the worker's custom
@@ -5425,6 +5562,142 @@ mod scope_tests {
             Ok(_) => panic!("ambiguous call must not resolve"),
             Err(e) => assert!(e.to_string().contains("Ambiguous function call 'agg'")),
         }
+    }
+
+    /// A scalar that counts how often its catalog advertisement is built:
+    /// `scalar_function_info` reads `metadata()` once per build. A spy — it
+    /// records, and answers nothing the real one would not.
+    struct CountingProbe {
+        name: &'static str,
+        builds: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ScalarFunction for CountingProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("value", 0, "int64", "value")]
+        }
+        fn process(&self, _p: &ProcessParams, b: &RecordBatch) -> Result<RecordBatch> {
+            Ok(b.clone())
+        }
+    }
+
+    /// Issue `catalog_schema_contents_functions` the way the extension does
+    /// (the request is hand-built; the response is the dispatcher's own) and
+    /// return the encoded items it answered with.
+    fn list_functions(d: &Dispatcher, schema: &str, kind: &str) -> Vec<Bytes> {
+        use vgi_protocol::generated::request_params::CatalogSchemaContentsFunctionsParams;
+        let batch = wire::to_batch(CatalogSchemaContentsFunctionsParams {
+            attach_opaque_data: Bytes::from(d.attach_bytes()),
+            path: path(schema),
+            r#type: vgi_rpc::DictString(kind.to_string()),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        let req = Request {
+            method: "catalog_schema_contents_functions".to_string(),
+            protocol: String::new(),
+            request_id: String::new(),
+            batch,
+            metadata: Arc::new(Default::default()),
+        };
+        let result = d.handle_contents_functions(&req).unwrap().unwrap();
+        let envelope = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let items: ItemsResult =
+            wire::from_batch(&ipc::read_batch(envelope.value(0)).unwrap()).unwrap();
+        items.items
+    }
+
+    fn listed_names(items: &[Bytes]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| {
+                let info: FunctionInfo =
+                    wire::from_batch(&ipc::read_batch(&item.0).unwrap()).unwrap();
+                info.name
+            })
+            .collect()
+    }
+
+    /// A function listing is built and encoded once, then served as-is. It used
+    /// to rebuild every `FunctionInfo` in the schema and re-encode each one on
+    /// every request — tens of milliseconds per listing on the example worker,
+    /// paid again on every ATTACH.
+    #[test]
+    fn function_listing_is_built_once_then_served_from_cache() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = dispatcher();
+        for name in ["gamma", "alpha", "beta"] {
+            d.register_scalar(Arc::new(CountingProbe {
+                name,
+                builds: builds.clone(),
+            }));
+        }
+        d.register_aggregate(Arc::new(AggProbe {
+            name: "agg",
+            tag: "main",
+        }));
+
+        let scalars = list_functions(&d, "main", "SCALAR_FUNCTION");
+        assert_eq!(listed_names(&scalars), ["alpha", "beta", "gamma"]);
+        let built = builds.load(Ordering::SeqCst);
+        assert_eq!(built, 3, "the first listing builds each function once");
+        for _ in 0..5 {
+            assert_eq!(list_functions(&d, "main", "SCALAR_FUNCTION"), scalars);
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            built,
+            "a repeated listing rebuilt its FunctionInfos"
+        );
+
+        // An unfiltered listing is the typed listings in order (scalar, table,
+        // aggregate) and reuses the cached scalar items.
+        let all = list_functions(&d, "main", "");
+        assert_eq!(listed_names(&all), ["alpha", "beta", "gamma", "agg"]);
+        assert_eq!(&all[..3], &scalars[..]);
+        assert_eq!(builds.load(Ordering::SeqCst), built);
+        assert!(list_functions(&d, "main", "TABLE_FUNCTION").is_empty());
+        // A schema no function lives in lists nothing (and is not cached).
+        assert!(list_functions(&d, "elsewhere", "SCALAR_FUNCTION").is_empty());
+    }
+
+    /// Anything that changes what a listing holds — a registration, hiding a
+    /// function — drops the cached listings, so none outlives the change.
+    #[test]
+    fn registration_after_a_listing_is_listed() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = dispatcher();
+        d.register_scalar(Arc::new(CountingProbe {
+            name: "alpha",
+            builds: builds.clone(),
+        }));
+        assert_eq!(
+            listed_names(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            ["alpha"]
+        );
+        d.register_scalar(Arc::new(CountingProbe {
+            name: "beta",
+            builds: builds.clone(),
+        }));
+        assert_eq!(
+            listed_names(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            ["alpha", "beta"]
+        );
+        d.hide_function("alpha");
+        assert_eq!(
+            listed_names(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            ["beta"]
+        );
     }
 
     /// `bound_scope` — the shape every 1.2.0 unary RPC uses: a named schema is
