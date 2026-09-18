@@ -115,6 +115,18 @@ pub trait TableInOutFunction: Send + Sync {
     /// input to the (possibly narrowed) output schema by column name. A
     /// distributed/accumulating function persists partial state to
     /// `params.storage` here and returns an empty batch.
+    ///
+    /// Accumulate in the **execution's** scope (`params.execution_id`), which
+    /// every connection of the execution shares and the finalize carries —
+    /// never under a process id. One process serves many connections under the
+    /// launcher, TCP or HTTP, and a client may fan one execution across several
+    /// of them, each its own substream (`params.substream_id`), then finalize
+    /// once: per-process state is overwritten by its neighbours, and
+    /// per-substream state is invisible to a `finish` running on another
+    /// substream. Appending (`FunctionStorage::append`) is safe for any number
+    /// of writers; state overwritten in place must not share a key between two
+    /// connections. `substream_partial_sum` in the example worker is the
+    /// pattern.
     fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
         Ok(vec![project_batch(batch, &params.output_schema)?])
     }
@@ -144,9 +156,9 @@ pub trait TableInOutFunction: Send + Sync {
         false
     }
 
-    /// End-of-stream: drain accumulated per-worker partials from
-    /// `params.storage` and emit the final output batches. Only called when
-    /// `has_finish()` is true.
+    /// End-of-stream: drain the execution's accumulated partials from
+    /// `params.storage` — every substream's, not only this finalize's — and
+    /// emit the final output batches. Only called when `has_finish()` is true.
     fn finish(&self, _params: &ProcessParams) -> Result<Vec<RecordBatch>> {
         Ok(Vec::new())
     }

@@ -363,10 +363,27 @@ impl VgiClient {
         bound: &BoundFunction,
         execution_id: &Bytes,
     ) -> Result<Scan<'a>> {
-        let opts = ScanOptions {
-            execution_id: Some(execution_id.clone()),
-            ..Default::default()
-        };
+        self.finalize_table_in_out_with_options(bound, execution_id, &ScanOptions::default())
+    }
+
+    /// Run the FINALIZE phase, forwarding init options — in particular the
+    /// `substream_id` the INPUT exchange was opened with.
+    ///
+    /// The protocol requires a substream's id to be identical across its init,
+    /// every tick and its finalize; [`finalize_table_in_out`](Self::finalize_table_in_out)
+    /// sends none, which is right only for an exchange opened without one. A
+    /// caller that fanned one execution across several connections, each its
+    /// own substream, finalizes once and carries the primary's id — as the
+    /// Python reference client does. `execution_id` overrides
+    /// `options.execution_id`.
+    pub fn finalize_table_in_out_with_options<'a>(
+        &'a mut self,
+        bound: &BoundFunction,
+        execution_id: &Bytes,
+        options: &ScanOptions,
+    ) -> Result<Scan<'a>> {
+        let mut opts = options.clone();
+        opts.execution_id = Some(execution_id.clone());
         self.open_phase_stream(bound, &opts, phase::FINALIZE, None)
     }
 

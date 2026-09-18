@@ -614,10 +614,14 @@ pub struct ProcessParams {
     /// Stable client-minted id for this streaming table-in-out substream.
     ///
     /// Present (identical across init / every `process` / `finish`) when the
-    /// client fanned this function out across per-substream workers; use it to
-    /// key per-substream accumulated state in shared storage so a `finish` that
-    /// lands on a different HTTP backend than the `process` calls still finds
-    /// it. `None` for the serial path or an old client that did not supply one.
+    /// client fanned this function out across per-substream workers. It tells
+    /// the substreams of one execution apart; it is not where their state
+    /// lives. A client may fan one execution across several connections and
+    /// finalize once with the primary's id, so accumulated state belongs in the
+    /// execution's scope (`execution_id`, which the finalize also carries, on
+    /// any HTTP backend) where that one `finish` can see all of it — see
+    /// [`TableInOutFunction::process`](crate::table_in_out::TableInOutFunction::process).
+    /// `None` for the serial path or an old client that did not supply one.
     /// See `InitRequest::substream_id`.
     pub substream_id: Option<Vec<u8>>,
     /// Opaque state returned by `on_bind` and echoed through

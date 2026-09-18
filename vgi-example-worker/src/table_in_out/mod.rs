@@ -73,22 +73,36 @@ impl TableInOutFunction for SlowCancellableInOutFunction {
 /// substream's partial sum. DuckDB fans the input across N substreams and
 /// unions their finalize outputs, so the caller re-aggregates with an outer
 /// `SELECT sum(...)` to get the global total — correct no matter how the rows
-/// were partitioned. State is keyed by the client-minted `substream_id` when
-/// present (stable across HTTP backends), else the substream's `execution_id`.
+/// were partitioned. State accumulates in the *execution's* scope — see
+/// [`tio_state_scope`] — so `finish` sees every substream of its execution.
 /// This is NOT a global cross-substream combine — that is a
 /// `TableBufferingFunction` (see `sum_all_columns_simple_distributed`).
 pub struct SubstreamPartialSumFunction;
 
 const SS_NS: &[u8] = b"ss_partial";
 
-impl SubstreamPartialSumFunction {
-    /// The storage scope for this substream's accumulated partials.
-    fn state_scope(params: &ProcessParams) -> Vec<u8> {
-        params
-            .substream_id
-            .clone()
-            .unwrap_or_else(|| params.execution_id.clone())
-    }
+/// Where a table-in-out accumulates the state its `finish` drains: the
+/// execution's own storage scope, with every substream of that execution
+/// appending to one log.
+///
+/// Not the substream: a client may fan one execution across several
+/// connections (the Python client does, each connection its own substream with
+/// its own `substream_id`) and finalize it **once**, carrying the primary's id
+/// — so a `finish` that read only its own substream's state saw one connection
+/// of many and undercounted. DuckDB gives every substream its own execution
+/// (each opens with its own INPUT init) and finalizes each one, so the
+/// execution scope is exactly one substream there, as before. The finalize
+/// carries the `execution_id` wherever it lands, so this survives an HTTP load
+/// balancer too.
+///
+/// Not a process id either (the bug vgi-python fixed in 072e543): one process
+/// serves many connections under the launcher, TCP or HTTP, so a per-process
+/// row is overwritten by its neighbours — and wasm32-wasi has no pid at all.
+/// `append` never overwrites, so the substreams can share one log with no
+/// per-writer key; state that is *overwritten* in place (`kv_put`) must never
+/// sit under a key two connections of one execution both write.
+fn tio_state_scope(params: &ProcessParams) -> &[u8] {
+    &params.execution_id
 }
 
 impl TableInOutFunction for SubstreamPartialSumFunction {
@@ -140,7 +154,7 @@ impl TableInOutFunction for SubstreamPartialSumFunction {
             .sum();
         if let Some(store) = &params.storage {
             store.append(
-                &Self::state_scope(params),
+                tio_state_scope(params),
                 SS_NS,
                 b"",
                 s.to_le_bytes().to_vec(),
@@ -150,11 +164,12 @@ impl TableInOutFunction for SubstreamPartialSumFunction {
         Ok(Vec::new())
     }
     fn finish(&self, params: &ProcessParams) -> Result<Vec<RecordBatch>> {
-        // Sum THIS substream's accumulated partials (one per process call that
-        // handled this substream's batches); their sum is this substream's partial.
+        // Sum this execution's accumulated partials — one per process call, on
+        // every substream (connection) of the execution; their sum is this
+        // finalize's partial.
         let mut total = 0i64;
         if let Some(store) = &params.storage {
-            for (_id, blob) in store.scan(&Self::state_scope(params), SS_NS, b"", -1, usize::MAX) {
+            for (_id, blob) in store.scan(tio_state_scope(params), SS_NS, b"", -1, usize::MAX) {
                 if let Ok(arr) = <[u8; 8]>::try_from(blob.as_slice()) {
                     total += i64::from_le_bytes(arr);
                 }
@@ -183,15 +198,6 @@ const MBF_NS: &[u8] = b"mbf_rows";
 /// COUNT means a whole BATCH was, and a flush truncated after its first batch
 /// still sums correctly, so only the count betrays it.
 pub struct MultiBatchFinishFunction;
-
-impl MultiBatchFinishFunction {
-    fn state_scope(params: &ProcessParams) -> Vec<u8> {
-        params
-            .substream_id
-            .clone()
-            .unwrap_or_else(|| params.execution_id.clone())
-    }
-}
 
 impl TableInOutFunction for MultiBatchFinishFunction {
     fn name(&self) -> &str {
@@ -244,7 +250,7 @@ impl TableInOutFunction for MultiBatchFinishFunction {
             // (sum, rows) for this process call; finish() folds them.
             let mut blob = s.to_le_bytes().to_vec();
             blob.extend_from_slice(&(a.len() as i64).to_le_bytes());
-            store.append(&Self::state_scope(params), MBF_NS, b"", blob);
+            store.append(tio_state_scope(params), MBF_NS, b"", blob);
         }
         Ok(Vec::new()) // accumulate only; the whole point is the flush
     }
@@ -252,7 +258,7 @@ impl TableInOutFunction for MultiBatchFinishFunction {
         let mut total = 0i64;
         let mut rows = 0i64;
         if let Some(store) = &params.storage {
-            for (_id, blob) in store.scan(&Self::state_scope(params), MBF_NS, b"", -1, usize::MAX) {
+            for (_id, blob) in store.scan(tio_state_scope(params), MBF_NS, b"", -1, usize::MAX) {
                 if blob.len() == 16 {
                     if let (Ok(t), Ok(r)) = (
                         <[u8; 8]>::try_from(&blob[0..8]),
