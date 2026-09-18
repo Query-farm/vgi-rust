@@ -51,7 +51,7 @@ domain-specific functions to your team as a single binary.
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.34"
+vgi = "0.35"
 vgi-rpc = "0.25"
 arrow-array = "59"
 arrow-schema = "59"
