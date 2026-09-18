@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_rpc::http::{HttpState, ARROW_CONTENT_TYPE};
 use vgi_rpc::metadata::{
@@ -193,6 +193,18 @@ fn init_body_with_filter(
     pushdown_filters: Option<Vec<u8>>,
     join_keys: Option<Vec<Vec<u8>>>,
 ) -> Vec<u8> {
+    init_body_for_schema(function, count, &schema_n(), pushdown_filters, join_keys)
+}
+
+/// The boxed `init` request body for `function(count)`, whose bind output
+/// schema is `output_schema`.
+fn init_body_for_schema(
+    function: &str,
+    count: i64,
+    output_schema: &SchemaRef,
+    pushdown_filters: Option<Vec<u8>>,
+    join_keys: Option<Vec<Vec<u8>>>,
+) -> Vec<u8> {
     let args = crate::arguments::Arguments::serialize_positional(&[
         Arc::new(Int64Array::from(vec![count])) as ArrayRef,
     ])
@@ -218,7 +230,7 @@ fn init_body_with_filter(
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
         bind_call: Bytes::from(bind_bytes),
-        output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
+        output_schema: Bytes::from(ipc::write_schema_ref(output_schema).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,
         pushdown_filters: pushdown_filters.map(LargeBytes),
@@ -1243,4 +1255,429 @@ fn finalize_flush_resumes_on_a_second_worker() {
         "a worker that never saw this stream could not finish it: resume must depend \
          only on the token and the shared store"
     );
+}
+
+// --- Dynamic filters across HTTP turns. Each turn of an HTTP producer rebuilds
+//     its filters from the tokens: the init snapshot plus the deltas the cursor
+//     carries. The cursor used to append every tick's delta and replay all of
+//     them on every turn — quadratic in the tick count, with a token growing
+//     every tick. These tests play the client (every request is hand-built; every
+//     response is the worker's) against two workers sharing a token key, sending
+//     each continuation to the worker that did NOT serve the previous turn, so
+//     every turn's filters come from the tokens alone. ---
+
+/// `{n, pushed_filters}` — the dynamic-filter echo's output.
+fn echo_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("pushed_filters", DataType::Utf8, true),
+    ]))
+}
+
+/// Descending integers `count-1 ..= 0`, BATCH per batch; each batch's
+/// `pushed_filters` echoes the filters the producer was handed for that tick.
+struct EchoProducer {
+    count: i64,
+    offset: i64,
+    witness: String,
+}
+impl TableProducer for EchoProducer {
+    fn on_dynamic_filters(&mut self, filters: Option<&crate::pushdown::PushdownFilters>) {
+        if let Some(f) = filters {
+            self.witness = f.format_repr();
+        }
+    }
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.offset >= self.count {
+            return Ok(None);
+        }
+        let end = (self.offset + BATCH).min(self.count);
+        let n: Int64Array = (self.offset..end).map(|i| self.count - 1 - i).collect();
+        let witness = StringArray::from(vec![self.witness.clone(); (end - self.offset) as usize]);
+        self.offset = end;
+        RecordBatch::try_new(echo_schema(), vec![Arc::new(n), Arc::new(witness)])
+            .map(Some)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.offset])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.offset = v[0];
+        }
+    }
+}
+
+struct EchoFunction;
+impl TableFunction for EchoFunction {
+    fn name(&self) -> &str {
+        "test_filter_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("count", 0, "int64", "rows to generate")]
+    }
+    fn on_bind(&self, _p: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: echo_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn producer(&self, p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(EchoProducer {
+            count: p.arguments.const_i64(0).unwrap_or(0).max(0),
+            offset: 0,
+            witness: p
+                .current_pushdown_filters
+                .as_ref()
+                .map(|f| f.format_repr())
+                .unwrap_or_default(),
+        }))
+    }
+}
+
+/// Two workers serving the echo under one token key: a continuation minted by
+/// either can be served by the other.
+fn start_echo_servers() -> [u16; 2] {
+    std::array::from_fn(|_| {
+        let mut w = Worker::new();
+        w.register_table(EchoFunction);
+        let server = Arc::new(w.build_server());
+        let state = HttpState::builder()
+            .server(server)
+            .producer_batch_limit(1)
+            .token_key(TEST_TOKEN_KEY)
+            .build();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            rt.block_on(vgi_rpc::http::serve_with_shutdown(state, listener))
+                .ok();
+        });
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        port
+    })
+}
+
+/// One Filter Encoding v2 document batch (`filter_spec` + int64 `value_i`
+/// payload columns), IPC-encoded the way the C++ client frames it.
+fn filter_document(json: &str, values: &[i64]) -> Vec<u8> {
+    let mut fields = vec![Field::new("filter_spec", DataType::Utf8, false)];
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![json]))];
+    for (i, value) in values.iter().enumerate() {
+        fields.push(Field::new(format!("value_{i}"), DataType::Int64, true));
+        arrays.push(Arc::new(Int64Array::from(vec![*value])));
+    }
+    let metadata = [
+        ("vgi_filter_encoding", "vgi.filters.v2"),
+        ("vgi_filter_version", "2"),
+        ("vgi_evaluation_context", "vgi.none.v1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let schema = Arc::new(Schema::new(fields).with_metadata(metadata));
+    ipc::write_batch(&RecordBatch::try_new(schema, arrays).unwrap()).unwrap()
+}
+
+fn empty_snapshot() -> Vec<u8> {
+    filter_document(
+        r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[]}"#,
+        &[],
+    )
+}
+
+/// An advisory `n <op> value_<value_ref>` upsert.
+fn upsert(id: &str, revision: u64, op: &str, value_ref: u64) -> String {
+    format!(
+        r#"{{"operation":"upsert","id":"{id}","revision":{revision},"mode":"advisory","source":"top_n","expression":{{"node":"comparison","op":"{op}","left":{{"node":"column_ref","column_index":0,"column_name":"n"}},"right":{{"node":"literal","value_ref":{value_ref}}}}}}}"#
+    )
+}
+
+fn remove(id: &str, revision: u64) -> String {
+    format!(r#"{{"operation":"remove","id":"{id}","revision":{revision}}}"#)
+}
+
+/// A tick's `vgi_pushdown_filters` value: one delta, standard base64.
+fn delta(updates: &[String], values: &[i64]) -> String {
+    let json = format!(
+        r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"delta","updates":[{}]}}"#,
+        updates.join(",")
+    );
+    base64(&filter_document(&json, values))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(bits >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A parsed echo response.
+struct EchoTurn {
+    values: Vec<i64>,
+    witnesses: Vec<String>,
+    token: Option<String>,
+    call_state: Option<String>,
+}
+
+fn parse_echo(body: &[u8]) -> EchoTurn {
+    let mut cursor = std::io::Cursor::new(body);
+    let mut turn = EchoTurn {
+        values: Vec::new(),
+        witnesses: Vec::new(),
+        token: None,
+        call_state: None,
+    };
+    while (cursor.position() as usize) < body.len() {
+        let Ok(mut r) = StreamReader::new(&mut cursor) else {
+            break;
+        };
+        while let Some((rb, md)) = r.read_next().unwrap() {
+            if let Some(t) = md_get(&md, STATE_KEY) {
+                turn.token = Some(t.to_string());
+            }
+            if let Some(t) = md_get(&md, CALL_STATE_KEY) {
+                turn.call_state = Some(t.to_string());
+            }
+            let schema = rb.schema();
+            let (Ok(n), Ok(w)) = (schema.index_of("n"), schema.index_of("pushed_filters")) else {
+                continue;
+            };
+            let n = rb.column(n).as_any().downcast_ref::<Int64Array>().unwrap();
+            let w = rb.column(w).as_any().downcast_ref::<StringArray>().unwrap();
+            turn.values.extend(n.values().iter().copied());
+            turn.witnesses
+                .extend((0..w.len()).map(|i| w.value(i).to_string()));
+        }
+    }
+    turn
+}
+
+/// A client-side echo stream: the init turn, then one continuation per `tick`.
+struct EchoStream {
+    ports: [u16; 2],
+    turns: usize,
+    token: String,
+    call_state: Option<String>,
+    /// The size of every continuation request sent, in order.
+    request_bytes: Vec<usize>,
+}
+
+impl EchoStream {
+    fn open(ports: [u16; 2], count: i64) -> (Self, EchoTurn) {
+        let first = parse_echo(&post(
+            ports[0],
+            "init/init",
+            init_body_for_schema(
+                "test_filter_echo",
+                count,
+                &echo_schema(),
+                Some(empty_snapshot()),
+                None,
+            ),
+        ));
+        assert_eq!(first.values.len(), BATCH as usize, "the init turn's batch");
+        let stream = EchoStream {
+            ports,
+            turns: 1,
+            token: first
+                .token
+                .clone()
+                .expect("a paginating scan mints a cursor"),
+            call_state: first.call_state.clone(),
+            request_bytes: Vec::new(),
+        };
+        (stream, first)
+    }
+
+    /// Send one continuation, carrying `delta` as its tick metadata, to the
+    /// worker that did not serve the previous turn.
+    fn tick(&mut self, delta: Option<String>) -> EchoTurn {
+        let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let mut md = std::collections::HashMap::<String, String>::from([
+            (RPC_METHOD_KEY.to_string(), "init".to_string()),
+            (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+            (REQUEST_ID_KEY.to_string(), "test".to_string()),
+            (STATE_KEY.to_string(), self.token.clone()),
+        ]);
+        if let Some(call) = &self.call_state {
+            md.insert(CALL_STATE_KEY.to_string(), call.clone());
+        }
+        if let Some(delta) = delta {
+            md.insert("vgi_pushdown_filters".to_string(), delta);
+        }
+        let mut body = Vec::new();
+        {
+            let mut w = StreamWriter::new(&mut body, empty.schema().as_ref()).unwrap();
+            w.write(&empty, Some(&md)).unwrap();
+            w.finish().unwrap();
+        }
+        self.request_bytes.push(body.len());
+        let port = self.ports[self.turns % 2];
+        self.turns += 1;
+        let raw = post(port, "init/exchange", body);
+        let turn = parse_echo(&raw);
+        assert!(
+            !turn.values.is_empty(),
+            "turn {} returned no rows: {}",
+            self.turns,
+            String::from_utf8_lossy(&raw)
+        );
+        self.token = turn.token.clone().expect("the scan is not exhausted");
+        self.call_state = turn.call_state.clone().or(self.call_state.take());
+        turn
+    }
+}
+
+/// A tightening Top-N bound sends a delta on every tick; the continuation must
+/// not grow with the tick count. Rows descend from 999 in batches of 10 and tick
+/// `r` narrows the bound to `n < 1000 - 10r`, exactly the rows it returns — so
+/// every tick's delta changes the live predicate, the case the client cannot
+/// skip.
+///
+/// Before compaction every tick appended its delta to the cursor: the
+/// continuation request grew every turn, and turn `k` replayed `k` deltas.
+#[test]
+fn dynamic_filter_continuation_stays_flat_as_ticks_accumulate() {
+    let (mut stream, _) = EchoStream::open(start_echo_servers(), 1000);
+    let ticks = 90u64;
+    for revision in 1..=ticks {
+        let bound = 1000 - 10 * revision as i64;
+        let turn = stream.tick(Some(delta(
+            &[upsert("top_n:0", revision, "lt", 0)],
+            &[bound],
+        )));
+        assert_eq!(
+            turn.values,
+            (bound - 10..bound).rev().collect::<Vec<_>>(),
+            "tick {revision}"
+        );
+        assert_eq!(
+            turn.witnesses[0],
+            format!("PushdownFilters([ConstantFilter(n < {bound})])"),
+            "tick {revision}: the rebuilt filters must be exactly the live bound"
+        );
+    }
+    // The first request carries no delta yet in its cursor; from the second on,
+    // the cursor carries the one live delta. It must stay that size.
+    let sizes = &stream.request_bytes;
+    let settled = sizes[1];
+    let largest = *sizes[1..].iter().max().unwrap();
+    assert!(
+        largest <= settled + 64,
+        "the continuation grew with the tick count: {settled} bytes at tick 2, \
+         {largest} at worst, {} at tick {ticks} (every size: {sizes:?})",
+        sizes[sizes.len() - 1]
+    );
+}
+
+/// Resending a revision with another value is a stale no-op: it filters
+/// nothing, and it is not kept for replay.
+#[test]
+fn a_resent_revision_is_stale_and_adds_nothing_to_replay() {
+    let (mut stream, _) = EchoStream::open(start_echo_servers(), 1000);
+    stream.tick(Some(delta(&[upsert("top_n:0", 1, "lt", 0)], &[100_000])));
+    let settled = stream.request_bytes.len();
+    for value in 0..60 {
+        // A different value each time, so that were they kept, no two would be
+        // byte-identical (the token is compressed, and identical repeats are
+        // nearly free).
+        let turn = stream.tick(Some(delta(&[upsert("top_n:0", 1, "lt", 0)], &[value])));
+        assert_eq!(
+            turn.values.len(),
+            BATCH as usize,
+            "n < {value} would have emptied it"
+        );
+        assert_eq!(
+            turn.witnesses[0],
+            "PushdownFilters([ConstantFilter(n < 100000)])"
+        );
+    }
+    let sizes = &stream.request_bytes[settled..];
+    let largest = *sizes.iter().max().unwrap();
+    assert!(
+        largest <= sizes[0] + 16,
+        "stale deltas were kept for replay: the continuation grew from {} to {largest} \
+         bytes (every size: {sizes:?})",
+        sizes[0]
+    );
+}
+
+/// A removed-then-re-added predicate keeps its position across turns.
+///
+/// Deltas: {a:1, b:1} -> [a, b]; {remove a:2, b:1} -> [b]; {a:3, b:1} -> [b, a].
+/// The compacted history is the deltas that first carried a:3 and b:1 — the
+/// third and the first — and replaying those alone yields [a, b]. A turn after
+/// the third delta, rebuilt purely from the tokens, must show [b, a].
+#[test]
+fn rebuilt_filters_keep_the_order_the_worker_had() {
+    let (mut stream, _) = EchoStream::open(start_echo_servers(), 1000);
+    stream.tick(Some(delta(
+        &[upsert("top_n:0", 1, "lt", 0), upsert("top_n:1", 1, "gt", 1)],
+        &[100_000, 5],
+    )));
+    stream.tick(Some(delta(
+        &[remove("top_n:0", 2), upsert("top_n:1", 1, "gt", 0)],
+        &[5],
+    )));
+    let applied = stream.tick(Some(delta(
+        &[upsert("top_n:0", 3, "lt", 0), upsert("top_n:1", 1, "gt", 1)],
+        &[99_999, 5],
+    )));
+    let rebuilt = stream.tick(None);
+    assert_eq!(
+        applied.witnesses[0],
+        "PushdownFilters([ConstantFilter(n > 5), ConstantFilter(n < 99999)])"
+    );
+    assert_eq!(rebuilt.witnesses[0], applied.witnesses[0]);
+    assert_eq!(applied.values.len(), BATCH as usize);
+    assert_eq!(rebuilt.values.len(), BATCH as usize);
+}
+
+/// A removal stays in force after its upsert is compacted away: a stale upsert
+/// cannot resurrect the predicate.
+#[test]
+fn a_tombstone_survives_compaction() {
+    let (mut stream, _) = EchoStream::open(start_echo_servers(), 1000);
+    stream.tick(Some(delta(&[upsert("top_n:0", 1, "lt", 0)], &[100_000])));
+    stream.tick(Some(delta(&[remove("top_n:0", 2)], &[])));
+    assert_eq!(stream.tick(None).witnesses[0], "(none)");
+    let stale = stream.tick(Some(delta(&[upsert("top_n:0", 1, "lt", 0)], &[5])));
+    assert_eq!(stale.witnesses[0], "(none)");
+    assert_eq!(stale.values.len(), BATCH as usize);
 }

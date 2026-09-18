@@ -309,7 +309,9 @@ impl PushdownFilters {
         Self::parse_with_join_keys_and_schema(&bytes, join_keys, Some(output_schema))
     }
 
-    pub fn apply_delta_b64(&mut self, encoded: &str) -> Result<()> {
+    /// [`apply_delta`](Self::apply_delta) for a standard-base64 delta, the form
+    /// it takes in the `vgi_pushdown_filters` tick metadata.
+    pub fn apply_delta_b64(&mut self, encoded: &str) -> Result<bool> {
         let bytes =
             b64_decode(encoded).ok_or_else(|| value_error("invalid base64 filter delta"))?;
         self.apply_delta(&bytes)
@@ -398,7 +400,12 @@ impl PushdownFilters {
     }
 
     /// Validate and atomically apply a v2 delta to this per-scan state.
-    pub fn apply_delta(&mut self, bytes: &[u8]) -> Result<()> {
+    ///
+    /// Returns whether the delta changed anything. An update whose revision is
+    /// not newer than the one already applied for its ID is stale and skipped,
+    /// so a delta made only of such updates is a validated no-op (`false`) —
+    /// and a caller keeping deltas to replay later has nothing to keep.
+    pub fn apply_delta(&mut self, bytes: &[u8]) -> Result<bool> {
         if bytes.len() > MAX_PAYLOAD {
             return Err(value_error("filter payload exceeds 16 MiB"));
         }
@@ -419,6 +426,7 @@ impl PushdownFilters {
         validate_header(&encoding, &semantics)?;
         let mut next = self.clone();
         let mut seen = HashSet::new();
+        let mut changed = false;
         let mut parser = Parser {
             batch: &batch,
             join_keys: &self.join_keys,
@@ -492,11 +500,47 @@ impl PushdownFilters {
                 _ => return Err(value_error("delta operation must be remove or upsert")),
             }
             next.revisions.insert(update.id, update.revision);
+            changed = true;
         }
         if next.revisions.len() > MAX_IDS {
             return Err(value_error("delta exceeds predicate-ID limit"));
         }
         *self = next;
+        Ok(changed)
+    }
+
+    /// The live predicate IDs, in evaluation order.
+    fn predicate_order(&self) -> Vec<String> {
+        self.predicates.iter().map(|p| p.id.clone()).collect()
+    }
+
+    /// Rearrange the live predicates into `order`, which must name exactly the
+    /// live predicate IDs. Only the order changes.
+    fn restore_predicate_order(&mut self, order: &[String]) -> Result<()> {
+        if self.predicates.iter().map(|p| &p.id).eq(order.iter()) {
+            return Ok(());
+        }
+        let mut by_id: HashMap<&str, &Predicate> =
+            self.predicates.iter().map(|p| (p.id.as_str(), p)).collect();
+        let mut reordered = Vec::with_capacity(order.len());
+        for id in order {
+            reordered.push(
+                by_id
+                    .remove(id.as_str())
+                    .ok_or_else(|| {
+                        value_error(
+                            "recorded predicate order does not match the replayed filter state",
+                        )
+                    })?
+                    .clone(),
+            );
+        }
+        if !by_id.is_empty() {
+            return Err(value_error(
+                "recorded predicate order does not match the replayed filter state",
+            ));
+        }
+        self.predicates = reordered;
         Ok(())
     }
 
@@ -608,6 +652,115 @@ impl PushdownFilters {
             .filter_map(|predicate| bounds_for(&predicate.expression, column))
             .reduce(intersect_bounds)
     }
+}
+
+/// The dynamic-filter deltas an HTTP stream carries between turns, compacted.
+///
+/// An HTTP stream cannot keep parsed filters between turns: each turn rebuilds
+/// them from the init snapshot plus the deltas its continuation token carries.
+/// Carrying *every* delta made turn `k` replay `k` of them — quadratic in the
+/// tick count, and a Top-N scan gets a delta on nearly every tick — while the
+/// token grew by one delta per tick.
+///
+/// So the history keeps, for each `(id, revision)` of the live state
+/// (tombstones included), only the first delta that carried it. Replaying just
+/// those reproduces the same predicates, values and revisions: an ID's earlier
+/// updates are overwritten by its current revision, and later ones were stale
+/// and stay stale. That bounds the history by the number of predicate IDs, not
+/// the number of ticks. Replay cannot always reproduce the predicate *order* (an
+/// ID removed and later re-added moves to the end), so the live order is kept
+/// alongside and restored after replay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeltaHistory {
+    /// Standard-base64 deltas as they arrived, in arrival order.
+    deltas: Vec<String>,
+    /// The live predicate IDs in order, as of the last recorded delta.
+    order: Vec<String>,
+}
+
+impl DeltaHistory {
+    /// Rebuild a history from the two lists a continuation token carries.
+    pub(crate) fn from_parts(deltas: Vec<String>, order: Vec<String>) -> Self {
+        Self { deltas, order }
+    }
+
+    /// The compacted deltas, for a continuation token.
+    pub(crate) fn deltas(&self) -> &[String] {
+        &self.deltas
+    }
+
+    /// The live predicate order they rebuild, for a continuation token.
+    pub(crate) fn order(&self) -> &[String] {
+        &self.order
+    }
+
+    /// Apply one tick's delta to `filters` and keep what a later turn must
+    /// replay to reach the same state.
+    ///
+    /// A stale delta — every update at or below its ID's applied revision —
+    /// changes nothing and is not kept at all. Otherwise the history is
+    /// re-compacted against the new live revisions, which also drops any older
+    /// delta whose every update this one superseded.
+    pub(crate) fn record(&mut self, filters: &mut PushdownFilters, encoded: String) -> Result<()> {
+        if !filters.apply_delta_b64(&encoded)? {
+            return Ok(());
+        }
+        let mut wanted: HashSet<(String, u64)> = filters
+            .revisions
+            .iter()
+            .map(|(id, revision)| (id.clone(), *revision))
+            .collect();
+        let mut kept = Vec::with_capacity(self.deltas.len() + 1);
+        for delta in std::mem::take(&mut self.deltas)
+            .into_iter()
+            .chain(std::iter::once(encoded))
+        {
+            let mut needed = false;
+            for pair in delta_revisions_b64(&delta)? {
+                needed |= wanted.remove(&pair);
+            }
+            if needed {
+                kept.push(delta);
+            }
+        }
+        self.deltas = kept;
+        self.order = filters.predicate_order();
+        Ok(())
+    }
+
+    /// Rebuild a turn's filters: apply the kept deltas to `filters` (parsed
+    /// from the init snapshot) and restore the recorded predicate order.
+    pub(crate) fn replay(&self, filters: &mut PushdownFilters) -> Result<()> {
+        if self.deltas.is_empty() {
+            return Ok(());
+        }
+        for delta in &self.deltas {
+            filters.apply_delta_b64(delta)?;
+        }
+        filters.restore_predicate_order(&self.order)
+    }
+}
+
+/// The `(id, revision)` of every update a standard-base64 delta carries, in
+/// document order. A structural read for bookkeeping over deltas that were
+/// already applied (and therefore validated); it applies nothing.
+fn delta_revisions_b64(encoded: &str) -> Result<Vec<(String, u64)>> {
+    let bytes = b64_decode(encoded).ok_or_else(|| value_error("invalid base64 filter delta"))?;
+    let (_, document) = validate_batch(&ipc::read_batch(&bytes)?)?;
+    let Document::Delta { updates, .. } = document else {
+        return Err(value_error("dynamic filter document must be a delta"));
+    };
+    updates
+        .iter()
+        .map(|update| {
+            let id = update.get("id").and_then(Value::as_str);
+            let revision = update.get("revision").and_then(Value::as_u64);
+            match (id, revision) {
+                (Some(id), Some(revision)) => Ok((id.to_string(), revision)),
+                _ => Err(value_error("delta update is missing its id or revision")),
+            }
+        })
+        .collect()
 }
 
 struct Parser<'a> {
@@ -2049,9 +2202,10 @@ mod tests {
         )
         .unwrap();
         let remove = r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"delta","updates":[{"operation":"remove","id":"p","revision":1}]}"#;
-        state.apply_delta(&encode(remove, vec![], vec![])).unwrap();
+        assert!(state.apply_delta(&encode(remove, vec![], vec![])).unwrap());
         let stale = r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"delta","updates":[{"operation":"upsert","id":"p","revision":1,"mode":"advisory","source":"join","expression":{"node":"literal","value_ref":999}}]}"#;
-        state.apply_delta(&encode(stale, vec![], vec![])).unwrap();
+        // Every update is at or below its ID's applied revision: validated, but a no-op.
+        assert!(!state.apply_delta(&encode(stale, vec![], vec![])).unwrap());
         assert_eq!(state.format_pushed(), "(none)");
         let malformed = r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"delta","updates":[{"operation":"upsert","id":"p","revision":1,"mode":"required","source":"join","expression":{"node":"literal","value_ref":999}}]}"#;
         assert!(state
@@ -2158,5 +2312,220 @@ mod tests {
                 max: None,
             })
         );
+    }
+
+    // --- DeltaHistory: the compacted delta list an HTTP continuation replays.
+
+    fn b64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                out.push(if i <= chunk.len() {
+                    ALPHABET[(bits >> (18 - 6 * i)) as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    fn upsert(id: &str, revision: u64, op: &str, value_ref: usize) -> String {
+        format!(
+            r#"{{"operation":"upsert","id":"{id}","revision":{revision},"mode":"advisory","source":"top_n","expression":{{"node":"comparison","op":"{op}","left":{{"node":"column_ref","column_index":0,"column_name":"n"}},"right":{{"node":"literal","value_ref":{value_ref}}}}}}}"#
+        )
+    }
+
+    fn remove(id: &str, revision: u64) -> String {
+        format!(r#"{{"operation":"remove","id":"{id}","revision":{revision}}}"#)
+    }
+
+    /// A standard-base64 delta, as it rides the `vgi_pushdown_filters` metadata.
+    fn delta(updates: &[String], values: &[i64]) -> String {
+        let json = format!(
+            r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"delta","updates":[{}]}}"#,
+            updates.join(",")
+        );
+        let (fields, arrays) = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    Arc::new(Field::new(format!("value_{i}"), DataType::Int64, true)),
+                    Arc::new(Int64Array::from(vec![*v])) as ArrayRef,
+                )
+            })
+            .unzip();
+        b64(&encode(&json, fields, arrays))
+    }
+
+    /// The init snapshot: one advisory predicate `s: n > -1000000`.
+    fn snapshot() -> PushdownFilters {
+        let json = r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{"id":"s","revision":0,"mode":"advisory","source":"query","expression":{"node":"comparison","op":"gt","left":{"node":"column_ref","column_index":0,"column_name":"n"},"right":{"node":"literal","value_ref":0}}}]}"#;
+        PushdownFilters::parse_with_schema(
+            &encode(
+                json,
+                vec![Arc::new(Field::new("value_0", DataType::Int64, true))],
+                vec![Arc::new(Int64Array::from(vec![-1_000_000]))],
+            ),
+            int64_schema(),
+        )
+        .unwrap()
+    }
+
+    /// What a later turn rebuilds from the history a continuation carries.
+    fn rebuilt(history: &DeltaHistory) -> PushdownFilters {
+        let carried = DeltaHistory::from_parts(history.deltas().to_vec(), history.order().to_vec());
+        let mut filters = snapshot();
+        carried.replay(&mut filters).unwrap();
+        filters
+    }
+
+    fn assert_same_state(live: &PushdownFilters, replayed: &PushdownFilters, context: &str) {
+        assert_eq!(live.format_repr(), replayed.format_repr(), "{context}");
+        assert_eq!(
+            live.predicate_order(),
+            replayed.predicate_order(),
+            "{context}"
+        );
+        assert_eq!(live.revisions, replayed.revisions, "{context}");
+    }
+
+    #[test]
+    fn history_keeps_one_delta_per_live_revision() {
+        let mut live = snapshot();
+        let mut history = DeltaHistory::default();
+        for revision in 1..=200u64 {
+            let bound = 10_000 - revision as i64;
+            history
+                .record(
+                    &mut live,
+                    delta(&[upsert("top_n:0", revision, "lt", 0)], &[bound]),
+                )
+                .unwrap();
+            assert_eq!(history.deltas().len(), 1, "revision {revision}");
+            assert_same_state(&live, &rebuilt(&history), &format!("revision {revision}"));
+        }
+        assert_eq!(
+            live.format_repr(),
+            "PushdownFilters([ConstantFilter(n > -1000000), ConstantFilter(n < 9800)])"
+        );
+    }
+
+    #[test]
+    fn a_stale_delta_is_not_recorded() {
+        let mut live = snapshot();
+        let mut history = DeltaHistory::default();
+        history
+            .record(&mut live, delta(&[upsert("a", 1, "lt", 0)], &[100]))
+            .unwrap();
+        let recorded = history.clone();
+        for value in 0..10 {
+            history
+                .record(&mut live, delta(&[upsert("a", 1, "lt", 0)], &[value]))
+                .unwrap();
+            // Revision 0 of the snapshot predicate is stale too.
+            history
+                .record(&mut live, delta(&[upsert("s", 0, "lt", 0)], &[value]))
+                .unwrap();
+        }
+        assert_eq!(history, recorded);
+        assert_eq!(
+            live.format_repr(),
+            "PushdownFilters([ConstantFilter(n > -1000000), ConstantFilter(n < 100)])"
+        );
+    }
+
+    #[test]
+    fn replay_restores_the_order_after_remove_and_readd() {
+        let mut live = snapshot();
+        let mut history = DeltaHistory::default();
+        for updates in [
+            delta(
+                &[upsert("a", 1, "lt", 0), upsert("b", 1, "gt", 1)],
+                &[100, 5],
+            ),
+            delta(&[remove("a", 2), upsert("b", 1, "gt", 0)], &[5]),
+            delta(
+                &[upsert("a", 3, "lt", 0), upsert("b", 1, "gt", 1)],
+                &[99, 5],
+            ),
+        ] {
+            history.record(&mut live, updates).unwrap();
+        }
+        assert_eq!(live.predicate_order(), ["s", "b", "a"]);
+        // The first and third deltas carry the live b:1 and a:3; replaying just
+        // those would put a before b.
+        assert_eq!(history.deltas().len(), 2);
+        assert_same_state(&live, &rebuilt(&history), "after remove + re-add");
+    }
+
+    #[test]
+    fn a_tombstone_survives_compaction() {
+        let mut live = snapshot();
+        let mut history = DeltaHistory::default();
+        history
+            .record(&mut live, delta(&[upsert("a", 1, "lt", 0)], &[100]))
+            .unwrap();
+        history
+            .record(&mut live, delta(&[remove("a", 2)], &[]))
+            .unwrap();
+        assert_eq!(history.deltas().len(), 1, "the upsert is superseded");
+        let mut replayed = rebuilt(&history);
+        assert_same_state(&live, &replayed, "after the removal");
+        let stale = delta(&[upsert("a", 1, "lt", 0)], &[5]);
+        assert!(!replayed.apply_delta_b64(&stale).unwrap());
+        assert_eq!(
+            replayed.format_repr(),
+            "PushdownFilters([ConstantFilter(n > -1000000)])"
+        );
+    }
+
+    /// Replay equivalence under arbitrary interleavings: upserts, removals and
+    /// stale updates over a few IDs (the snapshot's included). After every tick
+    /// the compacted history rebuilds exactly the live state — predicates,
+    /// values, revisions and order — and holds at most one delta per ID.
+    #[test]
+    fn compacted_replay_matches_the_live_state() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let ids = ["s", "a", "b", "c"];
+        let mut live = snapshot();
+        let mut history = DeltaHistory::default();
+        for tick in 0..2_000 {
+            let mut updates = Vec::new();
+            let mut values = Vec::new();
+            let first = next(ids.len() as u64) as usize;
+            for id in ids.iter().cycle().skip(first).take(1 + next(3) as usize) {
+                let current = live.revisions.get(*id).copied().unwrap_or(0);
+                // One in four is stale (at or below the applied revision).
+                let revision = if next(4) == 0 {
+                    current.saturating_sub(next(2))
+                } else {
+                    current + 1 + next(2)
+                };
+                if next(3) == 0 {
+                    updates.push(remove(id, revision));
+                } else {
+                    let op = if next(2) == 0 { "lt" } else { "gt" };
+                    updates.push(upsert(id, revision, op, values.len()));
+                    values.push(next(1_000) as i64);
+                }
+            }
+            history.record(&mut live, delta(&updates, &values)).unwrap();
+            assert!(history.deltas().len() <= ids.len(), "tick {tick}");
+            assert_same_state(&live, &rebuilt(&history), &format!("tick {tick}"));
+        }
     }
 }

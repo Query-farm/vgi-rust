@@ -1312,7 +1312,7 @@ impl Dispatcher {
                     project_to: None,
                     resume_blob,
                     conditional_checked: false,
-                    filter_deltas: Vec::new(),
+                    filter_history: Default::default(),
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
@@ -1385,7 +1385,7 @@ impl Dispatcher {
                 project_to: None,
                 resume_blob: None,
                 conditional_checked: false,
-                filter_deltas: Vec::new(),
+                filter_history: Default::default(),
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -1523,7 +1523,7 @@ impl Dispatcher {
                     project_to: None,
                     resume_blob,
                     conditional_checked: false,
-                    filter_deltas: Vec::new(),
+                    filter_history: Default::default(),
                 };
                 return Ok(
                     StreamResult::producer(output_schema, Box::new(state)).with_header(header)
@@ -1552,7 +1552,7 @@ impl Dispatcher {
                 params,
                 filters,
                 blob,
-                filter_deltas: Vec::new(),
+                filter_history: Default::default(),
             };
             return Ok(
                 StreamResult::exchange(output_schema, in_schema, Box::new(state))
@@ -1654,7 +1654,7 @@ impl Dispatcher {
                 project_to,
                 resume_blob,
                 conditional_checked: false,
-                filter_deltas: Vec::new(),
+                filter_history: Default::default(),
             };
             return Ok(StreamResult::producer(output_schema, Box::new(state)).with_header(header));
         }
@@ -1772,6 +1772,7 @@ impl Dispatcher {
                 .to_string(),
             schema_path: bind_call.schema_path.clone().unwrap_or_default(),
             filter_deltas: Vec::new(),
+            filter_predicate_order: Vec::new(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -1902,14 +1903,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
-            for delta in &blob.filter_deltas {
-                current_filters
-                    .as_mut()
-                    .ok_or_else(|| {
-                        RpcError::value_error("filter delta requires an initial snapshot")
-                    })?
-                    .apply_delta_b64(delta)?;
-            }
+            let filter_history = replay_filter_history(&blob, current_filters.as_mut())?;
             let filters = blob.auto_apply.then(|| current_filters.clone()).flatten();
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
                 TableProducerState {
@@ -1919,7 +1913,7 @@ impl Dispatcher {
                     project_to: None,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
-                    filter_deltas: blob.filter_deltas.clone(),
+                    filter_history,
                 },
             )));
         }
@@ -1959,7 +1953,7 @@ impl Dispatcher {
                     project_to: None,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
-                    filter_deltas: Vec::new(),
+                    filter_history: Default::default(),
                 },
             )));
         }
@@ -1978,14 +1972,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
-            for delta in &blob.filter_deltas {
-                parsed_filters
-                    .as_mut()
-                    .ok_or_else(|| {
-                        RpcError::value_error("filter delta requires an initial snapshot")
-                    })?
-                    .apply_delta_b64(delta)?;
-            }
+            let filter_history = replay_filter_history(&blob, parsed_filters.as_mut())?;
             params.current_pushdown_filters = parsed_filters.clone();
             let filters = blob.auto_apply.then(|| parsed_filters.clone()).flatten();
             let project_to = Some(output_schema.clone());
@@ -2002,7 +1989,7 @@ impl Dispatcher {
                     project_to,
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
-                    filter_deltas: blob.filter_deltas.clone(),
+                    filter_history,
                 },
             )));
         }
@@ -2022,14 +2009,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
-            for delta in &blob.filter_deltas {
-                parsed_filters
-                    .as_mut()
-                    .ok_or_else(|| {
-                        RpcError::value_error("filter delta requires an initial snapshot")
-                    })?
-                    .apply_delta_b64(delta)?;
-            }
+            let filter_history = replay_filter_history(&blob, parsed_filters.as_mut())?;
             params.current_pushdown_filters = parsed_filters.clone();
             let filters = blob.auto_apply.then_some(parsed_filters).flatten();
             Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
@@ -2038,7 +2018,7 @@ impl Dispatcher {
                     params,
                     filters,
                     blob: bytes.to_vec(),
-                    filter_deltas: blob.filter_deltas.clone(),
+                    filter_history,
                 },
             )))
         } else {
@@ -4254,10 +4234,17 @@ pub struct ExchangeBlob {
     /// bind-scoped state and is retained for continuation-token compatibility.
     #[serde(default)]
     pub plan_init_opaque: Vec<u8>,
-    /// Successfully applied v2 filter deltas, replayed in order when an HTTP
-    /// continuation reconstructs the stream on another worker.
+    /// The v2 filter deltas an HTTP continuation replays, in arrival order, to
+    /// rebuild the stream's filters on whichever worker receives it. Compacted
+    /// (see `pushdown::DeltaHistory`): only the deltas that installed a live
+    /// `(id, revision)`, so the list is bounded by the number of predicate IDs
+    /// rather than growing by one per tick.
     #[serde(default)]
     pub filter_deltas: Vec<String>,
+    /// The live predicate IDs in order, restored after replaying
+    /// `filter_deltas` (a compacted replay cannot always reproduce it).
+    #[serde(default)]
+    pub filter_predicate_order: Vec<String>,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -4457,7 +4444,8 @@ struct TableInOutExchangeState {
     params: ProcessParams,
     filters: Option<crate::pushdown::PushdownFilters>,
     blob: Vec<u8>,
-    filter_deltas: Vec<String>,
+    /// The dynamic-filter deltas a continuation must replay (compacted).
+    filter_history: crate::pushdown::DeltaHistory,
 }
 
 impl ExchangeState for TableInOutExchangeState {
@@ -4476,11 +4464,10 @@ impl ExchangeState for TableInOutExchangeState {
                 .ok_or_else(|| {
                     RpcError::value_error("filter delta requires an initial snapshot")
                 })?;
-            current.apply_delta_b64(&encoded)?;
+            self.filter_history.record(current, encoded)?;
             if self.filters.is_some() {
                 self.filters = Some(current.clone());
             }
-            self.filter_deltas.push(encoded);
         }
         // Conditional-revalidation validators (exchange-mode result cache): the
         // client holds a stale cached result for THIS input unit and asks the
@@ -4515,9 +4502,30 @@ impl ExchangeState for TableInOutExchangeState {
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(&self.blob)?;
-        blob.filter_deltas = self.filter_deltas.clone();
+        blob.filter_deltas = self.filter_history.deltas().to_vec();
+        blob.filter_predicate_order = self.filter_history.order().to_vec();
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
+}
+
+/// Rebuild a continuation's filters from the init snapshot (`filters`) and the
+/// compacted delta history its token carries, returning that history so the
+/// turn can keep recording into it.
+fn replay_filter_history(
+    blob: &ExchangeBlob,
+    filters: Option<&mut crate::pushdown::PushdownFilters>,
+) -> Result<crate::pushdown::DeltaHistory> {
+    let history = crate::pushdown::DeltaHistory::from_parts(
+        blob.filter_deltas.clone(),
+        blob.filter_predicate_order.clone(),
+    );
+    if history.deltas().is_empty() {
+        return Ok(history);
+    }
+    let filters = filters
+        .ok_or_else(|| RpcError::value_error("filter delta requires an initial snapshot"))?;
+    history.replay(filters)?;
+    Ok(history)
 }
 
 /// Read one conditional-revalidation validator, preferring this tick's metadata
@@ -4548,7 +4556,8 @@ struct TableProducerState {
     /// They only ever ride the first tick, so checking once keeps the per-batch
     /// hot path free of the two `tick_metadata` mutex acquisitions.
     conditional_checked: bool,
-    filter_deltas: Vec<String>,
+    /// The dynamic-filter deltas a continuation must replay (compacted).
+    filter_history: crate::pushdown::DeltaHistory,
 }
 
 impl TableProducerState {
@@ -4607,11 +4616,10 @@ impl vgi_rpc::ProducerState for TableProducerState {
             let current = self.current_filters.as_mut().ok_or_else(|| {
                 RpcError::value_error("filter delta requires an initial snapshot")
             })?;
-            current.apply_delta_b64(&encoded)?;
+            self.filter_history.record(current, encoded)?;
             if self.filters.is_some() {
                 self.filters = Some(current.clone());
             }
-            self.filter_deltas.push(encoded);
         }
         self.inner.on_dynamic_filters(self.current_filters.as_ref());
         // Conditional-revalidation validators. The client sends them on the
@@ -4708,7 +4716,8 @@ impl vgi_rpc::ProducerState for TableProducerState {
                 // partial-chunk cursor so the continuation resumes mid-chunk.
                 let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
                 blob.inner_resume = self.inner.encode_resume();
-                blob.filter_deltas = self.filter_deltas.clone();
+                blob.filter_deltas = self.filter_history.deltas().to_vec();
+                blob.filter_predicate_order = self.filter_history.order().to_vec();
                 vgi_rpc::stream_codec::bincode_encode(&blob)
             }
         }
