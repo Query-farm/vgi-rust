@@ -314,8 +314,14 @@ impl VgiClient {
             )),
             #[cfg(feature = "launcher")]
             VgiLocation::Launch(argv) => {
-                let sock = crate::launcher::ensure_worker(argv, &Default::default())?;
-                Self::connect_unix(sock)
+                let config = crate::launcher::LaunchConfig::default();
+                let sock = crate::launcher::ensure_worker(argv, &config)?;
+                let label = format!("unix://{}", sock.display());
+                // Not `connect_unix`: a launched worker may be shared by every
+                // process on the machine, so its accept queue can be full, and
+                // `launcher::connect` waits that out rather than failing.
+                let client = crate::launcher::connect_client(&sock, config.connect_timeout, None)?;
+                Ok(Self::configured_stream(client, label))
             }
             #[cfg(not(feature = "launcher"))]
             VgiLocation::Launch(_) => Err(vgi_rpc::errors::RpcError::value_error(
@@ -386,7 +392,11 @@ impl VgiClient {
                 config.state_dir = options.launcher_state_dir.clone();
                 let sock = crate::launcher::ensure_worker(argv, &config)?;
                 let label = format!("unix://{}", sock.display());
-                let client = RpcClient::unix_connect_with_timeout(sock, options.rpc_timeout)?;
+                let client = crate::launcher::connect_client(
+                    &sock,
+                    config.connect_timeout,
+                    options.rpc_timeout,
+                )?;
                 Ok(Self::configured_stream(client, label))
             }
             #[cfg(not(feature = "launcher"))]

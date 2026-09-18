@@ -29,6 +29,10 @@
 //!   races.
 //! * the worker CLI (`--unix PATH --idle-timeout SEC`) and the single
 //!   `UNIX:<path>` discovery line on stdout.
+//! * what a busy worker looks like: a listener whose accept queue is full is
+//!   **alive**, and its socket must never be unlinked. See [`ensure_worker`]
+//!   for how the probe tells the two apart, and [`connect`] for how a client
+//!   waits one out.
 //!
 //! # Known divergence
 //!
@@ -41,22 +45,39 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use vgi_rpc::errors::{Result, RpcError};
+use vgi_rpc_client::RpcClient;
 
 /// The scheme prefix a POSIX worker prints to advertise its socket.
 const DISCOVERY_PREFIX: &str = "UNIX:";
 
 /// Cap on pre-discovery stdout noise before the worker is considered broken.
 const MAX_PREAMBLE_BYTES: usize = 1024 * 1024;
+
+/// Pauses between re-probes of a socket that refused — see [`probe`]. macOS
+/// reports a full accept queue as `ECONNREFUSED`, the same as no listener, so a
+/// refusal is believed only after these; a socket left by a dead worker pays
+/// the 350 ms once, before it is replaced. The same schedule as the Python and
+/// C++ launchers.
+const PROBE_REFUSED_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+];
+
+/// Ceiling on the pause between connect attempts while a worker's accept queue
+/// is full — see [`connect`]. The first pause is 1 ms and doubles up to this.
+const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(50);
 
 /// How a `launch:` worker should be started.
 #[derive(Debug, Clone)]
@@ -79,6 +100,9 @@ pub struct LaunchConfig {
     /// included. The C++ launcher makes the same choice, with the same escape
     /// valve.
     pub stderr_path: Option<PathBuf>,
+    /// How long a client connect waits for a slot in a busy worker's accept
+    /// queue before giving up. See [`connect`].
+    pub connect_timeout: Duration,
 }
 
 impl Default for LaunchConfig {
@@ -89,6 +113,9 @@ impl Default for LaunchConfig {
             state_dir: None,
             spawn_timeout: Duration::from_secs(60),
             stderr_path: None,
+            // The C++ launcher's `ResolveAndConnect` default, sized to absorb
+            // accept-queue delays under a burst of connections.
+            connect_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -225,6 +252,15 @@ pub fn encode_idle_timeout(d: Duration) -> String {
 /// Fast path is the per-process cache. Otherwise: take the per-tuple `flock`,
 /// probe for an existing listener, and spawn only if there is none — so
 /// concurrent starters elect exactly one launcher.
+///
+/// A worker whose accept queue is full is **alive**, only busy, and is left
+/// alone. Reading it as dead is destructive: the socket gets unlinked out from
+/// under the live worker and a duplicate spawned in its place, orphaning the
+/// original and racing clients onto a vanished path — the Python reference
+/// launcher did exactly that, 64 workers for 2 commands under a 32-process test
+/// run. The probe tells the two apart with one non-blocking connect: `EAGAIN`
+/// is alive, and `ECONNREFUSED` — which is how macOS reports a full queue — is
+/// re-probed after 50, 100 and 200 ms before it is believed.
 pub fn ensure_worker(argv: &[String], config: &LaunchConfig) -> Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| RpcError::runtime_error(format!("getcwd: {e}")))?
@@ -250,8 +286,9 @@ pub fn ensure_worker(argv: &[String], config: &LaunchConfig) -> Result<PathBuf> 
         remember(&hash, &sock);
         return Ok(sock);
     }
-    // A socket file that exists but refuses connect is stale; the protocol
-    // requires unlinking it before the new worker binds.
+    // A socket file that exists but refuses connect — and kept refusing
+    // through `probe`'s re-probes — is stale; the protocol requires unlinking
+    // it before the new worker binds.
     if sock.exists() {
         let _ = fs::remove_file(&sock);
     }
@@ -399,10 +436,230 @@ fn write_meta(dir: &Path, hash: &str, argv: &[String], cwd: &str, sock: &Path) {
     let _ = fs::write(dir.join(format!("{hash}.meta")), json);
 }
 
-/// Can we connect? The only reliable liveness test — a socket file may outlive
-/// the worker that bound it.
+/// Is a worker listening on `sock`? The only reliable liveness test — a socket
+/// file may outlive the worker that bound it.
+///
+/// One **non-blocking** connect, classified:
+///
+/// * connected (or still connecting) — alive;
+/// * `EAGAIN`/`EWOULDBLOCK` — alive: Linux's answer when the listener's accept
+///   queue is full, distinct from the `ECONNREFUSED` of an unbound socket;
+/// * `ECONNREFUSED` — re-probed after 50, 100 and 200 ms before it is believed,
+///   because macOS reports a full queue that way too;
+/// * anything else (no such file, not a socket, …) — dead.
+///
+/// Non-blocking because a *blocking* `connect(2)` on Linux waits for a slot in
+/// a full queue for as long as it takes — forever, for a wedged worker — which
+/// would hang the launcher inside its `flock` and every starter queued behind
+/// it. This asks "is anything listening", not "is it responsive": a connect
+/// lands in the queue of a worker that never accepts, so a successful one never
+/// proved that either. Mirrors `vgi_rpc.launcher._probe` and the extension's
+/// `ProbeAlive`.
 fn probe(sock: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(sock).is_ok()
+    for attempt in 0..=PROBE_REFUSED_BACKOFF.len() {
+        if attempt > 0 {
+            std::thread::sleep(PROBE_REFUSED_BACKOFF[attempt - 1]);
+        }
+        match start_connect(sock) {
+            Ok(_) => return true,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Connect to a launched worker's socket, waiting out a full accept queue.
+///
+/// A connect that meets a full queue (`EAGAIN` on Linux) is a busy worker, not
+/// a dead one: it is retried with a capped backoff (1 ms doubling to 50 ms)
+/// until `timeout`, rather than failed — a failure here would read as a dead
+/// worker to anything that relaunches on a failed connect. Any other failure is
+/// returned at once. The returned stream is in blocking mode.
+///
+/// `std`'s `UnixStream::connect` cannot do this: it is a blocking `connect(2)`,
+/// which on Linux waits on a full queue with no bound at all, and on macOS
+/// fails immediately.
+pub fn connect(sock: &Path, timeout: Duration) -> Result<UnixStream> {
+    connect_io(sock, timeout).map_err(|e| {
+        RpcError::new(
+            "TransportError",
+            format!("connect unix socket {}: {e}", sock.display()),
+        )
+    })
+}
+
+fn connect_io(sock: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match start_connect(sock) {
+            Ok(Started::Connected(stream)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Ok(Started::InProgress(stream)) => {
+                finish_connect(&stream, deadline.saturating_duration_since(Instant::now()))?;
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {timeout:?}: the worker's accept queue stayed full"
+                        ),
+                    ));
+                }
+                std::thread::sleep(backoff.min(deadline - now));
+                backoff = (backoff * 2).min(BUSY_BACKOFF_CAP);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What one non-blocking `connect(2)` achieved.
+enum Started {
+    Connected(UnixStream),
+    /// `EINPROGRESS`. Linux never reports it for `AF_UNIX`; handled anyway, as
+    /// the C++ launcher does, rather than assumed impossible everywhere.
+    InProgress(UnixStream),
+}
+
+/// One non-blocking `connect(2)` to `sock`, leaving the stream non-blocking.
+fn start_connect(sock: &Path) -> io::Result<Started> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = sock.as_os_str().as_bytes();
+    // SAFETY: an all-zero `sockaddr_un` is a valid (empty) address.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.is_empty() || path.contains(&0) || path.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a usable AF_UNIX socket path",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(path) {
+        *dst = *src as libc::c_char;
+    }
+    // The family, the path and its terminating NUL — the length `std` passes.
+    let sun_path_offset = std::mem::size_of_val(&addr) - std::mem::size_of_val(&addr.sun_path);
+    let len = (sun_path_offset + path.len() + 1) as libc::socklen_t;
+
+    // Close-on-exec, as `std` does for its own sockets: a worker this process
+    // spawns must not inherit a connection to another one. Atomic where the
+    // platform allows it; the `fcntl` below covers the rest.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let ty = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let ty = libc::SOCK_STREAM;
+    // SAFETY: plain socket(2); the fd is owned by `stream` from the next line,
+    // so every early return below closes it.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, ty, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fcntl on an fd we own.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    // SAFETY: `addr` is a valid `sockaddr_un` and `len` is within it.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    };
+    if rc == 0 {
+        return Ok(Started::Connected(stream));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EINPROGRESS) {
+        return Ok(Started::InProgress(stream));
+    }
+    Err(err)
+}
+
+/// Wait up to `remaining` for an in-progress connect, then report its result.
+fn finish_connect(stream: &UnixStream, remaining: Duration) -> io::Result<()> {
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ms = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one valid pollfd.
+    match unsafe { libc::poll(&mut pfd, 1, ms) } {
+        0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for the connect to complete",
+            ))
+        }
+        n if n < 0 => return Err(io::Error::last_os_error()),
+        _ => {}
+    }
+    match stream.take_error()? {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Connect to a launched worker and wrap the stream as an RPC client.
+///
+/// `vgi-rpc-client`'s own unix transport can only connect by path, with the
+/// blocking `connect(2)` [`connect`] exists to avoid, so this hands it an
+/// already-connected stream instead. `read_timeout` is the per-read bound the
+/// path-based transport applies.
+pub(crate) fn connect_client(
+    sock: &Path,
+    connect_timeout: Duration,
+    read_timeout: Option<Duration>,
+) -> Result<RpcClient> {
+    let stream = connect(sock, connect_timeout)?;
+    // Both ends have to ask, not just the worker: an AF_UNIX write is bounded
+    // by space in the *receiver's* buffer.
+    vgi_rpc::unix::widen_socket_buffers(&stream);
+    if let Some(t) = read_timeout {
+        stream
+            .set_read_timeout(Some(t))
+            .map_err(|e| RpcError::new("TransportError", format!("set unix read timeout: {e}")))?;
+    }
+    let writer = stream
+        .try_clone()
+        .map_err(|e| RpcError::new("TransportError", format!("clone unix socket: {e}")))?;
+    Ok(RpcClient::from_transport(Box::new(LaunchedTransport {
+        reader: BufReader::new(stream),
+        writer,
+    })))
+}
+
+/// A connected launcher socket as a `vgi-rpc-client` transport — the same
+/// shape as that crate's `UnixTransport`, built from a stream rather than a
+/// path.
+struct LaunchedTransport {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl vgi_rpc_client::transport::Transport for LaunchedTransport {
+    fn split(&mut self) -> (&mut dyn Read, &mut dyn Write) {
+        (&mut self.reader, &mut self.writer)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        let _ = self.writer.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    }
 }
 
 fn cached(hash: &str) -> Option<PathBuf> {
