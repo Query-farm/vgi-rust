@@ -129,6 +129,7 @@ impl StreamTransport {
     }
 
     /// Wrap a client while retaining the runtime resources that drive it.
+    #[cfg(feature = "iroh")]
     pub(crate) fn new_owned(
         client: RpcClient,
         label: impl Into<String>,
