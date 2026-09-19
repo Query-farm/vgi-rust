@@ -10,6 +10,8 @@
 //! thread counts as such a thread is not something to reason about from the
 //! docs, so this asserts it against a real worker over a real socket.
 
+#![cfg(feature = "http")]
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
