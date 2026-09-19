@@ -30,10 +30,14 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      # The published `vgi` crate is gated clippy-clean under `-D warnings`.
-      # The `vgi-example-worker` fixture binary (publish = false) is not.
-      - name: cargo clippy (vgi)
-        run: cargo clippy -p vgi --all-targets --all-features -- -D warnings
+      # Every workspace crate — the published ones and the fixtures — is gated
+      # clippy-clean under `-D warnings`, tests and examples included. Clippy
+      # only type-checks (it never links), so `--all-features` is safe here even
+      # though `vgi-example-worker`'s `coverage` feature cannot link without
+      # `-Cinstrument-coverage` (see the build steps below). The other feature
+      # combinations are covered by the `features` job.
+      - name: cargo clippy (workspace, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # `vgi-example-worker`'s `coverage` feature FFI-links the LLVM profiling
       # runtime (`__llvm_profile_write_file`), which only exists under
@@ -53,6 +57,40 @@ jobs:
         run: cargo doc -p vgi --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Feature hygiene for the crates with optional features. Each crate is linted
+  # on its own (no workspace feature unification) with no default features,
+  # its defaults, each optional feature alone, and all features — so a test or
+  # helper that quietly depends on a feature it does not declare is a compile
+  # error or a dead-code warning here rather than a surprise for a downstream
+  # `default-features = false` build.
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      # Tests and examples included.
+      - name: cargo hack clippy --each-feature (all targets)
+        run: cargo hack clippy -p vgi -p vgi-client -p vgi-example-worker --each-feature --all-targets -- -D warnings
+
+      # The libraries alone. Building tests activates dev-dependency features
+      # (vgi-client's tests pull `vgi` with its defaults, and with it the
+      # vgi-rpc HTTP stack), which can hide a missing feature in the library
+      # itself; without them this is exactly what a dependent crate compiles.
+      - name: cargo hack clippy --each-feature (libraries only)
+        run: cargo hack clippy -p vgi -p vgi-client --each-feature -- -D warnings
 
   # Windows has no AF_UNIX launcher transport: the `vgi` crate must still
   # compile (stdio + http transports stay available). Guards against the

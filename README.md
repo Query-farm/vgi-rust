@@ -244,7 +244,9 @@ vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
 
 ```sh
 cargo build --workspace
-cargo clippy -p vgi --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+# every feature of vgi / vgi-client on its own (cargo install cargo-hack)
+cargo hack clippy -p vgi -p vgi-client -p vgi-example-worker --each-feature --all-targets -- -D warnings
 cargo test --doc -p vgi
 cargo fmt --all
 ```
