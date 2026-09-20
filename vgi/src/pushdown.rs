@@ -569,7 +569,7 @@ impl PushdownFilters {
         }
         self.predicates
             .iter()
-            .map(|p| format_expr(&p.expression))
+            .map(|p| format_predicate(&p.expression))
             .collect::<Vec<_>>()
             .join(" AND ")
     }
@@ -1739,7 +1739,50 @@ fn mentions(expression: &Expr, column: &str) -> bool {
     names.contains(column)
 }
 
+/// `WHERE flag` / `WHERE NOT flag` — a BOOLEAN column is a predicate on its own.
+///
+/// DuckDB pushes such a predicate down as a bare `column_ref` rather than
+/// rewriting it to `flag = true`, and the schema admits that: `coreExpression`
+/// lists `columnRef` first. The decoder accepts it (the boolean gate asks for
+/// the resolved type, so a BOOLEAN column passes), but nothing downstream
+/// recognised the shape: it reached the convenience views as
+/// `Filter::Other { kind: "expression" }`, which renders no SQL and is
+/// invisible to `get_column_values`. So a SQL-backed worker silently lost
+/// pushdown on the commonest boolean predicate there is — and a lost filter is
+/// a wrong answer, not a slow one, because DuckDB does not re-apply a predicate
+/// it pushed into a table function.
+///
+/// The projection is exact rather than approximate, including under NULLs:
+/// `WHERE flag` keeps only TRUE (a NULL predicate is not satisfied) and so does
+/// `flag = true`; `WHERE NOT flag` keeps only FALSE (`NOT NULL` is NULL) and so
+/// does `flag = false`. Three-valued logic makes both pairs agree on every
+/// input, which is what lets this be a projection and not a change of meaning.
+///
+/// A column that is not BOOLEAN is left alone rather than guessed at.
+///
+/// Returns the column name and the constant it compares equal to.
+fn boolean_column_leaf(expression: &Expr) -> Option<(&str, bool)> {
+    fn boolean_column(expression: &Expr) -> Option<&str> {
+        match expression {
+            Expr::Column {
+                name, data_type, ..
+            } if *data_type == DataType::Boolean => Some(name),
+            _ => None,
+        }
+    }
+    match expression {
+        Expr::Not(inner) => boolean_column(inner).map(|name| (name, false)),
+        _ => boolean_column(expression).map(|name| (name, true)),
+    }
+}
+
 fn filter_view(expression: &Expr) -> Filter {
+    if let Some((name, _)) = boolean_column_leaf(expression) {
+        return Filter::Constant {
+            column_name: name.into(),
+            op: "eq".into(),
+        };
+    }
     match expression {
         Expr::Comparison { op, left, .. } => Filter::Constant {
             column_name: root_column(left).unwrap_or("").into(),
@@ -1784,7 +1827,14 @@ fn constant_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
                 _ => None,
             }
         }
-        _ => None,
+        // `WHERE flag` pins `flag` to TRUE exactly as `flag = true` does, so a
+        // value-pruning caller sees the constant either way round.
+        _ => match boolean_column_leaf(expression) {
+            Some((name, value)) if name == column => {
+                Some(Arc::new(BooleanArray::from(vec![value])) as ArrayRef)
+            }
+            _ => None,
+        },
     }
 }
 fn in_values_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
@@ -1931,6 +1981,20 @@ fn union_bounds(left: ColumnBounds, right: ColumnBounds) -> ColumnBounds {
     }
 }
 
+/// Render one predicate, projecting a bare boolean column onto its equality
+/// form first.
+///
+/// `flag` on its own is legal SQL, so this is not about correctness of the
+/// fragment — it is that `flag = true` is the spelling `filter_view` reports,
+/// the spelling every other VGI SDK renders, and the spelling the shared
+/// `.test` corpus compares across all of them.
+fn format_predicate(expression: &Expr) -> String {
+    match boolean_column_leaf(expression) {
+        Some((name, value)) => format!("{name} = {value}"),
+        None => format_expr(expression),
+    }
+}
+
 fn format_expr(expression: &Expr) -> String {
     match expression {
         Expr::Column { name, .. } => name.clone(),
@@ -1954,7 +2018,7 @@ fn format_expr(expression: &Expr) -> String {
             "({})",
             values
                 .iter()
-                .map(format_expr)
+                .map(format_predicate)
                 .collect::<Vec<_>>()
                 .join(" AND ")
         ),
@@ -1962,7 +2026,7 @@ fn format_expr(expression: &Expr) -> String {
             "({})",
             values
                 .iter()
-                .map(format_expr)
+                .map(format_predicate)
                 .collect::<Vec<_>>()
                 .join(" OR ")
         ),
@@ -2147,6 +2211,138 @@ mod tests {
 
     fn int64_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]))
+    }
+
+    // -----------------------------------------------------------------------
+    // A BOOLEAN column is a predicate on its own
+    //
+    // `WHERE flag` / `WHERE NOT flag` is idiomatic SQL, and DuckDB pushes it
+    // down as a bare `column_ref` rather than rewriting it to `flag = true`.
+    // The decoder already accepted the shape — its boolean gate asks for the
+    // resolved type — but nothing downstream recognised it, so it landed in the
+    // convenience views as an opaque expression: no SQL rendering and no
+    // constant for `get_column_values`. See vgi-python 0.36.2.
+    // -----------------------------------------------------------------------
+
+    fn bool_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("n", DataType::Int64, true),
+        ]))
+    }
+
+    fn bool_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            bool_schema(),
+            vec![
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    Some(true),
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn bool_predicate(expression: &str) -> Vec<u8> {
+        encode(
+            &format!(
+                r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{{"id":"p","revision":0,"mode":"required","source":"query","expression":{expression}}}]}}"#
+            ),
+            vec![],
+            vec![],
+        )
+    }
+
+    const FLAG: &str = r#"{"node":"column_ref","column_index":0,"column_name":"flag"}"#;
+
+    #[test]
+    fn bare_boolean_column_is_a_valid_predicate_root() {
+        let state =
+            PushdownFilters::parse_with_schema(&bool_predicate(FLAG), bool_schema()).unwrap();
+        // A NULL predicate is not satisfied, so the NULL row drops — exactly
+        // the rows `flag = true` keeps.
+        let applied = state.apply(&bool_batch()).unwrap();
+        assert_eq!(
+            applied
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[1, 4]
+        );
+    }
+
+    #[test]
+    fn negated_boolean_column_is_a_valid_predicate_root() {
+        let state = PushdownFilters::parse_with_schema(
+            &bool_predicate(&format!(r#"{{"node":"not","expression":{FLAG}}}"#)),
+            bool_schema(),
+        )
+        .unwrap();
+        // `NOT NULL` is NULL, so the NULL row drops here too — exactly the rows
+        // `flag = false` keeps.
+        let applied = state.apply(&bool_batch()).unwrap();
+        assert_eq!(
+            applied
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[2]
+        );
+    }
+
+    #[test]
+    fn boolean_column_predicates_render_and_resolve_a_constant() {
+        // Rendering is the half a row-count check cannot see: a shape that
+        // parses but renders nothing leaves a SQL-backed worker with no WHERE
+        // clause, and DuckDB does not re-apply what it pushed down.
+        let positive =
+            PushdownFilters::parse_with_schema(&bool_predicate(FLAG), bool_schema()).unwrap();
+        assert_eq!(positive.format_pushed(), "flag = true");
+        assert_eq!(
+            positive.get_column_constant("flag").unwrap().as_ref(),
+            &BooleanArray::from(vec![true]) as &dyn Array
+        );
+
+        let negative = PushdownFilters::parse_with_schema(
+            &bool_predicate(&format!(r#"{{"node":"not","expression":{FLAG}}}"#)),
+            bool_schema(),
+        )
+        .unwrap();
+        assert_eq!(negative.format_pushed(), "flag = false");
+        assert_eq!(
+            negative.get_column_constant("flag").unwrap().as_ref(),
+            &BooleanArray::from(vec![false]) as &dyn Array
+        );
+    }
+
+    #[test]
+    fn boolean_column_inside_a_conjunction_still_projects() {
+        // The shape that actually turns up in queries. One unprojected child
+        // used to cost the whole conjunction its rendering.
+        let json = format!(
+            r#"{{"node":"and","children":[{{"node":"comparison","op":"gt","left":{{"node":"column_ref","column_index":1,"column_name":"n"}},"right":{{"node":"literal","value_ref":0}}}},{{"node":"not","expression":{FLAG}}}]}}"#
+        );
+        let bytes = encode(
+            &format!(
+                r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{{"id":"p","revision":0,"mode":"required","source":"query","expression":{json}}}]}}"#
+            ),
+            vec![Arc::new(Field::new("value_0", DataType::Int64, true))],
+            vec![Arc::new(Int64Array::from(vec![2]))],
+        );
+        let state = PushdownFilters::parse_with_schema(&bytes, bool_schema()).unwrap();
+        assert_eq!(state.format_pushed(), "(n > 2 AND flag = false)");
+    }
+
+    #[test]
+    fn a_non_boolean_column_is_still_refused_as_a_predicate_root() {
+        // `WHERE n` where n is BIGINT is not a predicate, and the projection
+        // must not make it look like one.
+        let bytes = bool_predicate(r#"{"node":"column_ref","column_index":1,"column_name":"n"}"#);
+        assert!(PushdownFilters::parse_with_schema(&bytes, bool_schema()).is_err());
     }
 
     #[test]

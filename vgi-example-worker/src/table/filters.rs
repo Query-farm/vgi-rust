@@ -15,6 +15,7 @@ use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(FilterEchoFunction);
+    w.register_table(BoolFilterEchoFunction);
     w.register_table(ValuePruneFunction);
     w.register_table(NamedParamsEchoFunction);
     w.register_table(FilterEchoPartitionedFunction);
@@ -840,6 +841,121 @@ impl TableFunction for FilterEchoFunction {
             remaining: count,
             cursor: 0,
             batch_size,
+            filter_str: pushed_filter_str(params),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bool_filter_echo(count) -> {n, flag, pushed_filters}
+//
+// A table function with a nullable BOOLEAN column, so `WHERE flag` and
+// `WHERE NOT flag` can be driven end to end. filter_echo cannot cover them —
+// its schema has no boolean column, so the predicate cannot even be written —
+// and the table-in-out `echo` path is never handed a bare boolean column as a
+// pushed predicate, so a case written there passes whether or not the worker
+// understands one.
+//
+// `pushed_filters` echoes the rendering, which covers the half a row count
+// cannot see: a shape that decodes and evaluates correctly but renders no SQL
+// shows up here as "(none)", and for a worker that builds a WHERE clause from
+// it that is silently wrong rows.
+// ---------------------------------------------------------------------------
+
+fn bool_filter_echo_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("pushed_filters", DataType::Utf8, true),
+    ]))
+}
+
+struct BoolFilterEchoProducer {
+    schema: SchemaRef,
+    remaining: i64,
+    cursor: i64,
+    filter_str: String,
+}
+impl TableProducer for BoolFilterEchoProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.remaining <= 0 {
+            return Ok(None);
+        }
+        let ns: Vec<i64> = (self.cursor..self.cursor + self.remaining).collect();
+        // TRUE, FALSE, NULL — the NULL row is what distinguishes `WHERE flag`
+        // from `WHERE flag IS NOT FALSE`, and `WHERE NOT flag` from
+        // `WHERE flag IS NOT TRUE`.
+        let flags: Vec<Option<bool>> = ns
+            .iter()
+            .map(|i| match i.rem_euclid(3) {
+                0 => Some(true),
+                1 => Some(false),
+                _ => None,
+            })
+            .collect();
+        let fs: Vec<&str> = vec![self.filter_str.as_str(); ns.len()];
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ns.clone())) as ArrayRef,
+                Arc::new(BooleanArray::from(flags)) as ArrayRef,
+                Arc::new(StringArray::from(fs)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        self.cursor += self.remaining;
+        self.remaining = 0;
+        Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.cursor, self.remaining])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 2) {
+            self.cursor = v[0];
+            self.remaining = v[1];
+        }
+    }
+}
+
+pub struct BoolFilterEchoFunction;
+impl TableFunction for BoolFilterEchoFunction {
+    fn name(&self) -> &str {
+        "bool_filter_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Rows with a nullable BOOLEAN column, echoing pushed-down filters")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg(
+            "count",
+            0,
+            "int64",
+            "Number of rows to generate",
+        )]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: bool_filter_echo_schema(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let count = params.arguments.const_i64(0)?;
+        Some(TableCardinality {
+            estimate: Some(count),
+            max: Some(count),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let count = params.arguments.const_i64(0).unwrap_or(0).max(0);
+        Ok(Box::new(BoolFilterEchoProducer {
+            schema: bool_filter_echo_schema(),
+            remaining: count,
+            cursor: 0,
             filter_str: pushed_filter_str(params),
         }))
     }
