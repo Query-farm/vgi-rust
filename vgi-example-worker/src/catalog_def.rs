@@ -501,6 +501,25 @@ fn data_tables() -> Vec<CatTable> {
             Some(123456),
             "123456 integers; stats served by the sequence function, not the table",
         ),
+        // Partition columns through a CATALOG TABLE. A table's scan function is
+        // built through a different client path than a direct function call, so
+        // a client can support partitioned aggregates for one and silently not
+        // the other; only a table exercises the catalog path. Its columns carry
+        // the function's partition annotation (the client resolves a table's
+        // partition columns from the table's own schema), and the partition
+        // column is declared last. See PartitionFunction::TrailingSales.
+        CatTable::new(
+            "trailing_partition_sales",
+            crate::table::partition::trailing_sales_schema(),
+            "trailing_partition_sales",
+            Arguments::serialize_scan_args(&[i64_arg(100)]).unwrap_or_default(),
+            Some(
+                "Per-country sales, SINGLE_VALUE partition column declared last; \
+                 GROUP BY country must plan as PARTITIONED_AGGREGATE"
+                    .to_string(),
+            ),
+            None,
+        ),
         scan(
             dtable(
                 "colors",

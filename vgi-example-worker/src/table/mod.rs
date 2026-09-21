@@ -8,7 +8,7 @@ mod cancellable;
 mod filters;
 mod more;
 mod order_modes;
-mod partition;
+pub mod partition;
 mod proj_repro;
 mod rff;
 mod settings_fixtures;

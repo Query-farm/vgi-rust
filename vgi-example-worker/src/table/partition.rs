@@ -3,6 +3,11 @@
 //! Partition-column table fixtures: queue-driven, one partition per emitted
 //! batch, each tagged with `vgi_partition_values#b64` so DuckDB can plan
 //! partitioned aggregates.
+//!
+//! `trailing_partition_sales` is `country_partitioned_sales` with the partition
+//! column declared LAST instead of first, and is also exposed as the catalog
+//! table `example.data.trailing_partition_sales` — see
+//! [`PartitionFunction::TrailingSales`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +21,7 @@ use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(PartitionFunction::CountrySales);
+    w.register_table(PartitionFunction::TrailingSales);
     w.register_table(PartitionFunction::RegionYear);
     w.register_table(PartitionFunction::Override);
     w.register_table(PartitionFunction::Disjoint);
@@ -195,6 +201,32 @@ const CATEGORIES: [&str; 3] = ["books", "music", "video"];
 #[derive(Clone, Copy)]
 pub enum PartitionFunction {
     CountrySales,
+    /// `trailing_partition_sales(rows_per_country)` — same contract and the same
+    /// deterministic values as `country_partitioned_sales`, but `country` sits
+    /// LAST (index 3) rather than first.
+    ///
+    /// Every other partitioned fixture declares its partition column at index
+    /// 0, which makes two distinct index spaces accidentally agree: the planner
+    /// asks `get_partition_info` about WORKER-SCHEMA indices, but the sink later
+    /// asks `get_partition_data` about SCAN-LOCAL ones (positions after
+    /// projection pushdown). `GROUP BY country` projects just `country` and
+    /// `sales`, so the sink asks about scan-local 0 while the declared index is
+    /// 3 — a client comparing them unmapped fails, fatally in the C++ client.
+    ///
+    /// Also a catalog TABLE (`example.data.trailing_partition_sales`, see
+    /// `catalog_def.rs`), because a table's scan function is built through a
+    /// different client path than a direct call: a client can wire
+    /// `get_partition_info` for one and silently never plan
+    /// `PARTITIONED_AGGREGATE` for the other.
+    ///
+    /// Declares `projection_pushdown` deliberately: without it the scan emits
+    /// every base column and DuckDB's own `CanUsePartitionedAggregate` maps the
+    /// projection's indices a second time (duckdb/duckdb#24327, not backported
+    /// to v1.5), which crashes the planner on 1.5-based builds.
+    ///
+    /// Port of vgi-python's `TrailingPartitionSalesFunction`; driven by
+    /// `test/sql/integration/table/partition_columns.test`.
+    TrailingSales,
     RegionYear,
     Override,
     Disjoint,
@@ -208,6 +240,7 @@ impl PartitionFunction {
                 partition_field("country", DataType::Utf8),
                 Field::new("sales", DataType::Int64, true),
             ])),
+            PartitionFunction::TrailingSales => trailing_sales_schema(),
             PartitionFunction::RegionYear => Arc::new(Schema::new(vec![
                 partition_field("region", DataType::Utf8),
                 partition_field("year", DataType::Int64),
@@ -227,7 +260,9 @@ impl PartitionFunction {
     }
     fn num_partitions(&self, params: &ProcessParams) -> i64 {
         match self {
-            PartitionFunction::CountrySales => COUNTRIES.len() as i64,
+            PartitionFunction::CountrySales | PartitionFunction::TrailingSales => {
+                COUNTRIES.len() as i64
+            }
             PartitionFunction::RegionYear => REGIONS_YEARS.len() as i64,
             PartitionFunction::Override => CATEGORIES.len() as i64,
             PartitionFunction::Disjoint | PartitionFunction::Overlapping => {
@@ -256,6 +291,22 @@ impl PartitionFunction {
                     Arc::new(Int64Array::from(
                         (0..rows).map(|i| base + i).collect::<Vec<_>>(),
                     )),
+                ]
+            }
+            PartitionFunction::TrailingSales => {
+                // Same deterministic sales values as country_partitioned_sales,
+                // so a test can assert the two agree despite the layout.
+                let c = COUNTRIES[idx as usize];
+                let base = idx * 1_000_000;
+                vec![
+                    Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|i| format!("{c}-{i}")).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| base + i).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(vec![c; n])),
                 ]
             }
             PartitionFunction::RegionYear => {
@@ -302,6 +353,19 @@ impl PartitionFunction {
     }
 }
 
+/// `(seq, label, sales, country)` — `country` is the (trailing) partition
+/// column. Shared with the `example.data.trailing_partition_sales` catalog
+/// table, whose columns must carry the same partition annotation: the client
+/// resolves a table's partition columns from the table's own schema.
+pub fn trailing_sales_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("sales", DataType::Int64, true),
+        partition_field("country", DataType::Utf8),
+    ]))
+}
+
 struct PartitionProducer {
     kind: PartitionFunction,
     schema: SchemaRef,
@@ -339,6 +403,7 @@ impl TableFunction for PartitionFunction {
     fn name(&self) -> &str {
         match self {
             PartitionFunction::CountrySales => "country_partitioned_sales",
+            PartitionFunction::TrailingSales => "trailing_partition_sales",
             PartitionFunction::RegionYear => "region_year_partitioned",
             PartitionFunction::Override => "partitioned_with_explicit_override",
             PartitionFunction::Disjoint => "disjoint_range_partitioned",
@@ -355,6 +420,26 @@ impl TableFunction for PartitionFunction {
             }
             _ => vgi::protocol::enums::partition_kind::SINGLE_VALUE_PARTITIONS,
         };
+        if let PartitionFunction::TrailingSales = self {
+            return FunctionMetadata {
+                description: "Per-country sales rows, one Arrow batch per country, with the \
+                              SINGLE_VALUE partition column declared LAST in the schema \
+                              instead of first."
+                    .to_string(),
+                categories: vec!["generator".into(), "partitioning".into()],
+                partition_kind: Some(kind.to_string()),
+                projection_pushdown: true,
+                examples: vec![vgi::function::FunctionExample {
+                    sql: "SELECT country, SUM(sales) FROM trailing_partition_sales(100) \
+                          GROUP BY country"
+                        .to_string(),
+                    description: "Partitioned aggregate over a non-leading partition column"
+                        .to_string(),
+                    expected_output: None,
+                }],
+                ..Default::default()
+            };
+        }
         FunctionMetadata {
             description: "Partition-column table fixture".to_string(),
             categories: vec!["generator".into(), "partitioning".into()],
@@ -372,6 +457,12 @@ impl TableFunction for PartitionFunction {
                 ArgSpec::const_arg("partitions", 0, "int64", "Number of overlapping partitions"),
                 ArgSpec::const_arg("rows_per_partition", -1, "int64", "Rows per partition"),
             ],
+            PartitionFunction::TrailingSales => vec![ArgSpec::const_arg(
+                "rows_per_country",
+                0,
+                "int64",
+                "Rows to emit per country partition",
+            )],
             _ => vec![ArgSpec::const_arg("rows", 0, "int64", "Rows per partition")],
         }
     }
