@@ -721,6 +721,15 @@ fn data_tables() -> Vec<CatTable> {
             &[("nonce", Int64)],
             "One-row cacheable result whose value changes per real invocation",
         ),
+        // Secret-dependent: the cache keys it on the vgi_example secret's
+        // fingerprint. vgi-python pre-binds this table (inline_bind) to cover
+        // the client's no-bind-RPC path; this SDK has no inline bind, so the
+        // scan takes the bind RPC like `cache_nonce`. See secret_cache.rs.
+        cache_table(
+            "secret_cache_nonce",
+            &[("secret_string", Utf8), ("nonce", Int64)],
+            "One-row cacheable result keyed on the vgi_example secret",
+        ),
         cache_table(
             "cache_multicol",
             &[("a", Int64), ("b", Int64), ("c", Int64)],

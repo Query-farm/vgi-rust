@@ -21,6 +21,7 @@ mod global_functions;
 mod narrow_bind;
 mod same_name;
 mod scalar;
+mod secret_cache;
 mod table;
 mod table_in_out;
 mod twin_catalogs;
@@ -51,6 +52,9 @@ fn main() {
     scalar::register(&mut worker);
     table::register(&mut worker, &catalog_name);
     table_in_out::register(&mut worker);
+    // Secret-dependent cacheable fixtures, one per kind (producer / scalar /
+    // blended map): cached per secret fingerprint. See secret_cache.rs.
+    secret_cache::register(&mut worker);
     buffering::register(&mut worker);
     aggregate::register(&mut worker);
     register_secrets_and_settings(&mut worker);
