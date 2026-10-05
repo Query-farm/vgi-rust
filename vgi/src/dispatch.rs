@@ -5890,6 +5890,30 @@ mod catalog_contents_tests {
         }
     }
 
+    /// Several arguments carrying several Arrow field-metadata keys each
+    /// (`vgi_arg`, `vgi_type`, docs) — the metadata lives in a `HashMap`, so
+    /// this is what would expose a non-deterministic item encoding.
+    struct MultiArg;
+    impl ScalarFunction for MultiArg {
+        fn name(&self) -> &str {
+            "multi_arg"
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![
+                ArgSpec::any_column("a", 0, "any column"),
+                ArgSpec::column("b", 1, "int64", "an int"),
+                ArgSpec::const_arg("n", -1, "int64", "a named constant"),
+                ArgSpec::const_arg("m", -1, "varchar", "another named constant"),
+            ]
+        }
+        fn process(&self, _p: &ProcessParams, b: &RecordBatch) -> Result<RecordBatch> {
+            Ok(b.clone())
+        }
+    }
+
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -5956,6 +5980,7 @@ mod catalog_contents_tests {
         });
         d.register_scalar(Arc::new(Probe("s_main")));
         d.register_scalar_scoped(Arc::new(Probe("s_data")), FunctionScope::new("cat", "data"));
+        d.register_scalar_scoped(Arc::new(MultiArg), FunctionScope::new("cat", "data"));
         d
     }
 
@@ -6134,6 +6159,20 @@ mod catalog_contents_tests {
             non_empty, 8,
             "the fixture should populate eight (schema, kind) lists"
         );
+    }
+
+    /// `catalog_contents` promises byte-identical items, so an item must encode
+    /// the same way every time — across separately built dispatchers (fresh
+    /// `HashMap` seeds, empty listing caches), not just from one cache.
+    /// arrow-ipc writes schema and field metadata in sorted key order, and
+    /// every map-typed item column (`tags`, `estimated_object_count`) is an
+    /// ordered `Vec` of pairs.
+    #[test]
+    fn items_encode_deterministically() {
+        let first = contents(&dispatcher()).schemas;
+        for _ in 0..8 {
+            assert_eq!(contents(&dispatcher()).schemas, first);
+        }
     }
 
     #[test]
