@@ -244,8 +244,8 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
 /// `api_key` is a credential, so it is also declared `secret`.
 pub fn required_catalog() -> vgi::catalog::CatalogModel {
     // A credential, so it is declared `secret` as well as required: clients
-    // and the DuckDB extension then mask it and keep it out of cache keys and
-    // logs, and can take it from a `vgi_attach` DuckDB secret.
+    // mask it, and the DuckDB extension redacts it from `duckdb_databases()`,
+    // keeps only a salted hash of it in its cache key, and never logs it.
     let api_key = vgi::catalog::serialize_attach_option_spec_with_flags(
         "api_key",
         "API key",

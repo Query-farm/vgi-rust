@@ -145,15 +145,15 @@ pub struct AttachOptionFlags {
     pub required: bool,
     /// The option carries a credential (an API key, token or password).
     ///
-    /// Credential options **must** be declared secret. Clients and the DuckDB
-    /// extension mask a secret option's value, keep it out of result-cache keys
-    /// (the extension hashes it instead), `duckdb_databases()`, exported or
-    /// shared configuration, logs and telemetry. They can also supply it from a
-    /// `vgi_attach` DuckDB secret instead of the ATTACH text:
+    /// Credential options **must** be declared secret. The value is passed
+    /// inline as an ordinary attach option. Clients mask it and keep it out of
+    /// exported or shared configuration. The DuckDB extension redacts it from
+    /// `duckdb_databases()`, keeps only a salted hash of it in its result-cache
+    /// key, and never logs it. To keep the credential out of the SQL text
+    /// itself, write it as an expression:
     ///
     /// ```sql
-    /// CREATE SECRET (TYPE vgi_attach, SCOPE '<worker url>', api_key '…');
-    /// ATTACH 'sales' (TYPE vgi, LOCATION '<worker url>');
+    /// ATTACH 'sales' (TYPE vgi, LOCATION '<worker url>', api_key getenv('SALES_API_KEY'));
     /// ```
     ///
     /// A secret option may declare a default, but normally has none: a

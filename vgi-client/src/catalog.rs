@@ -46,12 +46,14 @@ pub struct AttachOptionSpec {
     /// [`required`](Self::required). A secret option may declare a default but
     /// normally has none.
     ///
-    /// Workers must declare credential options secret. A client must treat the
-    /// value accordingly: mask it in any UI, and keep it out of cache keys,
-    /// logs, telemetry and exported or shared configuration. The DuckDB
-    /// extension does the same, and can supply the value from a `vgi_attach`
-    /// DuckDB secret so the ATTACH statement carries none:
-    /// `CREATE SECRET (TYPE vgi_attach, SCOPE '<worker url>', api_key '…')`.
+    /// Workers must declare credential options secret. The value is passed
+    /// inline as an attach option, so a client must treat it accordingly: mask
+    /// it in any UI, and keep it out of cache keys, logs, telemetry and
+    /// exported or shared configuration. The DuckDB extension redacts it from
+    /// `duckdb_databases()`, keeps only a salted hash of it in its cache key,
+    /// and never logs it. Writing the value as an expression keeps it out of
+    /// the SQL text: `ATTACH 'sales' (TYPE vgi, LOCATION '…', api_key
+    /// getenv('SALES_API_KEY'))`.
     pub secret: bool,
 }
 
