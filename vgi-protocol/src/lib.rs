@@ -38,8 +38,10 @@
 /// `vgi_rpc.protocol_version` custom metadata), so this must track
 /// `VgiProtocol.protocol_version` in vgi-python. Protocol 2.0 replaces scalar
 /// schema names with ordered schema paths, allowing arbitrary nesting without
-/// losing identifier boundaries.
-pub const VGI_PROTOCOL_VERSION: &str = "2.0.0";
+/// losing identifier boundaries. Protocol 2.1 adds the optional
+/// `catalog_contents` bulk-load RPC, advertised via
+/// `CatalogAttachResult.supports_catalog_contents`.
+pub const VGI_PROTOCOL_VERSION: &str = "2.1.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///

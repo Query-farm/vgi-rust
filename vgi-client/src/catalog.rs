@@ -1260,6 +1260,7 @@ mod attach_option_tests {
             global_function_prefix: String::new(),
             resolved_data_version: None,
             resolved_implementation_version: None,
+            supports_catalog_contents: false,
         };
         AttachedCatalog {
             handle: info.attach_opaque_data.clone(),

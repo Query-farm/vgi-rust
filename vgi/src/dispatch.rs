@@ -2128,6 +2128,7 @@ impl Dispatcher {
                 global_function_prefix: String::new(),
                 resolved_data_version: sec.data_version_spec.clone(),
                 resolved_implementation_version: sec.implementation_version.clone(),
+                supports_catalog_contents: false,
             };
             return Ok(Some(wire::to_result_batch(result)?));
         }
@@ -2226,6 +2227,7 @@ impl Dispatcher {
             global_function_prefix: self.catalog.global_function_prefix.clone(),
             resolved_data_version,
             resolved_implementation_version,
+            supports_catalog_contents: false,
         };
         Ok(Some(wire::to_result_batch(result)?))
     }

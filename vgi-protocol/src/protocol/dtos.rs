@@ -983,6 +983,10 @@ pub struct CatalogAttachResult {
     pub global_function_prefix: String,
     pub resolved_data_version: Option<String>,
     pub resolved_implementation_version: Option<String>,
+    /// Whether the worker serves the `catalog_contents` bulk-load RPC (protocol
+    /// 2.1.0). This SDK does not implement it yet, so the worker always sends
+    /// `false` and the client keeps loading the catalog per schema/kind.
+    pub supports_catalog_contents: bool,
 }
 
 // ---------------------------------------------------------------------------
