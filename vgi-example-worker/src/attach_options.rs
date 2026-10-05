@@ -241,13 +241,20 @@ pub fn catalog() -> vgi::catalog::CatalogModel {
 /// back to a value is by definition satisfiable without the caller, and
 /// `serialize_attach_option_spec` rejects declaring both. `region` carries a
 /// default, so the catalog also proves that required and optional coexist.
+/// `api_key` is a credential, so it is also declared `secret`.
 pub fn required_catalog() -> vgi::catalog::CatalogModel {
-    let api_key = vgi::catalog::serialize_attach_option_spec(
+    // A credential, so it is declared `secret` as well as required: clients
+    // and the DuckDB extension then mask it and keep it out of cache keys and
+    // logs, and can take it from a `vgi_attach` DuckDB secret.
+    let api_key = vgi::catalog::serialize_attach_option_spec_with_flags(
         "api_key",
         "API key",
         &DataType::Utf8,
         None,
-        true,
+        vgi::catalog::AttachOptionFlags {
+            required: true,
+            secret: true,
+        },
     )
     .unwrap();
     let region_default: ArrayRef = Arc::new(StringArray::from(vec!["us-east-1"]));

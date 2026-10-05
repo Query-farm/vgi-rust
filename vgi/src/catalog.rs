@@ -133,16 +133,49 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     ipc::write_batch(&batch)
 }
 
+/// Declaration flags for one ATTACH option, passed to
+/// [`serialize_attach_option_spec_with_flags`].
+///
+/// Both default to `false`. They combine freely: an option can be required,
+/// secret, both or neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttachOptionFlags {
+    /// The caller must supply this option at ATTACH time. A required option
+    /// cannot also declare a default.
+    pub required: bool,
+    /// The option carries a credential (an API key, token or password).
+    ///
+    /// Credential options **must** be declared secret. Clients and the DuckDB
+    /// extension mask a secret option's value, keep it out of result-cache keys
+    /// (the extension hashes it instead), `duckdb_databases()`, exported or
+    /// shared configuration, logs and telemetry. They can also supply it from a
+    /// `vgi_attach` DuckDB secret instead of the ATTACH text:
+    ///
+    /// ```sql
+    /// CREATE SECRET (TYPE vgi_attach, SCOPE '<worker url>', api_key '…');
+    /// ATTACH 'sales' (TYPE vgi, LOCATION '<worker url>');
+    /// ```
+    ///
+    /// A secret option may declare a default, but normally has none: a
+    /// credential baked into the worker's discovery record is not a secret.
+    pub secret: bool,
+}
+
 /// Serialize one `AttachOptionSpec` (discovery record for an ATTACH option).
 /// Schema `{name:str, description:str, type:binary (IPC schema of a single
 /// `value` field), default_value:binary? (IPC 1-row batch of the default),
-/// required:bool?}`.
+/// required:bool?, secret:bool?}`.
+///
+/// Equivalent to [`serialize_attach_option_spec_with_flags`] with
+/// `secret = false`. Declare credential options (API keys, tokens, passwords)
+/// through that function with [`AttachOptionFlags::secret`] set instead.
 ///
 /// `required` marks an option the caller must supply at ATTACH time, so a
 /// client can report that before attempting the attach rather than surfacing a
-/// failure that reads like an empty catalog. It is nullable and appended LAST:
-/// a peer that predates the column reads the batch by name and simply doesn't
-/// see it, and absent and explicit-null both mean "not required".
+/// failure that reads like an empty catalog. It is nullable and appended after
+/// the original four columns: a peer that predates the column reads the batch
+/// by name and simply doesn't see it, and absent and explicit-null both mean
+/// "not required".
 ///
 /// Passing `required = true` together with a `default` is an error — an option
 /// that falls back to a value is by definition satisfiable without the caller.
@@ -153,6 +186,54 @@ pub fn serialize_attach_option_spec(
     default: Option<&arrow_array::ArrayRef>,
     required: bool,
 ) -> Result<Vec<u8>> {
+    serialize_attach_option_spec_with_flags(
+        name,
+        description,
+        arrow_type,
+        default,
+        AttachOptionFlags {
+            required,
+            secret: false,
+        },
+    )
+}
+
+/// Serialize one `AttachOptionSpec` with its full set of declaration flags.
+///
+/// The wire batch is the one described on [`serialize_attach_option_spec`],
+/// with a nullable boolean `secret` column appended after `required`. Readers
+/// look it up by name; absent or null means "not secret", so peers that
+/// predate the column interoperate unchanged.
+///
+/// Credential options (API keys, tokens, passwords) **must** set
+/// [`AttachOptionFlags::secret`]; see its documentation for what clients and
+/// the DuckDB extension do with a secret option.
+///
+/// ```
+/// use arrow_schema::DataType;
+/// use vgi::catalog::{serialize_attach_option_spec_with_flags, AttachOptionFlags};
+///
+/// let api_key = serialize_attach_option_spec_with_flags(
+///     "api_key",
+///     "API key for the tenant",
+///     &DataType::Utf8,
+///     None,
+///     AttachOptionFlags { required: true, secret: true },
+/// )
+/// .unwrap();
+/// assert!(!api_key.is_empty());
+/// ```
+///
+/// Passing `required = true` together with a `default` is an error — an option
+/// that falls back to a value is by definition satisfiable without the caller.
+pub fn serialize_attach_option_spec_with_flags(
+    name: &str,
+    description: &str,
+    arrow_type: &DataType,
+    default: Option<&arrow_array::ArrayRef>,
+    flags: AttachOptionFlags,
+) -> Result<Vec<u8>> {
+    let AttachOptionFlags { required, secret } = flags;
     if required && default.is_some() {
         return Err(vgi_rpc::RpcError::runtime_error(format!(
             "Attach option '{name}' is required but also declares a default; an option \
@@ -180,6 +261,7 @@ pub fn serialize_attach_option_spec(
         Field::new("type", DataType::Binary, false),
         Field::new("default_value", DataType::Binary, true),
         Field::new("required", DataType::Boolean, true),
+        Field::new("secret", DataType::Boolean, true),
     ]));
     let cols: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![name])),
@@ -189,6 +271,8 @@ pub fn serialize_attach_option_spec(
         // Written explicitly rather than left null so a reader sees `false`,
         // not NULL, for an option that simply isn't required.
         Arc::new(arrow_array::BooleanArray::from(vec![required])),
+        // Same for `secret`: an explicit `false` rather than NULL.
+        Arc::new(arrow_array::BooleanArray::from(vec![secret])),
     ];
     let batch = RecordBatch::try_new(schema, cols)
         .map_err(|e| vgi_rpc::RpcError::runtime_error(e.to_string()))?;
@@ -208,6 +292,22 @@ pub fn serialize_attach_option_spec(
 /// are discovery records, and a malformed one should not turn a working catalog
 /// into an unattachable one. It simply is not enforced.
 pub fn required_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
+    flagged_attach_option_names(specs, "required")
+}
+
+/// Names of the options a catalog declares `secret`, read back out of the
+/// serialized [`serialize_attach_option_spec_with_flags`] records it
+/// advertises.
+///
+/// Use it to keep credential values out of a worker's own logs and error
+/// messages. Like [`required_attach_option_names`], an unreadable spec is
+/// skipped, and an absent or null `secret` column means "not secret".
+pub fn secret_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
+    flagged_attach_option_names(specs, "secret")
+}
+
+/// Names of the specs whose boolean column `flag` is present, non-null and true.
+fn flagged_attach_option_names(specs: &[Vec<u8>], flag: &str) -> Vec<String> {
     use arrow_array::{Array, BooleanArray, StringArray};
     let mut out = Vec::new();
     for raw in specs {
@@ -217,15 +317,15 @@ pub fn required_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
         if batch.num_rows() == 0 {
             continue;
         }
-        // `required` is nullable and was appended after the original columns:
-        // absent (a pre-update peer) and explicit-null both mean "not required".
-        let Some(req) = batch
-            .column_by_name("required")
+        // The flag columns are nullable and were appended after the original
+        // columns: absent (a pre-update peer) and explicit-null both mean false.
+        let Some(col) = batch
+            .column_by_name(flag)
             .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
         else {
             continue;
         };
-        if req.is_null(0) || !req.value(0) {
+        if col.is_null(0) || !col.value(0) {
             continue;
         }
         if let Some(name) = batch
@@ -797,7 +897,10 @@ pub struct CatalogModel {
     /// Per-resolved-version schema sets. When non-empty the catalog's visible
     /// objects vary by the resolved data version (encoded in attach_opaque_data).
     pub version_schemas: std::collections::HashMap<String, Vec<CatSchema>>,
-    /// Serialized `AttachOptionSpec` records (discovery via `catalog_catalogs`).
+    /// Serialized `AttachOptionSpec` records (discovery via `catalog_catalogs`),
+    /// built with [`serialize_attach_option_spec_with_flags`]. Credential
+    /// options (API keys, tokens, passwords) must be declared
+    /// [`secret`](AttachOptionFlags::secret).
     pub attach_option_specs: Vec<Vec<u8>>,
     /// IPC of the one-row default option batch (one column per declared option).
     /// When set, `catalog_attach` merges the user `options` over it and encodes
@@ -2247,5 +2350,141 @@ mod required_attach_option_discovery_tests {
                 .contains("required but also declares a default"),
             "unexpected message: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod attach_option_secret_tests {
+    use super::*;
+    use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
+
+    fn secret_column(bytes: &[u8]) -> Option<bool> {
+        let batch = ipc::read_batch(bytes).unwrap();
+        let col = batch
+            .column_by_name("secret")?
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .clone();
+        (!col.is_null(0)).then(|| col.value(0))
+    }
+
+    #[test]
+    fn secret_column_is_appended_after_required() {
+        let bytes = serialize_attach_option_spec_with_flags(
+            "api_key",
+            "API key",
+            &DataType::Utf8,
+            None,
+            AttachOptionFlags {
+                required: false,
+                secret: true,
+            },
+        )
+        .unwrap();
+        let batch = ipc::read_batch(&bytes).unwrap();
+        let schema = batch.schema();
+        let required = schema.index_of("required").unwrap();
+        let secret = schema.index_of("secret").unwrap();
+        assert_eq!(secret, required + 1, "secret must follow required");
+        assert!(schema.field(secret).is_nullable());
+        assert_eq!(secret_column(&bytes), Some(true));
+    }
+
+    #[test]
+    fn plain_serializer_writes_an_explicit_false() {
+        let bytes =
+            serialize_attach_option_spec("region", "", &DataType::Utf8, None, false).unwrap();
+        assert_eq!(secret_column(&bytes), Some(false));
+    }
+
+    #[test]
+    fn secret_combines_with_required() {
+        let bytes = serialize_attach_option_spec_with_flags(
+            "token",
+            "",
+            &DataType::Utf8,
+            None,
+            AttachOptionFlags {
+                required: true,
+                secret: true,
+            },
+        )
+        .unwrap();
+        let specs = vec![bytes];
+        assert_eq!(required_attach_option_names(&specs), vec!["token"]);
+        assert_eq!(secret_attach_option_names(&specs), vec!["token"]);
+    }
+
+    #[test]
+    fn secret_is_allowed_with_a_default() {
+        let default: ArrayRef = Arc::new(StringArray::from(vec!["dev-key"]));
+        let bytes = serialize_attach_option_spec_with_flags(
+            "api_key",
+            "",
+            &DataType::Utf8,
+            Some(&default),
+            AttachOptionFlags {
+                required: false,
+                secret: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(secret_column(&bytes), Some(true));
+    }
+
+    #[test]
+    fn required_plus_default_is_still_refused_when_secret() {
+        let default: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+        assert!(serialize_attach_option_spec_with_flags(
+            "both",
+            "",
+            &DataType::Utf8,
+            Some(&default),
+            AttachOptionFlags {
+                required: true,
+                secret: true,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn secret_names_come_back_out_of_the_advertised_specs() {
+        let specs = vec![
+            serialize_attach_option_spec_with_flags(
+                "api_key",
+                "",
+                &DataType::Utf8,
+                None,
+                AttachOptionFlags {
+                    required: true,
+                    secret: true,
+                },
+            )
+            .unwrap(),
+            serialize_attach_option_spec("region", "", &DataType::Utf8, None, true).unwrap(),
+        ];
+        assert_eq!(secret_attach_option_names(&specs), vec!["api_key"]);
+        assert_eq!(
+            required_attach_option_names(&specs),
+            vec!["api_key", "region"]
+        );
+    }
+
+    #[test]
+    fn a_spec_without_the_secret_column_is_not_secret() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("required", DataType::Boolean, true),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["legacy"])),
+            Arc::new(BooleanArray::from(vec![true])),
+        ];
+        let batch = arrow_array::RecordBatch::try_new(schema, cols).unwrap();
+        let specs = vec![ipc::write_batch(&batch).unwrap()];
+        assert!(secret_attach_option_names(&specs).is_empty());
+        assert_eq!(required_attach_option_names(&specs), vec!["legacy"]);
     }
 }
