@@ -147,8 +147,17 @@ where
 }
 
 fn decode_items<I: VgiArrow>(items: ItemsResult, method: &str) -> Result<Vec<I>> {
+    decode_item_blobs(items.items, method)
+}
+
+/// Decode IPC-serialized catalog items exactly as the per-schema call `method`
+/// would — e.g. a `SchemaContents` list from
+/// [`VgiClient::contents`](crate::VgiClient::contents): its `tables` decode as
+/// `catalog_schema_contents_tables` items, its `*_functions` as
+/// `catalog_schema_contents_functions` items (which backfills columns an older
+/// worker omits), and so on.
+pub fn decode_item_blobs<I: VgiArrow>(items: Vec<Bytes>, method: &str) -> Result<Vec<I>> {
     items
-        .items
         .into_iter()
         .enumerate()
         .map(|(i, blob)| {

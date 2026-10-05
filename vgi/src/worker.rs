@@ -131,6 +131,19 @@ impl Worker {
         self.disp.hide_function(name);
     }
 
+    /// Whether `catalog_attach` advertises `supports_catalog_contents`
+    /// (protocol 2.1.0), letting the client load every schema and all of its
+    /// contents with one `catalog_contents` call instead of one
+    /// `catalog_schema_contents_*` call per schema and kind.
+    ///
+    /// On by default — the declarative catalog is read-only and its listings
+    /// don't depend on the transaction. Turn it off to force the client back
+    /// onto the per-schema RPCs (e.g. to compare the two paths); the
+    /// `catalog_contents` RPC itself stays registered either way.
+    pub fn set_catalog_contents(&mut self, enabled: bool) {
+        self.disp.catalog_contents = enabled;
+    }
+
     /// Replace the shared cross-process state store.
     ///
     /// The default comes from [`crate::storage::default_storage`], selected by

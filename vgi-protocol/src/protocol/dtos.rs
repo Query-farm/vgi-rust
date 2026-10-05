@@ -957,37 +957,13 @@ pub struct AttachCatalogInfo {
     pub secret_ref: String,
 }
 
-/// `CatalogAttachResult` — flat result of `catalog_attach`.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct CatalogAttachResult {
-    pub attach_opaque_data: Bytes,
-    pub supports_transactions: bool,
-    pub supports_time_travel: bool,
-    pub catalog_version_frozen: bool,
-    pub catalog_version: i64,
-    pub attach_opaque_data_required: bool,
-    pub default_schema: String,
-    pub settings: Vec<Bytes>,
-    pub secret_types: Vec<Bytes>,
-    pub attach_catalogs: Vec<Bytes>,
-    pub comment: Option<String>,
-    pub tags: StrMap,
-    pub supports_column_statistics: bool,
-    /// IPC-serialized `FunctionInfo` values the worker asks the client to
-    /// publish into its *global* (catalog-independent) namespace. Added in
-    /// protocol 1.3.0; positioned between `supports_column_statistics` and
-    /// `resolved_data_version` to match `CatalogAttachResultSchema()`.
-    pub global_functions: Vec<Bytes>,
-    /// Name prefix applied to every entry of `global_functions`. Added in
-    /// protocol 1.3.0.
-    pub global_function_prefix: String,
-    pub resolved_data_version: Option<String>,
-    pub resolved_implementation_version: Option<String>,
-    /// Whether the worker serves the `catalog_contents` bulk-load RPC (protocol
-    /// 2.1.0). This SDK does not implement it yet, so the worker always sends
-    /// `false` and the client keeps loading the catalog per schema/kind.
-    pub supports_catalog_contents: bool,
-}
+/// `CatalogAttachResult` (flat result of `catalog_attach`) and the
+/// `catalog_contents` records are generated from the canonical Python records;
+/// see [`crate::generated::protocol_types`]. Re-exported here at their
+/// historical paths.
+pub use crate::generated::protocol_types::{
+    CatalogAttachResult, CatalogContentsResponse, SchemaContents,
+};
 
 // ---------------------------------------------------------------------------
 // catalog transactions / version / detach

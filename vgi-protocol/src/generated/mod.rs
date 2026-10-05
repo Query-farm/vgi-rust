@@ -7,4 +7,5 @@
 //! file diverges from what the generator would emit now.
 
 pub mod protocol_schemas;
+pub mod protocol_types;
 pub mod request_params;

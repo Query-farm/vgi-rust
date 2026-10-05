@@ -332,6 +332,16 @@ pub struct Dispatcher {
     /// Built `catalog_schema_contents_functions` listings, per listing. See
     /// [`Dispatcher::function_listing`]; cleared by every registration.
     function_listings: std::sync::Mutex<HashMap<FunctionListingKey, Arc<FunctionListing>>>,
+    /// Whether `catalog_attach` advertises `supports_catalog_contents`, letting
+    /// the client load the whole catalog with one `catalog_contents` call.
+    ///
+    /// On by default: a [`catalog::CatalogModel`] is declarative and read-only
+    /// (DDL is refused) and no listing depends on the transaction, which is
+    /// exactly the committed-catalog snapshot `catalog_contents` returns — the
+    /// analogue of vgi-python's `ReadOnlyCatalogInterface`. The RPC is served
+    /// either way; the flag only tells the client it may call it. See
+    /// [`crate::Worker::set_catalog_contents`].
+    pub catalog_contents: bool,
     exec_counter: AtomicU64,
 }
 
@@ -356,6 +366,7 @@ impl Dispatcher {
             copy_from_formats: Vec::new(),
             copy_to_formats: Vec::new(),
             function_listings: std::sync::Mutex::new(HashMap::new()),
+            catalog_contents: true,
             exec_counter: AtomicU64::new(1),
         }
     }
@@ -2128,7 +2139,7 @@ impl Dispatcher {
                 global_function_prefix: String::new(),
                 resolved_data_version: sec.data_version_spec.clone(),
                 resolved_implementation_version: sec.implementation_version.clone(),
-                supports_catalog_contents: false,
+                supports_catalog_contents: self.catalog_contents,
             };
             return Ok(Some(wire::to_result_batch(result)?));
         }
@@ -2227,7 +2238,7 @@ impl Dispatcher {
             global_function_prefix: self.catalog.global_function_prefix.clone(),
             resolved_data_version,
             resolved_implementation_version,
-            supports_catalog_contents: false,
+            supports_catalog_contents: self.catalog_contents,
         };
         Ok(Some(wire::to_result_batch(result)?))
     }
@@ -2588,36 +2599,118 @@ impl Dispatcher {
 
     pub fn handle_contents_views(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let path = read_string_list_col(req, "path")?;
+        Ok(Some(wire::to_result_batch(ItemsResult {
+            items: self.view_items(req, &path)?,
+        })?))
+    }
+
+    /// The encoded `ViewInfo` items of one schema — the `items` of
+    /// `catalog_schema_contents_views`, and `SchemaContents.views`.
+    fn view_items(&self, req: &Request, path: &[String]) -> Result<Vec<Bytes>> {
         let infos: Vec<ViewInfo> = self
-            .schema_for_req(req, &path)
+            .schema_for_req(req, path)
             .map(|s| {
                 s.views
                     .iter()
-                    .map(|v| catalog::view_info(&path, v))
+                    .map(|v| catalog::view_info(path, v))
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Some(wire::to_result_batch(ItemsResult {
-            items: catalog::serialize_items(infos)?,
-        })?))
+        catalog::serialize_items(infos)
     }
 
     pub fn handle_contents_tables(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let path = read_string_list_col(req, "path")?;
-        let infos: Vec<TableInfo> = match self.schema_for_req(req, &path) {
+        Ok(Some(wire::to_result_batch(ItemsResult {
+            items: self.table_items(req, &path)?,
+        })?))
+    }
+
+    /// The encoded `TableInfo` items of one schema — the `items` of
+    /// `catalog_schema_contents_tables`, and `SchemaContents.tables`.
+    fn table_items(&self, req: &Request, path: &[String]) -> Result<Vec<Bytes>> {
+        let infos: Vec<TableInfo> = match self.schema_for_req(req, path) {
             Some(s) => s
                 .tables
                 .iter()
                 .map(|t| {
-                    let scan_schema = self.resolve_table_function_schema(&t.scan_function, &path);
-                    catalog::table_info(&path, t, scan_schema.as_deref())
+                    let scan_schema = self.resolve_table_function_schema(&t.scan_function, path);
+                    catalog::table_info(path, t, scan_schema.as_deref())
                 })
                 .collect::<Result<_>>()?,
             None => Vec::new(),
         };
-        Ok(Some(wire::to_result_batch(ItemsResult {
-            items: catalog::serialize_items(infos)?,
-        })?))
+        catalog::serialize_items(infos)
+    }
+
+    /// `catalog_contents` — every schema of the request's catalog and all of its
+    /// contents in one result (protocol 2.1.0).
+    ///
+    /// Composed from the very producers the per-schema RPCs serve, so each item
+    /// is byte-for-byte what `catalog_schemas` / `catalog_schema_contents_*`
+    /// return: the `SchemaInfo` `catalog_schemas` lists, then tables,
+    /// views, the three function listings, the two macro kinds and indexes. A
+    /// kind the schema's `estimated_object_count` reports as exactly 0 is not
+    /// computed (an empty list — "none of that kind" — is what the per-kind RPC
+    /// would return anyway). Schemas are emitted parents before children. Takes
+    /// no transaction: no listing here depends on one.
+    pub fn handle_catalog_contents(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        Ok(Some(wire::to_result_batch(
+            self.catalog_contents_response(req)?,
+        )?))
+    }
+
+    pub(crate) fn catalog_contents_response(
+        &self,
+        req: &Request,
+    ) -> Result<CatalogContentsResponse> {
+        let cat = self.active_catalog(req);
+        let mut paths = Self::catalog_schema_paths(cat);
+        // Parent-before-child (a stable sort keeps `catalog_schemas` order
+        // among siblings).
+        paths.sort_by_key(Vec::len);
+        let mut schemas = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let info = self.schema_info_for(cat, path);
+            let counts = info.estimated_object_count.clone().unwrap_or_default();
+            // `Some(0)` is a hard guarantee; an absent count means "unknown".
+            let has = |kind: &str| !counts.iter().any(|(k, n)| k == kind && *n == 0);
+            let kind = |present: bool, items: &dyn Fn() -> Result<Vec<Bytes>>| {
+                if present {
+                    items()
+                } else {
+                    Ok(Vec::new())
+                }
+            };
+            let schema = catalog::serialize_items(vec![info])?
+                .pop()
+                .ok_or_else(|| RpcError::runtime_error("SchemaInfo did not serialize"))?;
+            let contents = SchemaContents {
+                schema,
+                tables: kind(has("table"), &|| self.table_items(req, path))?,
+                views: kind(has("view"), &|| self.view_items(req, path))?,
+                scalar_functions: kind(has("scalar_function"), &|| {
+                    self.function_items(req, path, "SCALAR_FUNCTION")
+                })?,
+                aggregate_functions: kind(has("aggregate_function"), &|| {
+                    self.function_items(req, path, "AGGREGATE_FUNCTION")
+                })?,
+                table_functions: kind(has("table_function"), &|| {
+                    self.function_items(req, path, "TABLE_FUNCTION")
+                })?,
+                scalar_macros: kind(has("macro"), &|| {
+                    self.macro_items(req, path, "SCALAR_MACRO")
+                })?,
+                table_macros: kind(has("macro"), &|| self.macro_items(req, path, "TABLE_MACRO"))?,
+                // `catalog_schema_contents_indexes` serves no indexes.
+                indexes: Vec::new(),
+            };
+            schemas.extend(catalog::serialize_items(vec![contents])?);
+        }
+        Ok(CatalogContentsResponse {
+            catalog_version: Self::CATALOG_VERSION,
+            schemas,
+        })
     }
 
     pub fn handle_table_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -3130,9 +3223,19 @@ impl Dispatcher {
 
     pub fn handle_contents_macros(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let path = read_string_list_col(req, "path")?;
-        let want = normalize_function_type(&read_string_col(req, "type").unwrap_or_default());
+        let type_filter = read_string_col(req, "type").unwrap_or_default();
+        Ok(Some(wire::to_result_batch(ItemsResult {
+            items: self.macro_items(req, &path, &type_filter)?,
+        })?))
+    }
+
+    /// The encoded `MacroInfo` items of one schema for a `type` filter — the
+    /// `items` of `catalog_schema_contents_macros`, and
+    /// `SchemaContents.{scalar,table}_macros`.
+    fn macro_items(&self, req: &Request, path: &[String], type_filter: &str) -> Result<Vec<Bytes>> {
+        let want = normalize_function_type(type_filter);
         let infos: Vec<MacroInfo> = self
-            .schema_for_req(req, &path)
+            .schema_for_req(req, path)
             .map(|s| {
                 s.macros
                     .iter()
@@ -3147,13 +3250,11 @@ impl Dispatcher {
                         Some("scalar") | Some("scalar_macro") => !m.table_macro,
                         _ => true,
                     })
-                    .map(|m| catalog::macro_info(&path, m))
+                    .map(|m| catalog::macro_info(path, m))
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Some(wire::to_result_batch(ItemsResult {
-            items: catalog::serialize_items(infos)?,
-        })?))
+        catalog::serialize_items(infos)
     }
 
     pub fn handle_contents_functions(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -3161,6 +3262,43 @@ impl Dispatcher {
         // rather than via a derived DTO (the derive can't emit a `type` field).
         let schema_path = read_string_list_col(req, "path")?;
         let type_filter = read_string_col(req, "type").unwrap_or_default();
+        let keys = self.function_listing_keys(req, &schema_path, &type_filter);
+        // The extension asks for one kind at a time: that response is served
+        // whole, as built the first time.
+        if let [key] = keys.as_slice() {
+            return Ok(Some(self.function_listing(key.clone())?.response.clone()));
+        }
+        let mut items = Vec::new();
+        for key in keys {
+            items.extend(self.function_listing(key)?.items.iter().cloned());
+        }
+        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+    }
+
+    /// The encoded `FunctionInfo` items of one schema for a `type` filter — the
+    /// `items` of `catalog_schema_contents_functions`, and
+    /// `SchemaContents.{scalar,aggregate,table}_functions`.
+    fn function_items(
+        &self,
+        req: &Request,
+        schema_path: &[String],
+        type_filter: &str,
+    ) -> Result<Vec<Bytes>> {
+        let mut items = Vec::new();
+        for key in self.function_listing_keys(req, schema_path, type_filter) {
+            items.extend(self.function_listing(key)?.items.iter().cloned());
+        }
+        Ok(items)
+    }
+
+    /// The function listings a `catalog_schema_contents_functions` request for
+    /// `type_filter` is composed of, in order.
+    fn function_listing_keys(
+        &self,
+        req: &Request,
+        schema_path: &[String],
+        type_filter: &str,
+    ) -> Vec<FunctionListingKey> {
         // The `projection_repro` app's functions are advertised only for that
         // catalog; every other catalog hides them (they share this binary).
         let proj_repro = read_binary_col(req, "attach_opaque_data")
@@ -3172,7 +3310,7 @@ impl Dispatcher {
         let catalog = self.secondary.iter().position(|c| std::ptr::eq(c, active));
         // An unfiltered listing is the three typed listings, in this order.
         // Table-buffering functions also surface under a TABLE request.
-        let kinds: &[ListingKind] = match normalize_function_type(&type_filter).as_deref() {
+        let kinds: &[ListingKind] = match normalize_function_type(type_filter).as_deref() {
             None => &[
                 ListingKind::Scalar,
                 ListingKind::Table,
@@ -3183,22 +3321,15 @@ impl Dispatcher {
             Some("aggregate") => &[ListingKind::Aggregate],
             Some(_) => &[],
         };
-        let key = |kind| FunctionListingKey {
-            catalog,
-            proj_repro,
-            schema_path: schema_path.clone(),
-            kind,
-        };
-        // The extension asks for one kind at a time: that response is served
-        // whole, as built the first time.
-        if let [kind] = kinds {
-            return Ok(Some(self.function_listing(key(*kind))?.response.clone()));
-        }
-        let mut items = Vec::new();
-        for &kind in kinds {
-            items.extend(self.function_listing(key(kind))?.items.iter().cloned());
-        }
-        Ok(Some(wire::to_result_batch(ItemsResult { items })?))
+        kinds
+            .iter()
+            .map(|&kind| FunctionListingKey {
+                catalog,
+                proj_repro,
+                schema_path: schema_path.to_vec(),
+                kind,
+            })
+            .collect()
     }
 
     /// One function listing — its encoded items and its whole response —
@@ -5728,5 +5859,313 @@ mod scope_tests {
             Dispatcher::bound_scope("cat", None).kind,
             ScopeKind::Bound
         ));
+    }
+}
+
+#[cfg(test)]
+mod catalog_contents_tests {
+    //! `catalog_contents` (protocol 2.1.0) is composed from the per-schema RPCs'
+    //! own producers, so every item it carries must be byte-for-byte what the
+    //! matching per-schema RPC answers — the client decodes both with one set of
+    //! decoders and fills one set of caches.
+
+    use super::*;
+    use crate::function::{ArgSpec, FunctionMetadata};
+    use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::generated::request_params as p;
+
+    struct Probe(&'static str);
+    impl ScalarFunction for Probe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            vec![ArgSpec::column("value", 0, "int64", "value")]
+        }
+        fn process(&self, _p: &ProcessParams, b: &RecordBatch) -> Result<RecordBatch> {
+            Ok(b.clone())
+        }
+    }
+
+    fn path(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn view(name: &str) -> catalog::CatView {
+        catalog::CatView {
+            name: name.to_string(),
+            definition: "SELECT 1 AS x".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn mac(name: &str, table_macro: bool) -> catalog::CatMacro {
+        catalog::CatMacro {
+            name: name.to_string(),
+            parameters: vec!["a".to_string()],
+            definition: if table_macro {
+                "SELECT a".to_string()
+            } else {
+                "a + 1".to_string()
+            },
+            table_macro,
+            ..Default::default()
+        }
+    }
+
+    /// Schemas declared child-first (`data.deep` before `data`), so the
+    /// parent-first ordering of `catalog_contents` is observable; every kind
+    /// populated somewhere, and the aggregate/table-function kinds empty
+    /// (advertised as 0, so skipped rather than computed).
+    fn dispatcher() -> Dispatcher {
+        let mut d = Dispatcher::new("cat");
+        let columns = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".to_string(),
+            schemas: vec![
+                catalog::CatSchema {
+                    path: path(&["data", "deep"]),
+                    views: vec![view("deep_view")],
+                    ..Default::default()
+                },
+                catalog::CatSchema {
+                    name: "data".to_string(),
+                    comment: Some("data schema".to_string()),
+                    tables: vec![catalog::CatTable::new(
+                        "t",
+                        columns,
+                        "t_scan",
+                        Vec::new(),
+                        Some("a table".to_string()),
+                        Some(3),
+                    )],
+                    macros: vec![mac("m_scalar", false), mac("m_table", true)],
+                    ..Default::default()
+                },
+                catalog::CatSchema {
+                    name: "main".to_string(),
+                    views: vec![view("v1"), view("v2")],
+                    macros: vec![mac("main_scalar_macro", false)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        d.register_scalar(Arc::new(Probe("s_main")));
+        d.register_scalar_scoped(Arc::new(Probe("s_data")), FunctionScope::new("cat", "data"));
+        d
+    }
+
+    fn request(method: &str, batch: RecordBatch) -> Request {
+        Request {
+            method: method.to_string(),
+            protocol: String::new(),
+            request_id: String::new(),
+            batch,
+            metadata: Arc::new(Default::default()),
+        }
+    }
+
+    fn inner(result: RecordBatch) -> RecordBatch {
+        let envelope = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        ipc::read_batch(envelope.value(0)).unwrap()
+    }
+
+    fn items(result: Result<Option<RecordBatch>>) -> Vec<Bytes> {
+        let items: ItemsResult = wire::from_batch(&inner(result.unwrap().unwrap())).unwrap();
+        items.items
+    }
+
+    fn decode<T: VgiArrow>(bytes: &Bytes) -> T {
+        wire::from_batch(&ipc::read_batch(&bytes.0).unwrap()).unwrap()
+    }
+
+    fn contents(d: &Dispatcher) -> CatalogContentsResponse {
+        let batch = wire::to_batch(p::CatalogContentsParams {
+            attach_opaque_data: Bytes::from(d.attach_bytes()),
+        })
+        .unwrap();
+        let result = d
+            .handle_catalog_contents(&request("catalog_contents", batch))
+            .unwrap()
+            .unwrap();
+        wire::from_batch(&inner(result)).unwrap()
+    }
+
+    /// Everything the per-schema RPCs answer for one schema, in
+    /// `SchemaContents` field order.
+    fn per_schema(d: &Dispatcher, path: &[String]) -> [Vec<Bytes>; 8] {
+        let attach = || Bytes::from(d.attach_bytes());
+        let functions = |kind: &str| {
+            let batch = wire::to_batch(p::CatalogSchemaContentsFunctionsParams {
+                attach_opaque_data: attach(),
+                path: path.to_vec(),
+                r#type: vgi_rpc::DictString(kind.to_string()),
+                transaction_opaque_data: None,
+            })
+            .unwrap();
+            items(d.handle_contents_functions(&request("catalog_schema_contents_functions", batch)))
+        };
+        let macros = |kind: &str| {
+            let batch = wire::to_batch(p::CatalogSchemaContentsMacrosParams {
+                attach_opaque_data: attach(),
+                path: path.to_vec(),
+                r#type: vgi_rpc::DictString(kind.to_string()),
+                transaction_opaque_data: None,
+            })
+            .unwrap();
+            items(d.handle_contents_macros(&request("catalog_schema_contents_macros", batch)))
+        };
+        let tables = wire::to_batch(p::CatalogSchemaContentsTablesParams {
+            attach_opaque_data: attach(),
+            path: path.to_vec(),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        let views = wire::to_batch(p::CatalogSchemaContentsViewsParams {
+            attach_opaque_data: attach(),
+            path: path.to_vec(),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        let indexes = wire::to_batch(p::CatalogSchemaContentsIndexesParams {
+            attach_opaque_data: attach(),
+            path: path.to_vec(),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        [
+            items(d.handle_contents_tables(&request("catalog_schema_contents_tables", tables))),
+            items(d.handle_contents_views(&request("catalog_schema_contents_views", views))),
+            functions("SCALAR_FUNCTION"),
+            functions("AGGREGATE_FUNCTION"),
+            functions("TABLE_FUNCTION"),
+            macros("SCALAR_MACRO"),
+            macros("TABLE_MACRO"),
+            items(d.handle_empty_items(&request("catalog_schema_contents_indexes", indexes))),
+        ]
+    }
+
+    #[test]
+    fn one_entry_per_schema_parents_first() {
+        let d = dispatcher();
+        let resp = contents(&d);
+        assert_eq!(resp.catalog_version, Dispatcher::CATALOG_VERSION);
+        let paths: Vec<Vec<String>> = resp
+            .schemas
+            .iter()
+            .map(|b| decode::<SchemaInfo>(&decode::<SchemaContents>(b).schema).path)
+            .collect();
+        assert_eq!(
+            paths,
+            [path(&["data"]), path(&["main"]), path(&["data", "deep"])]
+        );
+    }
+
+    #[test]
+    fn schema_items_equal_catalog_schemas_items_byte_for_byte() {
+        let d = dispatcher();
+        let batch = wire::to_batch(p::CatalogSchemasParams {
+            attach_opaque_data: Bytes::from(d.attach_bytes()),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        let mut listed = items(d.handle_catalog_schemas(&request("catalog_schemas", batch)));
+        let mut bulk: Vec<Bytes> = contents(&d)
+            .schemas
+            .iter()
+            .map(|b| decode::<SchemaContents>(b).schema)
+            .collect();
+        assert_eq!(
+            bulk.len(),
+            listed.len(),
+            "one entry per catalog_schemas item"
+        );
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        bulk.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(bulk, listed);
+    }
+
+    #[test]
+    fn every_kind_equals_its_per_schema_rpc_byte_for_byte() {
+        let d = dispatcher();
+        let mut non_empty = 0;
+        for blob in &contents(&d).schemas {
+            let sc: SchemaContents = decode(blob);
+            let path = decode::<SchemaInfo>(&sc.schema).path;
+            let bulk = [
+                &sc.tables,
+                &sc.views,
+                &sc.scalar_functions,
+                &sc.aggregate_functions,
+                &sc.table_functions,
+                &sc.scalar_macros,
+                &sc.table_macros,
+                &sc.indexes,
+            ];
+            let kinds = [
+                "tables",
+                "views",
+                "scalar_functions",
+                "aggregate_functions",
+                "table_functions",
+                "scalar_macros",
+                "table_macros",
+                "indexes",
+            ];
+            for ((kind, got), want) in kinds.iter().zip(bulk).zip(per_schema(&d, &path)) {
+                assert_eq!(
+                    got, &want,
+                    "{path:?}.{kind} differs from its per-schema RPC"
+                );
+                non_empty += usize::from(!want.is_empty());
+            }
+        }
+        // data: table, s_data, m_scalar, m_table; main: 2 views, s_main,
+        // main_scalar_macro; data.deep: its view.
+        assert_eq!(
+            non_empty, 8,
+            "the fixture should populate eight (schema, kind) lists"
+        );
+    }
+
+    #[test]
+    fn attach_advertises_catalog_contents_unless_disabled() {
+        fn attach(d: &Dispatcher) -> CatalogAttachResult {
+            let inner_req = wire::to_batch(CatalogAttachRequest {
+                name: "cat".to_string(),
+                options: None,
+                data_version_spec: None,
+                implementation_version: None,
+                client_capabilities: None,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogAttachParams {
+                request: Bytes::from(ipc::write_batch(&inner_req).unwrap()),
+            })
+            .unwrap();
+            let result = d
+                .handle_catalog_attach(&request("catalog_attach", batch))
+                .unwrap()
+                .unwrap();
+            wire::from_batch(&inner(result)).unwrap()
+        }
+        let mut d = dispatcher();
+        assert!(
+            d.catalog_contents,
+            "on by default for a declarative catalog"
+        );
+        assert!(attach(&d).supports_catalog_contents);
+        d.catalog_contents = false;
+        assert!(!attach(&d).supports_catalog_contents);
+        // Still served: the flag only tells the client it may call it.
+        assert_eq!(contents(&d).schemas.len(), 3);
     }
 }

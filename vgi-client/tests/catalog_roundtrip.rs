@@ -390,3 +390,101 @@ fn transactions_are_optional_and_round_trip_when_offered() {
 
     client.detach(&cat).expect("detach");
 }
+
+/// `catalog_contents` (protocol 2.1.0): the example worker advertises it, and
+/// one call returns every schema the per-schema calls list — parents first —
+/// with each kind holding exactly what the matching per-schema call returns.
+#[test]
+fn catalog_contents_matches_the_per_schema_calls() {
+    use vgi_client::dtos::{FunctionInfo, MacroInfo, SchemaInfo, TableInfo, ViewInfo};
+    use vgi_client::wire_call::decode_item_blobs;
+
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    assert!(
+        cat.supports_catalog_contents(),
+        "the example worker advertises catalog_contents"
+    );
+
+    let (version, contents) = client.contents_response(&cat).expect("catalog_contents");
+    assert_eq!(
+        version,
+        client.catalog_version(&cat).expect("catalog_version")
+    );
+
+    let listed = client.schemas(&cat).expect("catalog_schemas");
+    let bulk_schemas: Vec<SchemaInfo> = decode_item_blobs(
+        contents.iter().map(|c| c.schema.clone()).collect(),
+        "catalog_schemas",
+    )
+    .expect("decode SchemaInfo");
+    let mut bulk_paths: Vec<Vec<String>> = bulk_schemas.iter().map(|s| s.path.clone()).collect();
+    assert!(
+        bulk_paths.windows(2).all(|w| w[0].len() <= w[1].len()),
+        "schemas must come parents before children: {bulk_paths:?}"
+    );
+    let mut listed_paths: Vec<Vec<String>> = listed.iter().map(|s| s.path.clone()).collect();
+    bulk_paths.sort();
+    listed_paths.sort();
+    assert_eq!(bulk_paths, listed_paths, "one entry per schema");
+
+    fn names<T>(items: &[T], name: impl Fn(&T) -> &String) -> Vec<String> {
+        items.iter().map(|i| name(i).clone()).collect()
+    }
+    let mut total = 0usize;
+    for (sc, info) in contents.iter().zip(&bulk_schemas) {
+        let path = &info.path;
+        let tables: Vec<TableInfo> =
+            decode_item_blobs(sc.tables.clone(), "catalog_schema_contents_tables").unwrap();
+        let views: Vec<ViewInfo> =
+            decode_item_blobs(sc.views.clone(), "catalog_schema_contents_views").unwrap();
+        let fns = |blobs: &Vec<vgi_client::Bytes>| -> Vec<FunctionInfo> {
+            decode_item_blobs(blobs.clone(), "catalog_schema_contents_functions").unwrap()
+        };
+        let macros = |blobs: &Vec<vgi_client::Bytes>| -> Vec<MacroInfo> {
+            decode_item_blobs(blobs.clone(), "catalog_schema_contents_macros").unwrap()
+        };
+        assert_eq!(
+            names(&tables, |t| &t.name),
+            names(&client.tables_path(&cat, path).unwrap(), |t| &t.name),
+            "{path:?} tables"
+        );
+        assert_eq!(
+            names(&views, |v| &v.name),
+            names(&client.views_path(&cat, path).unwrap(), |v| &v.name),
+            "{path:?} views"
+        );
+        for (blobs, kind) in [
+            (&sc.scalar_functions, FunctionKind::Scalar),
+            (&sc.aggregate_functions, FunctionKind::Aggregate),
+            (&sc.table_functions, FunctionKind::Table),
+        ] {
+            let got = fns(blobs);
+            total += got.len();
+            assert_eq!(
+                names(&got, |f| &f.name),
+                names(&client.functions_path(&cat, path, kind).unwrap(), |f| &f
+                    .name),
+                "{path:?} {kind:?} functions"
+            );
+        }
+        for (blobs, kind) in [
+            (&sc.scalar_macros, MacroKind::Scalar),
+            (&sc.table_macros, MacroKind::Table),
+        ] {
+            assert_eq!(
+                names(&macros(blobs), |m| &m.name),
+                names(&client.macros_path(&cat, path, kind).unwrap(), |m| &m.name),
+                "{path:?} {kind:?} macros"
+            );
+        }
+        assert!(sc.indexes.is_empty(), "the example catalog has no indexes");
+        total += tables.len() + views.len();
+    }
+    assert!(total > 0, "the example catalog is not empty");
+
+    client.detach(&cat).expect("detach");
+}

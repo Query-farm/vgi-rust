@@ -264,6 +264,18 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         ));
     }
     {
+        // Protocol 2.1.0: the whole catalog in one call. Served always; the
+        // client calls it only when `catalog_attach` advertises
+        // `supports_catalog_contents`.
+        let d = disp.clone();
+        srv.register(vgi_rpc::MethodInfo::unary(
+            "catalog_contents",
+            wire::params_schema_for("catalog_contents"),
+            wire::result_binary_schema(),
+            move |req, _ctx| d.handle_catalog_contents(req),
+        ));
+    }
+    {
         let d = disp.clone();
         srv.register(vgi_rpc::MethodInfo::unary(
             "catalog_schema_get",

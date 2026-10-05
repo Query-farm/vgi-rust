@@ -439,7 +439,11 @@ pub fn jitter_fraction() -> f64 {
 pub fn method_is_retryable(method: &str) -> bool {
     matches!(
         method,
-        "bind" | "table_function_plan" | "catalog_catalogs" | "catalog_version"
+        "bind"
+            | "table_function_plan"
+            | "catalog_catalogs"
+            | "catalog_version"
+            | "catalog_contents"
     ) || method.starts_with("catalog_schema")
         || method.starts_with("catalog_table_")
 }

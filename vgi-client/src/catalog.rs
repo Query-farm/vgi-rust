@@ -11,9 +11,10 @@ use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, Strin
 use arrow_schema::DataType;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogInfo,
-    CatalogTransactionBeginResult, CatalogVersionResult, ClientCapabilities, FunctionInfo,
-    MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult, SchemaInfo, TableInfo, ViewInfo,
+    AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
+    CatalogInfo, CatalogTransactionBeginResult, CatalogVersionResult, ClientCapabilities,
+    FunctionInfo, MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult, SchemaContents,
+    SchemaInfo, TableInfo, ViewInfo,
 };
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
@@ -479,6 +480,12 @@ impl AttachedCatalog {
         self.info.supports_transactions
     }
 
+    /// Whether the worker serves [`VgiClient::contents`] — the whole catalog in
+    /// one call (protocol 2.1.0). `false` for an older worker.
+    pub fn supports_catalog_contents(&self) -> bool {
+        self.info.supports_catalog_contents
+    }
+
     /// The transaction handle threaded onto reads, if one is open.
     pub fn transaction(&self) -> Option<&Bytes> {
         self.transaction.as_ref()
@@ -626,6 +633,47 @@ impl VgiClient {
                 transaction_opaque_data: cat.txn(),
             },
         )
+    }
+
+    /// Every schema and all of its contents in one call (`catalog_contents`,
+    /// protocol 2.1.0) — call it only when
+    /// [`AttachedCatalog::supports_catalog_contents`] says the worker serves it.
+    ///
+    /// Each [`SchemaContents`] item is byte-for-byte what the matching
+    /// per-schema call returns (`schemas`, `tables_path`, `functions_path`, …),
+    /// so decode them with the same item decoders. Schemas come parents before
+    /// children. Read with no transaction: the result is the committed catalog
+    /// at `catalog_version`.
+    pub fn contents(&mut self, cat: &AttachedCatalog) -> Result<Vec<SchemaContents>> {
+        Ok(self.contents_response(cat)?.1)
+    }
+
+    /// [`Self::contents`] plus the `catalog_version` the snapshot was taken at.
+    pub fn contents_response(
+        &mut self,
+        cat: &AttachedCatalog,
+    ) -> Result<(i64, Vec<SchemaContents>)> {
+        let resp: CatalogContentsResponse = call(
+            self.transport_mut(),
+            "catalog_contents",
+            p::CatalogContentsParams {
+                attach_opaque_data: cat.handle.clone(),
+            },
+        )?;
+        let schemas = resp
+            .schemas
+            .iter()
+            .enumerate()
+            .map(|(i, blob)| {
+                let batch = vgi_protocol::ipc::read_batch(&blob.0).map_err(|e| {
+                    RpcError::type_error(format!(
+                        "catalog_contents: schemas[{i}] is not a readable IPC batch: {e}"
+                    ))
+                })?;
+                vgi_protocol::wire::from_batch(&batch)
+            })
+            .collect::<Result<_>>()?;
+        Ok((resp.catalog_version, schemas))
     }
 
     /// One schema by name, or `None` when the catalog has no such schema.

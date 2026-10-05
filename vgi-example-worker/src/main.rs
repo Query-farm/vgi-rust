@@ -5,7 +5,8 @@
 //! Registers every example function (scalar / table / table-in-out /
 //! aggregate / buffering) and serves the catalog named by
 //! `VGI_WORKER_CATALOG_NAME` (default `example`). Transport is selected from
-//! argv: stdio (default) or `--unix <path>` (launcher).
+//! argv: stdio (default) or `--unix <path>` (launcher). `VGI_CATALOG_CONTENTS=0`
+//! stops advertising the `catalog_contents` bulk-load RPC.
 
 mod accumulate;
 mod aggregate;
@@ -43,6 +44,10 @@ fn main() {
         std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
 
     let mut worker = Worker::new();
+    // Advertise `catalog_contents` (protocol 2.1.0; the framework default) unless
+    // VGI_CATALOG_CONTENTS=0, which forces the client back onto the per-schema
+    // RPCs — so the integration suite can be run over both load paths.
+    worker.set_catalog_contents(catalog_contents_enabled());
     if catalog_name == datafusion_companion::ROOT_CATALOG {
         datafusion_companion::register(&mut worker);
         worker.set_catalog(datafusion_companion::root_catalog());
@@ -104,6 +109,18 @@ fn main() {
     }
     worker.set_catalog(catalog);
     run_worker(worker);
+}
+
+/// `VGI_CATALOG_CONTENTS`: unset or anything but `0` / `false` / `off` → on.
+fn catalog_contents_enabled() -> bool {
+    !matches!(
+        std::env::var("VGI_CATALOG_CONTENTS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off"
+    )
 }
 
 /// Serve the example catalog behind the local Iroh HTTP bridge used by the
