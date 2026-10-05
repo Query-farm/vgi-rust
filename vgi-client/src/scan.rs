@@ -429,7 +429,10 @@ fn union_projection(
 }
 
 impl ScanOptions {
-    /// The projection this scan puts on the wire. See [`union_projection`].
+    /// The projection this scan puts on the wire: [`projection`](Self::projection)
+    /// followed by any filter-only column from
+    /// [`filter_columns`](Self::filter_columns), in first-reference order.
+    /// `None` when the projection is `None` (every column is emitted).
     pub fn wire_projection(&self) -> Option<Vec<i64>> {
         union_projection(self.projection.as_ref(), self.filter_columns.as_ref())
     }
@@ -1045,7 +1048,10 @@ pub struct PlanOptions {
 }
 
 impl PlanOptions {
-    /// The projection this plan puts on the wire. See [`union_projection`].
+    /// The projection this plan puts on the wire: [`projection`](Self::projection)
+    /// followed by any filter-only column from
+    /// [`filter_columns`](Self::filter_columns), in first-reference order.
+    /// `None` when the projection is `None` (every column is emitted).
     pub fn wire_projection(&self) -> Option<Vec<i64>> {
         union_projection(self.projection.as_ref(), self.filter_columns.as_ref())
     }

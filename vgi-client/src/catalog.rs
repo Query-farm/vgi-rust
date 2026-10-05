@@ -353,7 +353,7 @@ pub fn encode_attach_options(batch: &RecordBatch) -> Result<Bytes> {
 ///
 /// They are not listing filters. `SchemaObjectType` has one `TABLE_FUNCTION`
 /// member covering all three shapes; which shape a given function is comes back
-/// on [`FunctionInfo::function_type`](crate::FunctionInfo) in the response.
+/// on [`FunctionInfo::function_type`](crate::dtos::FunctionInfo::function_type) in the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
     /// Any table function — producer, buffered, or streaming table-in-out.
@@ -789,7 +789,7 @@ impl VgiClient {
     /// *function call the worker chose*, so scanning one means binding that
     /// function with the worker's own arguments. Those arguments arrive
     /// already IPC-encoded and are forwarded verbatim
-    /// ([`BindSpec::with_raw_arguments`]) rather than decoded and rebuilt,
+    /// ([`BindSpec::with_raw_arguments`](crate::BindSpec::with_raw_arguments)) rather than decoded and rebuilt,
     /// since they may carry types this client does not model.
     ///
     /// The worker may **inline** the answer on [`TableInfo::scan_function`] to
