@@ -356,7 +356,7 @@ impl Worker {
     /// Host additional application protocols beside `vgi.v2`.
     ///
     /// `hook` returns the protocols -- each a
-    /// [`HostedProtocol`](vgi_rpc::server::HostedProtocol): a name, an optional
+    /// [`HostedProtocol`]: a name, an optional
     /// version, and its methods (a `#[vgi_rpc::service]` type registers into
     /// one with its generated `register_with`). It is called **once**, when the
     /// worker's server is built, and may consult configuration or the
