@@ -51,6 +51,7 @@ fn main() {
     // VGI_CATALOG_CONTENTS=0, which forces the client back onto the per-schema
     // RPCs — so the integration suite can be run over both load paths.
     worker.set_catalog_contents(catalog_contents_enabled());
+    host_conformance_protocols(&mut worker);
     if catalog_name == datafusion_companion::ROOT_CATALOG {
         datafusion_companion::register(&mut worker);
         worker.set_catalog(datafusion_companion::root_catalog());
@@ -129,6 +130,32 @@ fn catalog_contents_enabled() -> bool {
     )
 }
 
+/// The cross-SDK conformance surface (vgi-rpc's MULTI_PROTOCOL_HOSTING.md §7).
+///
+/// `conformance.Secondary.v1` is hosted beside `vgi.v2` through the
+/// [`Worker::hosted_protocols`] hook on every transport -- additive: no
+/// existing fixture function changes, and `vgi.v2` dispatch cannot be
+/// affected because requests route on their protocol key.
+///
+/// With `--identity`, the worker also opts into `vgi_rpc.Identity.v1` (HTTP
+/// only) under the fixed `IDENTITY_CONFORMANCE_FIXTURE.md` policy, including
+/// the auth-unavailable token and purpose, and authenticates callers from the
+/// fixture's `X-Conformance-Principal` / `X-Conformance-Auth-Time` headers.
+/// That authenticator is trivially spoofable: test use only.
+fn host_conformance_protocols(worker: &mut Worker) {
+    use vgi_rpc::conformance_identity as fixture;
+
+    worker.hosted_protocols(|| {
+        vec![vgi_rpc::conformance_secondary::conformance_secondary_protocol()]
+    });
+    if std::env::args().any(|arg| arg == "--identity") {
+        worker.authenticate(std::sync::Arc::new(fixture::authenticate_from_headers));
+        worker.resolve_token(fixture::conformance_resolve_token);
+        worker.mint_grant(fixture::conformance_mint_grant);
+        worker.introspect_principals([fixture::INTROSPECTOR_PRINCIPAL]);
+    }
+}
+
 /// Serve the example catalog behind the local Iroh HTTP bridge used by the
 /// browser demo. This mode is deliberately explicit: ordinary `--http`
 /// retains its existing authentication configuration.
@@ -144,7 +171,9 @@ fn run_worker(worker: Worker) {
     )
     .expect("valid browser demo Iroh provider");
     let state = vgi_rpc::http::HttpState::builder()
-        .server(std::sync::Arc::new(worker.build_server()))
+        .server(std::sync::Arc::new(
+            worker.build_server_for(vgi::ServeTransport::Http),
+        ))
         .peer_identity_providers([provider])
         .peer_authentication_policy(vgi_rpc::peer_identity_primary("iroh"))
         .enable_sticky(true)

@@ -286,7 +286,7 @@ fn fmm(name: &str, ty: DataType, kvs: &[(&str, &str)]) -> Field {
     Field::new(name, ty, true).with_metadata(
         kvs.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
     )
 }
 

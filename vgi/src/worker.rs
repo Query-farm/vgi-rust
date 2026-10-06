@@ -6,6 +6,8 @@
 use std::sync::Arc;
 use vgi_protocol::{VGI_PROTOCOL_NAME, VGI_PROTOCOL_VERSION};
 
+use vgi_rpc::server::HostedProtocol;
+use vgi_rpc::token_identity::{IdentityImpl, IssuedGrant, TokenIdentity};
 use vgi_rpc::RpcServer;
 
 use crate::dispatch::Dispatcher;
@@ -44,7 +46,50 @@ use crate::protocol::register;
 pub struct Worker {
     disp: Dispatcher,
     server_id: Option<String>,
+    hosted_protocols: Option<HostedProtocolsHook>,
+    resolve_token: Option<vgi_rpc::token_identity::TokenResolver>,
+    mint_grant: Option<vgi_rpc::token_identity::GrantMinter>,
+    introspect_principals: Option<Vec<String>>,
+    /// Read only by the HTTP transport.
+    #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
+    authenticate: Option<vgi_rpc::Authenticate>,
 }
+
+/// The hook a worker supplies its additional application protocols through.
+/// See [`Worker::hosted_protocols`].
+pub type HostedProtocolsHook = Arc<dyn Fn() -> Vec<HostedProtocol> + Send + Sync>;
+
+/// The transport a worker's server is built for.
+///
+/// Only [`ServeTransport::Http`] changes what is hosted (`vgi_rpc.Identity.v1`,
+/// when opted in); the rest are named so the decision is made in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServeTransport {
+    /// stdin/stdout, and any byte stream handed to
+    /// [`Worker::serve_reader_writer`] (the SAB/wasm path).
+    Pipe,
+    /// The AF_UNIX launcher transport.
+    Unix,
+    /// Raw TCP.
+    Tcp,
+    /// The raw upstream behind `vgi-iroh-bridge`.
+    Iroh,
+    /// HTTP.
+    Http,
+}
+
+impl ServeTransport {
+    /// Transports that authenticate their callers, and so may host
+    /// `vgi_rpc.Identity.v1`: its allowlist is a list of *principals*, which
+    /// a transport without caller identity cannot check.
+    fn authenticates_callers(self) -> bool {
+        matches!(self, ServeTransport::Http)
+    }
+}
+
+/// Environment variable naming the principals allowed to call
+/// `vgi_rpc.Identity.v1`'s `introspect_token`, comma-separated.
+pub const INTROSPECT_PRINCIPALS_ENV: &str = "VGI_INTROSPECT_PRINCIPALS";
 
 impl Default for Worker {
     fn default() -> Self {
@@ -65,6 +110,11 @@ impl Worker {
         Worker {
             disp: Dispatcher::new(catalog_name),
             server_id: None,
+            hosted_protocols: None,
+            resolve_token: None,
+            mint_grant: None,
+            introspect_principals: None,
+            authenticate: None,
         }
     }
 
@@ -303,15 +353,145 @@ impl Worker {
         self.disp.register_attach_catalog(info);
     }
 
-    /// Build the configured [`RpcServer`], registering every VGI method.
+    /// Host additional application protocols beside `vgi.v2`.
+    ///
+    /// `hook` returns the protocols -- each a
+    /// [`HostedProtocol`](vgi_rpc::server::HostedProtocol): a name, an optional
+    /// version, and its methods (a `#[vgi_rpc::service]` type registers into
+    /// one with its generated `register_with`). It is called **once**, when the
+    /// worker's server is built, and may consult configuration or the
+    /// environment; what it returns is then fixed for the life of the process
+    /// and hosted on **every** transport the worker serves (stdio, unix, TCP,
+    /// the Iroh upstream, HTTP and the SAB/wasm path), listed by reflection
+    /// after `vgi.v2` in the order returned.
+    ///
+    /// Requests route on their `vgi_rpc.protocol` key with no fallback, so an
+    /// added protocol cannot change how `vgi.v2` (the DuckDB extension's
+    /// protocol) dispatches -- even when its method names repeat `vgi.v2`'s.
+    ///
+    /// A returned name that is malformed, repeats another, is `vgi.v2`, or
+    /// claims the reserved `vgi_rpc.` prefix stops the worker at startup with
+    /// an error naming this hook. Framework protocols are never supplied here:
+    /// reflection is always hosted, and `vgi_rpc.Identity.v1` is enabled with
+    /// [`resolve_token`](Self::resolve_token) / [`mint_grant`](Self::mint_grant).
+    ///
+    /// ```
+    /// use vgi::Worker;
+    /// use vgi_rpc::server::HostedProtocol;
+    /// use vgi_rpc::MethodInfo;
+    /// # fn empty_schema() -> arrow_schema::SchemaRef { std::sync::Arc::new(arrow_schema::Schema::empty()) }
+    ///
+    /// let mut worker = Worker::new();
+    /// worker.hosted_protocols(|| {
+    ///     vec![HostedProtocol::new("example.Health.v1").with_method(MethodInfo::unary(
+    ///         "ping",
+    ///         empty_schema(),
+    ///         empty_schema(),
+    ///         |_req, _ctx| Ok(None),
+    ///     ))]
+    /// });
+    /// let server = worker.build_server();
+    /// assert_eq!(server.hosted_protocol_names()[..2], ["vgi.v2", "example.Health.v1"]);
+    /// ```
+    pub fn hosted_protocols(
+        &mut self,
+        hook: impl Fn() -> Vec<HostedProtocol> + Send + Sync + 'static,
+    ) {
+        self.hosted_protocols = Some(Arc::new(hook));
+    }
+
+    /// Opt into `vgi_rpc.Identity.v1`'s `introspect_token`: resolve an opaque
+    /// bearer credential to the principal it authenticates as.
+    ///
+    /// For a reverse proxy that terminates the only public listener and must
+    /// know the caller before it can authorize anything. Hosted over **HTTP
+    /// only** (the transport that authenticates callers), and only when this
+    /// or [`mint_grant`](Self::mint_grant) is set: absent, the protocol is not
+    /// hosted at all, rather than hosted and refusing.
+    ///
+    /// Return `Ok(None)` for "the store answered and this credential is
+    /// unknown". For "the answer is not knowable" -- the store is down, a
+    /// timeout, a 5xx -- return
+    /// [`RpcError::auth_unavailable`](vgi_rpc::RpcError::auth_unavailable)
+    /// (optionally `.with_retry_after(secs)`), the same error an HTTP
+    /// authenticator returns for an outage. The framework sends it as
+    /// `identity_unavailable` (`UNAVAILABLE`) carrying your retry hint as
+    /// `RetryInfo`, so a caller retries instead of negative-caching an outage
+    /// as "unknown". Never put claims or the credential in the error.
+    ///
+    /// Enabling this requires an allowlist of principals permitted to ask
+    /// ([`introspect_principals`](Self::introspect_principals) or
+    /// `VGI_INTROSPECT_PRINCIPALS`); without one the worker **refuses to
+    /// start** on HTTP. There is no permissive default: authenticating and
+    /// introspecting are different capabilities, and "any authenticated
+    /// caller" lets any user resolve any other user's credential to its owner.
+    pub fn resolve_token(
+        &mut self,
+        hook: impl Fn(&str) -> vgi_rpc::Result<Option<TokenIdentity>> + Send + Sync + 'static,
+    ) {
+        self.resolve_token = Some(Arc::new(hook));
+    }
+
+    /// Opt into `vgi_rpc.Identity.v1`'s `issue_grant`: mint a standing
+    /// delegation credential for the calling user.
+    ///
+    /// The hook receives `(principal, purpose, scopes, ttl_seconds)`; the
+    /// principal is always the authenticated caller. Refuse with
+    /// [`grant_refused`](vgi_rpc::token_identity::grant_refused); for a
+    /// transient failure return
+    /// [`RpcError::auth_unavailable`](vgi_rpc::RpcError::auth_unavailable),
+    /// which -- as for [`resolve_token`](Self::resolve_token) -- reaches the
+    /// caller as `identity_unavailable` with your retry hint. HTTP only; needs
+    /// no allowlist, because a grant is only ever about the caller.
+    pub fn mint_grant(
+        &mut self,
+        hook: impl Fn(&str, &str, &[String], i64) -> vgi_rpc::Result<IssuedGrant>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.mint_grant = Some(Arc::new(hook));
+    }
+
+    /// Principals permitted to call `introspect_token`. Overrides
+    /// `VGI_INTROSPECT_PRINCIPALS`. See [`resolve_token`](Self::resolve_token).
+    pub fn introspect_principals<I, S>(&mut self, principals: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.introspect_principals = Some(principals.into_iter().map(Into::into).collect());
+    }
+
+    /// Authenticate HTTP callers with `authenticate` instead of the
+    /// environment-derived bearer configuration (`VGI_BEARER_TOKENS` /
+    /// `VGI_OPTIONAL_BEARER_TOKENS`). `vgi_rpc.Identity.v1` needs an
+    /// authenticated caller -- the introspector allowlist names principals --
+    /// so a worker opting into identity normally sets this too.
+    pub fn authenticate(&mut self, authenticate: vgi_rpc::Authenticate) {
+        self.authenticate = Some(authenticate);
+    }
+
+    /// Build the configured [`RpcServer`] for stdio, registering every VGI
+    /// method. See [`build_server_for`](Self::build_server_for).
     pub fn build_server(self) -> RpcServer {
-        self.build_parts().0
+        self.build_server_for(ServeTransport::Pipe)
+    }
+
+    /// Build the configured [`RpcServer`] for `transport`.
+    ///
+    /// The one construction path every transport uses: `vgi.v2`, then the
+    /// [`hosted_protocols`](Self::hosted_protocols) (every transport), then
+    /// `vgi_rpc.Reflection.v1` (every transport), then -- on HTTP, when opted
+    /// in -- `vgi_rpc.Identity.v1`.
+    pub fn build_server_for(self, transport: ServeTransport) -> RpcServer {
+        self.build_parts(transport).0
     }
 
     /// Build the [`RpcServer`] and return the shared [`Dispatcher`] handle
     /// alongside it. The HTTP transport reuses the dispatcher to serve the
     /// landing contract (`describe.json`) via catalog introspection.
-    fn build_parts(self) -> (RpcServer, Arc<Dispatcher>) {
+    fn build_parts(self, transport: ServeTransport) -> (RpcServer, Arc<Dispatcher>) {
         let server_id = self
             .server_id
             .clone()
@@ -320,7 +500,20 @@ impl Worker {
         // this env override so the C++ ATTACH fails with a clear mismatch.
         let protocol_version = std::env::var("VGI_PROTOCOL_VERSION_OVERRIDE")
             .unwrap_or_else(|_| VGI_PROTOCOL_VERSION.to_string());
-        let mut srv = RpcServer::builder()
+        let extra = match &self.hosted_protocols {
+            Some(hook) => validated_hosted_protocols(hook()),
+            None => Vec::new(),
+        };
+        let identity = if transport.authenticates_callers() {
+            build_identity(
+                self.resolve_token.clone(),
+                self.mint_grant.clone(),
+                self.introspect_principals.clone(),
+            )
+        } else {
+            None
+        };
+        let mut builder = RpcServer::builder()
             .server_id(server_id)
             .protocol_name(VGI_PROTOCOL_NAME)
             .protocol_version(protocol_version)
@@ -328,7 +521,13 @@ impl Worker {
             // `__describe__` method was retired in favour of the co-hosted
             // `vgi_rpc.Reflection.v1` protocol, which every server hosts
             // unconditionally and addresses through the ordinary routing key.
-            .build();
+            .add_protocols(extra);
+        if let Some(identity) = identity {
+            builder = builder.identity(identity);
+        }
+        let mut srv = builder
+            .try_build()
+            .unwrap_or_else(|err| panic!("{HOOK_NAME}: {}", err.message));
         let disp = Arc::new(self.disp);
         register::register(&mut srv, disp.clone());
         (srv, disp)
@@ -359,7 +558,9 @@ impl Worker {
         // landing contract).
         let worker_name = self.disp.catalog.name.clone();
         let worker_doc = self.disp.catalog.comment.clone().unwrap_or_default();
-        let (server, disp) = self.build_parts();
+        #[cfg(feature = "transport-http")]
+        let explicit_authenticate = self.authenticate.clone();
+        let (server, disp) = self.build_parts(transport_from_args(&args));
         let server = Arc::new(server);
 
         let iroh_bridge = args
@@ -423,7 +624,7 @@ impl Worker {
                 if explicit_bind {
                     crate::transport::serve_http_behind_iroh_at(
                         server,
-                        build_authenticate(),
+                        explicit_authenticate.clone().or_else(build_authenticate),
                         Some(info),
                         bridge,
                         host,
@@ -432,7 +633,7 @@ impl Worker {
                 } else {
                     crate::transport::serve_http_behind_iroh(
                         server,
-                        build_authenticate(),
+                        explicit_authenticate.clone().or_else(build_authenticate),
                         Some(info),
                         bridge,
                     );
@@ -440,13 +641,17 @@ impl Worker {
             } else if explicit_bind {
                 crate::transport::serve_http_at(
                     server,
-                    build_authenticate(),
+                    explicit_authenticate.clone().or_else(build_authenticate),
                     Some(info),
                     host,
                     port,
                 );
             } else {
-                crate::transport::serve_http(server, build_authenticate(), Some(info));
+                crate::transport::serve_http(
+                    server,
+                    explicit_authenticate.clone().or_else(build_authenticate),
+                    Some(info),
+                );
             }
             return;
         }
@@ -517,8 +722,126 @@ impl Worker {
     /// Serve the worker's RPC protocol over an arbitrary byte stream (used by the
     /// SAB transport and native tests). Blocking; consumes the worker.
     pub fn serve_reader_writer<R: std::io::Read, W: std::io::Write>(self, mut r: R, mut w: W) {
-        let (server, _disp) = self.build_parts();
+        let (server, _disp) = self.build_parts(ServeTransport::Pipe);
         std::sync::Arc::new(server).serve(&mut r, &mut w);
+    }
+}
+
+/// How [`Worker::hosted_protocols`] is named in startup errors.
+const HOOK_NAME: &str = "Worker::hosted_protocols hook";
+
+/// Check the hook's protocols before the server sees them, so an error names
+/// the hook to fix rather than only a protocol. vgi-rpc checks these too.
+fn validated_hosted_protocols(protocols: Vec<HostedProtocol>) -> Vec<HostedProtocol> {
+    let mut seen = std::collections::HashSet::new();
+    for (index, protocol) in protocols.iter().enumerate() {
+        let name = protocol.name();
+        if name.starts_with(vgi_rpc::binding::RESERVED_PROTOCOL_PREFIX) {
+            panic!(
+                "{HOOK_NAME}: entry {index} is named {name:?}, which claims the reserved \
+                 {:?} prefix. Framework protocols are not supplied through this hook: \
+                 reflection is hosted automatically, and vgi_rpc.Identity.v1 is enabled with \
+                 Worker::resolve_token and/or Worker::mint_grant.",
+                vgi_rpc::binding::RESERVED_PROTOCOL_PREFIX
+            );
+        }
+        if let Err(err) = vgi_rpc::binding::validate_protocol_name(name, false) {
+            panic!("{HOOK_NAME}: entry {index}: {err}");
+        }
+        if name == VGI_PROTOCOL_NAME {
+            panic!(
+                "{HOOK_NAME}: entry {index} is named {name:?}, the worker's own protocol. \
+                 Give it a distinct name."
+            );
+        }
+        if !seen.insert(name.to_string()) {
+            panic!(
+                "{HOOK_NAME}: protocol name {name:?} is listed twice. The name is the \
+                 routing key, so each hosted protocol needs a distinct one."
+            );
+        }
+    }
+    protocols
+}
+
+/// Build `vgi_rpc.Identity.v1`, or `None` when the worker set neither hook --
+/// in which case the protocol is not hosted at all. Absent beats
+/// routed-and-refusing: it is what keeps a dependency upgrade from growing a
+/// credential-to-identity oracle on every existing worker.
+fn build_identity(
+    resolve: Option<vgi_rpc::token_identity::TokenResolver>,
+    mint: Option<vgi_rpc::token_identity::GrantMinter>,
+    explicit_principals: Option<Vec<String>>,
+) -> Option<IdentityImpl> {
+    if resolve.is_none() && mint.is_none() {
+        return None;
+    }
+    let mut builder = IdentityImpl::builder();
+    if let Some(resolve) = resolve {
+        // Only introspection needs an allowlist: a worker that mints but
+        // resolves nothing is not an oracle.
+        builder = builder.resolve_token(resolve).introspect_principals(
+            resolve_introspect_principals(explicit_principals).unwrap_or_else(|message| {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }),
+        );
+    }
+    if let Some(mint) = mint {
+        builder = builder.mint_grant(mint);
+    }
+    Some(builder.build())
+}
+
+/// The introspector allowlist, or the actionable message the worker exits
+/// with.
+///
+/// Fail-closed and loud rather than defaulting to "any authenticated caller":
+/// a worker that implements `resolve_token` and forgets the allowlist must not
+/// start.
+fn resolve_introspect_principals(explicit: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    let principals: Vec<String> = match explicit {
+        Some(list) => list,
+        None => std::env::var(INTROSPECT_PRINCIPALS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+    }
+    .into_iter()
+    .map(|p| p.trim().to_string())
+    .filter(|p| !p.is_empty())
+    .collect();
+    if principals.is_empty() {
+        return Err(format!(
+            "Error: this worker sets Worker::resolve_token, which hosts the\n  \
+             vgi_rpc.Identity.v1 protocol, but no introspector allowlist was\n  \
+             configured. Set {INTROSPECT_PRINCIPALS_ENV} (comma-separated) or call\n  \
+             Worker::introspect_principals.\n\n  \
+             There is no permissive default on purpose: introspection is a\n  \
+             separate capability from authentication, and allowing every\n  \
+             authenticated caller lets any user resolve any other user's\n  \
+             credential to its owner. Remove resolve_token to leave the\n  \
+             protocol unhosted entirely."
+        ));
+    }
+    Ok(principals)
+}
+
+/// The transport `run` will serve, decided before the server is built so the
+/// one build path knows whether to host identity.
+fn transport_from_args(args: &[String]) -> ServeTransport {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if cfg!(feature = "transport-http") && has("--http") {
+        ServeTransport::Http
+    } else if has("--iroh-raw-upstream") {
+        ServeTransport::Iroh
+    } else if has("--tcp") {
+        ServeTransport::Tcp
+    } else if has("--unix") {
+        ServeTransport::Unix
+    } else {
+        ServeTransport::Pipe
     }
 }
 
@@ -648,4 +971,113 @@ fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
         ));
     }
     None
+}
+
+#[cfg(test)]
+mod hosting_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vgi_rpc::MethodInfo;
+
+    fn ping(name: &str) -> HostedProtocol {
+        HostedProtocol::new(name).with_method(MethodInfo::unary(
+            "ping",
+            Arc::new(arrow_schema::Schema::empty()),
+            Arc::new(arrow_schema::Schema::empty()),
+            |_req, _ctx| Ok(None),
+        ))
+    }
+
+    fn opted_in() -> Worker {
+        let mut worker = Worker::new();
+        worker.resolve_token(|_token| Ok(None));
+        worker.introspect_principals(["proxy"]);
+        worker
+    }
+
+    #[test]
+    fn the_hook_is_called_once_and_hosted_after_vgi_v2() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut worker = Worker::new();
+        worker.hosted_protocols(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            vec![ping("example.A.v1"), ping("example.B.v1")]
+        });
+        let server = worker.build_server_for(ServeTransport::Unix);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let names = server.hosted_protocol_names();
+        assert_eq!(names[..3], ["vgi.v2", "example.A.v1", "example.B.v1"]);
+        assert!(names.contains(&vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME));
+    }
+
+    #[test]
+    #[should_panic(expected = "Worker::hosted_protocols hook: entry 0")]
+    fn a_reserved_name_is_refused_naming_the_hook() {
+        let mut worker = Worker::new();
+        worker.hosted_protocols(|| vec![ping("vgi_rpc.Reflection.v1")]);
+        let _ = worker.build_server();
+    }
+
+    #[test]
+    #[should_panic(expected = "the worker's own protocol")]
+    fn the_primary_name_is_refused() {
+        let mut worker = Worker::new();
+        worker.hosted_protocols(|| vec![ping(VGI_PROTOCOL_NAME)]);
+        let _ = worker.build_server();
+    }
+
+    #[test]
+    #[should_panic(expected = "listed twice")]
+    fn a_repeated_name_is_refused() {
+        let mut worker = Worker::new();
+        worker.hosted_protocols(|| vec![ping("example.A.v1"), ping("example.A.v1")]);
+        let _ = worker.build_server();
+    }
+
+    #[test]
+    fn identity_is_hosted_on_http_only_and_only_when_opted_in() {
+        let identity = vgi_rpc::token_identity::IDENTITY_PROTOCOL_NAME;
+        assert!(opted_in()
+            .build_server_for(ServeTransport::Http)
+            .hosted_protocol_names()
+            .contains(&identity));
+        for transport in [
+            ServeTransport::Pipe,
+            ServeTransport::Unix,
+            ServeTransport::Tcp,
+            ServeTransport::Iroh,
+        ] {
+            assert!(!opted_in()
+                .build_server_for(transport)
+                .hosted_protocol_names()
+                .contains(&identity));
+        }
+        assert!(!Worker::new()
+            .build_server_for(ServeTransport::Http)
+            .hosted_protocol_names()
+            .contains(&identity));
+    }
+
+    #[test]
+    fn a_minter_alone_needs_no_allowlist() {
+        let mut worker = Worker::new();
+        worker.mint_grant(|_p, _purpose, _s, _t| Err(vgi_rpc::token_identity::grant_refused("no")));
+        let server = worker.build_server_for(ServeTransport::Http);
+        assert!(server
+            .hosted_protocol_names()
+            .contains(&vgi_rpc::token_identity::IDENTITY_PROTOCOL_NAME));
+    }
+
+    /// Introspection without an allowlist refuses to start: an explicit empty
+    /// list and blank entries do not count as one.
+    #[test]
+    fn introspection_without_an_allowlist_refuses() {
+        let err = resolve_introspect_principals(Some(vec![" ".into(), String::new()])).unwrap_err();
+        assert!(err.contains("VGI_INTROSPECT_PRINCIPALS"), "{err}");
+        assert_eq!(
+            resolve_introspect_principals(Some(vec![" proxy ".into()])).unwrap(),
+            ["proxy"]
+        );
+    }
 }

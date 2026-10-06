@@ -165,6 +165,10 @@ fn frame(batch: &RecordBatch, method: &str) -> Vec<u8> {
     let md = std::collections::HashMap::<String, String>::from([
         (RPC_METHOD_KEY.to_string(), method.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+        (
+            vgi_rpc::metadata::PROTOCOL_VERSION_KEY.to_string(),
+            vgi_protocol::VGI_PROTOCOL_VERSION.to_string(),
+        ),
         (REQUEST_ID_KEY.to_string(), "test".to_string()),
     ]);
     let schema = batch.schema();
@@ -178,7 +182,11 @@ fn frame(batch: &RecordBatch, method: &str) -> Vec<u8> {
 }
 
 fn post(port: u16, path: &str, body: Vec<u8>) -> Vec<u8> {
-    let url = format!("http://127.0.0.1:{port}/{path}");
+    // Every RPC path names its protocol: `{protocol}/{method}[/init|/exchange]`.
+    let url = format!(
+        "http://127.0.0.1:{port}/{}/{path}",
+        vgi_protocol::VGI_PROTOCOL_NAME
+    );
     match ureq::post(&url)
         .header("Content-Type", ARROW_CONTENT_TYPE)
         .send(&body[..])

@@ -58,6 +58,79 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # vgi-rpc's hosted-protocols group against the example fixture worker
+  # (MULTI_PROTOCOL_HOSTING.md §5/§7): reflection lists `vgi.v2` then
+  # `conformance.Secondary.v1` -- deliberately non-alphabetical, so a server
+  # that sorts its listing fails -- the secondary passes the routing,
+  # error-model and traceback groups, and over HTTP the fixture's opted-in
+  # `vgi_rpc.Identity.v1` passes the identity groups. Run on every transport
+  # the worker serves.
+  #
+  # The suite comes from vgi-rpc-python `main`, unpinned by design (the same
+  # pattern as vgi-rpc-rust's conformance job): a coordinated protocol change
+  # must be verifiable before either side is published.
+  hosted-protocols:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the vgi-rpc-python conformance suite
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi-rpc-python
+          path: vgi-rpc-python
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the hosted-protocols runner
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "./vgi-rpc-python[http,conformance]" pytest pytest-timeout
+
+      - name: Build the example worker
+        run: cargo build -p vgi-example-worker
+
+      - name: Hosted protocols over stdio
+        run: >-
+          vgi-rpc-test-hosted --cmd "$GITHUB_WORKSPACE/target/debug/vgi-example-worker"
+          --expect vgi.v2,conformance.Secondary.v1
+
+      - name: Hosted protocols over a unix socket
+        shell: bash
+        run: |
+          set -euo pipefail
+          sock=/tmp/vgi-hosted.sock
+          rm -f "$sock"
+          target/debug/vgi-example-worker --unix "$sock" --idle-timeout 600 > unix.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.1; done
+          [ -S "$sock" ] || { cat unix.log; exit 1; }
+          vgi-rpc-test-hosted --unix "$sock" --expect vgi.v2,conformance.Secondary.v1
+
+      - name: Hosted protocols over HTTP, with Identity opted in
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/vgi-example-worker --http --identity > http.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          port=""
+          for _ in $(seq 100); do
+            port="$(sed -n 's/.*PORT:\([0-9]*\).*/\1/p' http.log | head -1)"
+            [ -n "$port" ] && break
+            sleep 0.1
+          done
+          [ -n "$port" ] || { cat http.log; exit 1; }
+          vgi-rpc-test-hosted --url "http://127.0.0.1:$port" \
+            --expect vgi.v2,conformance.Secondary.v1 --identity
+
   # Feature hygiene for the crates with optional features. Each crate is linted
   # on its own (no workspace feature unification) with no default features,
   # its defaults, each optional feature alone, and all features — so a test or

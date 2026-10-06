@@ -167,6 +167,10 @@ fn frame(batch: &RecordBatch, method: &str, state_token: Option<&str>) -> Vec<u8
     let mut md = std::collections::HashMap::<String, String>::from([
         (RPC_METHOD_KEY.to_string(), method.to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+        (
+            vgi_rpc::metadata::PROTOCOL_VERSION_KEY.to_string(),
+            vgi_protocol::VGI_PROTOCOL_VERSION.to_string(),
+        ),
         (REQUEST_ID_KEY.to_string(), "test".to_string()),
     ]);
     if let Some(t) = state_token {
@@ -282,7 +286,7 @@ fn join_key_filter_named(values: &[i64], column_name: &str) -> (Vec<u8>, Vec<Vec
                 ),
             ]
             .into_iter()
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
         ),
     );
     let filter = RecordBatch::try_new(
@@ -297,7 +301,7 @@ fn join_key_filter_named(values: &[i64], column_name: &str) -> (Vec<u8>, Vec<Vec
         Schema::new(vec![Field::new("n", DataType::Int64, true)]).with_metadata(
             [("vgi_join_keys_version".to_string(), "2".to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         ),
     );
     let keys = RecordBatch::try_new(
@@ -327,6 +331,10 @@ fn exchange_body_with_call(token: &str, call_state: Option<&str>) -> Vec<u8> {
     let mut md = std::collections::HashMap::<String, String>::from([
         (RPC_METHOD_KEY.to_string(), "init".to_string()),
         (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+        (
+            vgi_rpc::metadata::PROTOCOL_VERSION_KEY.to_string(),
+            vgi_protocol::VGI_PROTOCOL_VERSION.to_string(),
+        ),
         (REQUEST_ID_KEY.to_string(), "test".to_string()),
         (STATE_KEY.to_string(), token.to_string()),
     ]);
@@ -343,7 +351,11 @@ fn exchange_body_with_call(token: &str, call_state: Option<&str>) -> Vec<u8> {
 }
 
 fn post(port: u16, path: &str, body: Vec<u8>) -> Vec<u8> {
-    let url = format!("http://127.0.0.1:{port}/{path}");
+    // Every RPC path names its protocol: `{protocol}/{method}[/init|/exchange]`.
+    let url = format!(
+        "http://127.0.0.1:{port}/{}/{path}",
+        vgi_protocol::VGI_PROTOCOL_NAME
+    );
     match ureq::post(&url)
         .header("Content-Type", ARROW_CONTENT_TYPE)
         .send(&body[..])
@@ -1396,7 +1408,7 @@ fn filter_document(json: &str, values: &[i64]) -> Vec<u8> {
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+    .collect::<std::collections::HashMap<String, String>>();
     let schema = Arc::new(Schema::new(fields).with_metadata(metadata));
     ipc::write_batch(&RecordBatch::try_new(schema, arrays).unwrap()).unwrap()
 }
@@ -1532,6 +1544,10 @@ impl EchoStream {
         let mut md = std::collections::HashMap::<String, String>::from([
             (RPC_METHOD_KEY.to_string(), "init".to_string()),
             (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+            (
+                vgi_rpc::metadata::PROTOCOL_VERSION_KEY.to_string(),
+                vgi_protocol::VGI_PROTOCOL_VERSION.to_string(),
+            ),
             (REQUEST_ID_KEY.to_string(), "test".to_string()),
             (STATE_KEY.to_string(), self.token.clone()),
         ]);

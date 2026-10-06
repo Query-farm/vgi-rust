@@ -1247,7 +1247,7 @@ fn parse_context(schema: &Schema) -> Result<EvaluationContext> {
         "vgi_integer_division",
     ];
     if profile == NO_CONTEXT {
-        if keys.iter().any(|key| metadata.contains_key(*key))
+        if keys.iter().any(|key| metadata.contains_key(key))
             || metadata.contains_key("vgi_context_provider_fingerprint")
         {
             return Err(value_error("vgi.none.v1 forbids session context metadata"));

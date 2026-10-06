@@ -606,16 +606,10 @@ impl VgiClient {
     pub fn connect_httpi_with_options(target: &str, options: IrohHttpOptions) -> Result<Self> {
         use crate::transport::HttpTransport;
         let worker_logs = WorkerLogRouter::default();
-        // NOTE: the `vgi_rpc.protocol` routing key is NOT bound here, unlike
-        // every other transport, because vgi-rpc-client 0.25.0's
-        // `HttpiClientBuilder` forwards `protocol_version` to the inner
-        // `HttpClientBuilder` but has no `protocol` forwarder, and the inner
-        // builder is a private field. Since 0.25.0 makes the routing key
-        // mandatory server-side, this lane is refused with "Request carries no
-        // 'vgi_rpc.protocol' routing key" until the forwarder is added
-        // upstream. Add `.protocol(vgi_protocol::VGI_PROTOCOL_NAME)` here the
-        // moment it exists.
+        // Bound like every other transport: each request names `vgi.v2` in
+        // its routing key and URL path (`HttpiClientBuilder::protocol`).
         let mut builder = vgi_rpc_client::HttpClient::connect_httpi(target)?
+            .protocol(vgi_protocol::VGI_PROTOCOL_NAME)
             .protocol_version(vgi_protocol::VGI_PROTOCOL_VERSION)
             .on_log(worker_logs.callback())
             .connect_timeout(options.connect_timeout)

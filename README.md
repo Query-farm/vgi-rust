@@ -179,6 +179,11 @@ SELECT external_db.main.transform(col) FROM t;   -- a function
 (`--unix <path>`, the launcher contract), or **HTTP** (`--http`, Arrow-IPC over
 HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
+Every transport hosts `vgi.v2`, `vgi_rpc.Reflection.v1`, and any protocols the
+worker adds with `Worker::hosted_protocols`; HTTP additionally hosts
+`vgi_rpc.Identity.v1` when the worker sets `Worker::resolve_token` and/or
+`Worker::mint_grant`. See [docs/hosted-protocols.md](docs/hosted-protocols.md).
+
 ## Protocol overview
 
 VGI uses [`vgi-rpc`](https://crates.io/crates/vgi-rpc), an Apache-Arrow-IPC RPC

@@ -181,4 +181,4 @@ pub use function::{
     ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FunctionExample, FunctionMetadata,
     ProcessParams, ScalarFunction,
 };
-pub use worker::Worker;
+pub use worker::{HostedProtocolsHook, ServeTransport, Worker, INTROSPECT_PRINCIPALS_ENV};
