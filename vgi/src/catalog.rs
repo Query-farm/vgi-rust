@@ -918,6 +918,26 @@ pub struct CatalogModel {
     /// entry when the client publishes it (e.g. `vgi_example` →
     /// `vgi_example_global_scalar`). Empty when the catalog publishes none.
     pub global_function_prefix: String,
+    /// The catalog author's `catalog_contents` hook: receives the client's
+    /// `if_none_match` and returns the snapshot plus an etag, or "not
+    /// modified" (see [`crate::catalog_contents`]). `None`: the framework builds
+    /// the snapshot and returns no etag.
+    pub contents_provider:
+        Option<std::sync::Arc<dyn crate::catalog_contents::CatalogContentsProvider>>,
+    /// Opt-in framework etag for `catalog_contents`
+    /// ([`CatalogContentsEtag::ContentHash`](crate::catalog_contents::CatalogContentsEtag::ContentHash)):
+    /// when the catalog returns no etag of its own, the SHA-256 of the snapshot.
+    /// Off by default.
+    pub catalog_contents_etag: crate::catalog_contents::CatalogContentsEtag,
+    /// Whether this catalog's `catalog_contents` depends on nothing but the
+    /// worker's registrations: not on the attach (its options, data version or
+    /// session) nor on the caller. Lets the dispatcher build the response once
+    /// and serve the same encoded batch to every call until a registration
+    /// changes what it serves (vgi-python: `catalog_contents_attach_independent`
+    /// together with a frozen catalog version; a declarative catalog's version
+    /// never changes while it serves). Ignored for a version-shaped catalog
+    /// (`version_schemas`), whose objects vary per attach. Off by default.
+    pub catalog_contents_attach_independent: bool,
 }
 
 impl CatalogModel {

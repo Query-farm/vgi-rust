@@ -121,8 +121,8 @@ pub use vgi_protocol::protocol::dtos;
 /// The catalog DTOs a caller handles by name, lifted out of [`dtos`] so the
 /// common ones need no module path.
 pub use vgi_protocol::protocol::dtos::{
-    PartitionTransform, ScanBranch, ScanBranchesResult, ScanFunctionResult, SchemaContents,
-    SortField, TableInfo,
+    CatalogContentsResponse, PartitionTransform, ScanBranch, ScanBranchesResult,
+    ScanFunctionResult, SchemaContents, SortField, TableInfo,
 };
 
 /// An opaque wire blob — a worker handle, or arguments it already encoded.

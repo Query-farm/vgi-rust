@@ -409,11 +409,15 @@ fn catalog_contents_matches_the_per_schema_calls() {
         "the example worker advertises catalog_contents"
     );
 
-    let (version, contents) = client.contents_response(&cat).expect("catalog_contents");
+    let resp = client
+        .contents_response(&cat, None)
+        .expect("catalog_contents");
+    assert!(!resp.not_modified);
     assert_eq!(
-        version,
+        resp.catalog_version,
         client.catalog_version(&cat).expect("catalog_version")
     );
+    let contents = resp.schemas;
 
     let listed = client.schemas(&cat).expect("catalog_schemas");
     let bulk_schemas: Vec<SchemaInfo> = decode_item_blobs(
@@ -485,6 +489,48 @@ fn catalog_contents_matches_the_per_schema_calls() {
         total += tables.len() + views.len();
     }
     assert!(total > 0, "the example catalog is not empty");
+
+    client.detach(&cat).expect("detach");
+}
+
+/// `catalog_contents` revalidation against the example worker, whose catalog
+/// returns a generation-counter etag: asking with that etag is `not_modified`
+/// (no schemas, same etag); any other etag gets the full snapshot again.
+#[test]
+fn catalog_contents_revalidates_with_its_etag() {
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let full = client
+        .contents_response(&cat, None)
+        .expect("catalog_contents");
+    // `VGI_CATALOG_CONTENTS_ETAG=none` runs the worker without an etag.
+    let Some(etag) = full.etag.clone() else {
+        let again = client
+            .contents_response(&cat, Some("whatever"))
+            .expect("catalog_contents");
+        assert!(!again.not_modified, "no etag: if_none_match is ignored");
+        assert_eq!(again.schemas.len(), full.schemas.len());
+        return;
+    };
+    assert!(!full.schemas.is_empty());
+
+    let same = client
+        .contents_response(&cat, Some(&etag))
+        .expect("conditional catalog_contents");
+    assert!(same.not_modified);
+    assert!(same.schemas.is_empty());
+    assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
+    assert_eq!(same.catalog_version, full.catalog_version);
+
+    let other = client
+        .contents_response(&cat, Some("not-the-current-etag"))
+        .expect("catalog_contents");
+    assert!(!other.not_modified);
+    assert_eq!(other.etag.as_deref(), Some(etag.as_str()));
+    assert_eq!(other.schemas.len(), full.schemas.len());
 
     client.detach(&cat).expect("detach");
 }

@@ -1243,6 +1243,11 @@ pub fn versioned() -> CatalogModel {
         version_schemas: std::collections::HashMap::new(),
         global_functions: Vec::new(),
         global_function_prefix: String::new(),
+        // catalog_contents revalidation is configured by main.rs
+        // (contents_reval::configure) for the catalog actually served.
+        contents_provider: None,
+        catalog_contents_etag: Default::default(),
+        catalog_contents_attach_independent: false,
         comment: Some(
             "Example catalog demonstrating data_version_spec validation and cookie stickiness"
                 .to_string(),
@@ -1336,6 +1341,11 @@ pub fn versioned_tables() -> CatalogModel {
         version_schemas,
         global_functions: Vec::new(),
         global_function_prefix: String::new(),
+        // catalog_contents revalidation is configured by main.rs
+        // (contents_reval::configure) for the catalog actually served.
+        contents_provider: None,
+        catalog_contents_etag: Default::default(),
+        catalog_contents_attach_independent: false,
         comment: Some(
             "Catalog whose visible tables depend on the resolved data version".to_string(),
         ),
@@ -1377,6 +1387,11 @@ pub fn build() -> CatalogModel {
         // vgi_example_global_table, vgi_example_global_agg,
         // vgi_example_global_buffered.
         global_function_prefix: crate::global_functions::PREFIX.to_string(),
+        // catalog_contents revalidation is configured by main.rs
+        // (contents_reval::configure) for the catalog actually served.
+        contents_provider: None,
+        catalog_contents_etag: Default::default(),
+        catalog_contents_attach_independent: false,
         global_functions: crate::global_functions::NAMES
             .iter()
             .map(|s| s.to_string())

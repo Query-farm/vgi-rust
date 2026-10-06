@@ -645,35 +645,63 @@ impl VgiClient {
     /// children. Read with no transaction: the result is the committed catalog
     /// at `catalog_version`.
     pub fn contents(&mut self, cat: &AttachedCatalog) -> Result<Vec<SchemaContents>> {
-        Ok(self.contents_response(cat)?.1)
+        Ok(self.contents_response(cat, None)?.schemas)
     }
 
-    /// [`Self::contents`] plus the `catalog_version` the snapshot was taken at.
+    /// The whole `catalog_contents` response: the snapshot plus the
+    /// `catalog_version` it was taken at and its `etag`, the worker's validator
+    /// for it (`None` when the worker does not revalidate).
+    ///
+    /// `if_none_match` is the etag of a snapshot the caller already holds: when
+    /// it is still current the answer is `not_modified` with no schemas (keep
+    /// what you have); otherwise it is the full, new snapshot. A worker that
+    /// returns no etag ignores it.
+    ///
+    /// Checked on receipt: a `not_modified` answer carries the etag asked about
+    /// and no schemas, and each schema's `path` equals the `SchemaInfo.path`
+    /// inside its `schema` item.
     pub fn contents_response(
         &mut self,
         cat: &AttachedCatalog,
-    ) -> Result<(i64, Vec<SchemaContents>)> {
+        if_none_match: Option<&str>,
+    ) -> Result<CatalogContentsResponse> {
         let resp: CatalogContentsResponse = call(
             self.transport_mut(),
             "catalog_contents",
             p::CatalogContentsParams {
                 attach_opaque_data: cat.handle.clone(),
+                if_none_match: if_none_match.map(str::to_string),
             },
         )?;
-        let schemas = resp
-            .schemas
-            .iter()
-            .enumerate()
-            .map(|(i, blob)| {
-                let batch = vgi_protocol::ipc::read_batch(&blob.0).map_err(|e| {
-                    RpcError::type_error(format!(
-                        "catalog_contents: schemas[{i}] is not a readable IPC batch: {e}"
-                    ))
-                })?;
-                vgi_protocol::wire::from_batch(&batch)
-            })
-            .collect::<Result<_>>()?;
-        Ok((resp.catalog_version, schemas))
+        if resp.not_modified {
+            if resp.etag.is_none() || resp.etag.as_deref() != if_none_match {
+                return Err(RpcError::type_error(format!(
+                    "catalog_contents: not_modified for etag {:?}, but asked about {:?}",
+                    resp.etag, if_none_match
+                )));
+            }
+            if !resp.schemas.is_empty() {
+                return Err(RpcError::type_error(
+                    "catalog_contents: a not_modified response carries schemas",
+                ));
+            }
+            return Ok(resp);
+        }
+        for (i, entry) in resp.schemas.iter().enumerate() {
+            let batch = vgi_protocol::ipc::read_batch(&entry.schema.0).map_err(|e| {
+                RpcError::type_error(format!(
+                    "catalog_contents: schemas[{i}].schema is not a readable IPC batch: {e}"
+                ))
+            })?;
+            let info: SchemaInfo = vgi_protocol::wire::from_batch(&batch)?;
+            if info.path != entry.path {
+                return Err(RpcError::type_error(format!(
+                    "catalog_contents: schemas[{i}].path {:?} differs from its SchemaInfo.path {:?}",
+                    entry.path, info.path
+                )));
+            }
+        }
+        Ok(resp)
     }
 
     /// One schema by name, or `None` when the catalog has no such schema.

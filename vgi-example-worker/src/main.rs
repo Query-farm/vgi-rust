@@ -6,13 +6,16 @@
 //! aggregate / buffering) and serves the catalog named by
 //! `VGI_WORKER_CATALOG_NAME` (default `example`). Transport is selected from
 //! argv: stdio (default) or `--unix <path>` (launcher). `VGI_CATALOG_CONTENTS=0`
-//! stops advertising the `catalog_contents` bulk-load RPC.
+//! stops advertising the `catalog_contents` bulk-load RPC;
+//! `VGI_CATALOG_CONTENTS_ETAG` / `VGI_CATALOG_CONTENTS_CACHE` choose how it
+//! revalidates and whether it is cached (see `contents_reval.rs`).
 
 mod accumulate;
 mod aggregate;
 mod attach_options;
 mod buffering;
 mod catalog_def;
+mod contents_reval;
 mod copy_from;
 mod copy_to;
 #[cfg(feature = "coverage")]
@@ -67,7 +70,7 @@ fn main() {
     if catalog_name == "attach_options" {
         attach_options::register(&mut worker);
     }
-    let catalog = if catalog_name == "attach_options" {
+    let mut catalog = if catalog_name == "attach_options" {
         attach_options::catalog()
     } else {
         catalog_def::build_by_name(&catalog_name)
@@ -107,6 +110,9 @@ fn main() {
         // asked to publish them under `vgi_example_*`.
         global_functions::register(&mut worker);
     }
+    // Revalidating catalog_contents (a generation-counter etag by default);
+    // see contents_reval.rs.
+    contents_reval::configure(&mut catalog);
     worker.set_catalog(catalog);
     run_worker(worker);
 }

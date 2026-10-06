@@ -342,7 +342,32 @@ pub struct Dispatcher {
     /// either way; the flag only tells the client it may call it. See
     /// [`crate::Worker::set_catalog_contents`].
     pub catalog_contents: bool,
+    /// Bumped by every change to what the worker serves (the same events that
+    /// clear [`Self::function_listings`]): the catalog generation a
+    /// [`crate::catalog_contents::CatalogContentsProvider`] may use as a cheap
+    /// etag.
+    catalog_generation: u64,
+    /// Built `catalog_contents` responses of catalogs that declare
+    /// [`catalog::CatalogModel::catalog_contents_attach_independent`], encoded
+    /// once and served to every call; cleared with the function listings.
+    contents_cache: std::sync::Mutex<HashMap<ContentsCacheKey, Arc<CachedContents>>>,
     exec_counter: AtomicU64,
+}
+
+/// Which cached `catalog_contents` response a call is served: the catalog
+/// (`None` = primary, else the index into `secondary`) and whether the attach
+/// is the `projection_repro` app (whose function set differs).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ContentsCacheKey {
+    catalog: Option<usize>,
+    proj_repro: bool,
+}
+
+/// One cached `catalog_contents` answer: its etag and the encoded full
+/// response batch (cloning a `RecordBatch` shares its buffers).
+struct CachedContents {
+    etag: Option<String>,
+    response: RecordBatch,
 }
 
 impl Dispatcher {
@@ -367,6 +392,8 @@ impl Dispatcher {
             copy_to_formats: Vec::new(),
             function_listings: std::sync::Mutex::new(HashMap::new()),
             catalog_contents: true,
+            catalog_generation: 0,
+            contents_cache: std::sync::Mutex::new(HashMap::new()),
             exec_counter: AtomicU64::new(1),
         }
     }
@@ -2644,27 +2671,118 @@ impl Dispatcher {
     }
 
     /// `catalog_contents` — every schema of the request's catalog and all of its
-    /// contents in one result (protocol 2.1.0).
+    /// contents in one result (protocol 2.1.0), or `not_modified` when the
+    /// client's `if_none_match` is still current.
     ///
-    /// Composed from the very producers the per-schema RPCs serve, so each item
-    /// is byte-for-byte what `catalog_schemas` / `catalog_schema_contents_*`
-    /// return: the `SchemaInfo` `catalog_schemas` lists, then tables,
-    /// views, the three function listings, the two macro kinds and indexes. A
-    /// kind the schema's `estimated_object_count` reports as exactly 0 is not
-    /// computed (an empty list — "none of that kind" — is what the per-kind RPC
-    /// would return anyway). Schemas are emitted parents before children. Takes
-    /// no transaction: no listing here depends on one.
+    /// The snapshot is composed from the very producers the per-schema RPCs
+    /// serve, so each item is byte-for-byte what `catalog_schemas` /
+    /// `catalog_schema_contents_*` return (see `build_contents`). The
+    /// catalog's [`catalog::CatalogModel::contents_provider`] (if any) answers
+    /// first and may short-circuit before anything is built; its answer, the
+    /// opt-in content-hash etag and the wire rules are applied by
+    /// [`crate::catalog_contents::finish`]. A catalog declaring
+    /// `catalog_contents_attach_independent` is built once and its encoded
+    /// response reused. Takes no transaction: no listing here depends on one.
     pub fn handle_catalog_contents(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let if_none_match = read_opt_string_col(req, "if_none_match");
+        let cat = self.active_catalog(req);
+        if let Some(key) = self.contents_cache_key(req, cat) {
+            let cached = self.cached_contents(req, key)?;
+            if let (Some(etag), Some(inm)) = (&cached.etag, &if_none_match) {
+                if etag == inm {
+                    return Ok(Some(wire::to_result_batch(CatalogContentsResponse {
+                        catalog_version: Self::CATALOG_VERSION,
+                        etag: Some(etag.clone()),
+                        not_modified: true,
+                        schemas: Vec::new(),
+                    })?));
+                }
+            }
+            return Ok(Some(cached.response.clone()));
+        }
         Ok(Some(wire::to_result_batch(
-            self.catalog_contents_response(req)?,
+            self.catalog_contents_response(req, if_none_match.as_deref())?,
         )?))
     }
 
+    /// The cache slot a `catalog_contents` call may be served from, or `None`
+    /// when its catalog has not declared its contents attach-independent (or
+    /// is version-shaped, so they cannot be).
+    fn contents_cache_key(
+        &self,
+        req: &Request,
+        cat: &catalog::CatalogModel,
+    ) -> Option<ContentsCacheKey> {
+        if !cat.catalog_contents_attach_independent || !cat.version_schemas.is_empty() {
+            return None;
+        }
+        Some(ContentsCacheKey {
+            catalog: self.secondary.iter().position(|c| std::ptr::eq(c, cat)),
+            proj_repro: read_binary_col(req, "attach_opaque_data")
+                .map(|b| b == PROJ_REPRO_APP.as_bytes())
+                .unwrap_or(false),
+        })
+    }
+
+    /// The cached full response for `key`, built (with no `if_none_match`, so
+    /// it is the full answer) on first use. Concurrent first calls may both
+    /// build it; whichever lands first is kept.
+    fn cached_contents(&self, req: &Request, key: ContentsCacheKey) -> Result<Arc<CachedContents>> {
+        let lock = || {
+            self.contents_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(hit) = lock().get(&key) {
+            return Ok(hit.clone());
+        }
+        let built = self.catalog_contents_response(req, None)?;
+        let cached = Arc::new(CachedContents {
+            etag: built.etag.clone(),
+            response: wire::to_result_batch(built)?,
+        });
+        Ok(lock().entry(key).or_insert(cached).clone())
+    }
+
+    /// Ask the request's catalog for its contents (its provider, or the
+    /// default build) and shape the typed wire response.
     pub(crate) fn catalog_contents_response(
         &self,
         req: &Request,
+        if_none_match: Option<&str>,
     ) -> Result<CatalogContentsResponse> {
+        use crate::catalog_contents::{finish, CatalogContentsRequest};
         let cat = self.active_catalog(req);
+        let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+        let build = || self.build_contents(req, cat);
+        let request = CatalogContentsRequest {
+            attach_opaque_data: &attach,
+            if_none_match,
+            catalog_version: Self::CATALOG_VERSION,
+            generation: self.catalog_generation,
+            build: &build,
+        };
+        let result = match &cat.contents_provider {
+            Some(provider) => provider.catalog_contents(&request)?,
+            None => request.default_contents()?,
+        };
+        finish(
+            result,
+            if_none_match,
+            Self::CATALOG_VERSION,
+            cat.catalog_contents_etag,
+        )
+    }
+
+    /// Every schema of `cat` and all of its contents, parents first. Each kind
+    /// is what the matching per-schema RPC answers; a kind the schema's
+    /// `estimated_object_count` reports as exactly 0 is not computed (an empty
+    /// list — "none of that kind" — is what that RPC would return anyway).
+    fn build_contents(
+        &self,
+        req: &Request,
+        cat: &catalog::CatalogModel,
+    ) -> Result<Vec<SchemaContents>> {
         let mut paths = Self::catalog_schema_paths(cat);
         // Parent-before-child (a stable sort keeps `catalog_schemas` order
         // among siblings).
@@ -2685,7 +2803,8 @@ impl Dispatcher {
             let schema = catalog::serialize_items(vec![info])?
                 .pop()
                 .ok_or_else(|| RpcError::runtime_error("SchemaInfo did not serialize"))?;
-            let contents = SchemaContents {
+            schemas.push(SchemaContents {
+                path: path.clone(),
                 schema,
                 tables: kind(has("table"), &|| self.table_items(req, path))?,
                 views: kind(has("view"), &|| self.view_items(req, path))?,
@@ -2704,13 +2823,9 @@ impl Dispatcher {
                 table_macros: kind(has("macro"), &|| self.macro_items(req, path, "TABLE_MACRO"))?,
                 // `catalog_schema_contents_indexes` serves no indexes.
                 indexes: Vec::new(),
-            };
-            schemas.extend(catalog::serialize_items(vec![contents])?);
+            });
         }
-        Ok(CatalogContentsResponse {
-            catalog_version: Self::CATALOG_VERSION,
-            schemas,
-        })
+        Ok(schemas)
     }
 
     pub fn handle_table_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -3487,6 +3602,12 @@ impl Dispatcher {
     fn function_listings_changed(&mut self) {
         match self.function_listings.get_mut() {
             Ok(listings) => listings.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        // What `catalog_contents` serves changed with it.
+        self.catalog_generation += 1;
+        match self.contents_cache.get_mut() {
+            Ok(cache) => cache.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
     }
@@ -5870,6 +5991,10 @@ mod catalog_contents_tests {
     //! decoders and fills one set of caches.
 
     use super::*;
+    use crate::catalog_contents::{
+        catalog_contents_digest, CatalogContentsEtag, CatalogContentsProvider,
+        CatalogContentsRequest, CatalogContentsResult,
+    };
     use crate::function::{ArgSpec, FunctionMetadata};
     use arrow_schema::{DataType, Field, Schema};
     use vgi_protocol::generated::request_params as p;
@@ -6013,15 +6138,22 @@ mod catalog_contents_tests {
     }
 
     fn contents(d: &Dispatcher) -> CatalogContentsResponse {
+        contents_if(d, None).unwrap()
+    }
+
+    /// `catalog_contents` with an `if_none_match`.
+    fn contents_if(d: &Dispatcher, if_none_match: Option<&str>) -> Result<CatalogContentsResponse> {
+        let result = d.handle_catalog_contents(&contents_request(d, if_none_match))?;
+        Ok(wire::from_batch(&inner(result.unwrap())).unwrap())
+    }
+
+    fn contents_request(d: &Dispatcher, if_none_match: Option<&str>) -> Request {
         let batch = wire::to_batch(p::CatalogContentsParams {
             attach_opaque_data: Bytes::from(d.attach_bytes()),
+            if_none_match: if_none_match.map(str::to_string),
         })
         .unwrap();
-        let result = d
-            .handle_catalog_contents(&request("catalog_contents", batch))
-            .unwrap()
-            .unwrap();
-        wire::from_batch(&inner(result)).unwrap()
+        request("catalog_contents", batch)
     }
 
     /// Everything the per-schema RPCs answer for one schema, in
@@ -6086,12 +6218,18 @@ mod catalog_contents_tests {
         let paths: Vec<Vec<String>> = resp
             .schemas
             .iter()
-            .map(|b| decode::<SchemaInfo>(&decode::<SchemaContents>(b).schema).path)
+            .map(|sc| decode::<SchemaInfo>(&sc.schema).path)
             .collect();
         assert_eq!(
             paths,
             [path(&["data"]), path(&["main"]), path(&["data", "deep"])]
         );
+        // The struct's `path` names the schema without decoding SchemaInfo.
+        let named: Vec<Vec<String>> = resp.schemas.iter().map(|sc| sc.path.clone()).collect();
+        assert_eq!(named, paths);
+        // No provider and no content hash: no etag, never not_modified.
+        assert_eq!(resp.etag, None);
+        assert!(!resp.not_modified);
     }
 
     #[test]
@@ -6106,7 +6244,7 @@ mod catalog_contents_tests {
         let mut bulk: Vec<Bytes> = contents(&d)
             .schemas
             .iter()
-            .map(|b| decode::<SchemaContents>(b).schema)
+            .map(|sc| sc.schema.clone())
             .collect();
         assert_eq!(
             bulk.len(),
@@ -6122,8 +6260,7 @@ mod catalog_contents_tests {
     fn every_kind_equals_its_per_schema_rpc_byte_for_byte() {
         let d = dispatcher();
         let mut non_empty = 0;
-        for blob in &contents(&d).schemas {
-            let sc: SchemaContents = decode(blob);
+        for sc in &contents(&d).schemas {
             let path = decode::<SchemaInfo>(&sc.schema).path;
             let bulk = [
                 &sc.tables,
@@ -6169,10 +6306,179 @@ mod catalog_contents_tests {
     /// ordered `Vec` of pairs.
     #[test]
     fn items_encode_deterministically() {
-        let first = contents(&dispatcher()).schemas;
+        let first = catalog_contents_digest(&contents(&dispatcher()).schemas);
         for _ in 0..8 {
-            assert_eq!(contents(&dispatcher()).schemas, first);
+            assert_eq!(
+                catalog_contents_digest(&contents(&dispatcher()).schemas),
+                first
+            );
         }
+    }
+
+    /// The default (no provider, no content hash) has no etag, so it ignores
+    /// `if_none_match` and always answers in full.
+    #[test]
+    fn without_an_etag_if_none_match_is_ignored() {
+        let d = dispatcher();
+        let resp = contents_if(&d, Some("anything")).unwrap();
+        assert!(!resp.not_modified);
+        assert_eq!(resp.etag, None);
+        assert_eq!(resp.schemas.len(), 3);
+    }
+
+    /// A generation-counter provider that counts how often it builds.
+    struct Reval(Arc<std::sync::atomic::AtomicUsize>);
+    impl CatalogContentsProvider for Reval {
+        fn catalog_contents(
+            &self,
+            req: &CatalogContentsRequest<'_>,
+        ) -> Result<CatalogContentsResult> {
+            let etag = format!("gen-{}", req.generation());
+            if req.if_none_match() == Some(etag.as_str()) {
+                return Ok(CatalogContentsResult::not_modified(etag));
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(CatalogContentsResult::full(req.build()?, Some(etag)))
+        }
+    }
+
+    fn with_provider(provider: Arc<dyn CatalogContentsProvider>) -> Dispatcher {
+        let mut d = dispatcher();
+        let mut model = d.catalog.clone();
+        model.contents_provider = Some(provider);
+        d.set_catalog(model);
+        d
+    }
+
+    /// A cheap validator short-circuits before anything is built; any other
+    /// etag gets the full snapshot with the current etag.
+    #[test]
+    fn provider_etag_short_circuits_without_building() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = with_provider(Arc::new(Reval(builds.clone())));
+        let full = contents(&d);
+        let etag = full.etag.clone().expect("the provider returns an etag");
+        assert!(!full.not_modified);
+        assert_eq!(full.schemas.len(), 3);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let same = contents_if(&d, Some(&etag)).unwrap();
+        assert!(same.not_modified);
+        assert!(same.schemas.is_empty());
+        assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
+        assert_eq!(same.catalog_version, Dispatcher::CATALOG_VERSION);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "not_modified built nothing"
+        );
+
+        let stale = contents_if(&d, Some("gen-stale")).unwrap();
+        assert!(!stale.not_modified);
+        assert_eq!(stale.etag.as_deref(), Some(etag.as_str()));
+        assert_eq!(stale.schemas.len(), 3);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A registration changes what the worker serves, so the generation — and
+    /// a generation-derived etag — moves with it.
+    #[test]
+    fn registration_moves_the_generation_etag() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = with_provider(Arc::new(Reval(builds)));
+        let before = contents(&d).etag.unwrap();
+        d.register_scalar(Arc::new(Probe("s_later")));
+        let after = contents_if(&d, Some(&before)).unwrap();
+        assert!(
+            !after.not_modified,
+            "the old etag is stale after a registration"
+        );
+        assert_ne!(after.etag.as_deref(), Some(before.as_str()));
+    }
+
+    /// A provider breaking the not_modified rules is refused, not forwarded.
+    #[test]
+    fn provider_not_modified_rules_are_enforced() {
+        struct Liar;
+        impl CatalogContentsProvider for Liar {
+            fn catalog_contents(
+                &self,
+                _: &CatalogContentsRequest<'_>,
+            ) -> Result<CatalogContentsResult> {
+                Ok(CatalogContentsResult::not_modified("always"))
+            }
+        }
+        let d = with_provider(Arc::new(Liar));
+        assert!(contents_if(&d, None).is_err());
+        assert!(contents_if(&d, Some("different")).is_err());
+        assert!(contents_if(&d, Some("always")).unwrap().not_modified);
+    }
+
+    /// Content-hash mode: the etag is the snapshot's SHA-256 — the same from
+    /// independently built dispatchers — and a match is not_modified.
+    #[test]
+    fn content_hash_etag_is_deterministic_and_revalidates() {
+        let hashed = || {
+            let mut d = dispatcher();
+            let mut model = d.catalog.clone();
+            model.catalog_contents_etag = CatalogContentsEtag::ContentHash;
+            d.set_catalog(model);
+            d
+        };
+        let d = hashed();
+        let full = contents(&d);
+        let etag = full.etag.clone().expect("content-hash sets an etag");
+        assert_eq!(etag, catalog_contents_digest(&full.schemas));
+        for _ in 0..4 {
+            assert_eq!(contents(&hashed()).etag.as_deref(), Some(etag.as_str()));
+        }
+        let same = contents_if(&d, Some(&etag)).unwrap();
+        assert!(same.not_modified && same.schemas.is_empty());
+        let other = contents_if(&d, Some("0000")).unwrap();
+        assert!(!other.not_modified);
+        assert_eq!(other.schemas.len(), 3);
+    }
+
+    /// An attach-independent catalog is built once and its encoded response
+    /// reused; a registration drops the cached copy.
+    #[test]
+    fn attach_independent_contents_are_cached() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut d = dispatcher();
+        let mut model = d.catalog.clone();
+        model.contents_provider = Some(Arc::new(Reval(builds.clone())));
+        model.catalog_contents_attach_independent = true;
+        d.set_catalog(model);
+
+        let first = d
+            .handle_catalog_contents(&contents_request(&d, None))
+            .unwrap()
+            .unwrap();
+        let second = d
+            .handle_catalog_contents(&contents_request(&d, Some("stale")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "built once");
+        // The very same encoded bytes (shared buffers, not a re-encode).
+        let bytes = |b: &RecordBatch| {
+            let col = b.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            col.value(0).as_ptr()
+        };
+        assert_eq!(bytes(&first), bytes(&second));
+
+        let etag = contents(&d).etag.unwrap();
+        let same = contents_if(&d, Some(&etag)).unwrap();
+        assert!(same.not_modified && same.schemas.is_empty());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        d.register_scalar(Arc::new(Probe("s_later")));
+        let after = contents_if(&d, Some(&etag)).unwrap();
+        assert!(!after.not_modified);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "rebuilt after a registration"
+        );
     }
 
     #[test]

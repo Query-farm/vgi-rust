@@ -140,6 +140,10 @@ impl Worker {
     /// don't depend on the transaction. Turn it off to force the client back
     /// onto the per-schema RPCs (e.g. to compare the two paths); the
     /// `catalog_contents` RPC itself stays registered either way.
+    ///
+    /// Revalidation (`if_none_match` / etag) and the worker-side cache are
+    /// per catalog: see [`crate::catalog::CatalogModel::contents_provider`],
+    /// `catalog_contents_etag` and `catalog_contents_attach_independent`.
     pub fn set_catalog_contents(&mut self, enabled: bool) {
         self.disp.catalog_contents = enabled;
     }
