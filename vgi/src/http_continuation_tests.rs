@@ -930,7 +930,9 @@ fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
 
     // 3. A tampered grant is refused before any vgi.v2 code runs.
     *seen.lock().unwrap() = None;
-    let tampered = format!("{}x", &token[..token.len() - 1]);
+    // A fixed replacement is a no-op whenever the token already ends in it.
+    let last = if token.ends_with('x') { 'y' } else { 'x' };
+    let tampered = format!("{}{last}", &token[..token.len() - 1]);
     let (status, _) = post_as(
         port,
         &format!("{}/bind", vgi_protocol::VGI_PROTOCOL_NAME),
