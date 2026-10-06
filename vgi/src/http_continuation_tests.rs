@@ -753,6 +753,194 @@ fn buffering_bind_resolves_after_secrets_provided() {
     );
 }
 
+/// Records the `auth_principal` its bind saw -- the authentication a vgi.v2
+/// call ran under.
+struct PrincipalProbe(Arc<std::sync::Mutex<Option<Option<String>>>>);
+impl TableBufferingFunction for PrincipalProbe {
+    fn name(&self) -> &str {
+        "secret_sink"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("path", 0, "varchar", "destination path")]
+    }
+    fn on_bind(&self, p: &BindParams) -> Result<BindResponse> {
+        *self.0.lock().unwrap() = Some(p.auth_principal.clone());
+        Ok(BindResponse {
+            output_schema: schema_n(),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn process(&self, _p: &BufferingParams, _b: &RecordBatch) -> Result<Vec<u8>> {
+        unimplemented!()
+    }
+    fn combine(&self, _p: &BufferingParams, _s: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        unimplemented!()
+    }
+    fn finalize_producer(
+        &self,
+        _p: &BufferingParams,
+        _f: Vec<u8>,
+    ) -> Result<Box<dyn TableProducer>> {
+        unimplemented!()
+    }
+}
+
+const LOGIN_HEADER: &str = "x-test-login";
+
+/// A deployment authenticator that knows only fresh logins: the header names
+/// the principal and the login just happened (`auth_time` = now).
+fn fresh_login(req: &vgi_rpc::AuthRequest) -> vgi_rpc::AuthResult {
+    Ok(match req.header(LOGIN_HEADER) {
+        Some(p) if !p.is_empty() => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            vgi_rpc::AuthContext::for_principal("login", p).with_claim("auth_time", now.to_string())
+        }
+        _ => vgi_rpc::AuthContext::anonymous(),
+    })
+}
+
+fn post_as(port: u16, path: &str, body: Vec<u8>, header: (&str, &str)) -> (u16, Vec<u8>) {
+    let url = format!("http://127.0.0.1:{port}/{path}");
+    match ureq::post(&url)
+        .header("Content-Type", ARROW_CONTENT_TYPE)
+        .header(header.0, header.1)
+        .send(&body[..])
+    {
+        Ok(mut resp) => (200, resp.body_mut().read_to_vec().unwrap()),
+        Err(ureq::Error::StatusCode(code)) => (code, Vec::new()),
+        Err(e) => panic!("POST {path} failed: {e}"),
+    }
+}
+
+/// A sealed-grant worker over HTTP, plus the principal its probe saw.
+fn start_grant_server() -> (u16, Arc<std::sync::Mutex<Option<Option<String>>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let mut w = Worker::new();
+    w.register_buffering(PrincipalProbe(seen.clone()));
+    w.grant_keys(vgi_rpc::grants::GrantKeys::new([vec![0x5a; 32]], "sdk-test", 3600, 60).unwrap());
+    let server = Arc::new(w.build_server_for(crate::ServeTransport::Http));
+    let state = HttpState::builder()
+        .server(server)
+        .authenticate(Arc::new(fresh_login))
+        .build();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        rt.block_on(vgi_rpc::http::serve_with_shutdown(state, listener))
+            .ok();
+    });
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (port, seen)
+}
+
+/// The grant loop, end to end over HTTP: a freshly logged-in user mints a
+/// sealed grant through `vgi_rpc.Identity.v1`'s `issue_grant`, and a vgi.v2
+/// call presenting it as `Bearer <grant>` runs authenticated as that user.
+#[test]
+fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
+    use vgi_rpc::token_identity::{issue_grant_params_schema, IDENTITY_PROTOCOL_NAME};
+    let (port, seen) = start_grant_server();
+
+    // 1. Mint, as alice, freshly authenticated.
+    let mut scopes =
+        arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
+    scopes.values().append_value("read");
+    scopes.append(true);
+    let grant_req = RecordBatch::try_new(
+        issue_grant_params_schema(),
+        vec![
+            Arc::new(StringArray::from(vec!["nightly"])) as ArrayRef,
+            Arc::new(scopes.finish()) as ArrayRef,
+            Arc::new(Int64Array::from(vec![600])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut md = std::collections::HashMap::<String, String>::from([
+        (RPC_METHOD_KEY.to_string(), "issue_grant".to_string()),
+        (REQUEST_VERSION_KEY.to_string(), REQUEST_VERSION.to_string()),
+    ]);
+    md.insert(
+        vgi_rpc::metadata::PROTOCOL_KEY.to_string(),
+        IDENTITY_PROTOCOL_NAME.to_string(),
+    );
+    let mut body = Vec::new();
+    {
+        let mut w = StreamWriter::new(&mut body, grant_req.schema().as_ref()).unwrap();
+        w.write(&grant_req, Some(&md)).unwrap();
+        w.finish().unwrap();
+    }
+    let (status, resp) = post_as(
+        port,
+        &format!("{IDENTITY_PROTOCOL_NAME}/issue_grant"),
+        body,
+        (LOGIN_HEADER, "alice@example"),
+    );
+    assert_eq!(status, 200);
+    let mut cursor = std::io::Cursor::new(resp);
+    let mut r = StreamReader::new(&mut cursor).unwrap();
+    let (envelope, _) = r.read_next().unwrap().expect("an issue_grant result");
+    let nested = envelope
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .value(0)
+        .to_vec();
+    let grant = ipc::read_batch(&nested).unwrap();
+    let token = grant
+        .column_by_name("token")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert!(token.starts_with("vgig1."), "{token}");
+
+    // 2. A vgi.v2 call presenting the grant runs as alice.
+    let (status, _) = post_as(
+        port,
+        &format!("{}/bind", vgi_protocol::VGI_PROTOCOL_NAME),
+        bind_body("secret_sink", "s3://bucket/out.dat", true),
+        ("authorization", &format!("Bearer {token}")),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        Some(Some("alice@example".to_string())),
+        "the vgi.v2 call ran under the grant's owner"
+    );
+
+    // 3. A tampered grant is refused before any vgi.v2 code runs.
+    *seen.lock().unwrap() = None;
+    let tampered = format!("{}x", &token[..token.len() - 1]);
+    let (status, _) = post_as(
+        port,
+        &format!("{}/bind", vgi_protocol::VGI_PROTOCOL_NAME),
+        bind_body("secret_sink", "s3://bucket/out.dat", true),
+        ("authorization", &format!("Bearer {tampered}")),
+    );
+    assert_eq!(status, 401);
+    assert_eq!(*seen.lock().unwrap(), None);
+}
+
 /// A table-in-out function whose FINALIZE flush is MORE THAN ONE batch.
 ///
 /// This shape had no fixture in any SDK, which is why nothing caught that it

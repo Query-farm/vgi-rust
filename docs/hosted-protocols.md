@@ -87,3 +87,47 @@ as `vgi_rpc.RetryInfo`. A caller can then tell an outage from "unknown":
 it retries the first and may cache the second. Returning a plain error such as
 `RpcError::value_error` instead would read as a definitive refusal. Never put
 the credential or claims in the error.
+
+## Sealed grants: `issue_grant` tokens accepted as bearers
+
+`issue_grant` mints a standing delegation that automation later presents as an
+ordinary `Authorization: Bearer` credential. Give the worker a **grant key** and
+the framework does both halves -- no storage, no author code:
+
+```bash
+# 32 random bytes, standard base64. Comma-separate several: the first mints,
+# all verify (rotation: add the new key first, drop the old after its grants expire).
+export VGI_RPC_GRANT_KEYS="$(head -c 32 /dev/urandom | base64)"
+export VGI_RPC_GRANT_AUDIENCE=reports-prod          # optional, default ""
+export VGI_RPC_GRANT_MAX_TTL_SECONDS=86400          # optional, default 7 days
+my-worker --http                                    # or: --grant-key <base64> (repeatable)
+```
+
+or in code, `worker.grant_keys(vgi_rpc::grants::GrantKeys::new(...)?)`.
+
+- **Over HTTP only**, `vgi_rpc.Identity.v1` hosts `issue_grant`, minting sealed
+  `vgig1.` tokens -- unless the worker sets its own `Worker::mint_grant`, which
+  keeps priority. The caller must have authenticated recently (`auth_time`
+  within `max_auth_age`); a grant-authenticated caller carries no `auth_time`,
+  so **grants never mint grants**.
+- The HTTP server **accepts the grants back**: a request with `Bearer <grant>`
+  runs as the user it was minted for, with `domain = "grant"` and claims
+  `grant_id`, `purpose` and `scopes` (a JSON array as text; decode with
+  `vgi_rpc::auth::identity_bearer::grant_scopes`). A forged, tampered,
+  wrong-key or wrong-audience grant is 401 (`invalid_credential`); one past
+  its lifetime is 401 (`expired_credential`).
+- **Not individually revocable.** Keep `VGI_RPC_GRANT_MAX_TTL_SECONDS` short
+  and re-issue; removing a key revokes every grant it minted.
+- A malformed key (not base64 of exactly 32 bytes, a duplicate) stops the
+  worker at startup. No key: nothing changes.
+
+`resolve_token` feeds authentication the same way: when a worker sets it, its
+HTTP server also accepts any bearer the hook resolves (`domain = "token"`), after
+the deployment's own authenticator and after sealed grants. `Ok(None)` is a
+401; `RpcError::auth_unavailable` is a 503 with your `Retry-After`. The hook
+never sees a grant, a JWS, a blank or an over-long token.
+
+With either active, a request carrying an `Authorization` header that nothing
+accepts is refused (401) -- including under `VGI_OPTIONAL_BEARER_TOKENS`, which
+otherwise answers anonymous for unknown tokens. A request with no credential at
+all is still anonymous.

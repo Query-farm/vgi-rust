@@ -50,6 +50,7 @@ pub struct Worker {
     resolve_token: Option<vgi_rpc::token_identity::TokenResolver>,
     mint_grant: Option<vgi_rpc::token_identity::GrantMinter>,
     introspect_principals: Option<Vec<String>>,
+    grant_keys: Option<vgi_rpc::grants::GrantKeys>,
     /// Read only by the HTTP transport.
     #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
     authenticate: Option<vgi_rpc::Authenticate>,
@@ -114,6 +115,7 @@ impl Worker {
             resolve_token: None,
             mint_grant: None,
             introspect_principals: None,
+            grant_keys: None,
             authenticate: None,
         }
     }
@@ -472,6 +474,22 @@ impl Worker {
         self.introspect_principals = Some(principals.into_iter().map(Into::into).collect());
     }
 
+    /// Configure sealed grants (vgi-rpc's IDENTITY_V1_SPEC §9).
+    ///
+    /// With grant keys, the worker's HTTP server mints sealed grants through
+    /// `vgi_rpc.Identity.v1`'s `issue_grant` -- unless the worker set its own
+    /// [`mint_grant`](Self::mint_grant) -- and accepts them back as ordinary
+    /// `Authorization: Bearer` credentials: automation presenting a grant is
+    /// authenticated as the user it was minted for, with `domain = "grant"`.
+    /// No storage, no author code.
+    ///
+    /// Overrides the configuration `run` reads from `--grant-key` (repeatable,
+    /// first mints) and `VGI_RPC_GRANT_KEYS` / `VGI_RPC_GRANT_AUDIENCE` /
+    /// `VGI_RPC_GRANT_MAX_TTL_SECONDS`. Without keys, nothing changes.
+    pub fn grant_keys(&mut self, keys: vgi_rpc::grants::GrantKeys) {
+        self.grant_keys = Some(keys);
+    }
+
     /// Authenticate HTTP callers with `authenticate` instead of the
     /// environment-derived bearer configuration (`VGI_BEARER_TOKENS` /
     /// `VGI_OPTIONAL_BEARER_TOKENS`). `vgi_rpc.Identity.v1` needs an
@@ -514,10 +532,19 @@ impl Worker {
             None => Vec::new(),
         };
         let identity = if transport.authenticates_callers() {
+            // Explicit keys win; otherwise the environment. A malformed key
+            // stops the worker rather than running with a key it misread.
+            let grant_keys = self.grant_keys.clone().or_else(|| {
+                vgi_rpc::grants::GrantKeys::from_env().unwrap_or_else(|err| {
+                    eprintln!("Error: {}", err.message);
+                    std::process::exit(1);
+                })
+            });
             build_identity(
                 self.resolve_token.clone(),
                 self.mint_grant.clone(),
                 self.introspect_principals.clone(),
+                grant_keys,
             )
         } else {
             None
@@ -530,7 +557,11 @@ impl Worker {
             // `__describe__` method was retired in favour of the co-hosted
             // `vgi_rpc.Reflection.v1` protocol, which every server hosts
             // unconditionally and addresses through the ordinary routing key.
-            .add_protocols(extra);
+            .add_protocols(extra)
+            // Grant keys reach the server only through the identity built
+            // above (HTTP only); the port must not read the environment
+            // itself, or a stdio worker would grow `issue_grant`.
+            .grant_keys(vgi_rpc::server::GrantKeysSetting::Off);
         if let Some(identity) = identity {
             builder = builder.identity(identity);
         }
@@ -556,12 +587,34 @@ impl Worker {
     ///   auto-selects; `--idle-timeout <secs>` optional).
     /// - `--http` — **HTTP** transport (Arrow-IPC over HTTP). Optional
     ///   `--host` / `--port` select the bind address. Bearer auth is enabled by
-    ///   setting `VGI_BEARER_TOKENS` (`token=principal,…`).
+    ///   setting `VGI_BEARER_TOKENS` (`token=principal,…`). `--grant-key <base64>`
+    ///   (repeatable, first mints; or `VGI_RPC_GRANT_KEYS`) turns on sealed
+    ///   grants -- see [`grant_keys`](Self::grant_keys).
     /// - `--iroh-raw-upstream [<host>:]<port> --iroh-issuer <namespace>` —
     ///   loopback raw upstream for `vgi-iroh-bridge`. Add `--iroh-observe` to
     ///   expose peer evidence without making it the application principal.
-    pub fn run(self) {
+    pub fn run(mut self) {
         let args: Vec<String> = std::env::args().collect();
+        // `--grant-key` (repeatable) replaces VGI_RPC_GRANT_KEYS; an explicit
+        // `Worker::grant_keys` wins over both. A malformed key stops the
+        // worker here, before it binds anything.
+        if self.grant_keys.is_none() {
+            let cli_keys: Vec<String> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "--grant-key")
+                .map(|(i, _)| {
+                    args.get(i + 1)
+                        .expect("--grant-key requires a base64 key")
+                        .clone()
+                })
+                .collect();
+            self.grant_keys = vgi_rpc::grants::GrantKeys::from_cli_or_env(&cli_keys)
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {}", err.message);
+                    std::process::exit(1);
+                });
+        }
         // Capture the worker's display name / doc from the primary catalog
         // before the dispatcher is moved into the server (used by the HTTP
         // landing contract).
@@ -781,11 +834,17 @@ fn build_identity(
     resolve: Option<vgi_rpc::token_identity::TokenResolver>,
     mint: Option<vgi_rpc::token_identity::GrantMinter>,
     explicit_principals: Option<Vec<String>>,
+    grant_keys: Option<vgi_rpc::grants::GrantKeys>,
 ) -> Option<IdentityImpl> {
-    if resolve.is_none() && mint.is_none() {
+    if resolve.is_none() && mint.is_none() && grant_keys.is_none() {
         return None;
     }
     let mut builder = IdentityImpl::builder();
+    if let Some(keys) = grant_keys {
+        // Keys and no `mint_grant` of the worker's own: the framework mints
+        // sealed grants. Either way the HTTP server accepts them as bearers.
+        builder = builder.grant_keys(keys);
+    }
     if let Some(resolve) = resolve {
         // Only introspection needs an allowlist: a worker that mints but
         // resolves nothing is not an oracle.
@@ -1076,6 +1135,41 @@ mod hosting_tests {
         assert!(server
             .hosted_protocol_names()
             .contains(&vgi_rpc::token_identity::IDENTITY_PROTOCOL_NAME));
+    }
+
+    /// Grant keys host `vgi_rpc.Identity.v1` (sealed `issue_grant`) on HTTP
+    /// only, with no allowlist needed; a worker's own `mint_grant` keeps
+    /// priority, and the keys still make HTTP accept grants.
+    #[test]
+    fn grant_keys_host_a_sealed_minter_on_http_only() {
+        let identity = vgi_rpc::token_identity::IDENTITY_PROTOCOL_NAME;
+        let keys = || vgi_rpc::grants::GrantKeys::new([vec![9u8; 32]], "", 3600, 60).unwrap();
+        let with_keys = || {
+            let mut w = Worker::new();
+            w.grant_keys(keys());
+            w
+        };
+        assert!(with_keys()
+            .build_server_for(ServeTransport::Http)
+            .hosted_protocol_names()
+            .contains(&identity));
+        for transport in [
+            ServeTransport::Pipe,
+            ServeTransport::Unix,
+            ServeTransport::Tcp,
+        ] {
+            assert!(!with_keys()
+                .build_server_for(transport)
+                .hosted_protocol_names()
+                .contains(&identity));
+        }
+        let built =
+            build_identity(None, None, None, Some(keys())).expect("keys alone host identity");
+        assert!(built.grant_keys().is_some());
+        assert_eq!(
+            built.offered_methods().into_iter().collect::<Vec<_>>(),
+            vec![vgi_rpc::token_identity::ISSUE_GRANT_METHOD]
+        );
     }
 
     /// Introspection without an allowlist refuses to start: an explicit empty
