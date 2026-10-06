@@ -14,8 +14,8 @@
 
 use vgi_protocol::generated::protocol_schemas as gen;
 use vgi_protocol::protocol::dtos::{
-    CatalogInfo, FunctionInfo, MacroInfo, ScanBranch, ScanFunctionResult, SchemaInfo, TableInfo,
-    ViewInfo,
+    CatalogInfo, FunctionInfo, IndexInfo, MacroInfo, ScanBranch, ScanFunctionResult, SchemaInfo,
+    TableCreateRequest, TableInfo, ViewInfo,
 };
 use vgi_protocol::wire::flat_schema;
 
@@ -76,4 +76,19 @@ fn scan_function_result_matches() {
 #[test]
 fn scan_branch_matches() {
     assert_eq!(flat_schema::<ScanBranch>(), gen::scan_branch_schema());
+}
+
+#[test]
+fn index_info_matches() {
+    // Added for the client's `catalog_contents` decode of every kind.
+    assert_eq!(flat_schema::<IndexInfo>(), gen::index_info_schema());
+}
+
+#[test]
+fn table_create_request_matches() {
+    // The boxed `catalog_table_create` request a DDL-capable catalog decodes.
+    assert_eq!(
+        flat_schema::<TableCreateRequest>(),
+        gen::table_create_request_schema()
+    );
 }

@@ -1180,6 +1180,40 @@ pub struct MacroInfo {
     pub arguments_schema: Option<Bytes>,
 }
 
+/// `IndexInfo` item (`catalog_schema_contents_indexes`, and
+/// `SchemaContents.indexes`).
+#[derive(Debug, Clone, VgiArrow)]
+pub struct IndexInfo {
+    pub comment: Option<String>,
+    pub tags: StrMap,
+    pub name: String,
+    pub schema_path: SchemaPath,
+    pub table_name: String,
+    pub index_type: String,
+    /// `UNIQUE` / `PRIMARY` / `FOREIGN` / `NONE` — dictionary-encoded on the wire.
+    pub constraint_type: DictString,
+    pub expressions: Vec<String>,
+    pub options: StrMap,
+}
+
+/// Boxed request of `catalog_table_create` (`CREATE TABLE` on a DDL-capable
+/// catalog). `columns` is the IPC-serialized Arrow schema of the new table.
+#[derive(Debug, Clone, VgiArrow)]
+pub struct TableCreateRequest {
+    pub attach_opaque_data: Bytes,
+    pub schema_path: SchemaPath,
+    pub name: String,
+    pub columns: Bytes,
+    /// `error` / `ignore` / `replace` — dictionary-encoded on the wire.
+    pub on_conflict: DictString,
+    pub not_null_constraints: Vec<i32>,
+    pub unique_constraints: Vec<Vec<i32>>,
+    pub check_constraints: Vec<String>,
+    pub primary_key_constraints: Vec<Vec<i32>>,
+    pub foreign_key_constraints: Vec<Bytes>,
+    pub transaction_opaque_data: Option<Bytes>,
+}
+
 /// `ScanFunctionResult` — names the table function that scans a catalog table.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanFunctionResult {

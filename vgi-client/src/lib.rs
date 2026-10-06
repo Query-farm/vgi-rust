@@ -84,8 +84,9 @@ pub use cache::{
 };
 pub use catalog::{
     decode_attach_option_specs, decode_macro_defaults, decode_setting_specs, encode_attach_options,
-    At, AttachOptionSpec, AttachOptions, AttachedCatalog, CatalogScanBranches, FunctionKind,
-    MacroKind, ScanBranchesResolution, SettingSpec,
+    At, AttachOptionSpec, AttachOptions, AttachedCatalog, CatalogLoadSource, CatalogScanBranches,
+    CatalogSnapshot, FunctionKind, MacroKind, OnConflict, ScanBranchesResolution, SchemaSnapshot,
+    SettingSpec,
 };
 #[cfg(feature = "iroh")]
 pub use client::IrohHttpOptions;

@@ -59,7 +59,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_version",
             wire::params_schema_for("catalog_version"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_version(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_catalog_version(req)),
         ));
     }
     {
@@ -68,7 +68,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_transaction_begin",
             wire::params_schema_for("catalog_transaction_begin"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_transaction_begin(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_transaction_begin(req)),
         ));
     }
     // --- aggregates ---
@@ -215,8 +215,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     register_void(srv, &disp, "catalog_transaction_rollback");
     register_void(srv, &disp, "catalog_detach");
 
-    // --- catalog-mutating DDL: accepted (pins the wire contract) then
-    //     rejected with `catalog is read-only` (the example catalog is r/o) ---
+    // --- catalog-mutating DDL: served by a stored (DDL-capable) catalog;
+    //     for a declarative catalog accepted (pins the wire contract) then
+    //     rejected with `catalog is read-only` ---
     for name in [
         "catalog_create",
         "catalog_drop",
@@ -248,8 +249,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         srv.register(vgi_rpc::MethodInfo::unary(
             name,
             wire::params_schema_for(name),
-            wire::result_binary_schema(),
-            move |req, _ctx| d.handle_read_only(req),
+            // Void on success (vgi-python declares these `-> None`).
+            Arc::new(arrow_schema::Schema::empty()),
+            move |req, _ctx| d.stored_or(req, || d.handle_read_only(req)),
         ));
     }
 
@@ -260,7 +262,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schemas",
             wire::params_schema_for("catalog_schemas"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_schemas(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_catalog_schemas(req)),
         ));
     }
     {
@@ -272,7 +274,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_contents",
             wire::params_schema_for("catalog_contents"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_contents(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_catalog_contents(req)),
         ));
     }
     {
@@ -281,7 +283,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_get",
             wire::params_schema_for("catalog_schema_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_schema_get(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_schema_get(req)),
         ));
     }
     {
@@ -290,7 +292,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_functions",
             wire::params_schema_for("catalog_schema_contents_functions"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_contents_functions(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_contents_functions(req)),
         ));
     }
 
@@ -300,7 +302,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_views",
             wire::params_schema_for("catalog_schema_contents_views"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_contents_views(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_contents_views(req)),
         ));
     }
     {
@@ -309,7 +311,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_macros",
             wire::params_schema_for("catalog_schema_contents_macros"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_contents_macros(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_contents_macros(req)),
         ));
     }
     {
@@ -318,7 +320,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_tables",
             wire::params_schema_for("catalog_schema_contents_tables"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_contents_tables(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_contents_tables(req)),
         ));
     }
     {
@@ -327,7 +329,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_get",
             wire::params_schema_for("catalog_table_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_table_get(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_table_get(req)),
         ));
     }
     {
@@ -339,7 +341,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_scan_function_get",
             wire::params_schema_for("catalog_table_scan_function_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_table_scan_function_get(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_table_scan_function_get(req)),
         ));
     }
     {
@@ -348,7 +350,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_scan_branches_get",
             wire::params_schema_for("catalog_table_scan_branches_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_table_scan_branches_get(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_table_scan_branches_get(req)),
         ));
     }
     {
@@ -357,7 +359,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_column_statistics_get",
             wire::params_schema_for("catalog_table_column_statistics_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_table_column_statistics_get(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_table_column_statistics_get(req)),
         ));
     }
     {
@@ -412,7 +414,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_copy_from_formats",
             wire::params_schema_for("catalog_copy_from_formats"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_copy_from_formats(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_catalog_copy_from_formats(req)),
         ));
     }
 
@@ -428,7 +430,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             name,
             wire::params_schema_for(name),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_empty_items(req),
+            move |req, _ctx| d.stored_or(req, || d.handle_empty_items(req)),
         ));
     }
 }
@@ -440,6 +442,6 @@ fn register_void(srv: &mut RpcServer, disp: &Arc<Dispatcher>, name: &str) {
         name.to_string(),
         wire::params_schema_for(name),
         empty,
-        move |req, _ctx| d.handle_void(req),
+        move |req, _ctx| d.stored_or(req, || d.handle_void(req)),
     ));
 }

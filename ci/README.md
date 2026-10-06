@@ -51,7 +51,7 @@ its own is not evidence anything ran: a dead shared worker, an empty stage, or a
 mis-wired env var all read as green while the suite quietly tested nothing.
 `run_unittest` accumulates the executed count (staged cases minus skips) across
 every invocation, and the run fails if it collapses below a per-lane
-`MIN_EXECUTED` (stdio 250, launch 255, http 245 — conservative floors below
+`MIN_EXECUTED` (stdio 255, launch 260, http 250 — conservative floors below
 the current suite, leaving room for environment-dependent skips).
 A collapse in that number is the tell of a suite-wide silent skip; it is a floor,
 not an equality, so **do not lower it to make a run pass** — find what stopped

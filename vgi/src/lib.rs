@@ -138,6 +138,7 @@ pub mod settings;
 pub mod split_token;
 pub mod statistics;
 pub mod storage;
+pub mod stored_catalog;
 pub mod table_function;
 pub mod table_in_out;
 pub mod transport;

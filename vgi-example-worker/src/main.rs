@@ -15,6 +15,7 @@ mod aggregate;
 mod attach_options;
 mod buffering;
 mod catalog_def;
+mod contents_fixtures;
 mod contents_reval;
 mod copy_from;
 mod copy_to;
@@ -104,6 +105,10 @@ fn main() {
         // ... and the same name in the `main` schema of two *catalogs*, where
         // only the attachment tells them apart.
         twin_catalogs::register(&mut worker);
+        // The six catalog_contents fixture catalogs (contents_probe / _broken /
+        // _legacy / _memory / _reval / _hash) the cross-SDK
+        // catalog_contents*.test files attach. See contents_fixtures.rs.
+        contents_fixtures::register(&mut worker);
         // Global-registration probes — one per function type. They are ordinary
         // `main`-schema members of the example catalog (a global function must
         // be schema-resident, since bind dispatch is keyed on (schema, name))

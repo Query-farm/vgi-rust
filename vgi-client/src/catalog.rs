@@ -13,8 +13,8 @@ use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
     CatalogInfo, CatalogTransactionBeginResult, CatalogVersionResult, ClientCapabilities,
-    FunctionInfo, MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult, SchemaContents,
-    SchemaInfo, TableInfo, ViewInfo,
+    FunctionInfo, IndexInfo, MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult,
+    SchemaContents, SchemaInfo, TableInfo, ViewInfo,
 };
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
@@ -439,6 +439,157 @@ pub struct CatalogScanBranches {
     pub resolution: ScanBranchesResolution,
 }
 
+/// One schema and everything in it, decoded — an entry of
+/// [`CatalogSnapshot::schemas`].
+///
+/// Each list is complete: empty means "this schema has none of that kind".
+#[derive(Debug, Clone)]
+pub struct SchemaSnapshot {
+    /// The schema itself (its path, comment, tags and object counts).
+    pub schema: SchemaInfo,
+    /// Tables.
+    pub tables: Vec<TableInfo>,
+    /// Views.
+    pub views: Vec<ViewInfo>,
+    /// Scalar functions.
+    pub scalar_functions: Vec<FunctionInfo>,
+    /// Aggregate functions.
+    pub aggregate_functions: Vec<FunctionInfo>,
+    /// Table functions (producer, buffered and streaming table-in-out).
+    pub table_functions: Vec<FunctionInfo>,
+    /// Scalar macros.
+    pub scalar_macros: Vec<MacroInfo>,
+    /// Table macros.
+    pub table_macros: Vec<MacroInfo>,
+    /// Indexes.
+    pub indexes: Vec<IndexInfo>,
+}
+
+impl SchemaSnapshot {
+    /// The schema's path.
+    pub fn path(&self) -> &[String] {
+        &self.schema.path
+    }
+
+    /// Decode one `catalog_contents` schema entry, checking that its `path`
+    /// equals the `SchemaInfo.path` inside its `schema` item.
+    pub fn decode(entry: &SchemaContents) -> Result<Self> {
+        fn item<T: vgi_rpc::VgiArrow>(bytes: &Bytes, what: &str, path: &[String]) -> Result<T> {
+            let batch = vgi_protocol::ipc::read_batch(&bytes.0).map_err(|e| {
+                RpcError::type_error(format!(
+                    "catalog_contents: {what} item of schema {path:?} is not a readable IPC batch: {}",
+                    e.message
+                ))
+            })?;
+            vgi_protocol::wire::from_batch(&batch)
+        }
+        fn items<T: vgi_rpc::VgiArrow>(
+            list: &[Bytes],
+            what: &str,
+            path: &[String],
+        ) -> Result<Vec<T>> {
+            list.iter().map(|b| item(b, what, path)).collect()
+        }
+        let path = entry.path.as_slice();
+        let schema: SchemaInfo = item(&entry.schema, "schema", path)?;
+        if schema.path != entry.path {
+            return Err(RpcError::type_error(format!(
+                "catalog_contents: schema path {:?} differs from its SchemaInfo.path {:?}",
+                entry.path, schema.path
+            )));
+        }
+        Ok(SchemaSnapshot {
+            schema,
+            tables: items(&entry.tables, "tables", path)?,
+            views: items(&entry.views, "views", path)?,
+            scalar_functions: items(&entry.scalar_functions, "scalar_functions", path)?,
+            aggregate_functions: items(&entry.aggregate_functions, "aggregate_functions", path)?,
+            table_functions: items(&entry.table_functions, "table_functions", path)?,
+            scalar_macros: items(&entry.scalar_macros, "scalar_macros", path)?,
+            table_macros: items(&entry.table_macros, "table_macros", path)?,
+            indexes: items(&entry.indexes, "indexes", path)?,
+        })
+    }
+}
+
+/// Which RPCs served a [`CatalogSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogLoadSource {
+    /// One `catalog_contents` call.
+    CatalogContents,
+    /// `catalog_schemas` plus the per-schema `catalog_schema_contents_*` calls.
+    PerSchema,
+}
+
+/// A whole catalog — every schema and everything in it — from
+/// [`VgiClient::load_catalog`].
+///
+/// Hold on to it and pass it back as `previous` to revalidate: when it came
+/// from `catalog_contents` with an etag, the next load sends `if_none_match`,
+/// and a `not_modified` answer returns this same content without downloading
+/// it again.
+#[derive(Debug, Clone)]
+pub struct CatalogSnapshot {
+    /// One entry per schema, parents before children.
+    pub schemas: Vec<SchemaSnapshot>,
+    /// The catalog version the snapshot was taken at; `None` when it was
+    /// assembled from the per-schema calls (which carry none).
+    pub catalog_version: Option<i64>,
+    /// The `catalog_contents` validator; `None` when the worker does not
+    /// revalidate or the snapshot did not come from `catalog_contents`.
+    pub etag: Option<String>,
+    /// Which RPCs served it.
+    pub source: CatalogLoadSource,
+    /// `true` when this is `previous` confirmed current by a `not_modified`
+    /// answer.
+    pub not_modified: bool,
+    /// Why an advertised `catalog_contents` was not used (its error, or a
+    /// protocol violation); `None` otherwise.
+    pub fallback_reason: Option<String>,
+}
+
+impl CatalogSnapshot {
+    /// The schema at `path`, if the catalog has it.
+    pub fn schema(&self, path: &[String]) -> Option<&SchemaSnapshot> {
+        self.schemas.iter().find(|s| s.schema.path == path)
+    }
+}
+
+/// The `estimated_object_count` key of each per-schema kind. A count of
+/// exactly 0 is the worker's guarantee that the schema has none, so the
+/// per-schema load skips that call (the rule the DuckDB extension applies).
+fn kind_may_exist(schema: &SchemaInfo, key: &str) -> bool {
+    !schema
+        .estimated_object_count
+        .as_ref()
+        .is_some_and(|counts| counts.iter().any(|(k, n)| k == key && *n == 0))
+}
+
+/// Which kind of DDL conflict handling to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnConflict {
+    /// Fail when the object exists.
+    #[default]
+    Error,
+    /// Do nothing when it exists (`IF NOT EXISTS`).
+    Ignore,
+    /// Replace it (`OR REPLACE`).
+    Replace,
+}
+
+impl OnConflict {
+    fn dict(self) -> DictString {
+        DictString(
+            match self {
+                Self::Error => "error",
+                Self::Ignore => "ignore",
+                Self::Replace => "replace",
+            }
+            .to_string(),
+        )
+    }
+}
+
 const BRANCHES_CAPABILITY_UNKNOWN: u8 = 0;
 const BRANCHES_CAPABILITY_SUPPORTED: u8 = 1;
 const BRANCHES_CAPABILITY_UNSUPPORTED: u8 = 2;
@@ -636,8 +787,9 @@ impl VgiClient {
     }
 
     /// Every schema and all of its contents in one call (`catalog_contents`,
-    /// protocol 2.1.0) — call it only when
-    /// [`AttachedCatalog::supports_catalog_contents`] says the worker serves it.
+    /// protocol 2.1.0), raw — refused when
+    /// [`AttachedCatalog::supports_catalog_contents`] is false. Most callers
+    /// want [`VgiClient::load_catalog`] instead.
     ///
     /// Each [`SchemaContents`] item is byte-for-byte what the matching
     /// per-schema call returns (`schemas`, `tables_path`, `functions_path`, …),
@@ -660,11 +812,25 @@ impl VgiClient {
     /// Checked on receipt: a `not_modified` answer carries the etag asked about
     /// and no schemas, and each schema's `path` equals the `SchemaInfo.path`
     /// inside its `schema` item.
+    ///
+    /// Refused without a round trip when the attach did not advertise
+    /// [`AttachedCatalog::supports_catalog_contents`]. For whole-catalog
+    /// enumeration prefer [`VgiClient::load_catalog`], which picks the path,
+    /// falls back and revalidates.
     pub fn contents_response(
         &mut self,
         cat: &AttachedCatalog,
         if_none_match: Option<&str>,
     ) -> Result<CatalogContentsResponse> {
+        // Never sent to a worker that did not advertise it: an older worker
+        // has no such method, and a worker that opted out may not serve it
+        // consistently. Refused locally, with no round trip.
+        if !cat.supports_catalog_contents() {
+            return Err(RpcError::value_error(
+                "catalog_contents: this catalog's attach did not advertise \
+                 supports_catalog_contents; use load_catalog (or the per-schema calls)",
+            ));
+        }
         let resp: CatalogContentsResponse = call(
             self.transport_mut(),
             "catalog_contents",
@@ -702,6 +868,231 @@ impl VgiClient {
             }
         }
         Ok(resp)
+    }
+
+    /// Load every schema and all of its contents, in as few calls as the
+    /// worker allows — the client's whole-catalog enumeration.
+    ///
+    /// - When the attach advertised `supports_catalog_contents`, one
+    ///   `catalog_contents` call. Never sent otherwise.
+    /// - Inside a transaction (`cat.transaction()` is set), or when that call
+    ///   fails or breaks the protocol, `catalog_schemas` plus the per-schema
+    ///   `catalog_schema_contents_*` calls (skipping a kind whose
+    ///   `estimated_object_count` is exactly 0); `fallback_reason` says why.
+    ///   `catalog_contents` returns only the committed catalog, so a
+    ///   transactional load always takes the transaction-aware per-schema path.
+    ///
+    /// Revalidation: pass a snapshot from an earlier load as `previous`. When
+    /// it came from `catalog_contents` with an etag, the call sends
+    /// `if_none_match`; a `not_modified` answer returns `previous`'s content
+    /// (with `not_modified = true` and the current version) and a full answer
+    /// replaces it. A snapshot older than `previous` (a lagging replica) is
+    /// retried once, then the per-schema calls are used. Version 0 means
+    /// "unknown" and is never treated as older.
+    pub fn load_catalog(
+        &mut self,
+        cat: &AttachedCatalog,
+        previous: Option<&CatalogSnapshot>,
+    ) -> Result<CatalogSnapshot> {
+        if !cat.supports_catalog_contents() || cat.transaction.is_some() {
+            return self.load_catalog_per_schema(cat, None);
+        }
+        let if_none_match = previous
+            .filter(|p| p.source == CatalogLoadSource::CatalogContents)
+            .and_then(|p| p.etag.clone());
+        let known_version = previous.and_then(|p| p.catalog_version).unwrap_or(0);
+        let mut reason = String::new();
+        for _attempt in 0..2 {
+            let resp = match self.contents_response(cat, if_none_match.as_deref()) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    reason = e.message;
+                    break;
+                }
+            };
+            if resp.not_modified {
+                // `contents_response` already checked the etag matches.
+                let Some(previous) = previous.filter(|_| if_none_match.is_some()) else {
+                    reason = "catalog_contents answered not_modified to a request it could not \
+                              match"
+                        .to_string();
+                    break;
+                };
+                let mut kept = previous.clone();
+                kept.catalog_version = Some(resp.catalog_version);
+                kept.etag = resp.etag.or(kept.etag);
+                kept.not_modified = true;
+                kept.fallback_reason = None;
+                return Ok(kept);
+            }
+            if known_version != 0
+                && resp.catalog_version != 0
+                && resp.catalog_version < known_version
+            {
+                reason = format!(
+                    "catalog_contents returned version {}, older than the known version {known_version}",
+                    resp.catalog_version
+                );
+                continue;
+            }
+            let decoded = resp
+                .schemas
+                .iter()
+                .map(SchemaSnapshot::decode)
+                .collect::<Result<Vec<_>>>();
+            match decoded {
+                Ok(schemas) => {
+                    return Ok(CatalogSnapshot {
+                        schemas,
+                        catalog_version: Some(resp.catalog_version),
+                        etag: resp.etag,
+                        source: CatalogLoadSource::CatalogContents,
+                        not_modified: false,
+                        fallback_reason: None,
+                    })
+                }
+                Err(e) => {
+                    reason = e.message;
+                    break;
+                }
+            }
+        }
+        log::debug!("catalog_contents not used, falling back to per-schema calls: {reason}");
+        self.load_catalog_per_schema(cat, Some(reason))
+    }
+
+    /// Assemble a snapshot from `catalog_schemas` and the per-schema calls.
+    fn load_catalog_per_schema(
+        &mut self,
+        cat: &AttachedCatalog,
+        fallback_reason: Option<String>,
+    ) -> Result<CatalogSnapshot> {
+        let mut schemas = Vec::new();
+        for schema in self.schemas(cat)? {
+            let path = schema.path.clone();
+            let has = |key: &str| kind_may_exist(&schema, key);
+            let tables = if has("table") {
+                self.tables_path(cat, &path)?
+            } else {
+                Vec::new()
+            };
+            let views = if has("view") {
+                self.views_path(cat, &path)?
+            } else {
+                Vec::new()
+            };
+            let scalar_functions = if has("scalar_function") {
+                self.functions_path(cat, &path, FunctionKind::Scalar)?
+            } else {
+                Vec::new()
+            };
+            let aggregate_functions = if has("aggregate_function") {
+                self.functions_path(cat, &path, FunctionKind::Aggregate)?
+            } else {
+                Vec::new()
+            };
+            let table_functions = if has("table_function") {
+                self.functions_path(cat, &path, FunctionKind::Table)?
+            } else {
+                Vec::new()
+            };
+            let (scalar_macros, table_macros) = if has("macro") {
+                (
+                    self.macros_path(cat, &path, MacroKind::Scalar)?,
+                    self.macros_path(cat, &path, MacroKind::Table)?,
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let indexes = if has("index") {
+                self.indexes_path(cat, &path)?
+            } else {
+                Vec::new()
+            };
+            schemas.push(SchemaSnapshot {
+                schema,
+                tables,
+                views,
+                scalar_functions,
+                aggregate_functions,
+                table_functions,
+                scalar_macros,
+                table_macros,
+                indexes,
+            });
+        }
+        // Parents before children, as catalog_contents orders them.
+        schemas.sort_by_key(|s| s.schema.path.len());
+        Ok(CatalogSnapshot {
+            schemas,
+            catalog_version: None,
+            etag: None,
+            source: CatalogLoadSource::PerSchema,
+            not_modified: false,
+            fallback_reason,
+        })
+    }
+
+    /// Indexes in an arbitrarily nested schema path.
+    pub fn indexes_path(
+        &mut self,
+        cat: &AttachedCatalog,
+        path: &[String],
+    ) -> Result<Vec<IndexInfo>> {
+        call_items(
+            self.transport_mut(),
+            "catalog_schema_contents_indexes",
+            p::CatalogSchemaContentsIndexesParams {
+                attach_opaque_data: cat.handle.clone(),
+                path: path.to_vec(),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
+    }
+
+    /// `CREATE VIEW` on a DDL-capable catalog.
+    pub fn view_create(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        definition: &str,
+        on_conflict: OnConflict,
+    ) -> Result<()> {
+        call_unit(
+            self.transport_mut(),
+            "catalog_view_create",
+            p::CatalogViewCreateParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_path: schema_path.to_vec(),
+                name: name.to_string(),
+                definition: definition.to_string(),
+                on_conflict: on_conflict.dict(),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
+    }
+
+    /// `DROP VIEW` on a DDL-capable catalog.
+    pub fn view_drop(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        ignore_not_found: bool,
+    ) -> Result<()> {
+        call_unit(
+            self.transport_mut(),
+            "catalog_view_drop",
+            p::CatalogViewDropParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_path: schema_path.to_vec(),
+                name: name.to_string(),
+                ignore_not_found,
+                cascade: false,
+                transaction_opaque_data: cat.txn(),
+            },
+        )
     }
 
     /// One schema by name, or `None` when the catalog has no such schema.
@@ -1648,5 +2039,321 @@ mod macro_default_tests {
             .unwrap_err()
             .message
             .contains("duplicate default"));
+    }
+}
+
+/// `load_catalog` against a scripted worker: the protocol-violation and
+/// version-ordering branches a real worker cannot be made to take on demand.
+#[cfg(test)]
+mod load_catalog_tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use vgi_protocol::{ipc, wire};
+
+    use crate::transport::{ExchangeStream, ProducerStream, VgiTransport};
+
+    use super::*;
+
+    type Reply = Box<dyn FnOnce() -> Result<RecordBatch> + Send>;
+
+    /// Answers `catalog_contents` from a script; the per-schema calls with one
+    /// empty `main` schema whose counts are all 0 (so no per-kind calls).
+    struct Scripted {
+        contents: VecDeque<Reply>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn schema_item(path: &[&str]) -> Bytes {
+        let info = SchemaInfo {
+            comment: None,
+            tags: Vec::new(),
+            attach_opaque_data: Bytes(vec![1]),
+            path: path.iter().map(|s| s.to_string()).collect(),
+            estimated_object_count: Some(
+                [
+                    "table",
+                    "view",
+                    "macro",
+                    "index",
+                    "scalar_function",
+                    "aggregate_function",
+                    "table_function",
+                ]
+                .iter()
+                .map(|k| (k.to_string(), 0))
+                .collect(),
+            ),
+        };
+        Bytes(ipc::write_batch(&wire::to_batch(info).unwrap()).unwrap())
+    }
+
+    fn entry(path: &[&str], schema_path: &[&str]) -> SchemaContents {
+        SchemaContents {
+            path: path.iter().map(|s| s.to_string()).collect(),
+            schema: schema_item(schema_path),
+            tables: Vec::new(),
+            views: Vec::new(),
+            scalar_functions: Vec::new(),
+            aggregate_functions: Vec::new(),
+            table_functions: Vec::new(),
+            scalar_macros: Vec::new(),
+            table_macros: Vec::new(),
+            indexes: Vec::new(),
+        }
+    }
+
+    fn reply(resp: CatalogContentsResponse) -> Reply {
+        Box::new(move || wire::to_result_batch(resp))
+    }
+
+    fn full(version: i64, etag: Option<&str>, schemas: Vec<SchemaContents>) -> Reply {
+        reply(CatalogContentsResponse {
+            catalog_version: version,
+            etag: etag.map(str::to_string),
+            not_modified: false,
+            schemas,
+        })
+    }
+
+    impl VgiTransport for Scripted {
+        fn call_unary(&mut self, method: &str, _params: &RecordBatch) -> Result<RecordBatch> {
+            self.calls.lock().unwrap().push(method.to_string());
+            match method {
+                "catalog_contents" => (self
+                    .contents
+                    .pop_front()
+                    .expect("an unscripted catalog_contents call"))(
+                ),
+                "catalog_schemas" => {
+                    wire::to_result_batch(vgi_protocol::protocol::dtos::ItemsResult {
+                        items: vec![schema_item(&["main"])],
+                    })
+                }
+                other => Err(RpcError::runtime_error(format!("unexpected call {other}"))),
+            }
+        }
+        fn open_producer<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _metadata: Option<vgi_rpc::wire::Metadata>,
+            _has_header: bool,
+        ) -> Result<Box<dyn ProducerStream + 'a>> {
+            Err(RpcError::runtime_error("no producer stream"))
+        }
+        fn open_exchange<'a>(
+            &'a mut self,
+            _method: &str,
+            _params: &RecordBatch,
+            _has_header: bool,
+        ) -> Result<Box<dyn ExchangeStream + 'a>> {
+            Err(RpcError::runtime_error("no exchange stream"))
+        }
+        fn label(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn client(script: Vec<Reply>) -> (VgiClient, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let t = Scripted {
+            contents: script.into(),
+            calls: calls.clone(),
+        };
+        (VgiClient::new(Box::new(t)), calls)
+    }
+
+    fn attached(supports: bool) -> AttachedCatalog {
+        let info = CatalogAttachResult {
+            attach_opaque_data: Bytes(vec![1]),
+            supports_transactions: false,
+            supports_time_travel: false,
+            catalog_version_frozen: false,
+            catalog_version: 1,
+            attach_opaque_data_required: true,
+            default_schema: "main".to_string(),
+            settings: Vec::new(),
+            secret_types: Vec::new(),
+            attach_catalogs: Vec::new(),
+            comment: None,
+            tags: Vec::new(),
+            supports_column_statistics: false,
+            global_functions: Vec::new(),
+            global_function_prefix: String::new(),
+            resolved_data_version: None,
+            resolved_implementation_version: None,
+            supports_catalog_contents: supports,
+        };
+        AttachedCatalog {
+            handle: info.attach_opaque_data.clone(),
+            info,
+            transaction: None,
+            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
+        }
+    }
+
+    fn calls(c: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        std::mem::take(&mut *c.lock().unwrap())
+    }
+
+    #[test]
+    fn a_path_that_disagrees_with_its_schema_info_falls_back() {
+        let (mut client, log) = client(vec![full(2, None, vec![entry(&["main"], &["other"])])]);
+        let snap = client.load_catalog(&attached(true), None).unwrap();
+        assert_eq!(snap.source, CatalogLoadSource::PerSchema);
+        assert!(snap
+            .fallback_reason
+            .unwrap()
+            .contains("differs from its SchemaInfo.path"));
+        assert_eq!(calls(&log), ["catalog_contents", "catalog_schemas"]);
+    }
+
+    #[test]
+    fn an_older_snapshot_is_retried_once_then_falls_back() {
+        let previous = CatalogSnapshot {
+            schemas: Vec::new(),
+            catalog_version: Some(5),
+            etag: Some("e5".to_string()),
+            source: CatalogLoadSource::CatalogContents,
+            not_modified: false,
+            fallback_reason: None,
+        };
+        // Older, then current: the retry wins.
+        let (mut c, log) = client(vec![
+            full(4, Some("e4"), vec![entry(&["main"], &["main"])]),
+            full(6, Some("e6"), vec![entry(&["main"], &["main"])]),
+        ]);
+        let snap = c.load_catalog(&attached(true), Some(&previous)).unwrap();
+        assert_eq!(snap.catalog_version, Some(6));
+        assert_eq!(snap.etag.as_deref(), Some("e6"));
+        assert_eq!(calls(&log), ["catalog_contents", "catalog_contents"]);
+        // Older twice: per-schema.
+        let (mut c, log) = client(vec![
+            full(4, Some("e4"), vec![entry(&["main"], &["main"])]),
+            full(3, Some("e3"), vec![entry(&["main"], &["main"])]),
+        ]);
+        let snap = c.load_catalog(&attached(true), Some(&previous)).unwrap();
+        assert_eq!(snap.source, CatalogLoadSource::PerSchema);
+        assert!(snap
+            .fallback_reason
+            .unwrap()
+            .contains("older than the known version 5"));
+        assert_eq!(
+            calls(&log),
+            ["catalog_contents", "catalog_contents", "catalog_schemas"]
+        );
+        // Version 0 is "unknown", never older.
+        let (mut c, _) = client(vec![full(0, None, vec![entry(&["main"], &["main"])])]);
+        let snap = c.load_catalog(&attached(true), Some(&previous)).unwrap();
+        assert_eq!(snap.source, CatalogLoadSource::CatalogContents);
+    }
+
+    #[test]
+    fn not_modified_keeps_previous_and_an_unasked_one_is_rejected() {
+        let previous = CatalogSnapshot {
+            schemas: vec![SchemaSnapshot::decode(&entry(&["main"], &["main"])).unwrap()],
+            catalog_version: Some(2),
+            etag: Some("e2".to_string()),
+            source: CatalogLoadSource::CatalogContents,
+            not_modified: false,
+            fallback_reason: None,
+        };
+        let nm = |etag: &str| {
+            reply(CatalogContentsResponse {
+                catalog_version: 2,
+                etag: Some(etag.to_string()),
+                not_modified: true,
+                schemas: Vec::new(),
+            })
+        };
+        let (mut c, _) = client(vec![nm("e2")]);
+        let kept = c.load_catalog(&attached(true), Some(&previous)).unwrap();
+        assert!(kept.not_modified);
+        assert_eq!(kept.schemas.len(), 1);
+        // not_modified with no if_none_match sent: a protocol violation → fallback.
+        let (mut c, _) = client(vec![nm("e2")]);
+        let snap = c.load_catalog(&attached(true), None).unwrap();
+        assert_eq!(snap.source, CatalogLoadSource::PerSchema);
+        assert!(snap.fallback_reason.is_some());
+        // A per-schema `previous` has no etag, so none is sent.
+        let per_schema = CatalogSnapshot {
+            source: CatalogLoadSource::PerSchema,
+            etag: Some("stale".to_string()),
+            ..previous.clone()
+        };
+        let (mut c, _) = client(vec![nm("stale")]);
+        let snap = c.load_catalog(&attached(true), Some(&per_schema)).unwrap();
+        assert_eq!(
+            snap.source,
+            CatalogLoadSource::PerSchema,
+            "not_modified to no etag"
+        );
+    }
+
+    #[test]
+    fn not_advertised_never_sends_and_raw_call_refuses() {
+        let (mut c, log) = client(Vec::new());
+        let snap = c.load_catalog(&attached(false), None).unwrap();
+        assert_eq!(snap.source, CatalogLoadSource::PerSchema);
+        assert_eq!(snap.fallback_reason, None);
+        assert!(c.contents_response(&attached(false), None).is_err());
+        assert_eq!(calls(&log), ["catalog_schemas"]);
+    }
+
+    #[test]
+    fn decodes_every_kind() {
+        let table = TableInfo {
+            comment: None,
+            tags: Vec::new(),
+            name: "t".to_string(),
+            schema_path: vec!["main".to_string()],
+            columns: Bytes(
+                ipc::write_schema(&arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "x",
+                    DataType::Int64,
+                    true,
+                )]))
+                .unwrap(),
+            ),
+            not_null_constraints: Vec::new(),
+            unique_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            primary_key_constraints: Vec::new(),
+            foreign_key_constraints: Vec::new(),
+            write_result_modes: Vec::new(),
+            supports_column_statistics: false,
+            scan_function: None,
+            insert_function: None,
+            update_function: None,
+            delete_function: None,
+            cardinality_estimate: None.into(),
+            cardinality_max: None.into(),
+            column_statistics: None,
+            bind_result: None,
+            required_filters: Vec::new(),
+        };
+        let index = IndexInfo {
+            comment: None,
+            tags: Vec::new(),
+            name: "ix".to_string(),
+            schema_path: vec!["main".to_string()],
+            table_name: "t".to_string(),
+            index_type: "ART".to_string(),
+            constraint_type: DictString("NONE".to_string()),
+            expressions: vec!["x".to_string()],
+            options: Vec::new(),
+        };
+        let enc = |b: RecordBatch| Bytes(ipc::write_batch(&b).unwrap());
+        let mut e = entry(&["main"], &["main"]);
+        e.tables = vec![enc(wire::to_batch(table).unwrap())];
+        e.indexes = vec![enc(wire::to_batch(index).unwrap())];
+        let snap = SchemaSnapshot::decode(&e).unwrap();
+        assert_eq!(snap.tables[0].name, "t");
+        assert_eq!(snap.indexes[0].name, "ix");
+        // A corrupt item is an error naming the kind.
+        e.views = vec![Bytes(vec![1, 2, 3])];
+        let err = SchemaSnapshot::decode(&e).unwrap_err();
+        assert!(err.message.contains("views"), "{}", err.message);
     }
 }

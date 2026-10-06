@@ -337,6 +337,15 @@ impl Worker {
         self.disp.register_secondary_catalog(model, functions);
     }
 
+    /// Serve a DDL-capable catalog alongside the primary: advertised by
+    /// `catalog_catalogs`, attachable by its name, and private per ATTACH, with
+    /// its state in this worker's shared storage (so it survives the subprocess
+    /// pool handing an attach's RPCs to different processes). See
+    /// [`crate::stored_catalog`].
+    pub fn register_stored_catalog(&mut self, catalog: crate::stored_catalog::StoredCatalog) {
+        self.disp.register_stored_catalog(catalog);
+    }
+
     /// Register a secret type (surfaced via `catalog_attach`).
     pub fn register_secret_type(&mut self, spec: crate::catalog::SecretTypeSpec) {
         self.disp.register_secret_type(spec);

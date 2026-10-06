@@ -938,6 +938,16 @@ pub struct CatalogModel {
     /// never changes while it serves). Ignored for a version-shaped catalog
     /// (`version_schemas`), whose objects vary per attach. Off by default.
     pub catalog_contents_attach_independent: bool,
+    /// Per-catalog override of whether `catalog_attach` advertises
+    /// `supports_catalog_contents`. `None` (the default): the worker-wide
+    /// setting ([`crate::Worker::set_catalog_contents`]). `Some(false)` makes
+    /// this catalog look like a pre-2.1.0 worker to the client — it then never
+    /// sends `catalog_contents` — while the RPC itself stays served.
+    pub supports_catalog_contents: Option<bool>,
+    /// Advertise `catalog_version_frozen`: the catalog's objects never change
+    /// while the worker serves it, so a client may skip its per-transaction
+    /// version check (vgi-python's `ReadOnlyCatalogInterface`). Off by default.
+    pub catalog_version_frozen: bool,
 }
 
 impl CatalogModel {

@@ -1248,6 +1248,8 @@ pub fn versioned() -> CatalogModel {
         contents_provider: None,
         catalog_contents_etag: Default::default(),
         catalog_contents_attach_independent: false,
+        supports_catalog_contents: None,
+        catalog_version_frozen: false,
         comment: Some(
             "Example catalog demonstrating data_version_spec validation and cookie stickiness"
                 .to_string(),
@@ -1346,6 +1348,8 @@ pub fn versioned_tables() -> CatalogModel {
         contents_provider: None,
         catalog_contents_etag: Default::default(),
         catalog_contents_attach_independent: false,
+        supports_catalog_contents: None,
+        catalog_version_frozen: false,
         comment: Some(
             "Catalog whose visible tables depend on the resolved data version".to_string(),
         ),
@@ -1392,6 +1396,8 @@ pub fn build() -> CatalogModel {
         contents_provider: None,
         catalog_contents_etag: Default::default(),
         catalog_contents_attach_independent: false,
+        supports_catalog_contents: None,
+        catalog_version_frozen: false,
         global_functions: crate::global_functions::NAMES
             .iter()
             .map(|s| s.to_string())

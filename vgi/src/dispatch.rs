@@ -352,6 +352,10 @@ pub struct Dispatcher {
     /// once and served to every call; cleared with the function listings.
     contents_cache: std::sync::Mutex<HashMap<ContentsCacheKey, Arc<CachedContents>>>,
     exec_counter: AtomicU64,
+    /// DDL-capable catalogs kept in shared storage, private per ATTACH (see
+    /// [`crate::stored_catalog`]). Attached by name; their sessions ride the
+    /// secondary-catalog `attach_opaque_data` encoding.
+    stored: Vec<Arc<crate::stored_catalog::StoredCatalog>>,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -395,6 +399,7 @@ impl Dispatcher {
             catalog_generation: 0,
             contents_cache: std::sync::Mutex::new(HashMap::new()),
             exec_counter: AtomicU64::new(1),
+            stored: Vec::new(),
         }
     }
 
@@ -454,6 +459,48 @@ impl Dispatcher {
         self.secondary.push(model);
         self.secondary_functions.push(functions);
         self.function_listings_changed();
+    }
+
+    /// Serve a DDL-capable [`StoredCatalog`](crate::stored_catalog::StoredCatalog)
+    /// alongside the primary: advertised by `catalog_catalogs`, attachable by
+    /// its name, every attach a private session.
+    pub fn register_stored_catalog(&mut self, catalog: crate::stored_catalog::StoredCatalog) {
+        self.stored.push(Arc::new(catalog));
+    }
+
+    /// The stored catalog and session a request's `attach_opaque_data` names,
+    /// with the raw handle.
+    fn stored_session(
+        &self,
+        req: &Request,
+    ) -> Option<(&crate::stored_catalog::StoredCatalog, Vec<u8>, Vec<u8>)> {
+        if self.stored.is_empty() {
+            return None;
+        }
+        // Flat requests carry the handle as a column; boxed ones
+        // (`catalog_table_create`, `catalog_macro_create`, …) inside `request`.
+        let attach = read_binary_col(req, "attach_opaque_data").or_else(|| {
+            let inner = request_inner_batch(req).ok()?;
+            let col = inner.column_by_name("attach_opaque_data")?;
+            let col = col.as_any().downcast_ref::<arrow_array::BinaryArray>()?;
+            (!col.is_empty() && !col.is_null(0)).then(|| col.value(0).to_vec())
+        })?;
+        let (name, session) = decode_secondary_opaque(&attach)?;
+        let cat = self.stored.iter().find(|c| c.name() == name)?;
+        Some((cat, attach, session))
+    }
+
+    /// Serve a catalog RPC from the stored catalog its attach names, or fall
+    /// through to `otherwise` (the declarative catalogs).
+    pub fn stored_or(
+        &self,
+        req: &Request,
+        otherwise: impl FnOnce() -> Result<Option<RecordBatch>>,
+    ) -> Result<Option<RecordBatch>> {
+        match self.stored_session(req) {
+            Some((cat, attach, session)) => cat.handle(self.store.as_ref(), &attach, &session, req),
+            None => otherwise(),
+        }
     }
 
     pub fn register_secret_type(&mut self, spec: catalog::SecretTypeSpec) {
@@ -2111,11 +2158,24 @@ impl Dispatcher {
         for sec in &self.secondary {
             items.push(Bytes::from(catalog::serialize_catalog_info(sec)?));
         }
+        for stored in &self.stored {
+            items.push(Bytes::from(catalog::serialize_catalog_info(
+                &stored.discovery_model(),
+            )?));
+        }
         Ok(Some(wire::to_result_batch(ItemsResult { items })?))
     }
 
     pub fn handle_catalog_attach(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: CatalogAttachRequest = boxed(req)?;
+        // A stored (DDL-capable) catalog: every attach is a fresh private
+        // session whose state lives in shared storage.
+        if let Some(stored) = self.stored.iter().find(|c| c.name() == dto.name) {
+            let session = self.next_execution_id();
+            let attach = encode_secondary_opaque(stored.name(), &session);
+            let result = stored.attach(self.store.as_ref(), &session, attach, &dto)?;
+            return Ok(Some(wire::to_result_batch(result)?));
+        }
         // Refuse the attach when a declared-`required` option was not supplied,
         // BEFORE any of the per-catalog-shape work below — including the
         // secondary early-return, so the rule holds for every catalog this
@@ -2152,7 +2212,7 @@ impl Dispatcher {
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
                 supports_time_travel: sec.supports_time_travel,
-                catalog_version_frozen: false,
+                catalog_version_frozen: sec.catalog_version_frozen,
                 catalog_version: 1,
                 attach_opaque_data_required: true,
                 default_schema: catalog::MAIN_SCHEMA.to_string(),
@@ -2166,7 +2226,9 @@ impl Dispatcher {
                 global_function_prefix: String::new(),
                 resolved_data_version: sec.data_version_spec.clone(),
                 resolved_implementation_version: sec.implementation_version.clone(),
-                supports_catalog_contents: self.catalog_contents,
+                supports_catalog_contents: sec
+                    .supports_catalog_contents
+                    .unwrap_or(self.catalog_contents),
             };
             return Ok(Some(wire::to_result_batch(result)?));
         }
@@ -2234,7 +2296,7 @@ impl Dispatcher {
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
             supports_time_travel: self.catalog.supports_time_travel,
-            catalog_version_frozen: false,
+            catalog_version_frozen: self.catalog.catalog_version_frozen,
             catalog_version: 1,
             attach_opaque_data_required: true,
             default_schema: catalog::MAIN_SCHEMA.to_string(),
@@ -2265,7 +2327,10 @@ impl Dispatcher {
             global_function_prefix: self.catalog.global_function_prefix.clone(),
             resolved_data_version,
             resolved_implementation_version,
-            supports_catalog_contents: self.catalog_contents,
+            supports_catalog_contents: self
+                .catalog
+                .supports_catalog_contents
+                .unwrap_or(self.catalog_contents),
         };
         Ok(Some(wire::to_result_batch(result)?))
     }
@@ -2661,7 +2726,8 @@ impl Dispatcher {
                 .tables
                 .iter()
                 .map(|t| {
-                    let scan_schema = self.resolve_table_function_schema(&t.scan_function, path);
+                    let scan_schema =
+                        self.resolve_table_function_schema(req, &t.scan_function, path);
                     catalog::table_info(path, t, scan_schema.as_deref())
                 })
                 .collect::<Result<_>>()?,
@@ -2839,7 +2905,7 @@ impl Dispatcher {
             .map(|t| {
                 let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
                 let scan_schema =
-                    self.resolve_table_function_schema(&tt.scan_function, &schema_path);
+                    self.resolve_table_function_schema(req, &tt.scan_function, &schema_path);
                 catalog::table_info(&schema_path, &tt, scan_schema.as_deref())
             })
             .transpose()?
@@ -2862,18 +2928,33 @@ impl Dispatcher {
     /// function's one real home when it's registered exactly once elsewhere;
     /// returns `None` (caller falls back to the table's own schema as a
     /// best-effort default) when the registry has no unambiguous answer.
+    ///
+    /// Only the homes in the request's own catalog count: one implementation
+    /// may be registered into several catalogs served by this worker (each a
+    /// separate home), and a home in another catalog is not where this
+    /// catalog's bind will resolve the name. When the catalog has none (a
+    /// secondary whose tables scan the primary's unscoped functions), every
+    /// home is considered, as before.
     fn resolve_table_function_schema(
         &self,
+        req: &Request,
         function_name: &str,
         table_schema_path: &[String],
     ) -> Option<Vec<String>> {
-        let homes = self.homes_of(FnKind::Table, function_name);
+        let catalog = self.catalog_identity(self.active_catalog(req));
+        let all = self.homes_of(FnKind::Table, function_name);
+        let mine: Vec<&FunctionScope> = all.iter().filter(|h| h.in_catalog(catalog)).collect();
+        let homes: Vec<&FunctionScope> = if mine.is_empty() {
+            all.iter().collect()
+        } else {
+            mine
+        };
         if homes
             .iter()
             .any(|h| h.matches(&h.catalog, table_schema_path))
         {
             Some(table_schema_path.to_vec())
-        } else if let [only] = homes {
+        } else if let [only] = homes.as_slice() {
             Some(only.schema_path.clone())
         } else {
             None
@@ -2898,7 +2979,7 @@ impl Dispatcher {
             })?;
         let t = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
         let resolved_schema = self
-            .resolve_table_function_schema(&t.scan_function, &schema_path)
+            .resolve_table_function_schema(req, &t.scan_function, &schema_path)
             .unwrap_or_else(|| schema_path.clone());
         Ok(Some(wire::to_result_batch(catalog::scan_function_result(
             &resolved_schema,
@@ -3286,7 +3367,7 @@ impl Dispatcher {
                     // the SOURCE table's schema, a different, older field:
                     // source_schema_path).
                     let branch_schema = (!d.function_name.is_empty()).then(|| {
-                        self.resolve_table_function_schema(&d.function_name, &schema_path)
+                        self.resolve_table_function_schema(req, &d.function_name, &schema_path)
                             .unwrap_or_else(|| schema_path.clone())
                     });
                     mk(ScanBranch {
@@ -3319,7 +3400,7 @@ impl Dispatcher {
                 branch_filter: None,
                 writable: false,
                 schema_path: Some(
-                    self.resolve_table_function_schema(&t.scan_function, &schema_path)
+                    self.resolve_table_function_schema(req, &t.scan_function, &schema_path)
                         .unwrap_or_else(|| schema_path.clone()),
                 ),
                 source_catalog: None,
@@ -3508,7 +3589,12 @@ impl Dispatcher {
                 return false;
             }
             match active_sec_fns {
-                Some(fns) => fns.iter().any(|f| f == name),
+                // A secondary lists every function homed in it — the names it
+                // adopted and any instance registered straight into it with
+                // `register_*_in` (`in_schema` below does the per-instance
+                // check), so one implementation can be served by several
+                // catalogs under the same name.
+                Some(_) => true,
                 None => !all_sec_fns.contains(name),
             }
         };
@@ -6602,5 +6688,105 @@ mod catalog_contents_tests {
         assert!(!attach(&d).supports_catalog_contents);
         // Still served: the flag only tells the client it may call it.
         assert_eq!(contents(&d).schemas.len(), 3);
+    }
+
+    fn attach_named(d: &Dispatcher, name: &str) -> CatalogAttachResult {
+        let inner_req = wire::to_batch(CatalogAttachRequest {
+            name: name.to_string(),
+            options: None,
+            data_version_spec: None,
+            implementation_version: None,
+            client_capabilities: None,
+        })
+        .unwrap();
+        let batch = wire::to_batch(p::CatalogAttachParams {
+            request: Bytes::from(ipc::write_batch(&inner_req).unwrap()),
+        })
+        .unwrap();
+        let result = d
+            .handle_catalog_attach(&request("catalog_attach", batch))
+            .unwrap()
+            .unwrap();
+        wire::from_batch(&inner(result)).unwrap()
+    }
+
+    /// Per-catalog capability flags on a secondary catalog: one that opts out
+    /// of `catalog_contents` reads like a pre-2.1.0 worker; a frozen one says
+    /// so; neither touches the worker-wide default the primary uses.
+    #[test]
+    fn secondary_catalog_capability_overrides() {
+        let mut d = dispatcher();
+        d.register_secondary_catalog(
+            catalog::CatalogModel {
+                name: "legacy".to_string(),
+                supports_catalog_contents: Some(false),
+                catalog_version_frozen: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let legacy = attach_named(&d, "legacy");
+        assert!(!legacy.supports_catalog_contents);
+        assert!(legacy.catalog_version_frozen);
+        let primary = attach_named(&d, "cat");
+        assert!(primary.supports_catalog_contents);
+        assert!(!primary.catalog_version_frozen);
+    }
+
+    struct NoRows(&'static str);
+    impl TableFunction for NoRows {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            Vec::new()
+        }
+        fn on_bind(&self, _p: &BindParams) -> Result<crate::function::BindResponse> {
+            Err(RpcError::runtime_error("not bound in this test"))
+        }
+        fn producer(&self, _p: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+            Err(RpcError::runtime_error("not run in this test"))
+        }
+    }
+
+    /// A function also registered into ANOTHER catalog (a second home) must
+    /// not change where this catalog's table says its scan function lives:
+    /// `t` (in `data`) is scanned by the unscoped `t_scan`, whose home in
+    /// `cat` is `main`, however many other catalogs serve the same name.
+    #[test]
+    fn scan_function_schema_ignores_homes_in_other_catalogs() {
+        let scan_schema = |d: &Dispatcher| {
+            let batch = wire::to_batch(p::CatalogTableScanFunctionGetParams {
+                attach_opaque_data: Bytes::from(d.attach_bytes()),
+                schema_path: path(&["data"]),
+                name: "t".to_string(),
+                at_unit: None,
+                at_value: None,
+                transaction_opaque_data: None,
+            })
+            .unwrap();
+            let r: ScanFunctionResult = wire::from_batch(&inner(
+                d.handle_table_scan_function_get(&request(
+                    "catalog_table_scan_function_get",
+                    batch,
+                ))
+                .unwrap()
+                .unwrap(),
+            ))
+            .unwrap();
+            r.schema_path
+        };
+        let mut d = dispatcher();
+        d.register_table(Arc::new(NoRows("t_scan")));
+        assert_eq!(scan_schema(&d), Some(path(&["main"])));
+        d.register_table_scoped(
+            Arc::new(NoRows("t_scan")),
+            FunctionScope::new("other", "main"),
+        );
+        d.register_table_scoped(Arc::new(NoRows("t_scan")), FunctionScope::new("third", "x"));
+        assert_eq!(scan_schema(&d), Some(path(&["main"])));
     }
 }

@@ -296,11 +296,14 @@ rc=0
 #
 # The Linux floors are deliberately conservative relative to the current suite;
 # the lower Windows-http value remains for local use of this portable driver.
+# Each was raised by 5 when the five catalog_contents*.test files that used to be
+# gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only) started running against
+# this worker's contents_* fixture catalogs (vgi-example-worker/src/contents_fixtures.rs).
 TOTAL_EXECUTED=0
 case "$TRANSPORT" in
-  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-250}" ;;
-  launch) MIN_EXECUTED="${MIN_EXECUTED:-255}" ;;
-  http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-240}"; else MIN_EXECUTED="${MIN_EXECUTED:-245}"; fi ;;
+  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-255}" ;;
+  launch) MIN_EXECUTED="${MIN_EXECUTED:-260}" ;;
+  http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-245}"; else MIN_EXECUTED="${MIN_EXECUTED:-250}"; fi ;;
 esac
 
 # run_unittest — invoke haybarn-unittest, streaming its output, and additionally
