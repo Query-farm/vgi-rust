@@ -3912,6 +3912,25 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
+        let (response, logs) = self.buffering_combine(dto)?;
+        Self::drain_buffering_logs(&logs, ctx);
+        Ok(Some(wire::to_result_batch(response)?))
+    }
+
+    /// The transport-free core of `table_buffering_combine`.
+    ///
+    /// `state_ids` may be EMPTY: when a buffering function's input is empty at
+    /// runtime no Sink thread ever ran, yet the extension still inits the
+    /// buffering phase, combines with an empty list and finalizes, so a
+    /// whole-input reduction answers for empty input (vgi 63eb257). The empty
+    /// list is passed straight through to the function's `combine`.
+    fn buffering_combine(
+        &self,
+        dto: TableBufferingCombineRequest,
+    ) -> Result<(
+        TableBufferingCombineResponse,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    )> {
         let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
         let persisted = self.buffering_schema(&dto.execution_id.0);
         let schema = dto
@@ -3940,12 +3959,12 @@ impl Dispatcher {
         };
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();
         let finalize_ids = f.combine(&params, &state_ids)?;
-        Self::drain_buffering_logs(&logs, ctx);
-        Ok(Some(wire::to_result_batch(
+        Ok((
             TableBufferingCombineResponse {
                 finalize_state_ids: finalize_ids.into_iter().map(Bytes::from).collect(),
             },
-        )?))
+            logs,
+        ))
     }
 
     pub fn handle_buffering_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -5230,6 +5249,77 @@ mod buffering_schema_tests {
             .expect("recompute via on_bind");
         assert_eq!(out.fields().len(), 1);
         assert_eq!(out.field(0).data_type(), &DataType::Float64);
+    }
+
+    /// Empty input at runtime (vgi 63eb257): the extension inits the
+    /// buffering phase itself, then combines with an EMPTY `state_ids` list.
+    /// The combine must reach the function with that empty list -- not be
+    /// refused or skipped -- so a whole-input reduction can answer.
+    #[test]
+    fn combine_accepts_an_empty_state_id_list() {
+        struct CountingCombine(std::sync::Mutex<Option<usize>>);
+        impl crate::buffering::TableBufferingFunction for CountingCombine {
+            fn name(&self) -> &str {
+                "counting_combine"
+            }
+            fn metadata(&self) -> crate::function::FunctionMetadata {
+                Default::default()
+            }
+            fn argument_specs(&self) -> Vec<crate::function::ArgSpec> {
+                vec![]
+            }
+            fn on_bind(&self, _p: &BindParams) -> Result<crate::function::BindResponse> {
+                unreachable!("the output schema was persisted by the buffering init")
+            }
+            fn process(
+                &self,
+                _p: &crate::buffering::BufferingParams,
+                _b: &arrow_array::RecordBatch,
+            ) -> Result<Vec<u8>> {
+                unreachable!("empty input: no Sink thread runs")
+            }
+            fn combine(
+                &self,
+                p: &crate::buffering::BufferingParams,
+                s: &[Vec<u8>],
+            ) -> Result<Vec<Vec<u8>>> {
+                *self.0.lock().unwrap() = Some(s.len());
+                p.log("combined");
+                Ok(vec![p.execution_id.clone()])
+            }
+            fn finalize_producer(
+                &self,
+                _p: &crate::buffering::BufferingParams,
+                _f: Vec<u8>,
+            ) -> Result<Box<dyn crate::table_function::TableProducer>> {
+                unimplemented!()
+            }
+        }
+
+        let f = Arc::new(CountingCombine(std::sync::Mutex::new(None)));
+        let mut d = Dispatcher::new("test");
+        d.register_buffering(f.clone());
+        let exec = format!("test-empty-combine-{}", std::process::id()).into_bytes();
+        d.store.clear(&exec);
+        // What the buffering-phase init persists before combine.
+        let out = Arc::new(Schema::new(vec![Field::new("s", DataType::Int64, true)]));
+        d.store
+            .kv_put(&exec, b"outsc", &ipc::write_schema_ref(&out).unwrap());
+
+        let (response, logs) = d
+            .buffering_combine(TableBufferingCombineRequest {
+                function_name: "counting_combine".to_string(),
+                execution_id: Bytes::from(exec.clone()),
+                state_ids: Vec::new(),
+                attach_opaque_data: None,
+                transaction_id: None,
+                schema_path: None,
+            })
+            .expect("an empty combine succeeds");
+        assert_eq!(*f.0.lock().unwrap(), Some(0), "combine saw the empty list");
+        assert_eq!(response.finalize_state_ids.len(), 1);
+        assert_eq!(logs.lock().unwrap().as_slice(), ["combined".to_string()]);
+        d.store.clear(&exec);
     }
 
     // No stored schema and no input to rebind from → fail loudly, never guess.
