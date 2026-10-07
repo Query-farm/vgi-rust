@@ -275,7 +275,7 @@ INSTALL parquet FROM core;
 statement ok
 INSTALL spatial FROM core;
 EOF
-"$HAYBARN_UNITTEST" "test/_warm.test" >/dev/null 2>&1 || \
+"$HAYBARN_UNITTEST" --test-dir "$STAGE" "test/_warm.test" >/dev/null 2>&1 || \
   echo "::warning::extension warm-up did not fully succeed; individual require gates remain authoritative"
 rm -f "$STAGE/test/_warm.test"
 
@@ -326,7 +326,14 @@ esac
 run_unittest() {
   local log unittest_rc=0
   log="$(mktemp)"
-  "$HAYBARN_UNITTEST" --test-config "$TEST_CONFIG" "$@" 2>&1 | tee "$log"
+  # --test-dir "$STAGE": DuckDB's unittest chdirs to its compiled-in root
+  # (DUCKDB_ROOT_DIRECTORY) when that exists. haybarn-unittest's does not, so it stays in
+  # $STAGE; a locally built extension unittest moves to its own checkout, runs that tree
+  # instead of the staged one, and resolves `__TEST_DIR__` there -- while the HTTP workers,
+  # started in $STAGE, open COPY TO/FROM paths (duckdb_unittest_tempdir/...) relative to
+  # $STAGE and miss them (9 copy_* failures). Pinning the directory makes unittest and the
+  # workers agree by construction rather than by a property of the binary.
+  "$HAYBARN_UNITTEST" --test-dir "$STAGE" --test-config "$TEST_CONFIG" "$@" 2>&1 | tee "$log"
   # Read PIPESTATUS immediately: any command in between (including `|| true`)
   # overwrites it and would silently swallow every real test failure.
   unittest_rc="${PIPESTATUS[0]}"
