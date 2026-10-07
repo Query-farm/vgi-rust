@@ -20,7 +20,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "bind",
             wire::params_schema_for("bind"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_bind(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_bind(req, ctx)),
         ));
     }
     {
@@ -35,7 +35,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "init",
             MethodType::Dynamic,
             wire::params_schema_for("init"),
-            move |req, ctx| d.handle_init(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_init(req, ctx)),
         )
         // HTTP continuations rebuild the (stateless) exchange handler from an
         // AEAD state token; without a decoder the server 500s on /init/exchange.
@@ -50,7 +50,10 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_attach",
             wire::params_schema_for("catalog_attach"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_attach(req),
+            move |req, ctx| {
+                let result = d.with_opened(req, ctx, |opened| d.handle_catalog_attach(opened))?;
+                d.seal_result(req, ctx, result)
+            },
         ));
     }
     {
@@ -59,7 +62,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_version",
             wire::params_schema_for("catalog_version"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_catalog_version(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_catalog_version(req))
+                })
+            },
         ));
     }
     {
@@ -68,7 +75,12 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_transaction_begin",
             wire::params_schema_for("catalog_transaction_begin"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_transaction_begin(req)),
+            move |req, ctx| {
+                let result = d.with_opened(req, ctx, |opened| {
+                    d.stored_or(opened, || d.handle_transaction_begin(opened))
+                })?;
+                d.seal_result(req, ctx, result)
+            },
         ));
     }
     // --- aggregates ---
@@ -78,7 +90,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_bind",
             wire::params_schema_for("aggregate_bind"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_aggregate_bind(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_bind(req, ctx)),
         ));
     }
     {
@@ -87,7 +99,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_update",
             wire::params_schema_for("aggregate_update"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_update(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_update(req)),
         ));
     }
     {
@@ -96,7 +108,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_combine",
             wire::params_schema_for("aggregate_combine"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_combine(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_combine(req)),
         ));
     }
     {
@@ -105,7 +117,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_finalize",
             wire::params_schema_for("aggregate_finalize"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_finalize(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_finalize(req)),
         ));
     }
     {
@@ -114,7 +126,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_destructor",
             wire::params_schema_for("aggregate_destructor"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_destructor(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_destructor(req)),
         ));
     }
     {
@@ -123,7 +135,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_window_init",
             wire::params_schema_for("aggregate_window_init"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_window_init(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window_init(req)),
         ));
     }
     {
@@ -132,7 +144,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_window",
             wire::params_schema_for("aggregate_window"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_window(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window(req)),
         ));
     }
     {
@@ -141,7 +153,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_window_batch",
             wire::params_schema_for("aggregate_window_batch"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_window_batch(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window_batch(req)),
         ));
     }
     {
@@ -150,7 +162,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_window_destructor",
             wire::params_schema_for("aggregate_window_destructor"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_window_destructor(req),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| d.handle_aggregate_window_destructor(req))
+            },
         ));
     }
     {
@@ -159,7 +173,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_streaming_open",
             wire::params_schema_for("aggregate_streaming_open"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_streaming_open(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_open(req)),
         ));
     }
     {
@@ -168,7 +182,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_streaming_chunk",
             wire::params_schema_for("aggregate_streaming_chunk"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_streaming_chunk(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_chunk(req)),
         ));
     }
     {
@@ -177,7 +191,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "aggregate_streaming_close",
             wire::params_schema_for("aggregate_streaming_close"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_aggregate_streaming_close(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_close(req)),
         ));
     }
 
@@ -188,7 +202,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_buffering_process",
             wire::params_schema_for("table_buffering_process"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_buffering_process(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_process(req, ctx)),
         ));
     }
     {
@@ -197,7 +211,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_buffering_combine",
             wire::params_schema_for("table_buffering_combine"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_buffering_combine(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_combine(req, ctx)),
         ));
     }
     {
@@ -207,7 +221,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_buffering_destructor",
             wire::params_schema_for("table_buffering_destructor"),
             empty,
-            move |req, _ctx| d.handle_buffering_destructor(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_destructor(req)),
         ));
     }
 
@@ -251,7 +265,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             wire::params_schema_for(name),
             // Void on success (vgi-python declares these `-> None`).
             Arc::new(arrow_schema::Schema::empty()),
-            move |req, _ctx| d.stored_or(req, || d.handle_read_only(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_read_only(req)))
+            },
         ));
     }
 
@@ -262,7 +278,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schemas",
             wire::params_schema_for("catalog_schemas"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_catalog_schemas(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_catalog_schemas(req))
+                })
+            },
         ));
     }
     {
@@ -274,7 +294,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_contents",
             wire::params_schema_for("catalog_contents"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_catalog_contents(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_catalog_contents(req))
+                })
+            },
         ));
     }
     {
@@ -283,7 +307,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_get",
             wire::params_schema_for("catalog_schema_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_schema_get(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_schema_get(req))
+                })
+            },
         ));
     }
     {
@@ -292,7 +320,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_functions",
             wire::params_schema_for("catalog_schema_contents_functions"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_contents_functions(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_contents_functions(req))
+                })
+            },
         ));
     }
 
@@ -302,7 +334,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_views",
             wire::params_schema_for("catalog_schema_contents_views"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_contents_views(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_contents_views(req))
+                })
+            },
         ));
     }
     {
@@ -311,7 +347,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_macros",
             wire::params_schema_for("catalog_schema_contents_macros"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_contents_macros(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_contents_macros(req))
+                })
+            },
         ));
     }
     {
@@ -320,7 +360,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_schema_contents_tables",
             wire::params_schema_for("catalog_schema_contents_tables"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_contents_tables(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_contents_tables(req))
+                })
+            },
         ));
     }
     {
@@ -329,7 +373,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_get",
             wire::params_schema_for("catalog_table_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_table_get(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_table_get(req)))
+            },
         ));
     }
     {
@@ -341,7 +387,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_scan_function_get",
             wire::params_schema_for("catalog_table_scan_function_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_table_scan_function_get(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_table_scan_function_get(req))
+                })
+            },
         ));
     }
     {
@@ -350,7 +400,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_scan_branches_get",
             wire::params_schema_for("catalog_table_scan_branches_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_table_scan_branches_get(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_table_scan_branches_get(req))
+                })
+            },
         ));
     }
     {
@@ -359,7 +413,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_table_column_statistics_get",
             wire::params_schema_for("catalog_table_column_statistics_get"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_table_column_statistics_get(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_table_column_statistics_get(req))
+                })
+            },
         ));
     }
     {
@@ -368,7 +426,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_function_statistics",
             wire::params_schema_for("table_function_statistics"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_table_function_statistics(req, ctx),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| d.handle_table_function_statistics(req, ctx))
+            },
         ));
     }
     {
@@ -377,7 +437,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_function_cardinality",
             wire::params_schema_for("table_function_cardinality"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_table_function_cardinality(req, ctx),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.handle_table_function_cardinality(req, ctx)
+                })
+            },
         ));
     }
     {
@@ -386,7 +450,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_function_plan",
             wire::params_schema_for("table_function_plan"),
             wire::result_binary_schema(),
-            move |req, ctx| d.handle_table_function_plan(req, ctx),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_table_function_plan(req, ctx)),
         ));
     }
     {
@@ -395,7 +459,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "table_function_dynamic_to_string",
             wire::params_schema_for("table_function_dynamic_to_string"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_table_function_dynamic_to_string(req),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.handle_table_function_dynamic_to_string(req)
+                })
+            },
         ));
     }
 
@@ -405,7 +473,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_catalogs",
             wire::params_schema_for("catalog_catalogs"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.handle_catalog_catalogs(req),
+            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_catalog_catalogs(req)),
         ));
     }
     {
@@ -414,7 +482,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             "catalog_copy_from_formats",
             wire::params_schema_for("catalog_copy_from_formats"),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_catalog_copy_from_formats(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_catalog_copy_from_formats(req))
+                })
+            },
         ));
     }
 
@@ -430,7 +502,11 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             name,
             wire::params_schema_for(name),
             wire::result_binary_schema(),
-            move |req, _ctx| d.stored_or(req, || d.handle_empty_items(req)),
+            move |req, ctx| {
+                d.with_opened(req, ctx, |req| {
+                    d.stored_or(req, || d.handle_empty_items(req))
+                })
+            },
         ));
     }
 }
@@ -442,6 +518,6 @@ fn register_void(srv: &mut RpcServer, disp: &Arc<Dispatcher>, name: &str) {
         name.to_string(),
         wire::params_schema_for(name),
         empty,
-        move |req, _ctx| d.stored_or(req, || d.handle_void(req)),
+        move |req, ctx| d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_void(req))),
     ));
 }

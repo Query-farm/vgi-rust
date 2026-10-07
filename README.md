@@ -186,6 +186,14 @@ worker adds with `Worker::hosted_protocols`; HTTP additionally hosts
 it mints sealed grants and accepts them back as bearer credentials. See
 [docs/hosted-protocols.md](docs/hosted-protocols.md).
 
+Over HTTP the worker seals the `attach_opaque_data` and
+`transaction_opaque_data` values it hands the client (XChaCha20-Poly1305 under
+`VGI_SIGNING_KEY` / `Worker::signing_key`, or a key generated at startup when
+neither is set), binds each to its caller and each transaction to its attach,
+and refuses anything that does not open with the one error
+`<field> not recognized`. Secret attach options never enter either value on any
+transport. See `vgi::opaque`.
+
 ## Protocol overview
 
 VGI uses [`vgi-rpc`](https://crates.io/crates/vgi-rpc), an Apache-Arrow-IPC RPC

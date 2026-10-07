@@ -356,6 +356,10 @@ pub struct Dispatcher {
     /// [`crate::stored_catalog`]). Attached by name; their sessions ride the
     /// secondary-catalog `attach_opaque_data` encoding.
     stored: Vec<Arc<crate::stored_catalog::StoredCatalog>>,
+    /// Seals `attach_opaque_data` / `transaction_opaque_data` on a transport
+    /// that authenticates callers (HTTP); `None` on the OS-owned transports.
+    /// See [`crate::opaque`].
+    pub(crate) opaque: Option<crate::opaque::OpaqueSealer>,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -400,6 +404,47 @@ impl Dispatcher {
             contents_cache: std::sync::Mutex::new(HashMap::new()),
             exec_counter: AtomicU64::new(1),
             stored: Vec::new(),
+            opaque: None,
+        }
+    }
+
+    /// Run `f` on `req` with every opaque value it carries opened for the
+    /// caller (see [`crate::opaque::OpaqueSealer::open_batch`]). Without a
+    /// sealer (stdio, unix, TCP) `f` sees `req` unchanged. A value that does
+    /// not open is the uniform `<field> not recognized` rejection, before any
+    /// handler runs -- there is no plaintext fallback.
+    pub fn with_opened<R>(
+        &self,
+        req: &Request,
+        ctx: &vgi_rpc::CallContext,
+        f: impl FnOnce(&Request) -> Result<R>,
+    ) -> Result<R> {
+        let Some(sealer) = &self.opaque else {
+            return f(req);
+        };
+        let opened = Request {
+            method: req.method.clone(),
+            protocol: req.protocol.clone(),
+            request_id: req.request_id.clone(),
+            batch: sealer.open_batch(&req.batch, &ctx.auth)?,
+            metadata: req.metadata.clone(),
+        };
+        f(&opened)
+    }
+
+    /// Seal the opaque value a `catalog_attach` / `catalog_transaction_begin`
+    /// result minted, for the caller; `req` is the request as sent (its
+    /// sealed attach is what a transaction binds to). Pass-through without a
+    /// sealer.
+    pub fn seal_result(
+        &self,
+        req: &Request,
+        ctx: &vgi_rpc::CallContext,
+        result: Option<RecordBatch>,
+    ) -> Result<Option<RecordBatch>> {
+        match &self.opaque {
+            None => Ok(result),
+            Some(sealer) => sealer.seal_result(&req.method, &req.batch, result, &ctx.auth),
         }
     }
 
@@ -806,10 +851,14 @@ impl Dispatcher {
         let pid = std::process::id();
         #[cfg(target_arch = "wasm32")]
         let pid: u32 = 0;
+        // Ids land inside opaque values (secondary sessions, transactions) and
+        // name storage scopes, so they must not be guessable: 20 bytes from the
+        // CSPRNG. The `vgi-exec-` tag and the 29-byte length are unchanged.
+        let _ = (n, t, pid);
         let mut v = b"vgi-exec-".to_vec();
-        v.extend_from_slice(&pid.to_le_bytes());
-        v.extend_from_slice(&t.to_le_bytes());
-        v.extend_from_slice(&n.to_le_bytes());
+        let mut random = [0u8; 20];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
+        v.extend_from_slice(&random);
         v
     }
 
@@ -2249,6 +2298,20 @@ impl Dispatcher {
                     .as_ref()
                     .map(|b| ipc::read_batch(&b.0))
                     .transpose()?;
+                // Secret options never enter the value, sealed or not: it is
+                // also persisted server-side (`bufattach`) and, on an OS-owned
+                // transport, travels in plaintext.
+                let secret = catalog::secret_attach_option_names(&self.catalog.attach_option_specs);
+                let is_secret = |name: &str| secret.iter().any(|s| s.eq_ignore_ascii_case(name));
+                let default_batch = {
+                    let schema = default_batch.schema();
+                    let keep: Vec<usize> = (0..schema.fields().len())
+                        .filter(|&i| !is_secret(schema.field(i).name()))
+                        .collect();
+                    default_batch
+                        .project(&keep)
+                        .map_err(|e| RpcError::runtime_error(e.to_string()))?
+                };
                 let cols: Vec<arrow_array::ArrayRef> = default_batch
                     .schema()
                     .fields()
@@ -6655,6 +6718,84 @@ mod catalog_contents_tests {
             2,
             "rebuilt after a registration"
         );
+    }
+
+    /// Rule 5: a `secret` attach option never lands in `attach_opaque_data`
+    /// -- not on an OS-owned transport where the value is plaintext, and so
+    /// not in the persisted `bufattach` copy either -- even with a declared
+    /// default and a supplied value. Non-secret options still round-trip.
+    #[test]
+    fn secret_attach_options_never_enter_the_opaque_value() {
+        use arrow_array::StringArray;
+        use arrow_schema::{DataType, Field, Schema};
+        let spec = |name: &str, secret: bool| {
+            let default: ArrayRef = Arc::new(StringArray::from(vec!["dflt"]));
+            catalog::serialize_attach_option_spec_with_flags(
+                name,
+                "",
+                &DataType::Utf8,
+                Some(&default),
+                catalog::AttachOptionFlags {
+                    required: false,
+                    secret,
+                },
+            )
+            .unwrap()
+        };
+        let default_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("API_KEY", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["dflt"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["default-secret-zzz"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut d = dispatcher();
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".into(),
+            attach_option_specs: vec![spec("region", false), spec("api_key", true)],
+            attach_options_default_batch: Some(ipc::write_batch(&default_batch).unwrap()),
+            ..Default::default()
+        });
+        let options = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("API_KEY", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["eu-west-9"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["sk-supplied-secret-yyy"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let inner_req = wire::to_batch(CatalogAttachRequest {
+            name: "cat".to_string(),
+            options: Some(Bytes::from(ipc::write_batch(&options).unwrap())),
+            data_version_spec: None,
+            implementation_version: None,
+            client_capabilities: None,
+        })
+        .unwrap();
+        let batch = wire::to_batch(p::CatalogAttachParams {
+            request: Bytes::from(ipc::write_batch(&inner_req).unwrap()),
+        })
+        .unwrap();
+        let result = d
+            .handle_catalog_attach(&request("catalog_attach", batch))
+            .unwrap()
+            .unwrap();
+        let attached: CatalogAttachResult = wire::from_batch(&inner(result)).unwrap();
+        let value = attached.attach_opaque_data.0;
+        for secret in [&b"sk-supplied-secret-yyy"[..], b"default-secret-zzz"] {
+            assert!(
+                !value.windows(secret.len()).any(|w| w == secret),
+                "a secret option reached attach_opaque_data"
+            );
+        }
+        assert!(value.windows(9).any(|w| w == b"eu-west-9"));
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub struct Worker {
     mint_grant: Option<vgi_rpc::token_identity::GrantMinter>,
     introspect_principals: Option<Vec<String>>,
     grant_keys: Option<vgi_rpc::grants::GrantKeys>,
+    /// Explicitly configured signing key ([`Worker::signing_key`]); otherwise
+    /// `VGI_SIGNING_KEY`, otherwise one generated when an HTTP server is built.
+    signing_key: Option<Vec<u8>>,
     /// Read only by the HTTP transport.
     #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
     authenticate: Option<vgi_rpc::Authenticate>,
@@ -88,6 +91,10 @@ impl ServeTransport {
     }
 }
 
+/// Environment variable holding the deployment's signing key (see
+/// [`Worker::signing_key`]).
+pub const SIGNING_KEY_ENV: &str = "VGI_SIGNING_KEY";
+
 /// Environment variable naming the principals allowed to call
 /// `vgi_rpc.Identity.v1`'s `introspect_token`, comma-separated.
 pub const INTROSPECT_PRINCIPALS_ENV: &str = "VGI_INTROSPECT_PRINCIPALS";
@@ -116,6 +123,7 @@ impl Worker {
             mint_grant: None,
             introspect_principals: None,
             grant_keys: None,
+            signing_key: None,
             authenticate: None,
         }
     }
@@ -499,6 +507,20 @@ impl Worker {
         self.authenticate = Some(authenticate);
     }
 
+    /// Configure the deployment's signing key explicitly, in place of
+    /// `VGI_SIGNING_KEY`.
+    ///
+    /// On HTTP it seals `attach_opaque_data` and `transaction_opaque_data`
+    /// ([`crate::opaque`]): each value is bound to its caller (and a
+    /// transaction to its attach) and opened on every request, refusing
+    /// anything that does not open. With neither this nor `VGI_SIGNING_KEY`, an
+    /// HTTP worker generates a random key at startup -- values then do not
+    /// survive a restart, and clients re-attach. Any length; normalized as
+    /// every vgi-rpc envelope key is. Rotating it invalidates every value.
+    pub fn signing_key(&mut self, key: impl Into<Vec<u8>>) {
+        self.signing_key = Some(key.into());
+    }
+
     /// Build the configured [`RpcServer`] for stdio, registering every VGI
     /// method. See [`build_server_for`](Self::build_server_for).
     pub fn build_server(self) -> RpcServer {
@@ -531,6 +553,25 @@ impl Worker {
             Some(hook) => validated_hosted_protocols(hook()),
             None => Vec::new(),
         };
+        let mut disp = self.disp;
+        if transport.authenticates_callers() {
+            // An unset VGI_SIGNING_KEY never means "don't seal": generate one.
+            let key = self
+                .signing_key
+                .clone()
+                .or_else(|| {
+                    std::env::var(SIGNING_KEY_ENV)
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .map(String::into_bytes)
+                })
+                .unwrap_or_else(|| {
+                    let mut key = vec![0u8; 32];
+                    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+                    key
+                });
+            disp.opaque = Some(crate::opaque::OpaqueSealer::new(key));
+        }
         let identity = if transport.authenticates_callers() {
             // Explicit keys win; otherwise the environment. A malformed key
             // stops the worker rather than running with a key it misread.
@@ -568,7 +609,7 @@ impl Worker {
         let mut srv = builder
             .try_build()
             .unwrap_or_else(|err| panic!("{HOOK_NAME}: {}", err.message));
-        let disp = Arc::new(self.disp);
+        let disp = Arc::new(disp);
         register::register(&mut srv, disp.clone());
         (srv, disp)
     }

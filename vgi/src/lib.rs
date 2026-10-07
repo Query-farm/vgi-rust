@@ -129,6 +129,7 @@ pub mod copy_to;
 pub mod dispatch;
 pub mod function;
 pub mod numeric;
+pub mod opaque;
 pub mod overload;
 pub mod partition;
 pub mod protocol;
