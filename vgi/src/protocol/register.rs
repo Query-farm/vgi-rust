@@ -1,530 +1,37 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Wire every VGI RPC method onto an [`RpcServer`], delegating to a shared
-//! [`Dispatcher`].
+//! Host `vgi.v2` on an [`RpcServer`]: the [`Dispatcher`]'s implementation of the
+//! generated [`VgiService`] trait.
+//!
+//! The method table itself — every method's name, method type and params /
+//! result / header schemas — is generated from the reference
+//! ([`super::vgi_service::register`]). This module only says what each method
+//! *does*: open the sealed opaque values a request carries, route a catalog RPC
+//! to the stored catalog its attach names, and call the handler. A method not
+//! overridden here keeps the generated `UNIMPLEMENTED` default.
 
 use std::sync::Arc;
 
-use vgi_rpc::{MethodType, RpcServer};
+use arrow_array::RecordBatch;
+use vgi_rpc::stream::StreamStateKind;
+use vgi_rpc::{CallContext, Request, Result, RpcServer, StreamResult};
 
 use crate::dispatch::Dispatcher;
 
-use crate::wire;
+pub use super::vgi_service::{not_implemented, VgiService};
 
 /// Register all VGI methods against `srv`, backed by `disp`.
 pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
-    // --- core: bind (unary) + init (dynamic stream) ---
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "bind",
-            wire::params_schema_for("bind"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_bind(req, ctx)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        let dd = disp.clone();
-        // `init` declares the same boxed `{request: binary}` params schema as
-        // every other method. It used to register `Schema::empty()` — harmless
-        // while nothing validated it, but vgi-rpc now enforces the declared
-        // parameter contract before dispatch, and an empty declaration means
-        // "this method takes no columns", which rejects the boxed request.
-        let info = vgi_rpc::MethodInfo::stream(
-            "init",
-            MethodType::Dynamic,
-            wire::params_schema_for("init"),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_init(req, ctx)),
-        )
-        // The stream's header is a `GlobalInitResponse`. Declared because the
-        // reference declares it and the `vgi.v2` protocol hash covers it; the
-        // generated schema fixes the field order the emitted header must use.
-        .header_schema(vgi_protocol::generated::protocol_schemas::global_init_response_schema())
-        // HTTP continuations rebuild the (stateless) exchange handler from an
-        // AEAD state token; without a decoder the server 500s on /init/exchange.
-        .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
-        srv.register(info);
-    }
-
-    // --- catalog handshake ---
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_attach",
-            wire::params_schema_for("catalog_attach"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                let result = d.with_opened(req, ctx, |opened| {
-                    d.handle_catalog_attach_as(opened, &ctx.auth)
-                })?;
-                d.seal_result(req, ctx, result)
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_version",
-            wire::params_schema_for("catalog_version"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_catalog_version(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_transaction_begin",
-            wire::params_schema_for("catalog_transaction_begin"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                let result = d.with_opened(req, ctx, |opened| {
-                    d.stored_or(opened, || d.handle_transaction_begin(opened))
-                })?;
-                d.seal_result(req, ctx, result)
-            },
-        ));
-    }
-    // --- aggregates ---
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_bind",
-            wire::params_schema_for("aggregate_bind"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_bind(req, ctx)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_update",
-            wire::params_schema_for("aggregate_update"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_update(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_combine",
-            wire::params_schema_for("aggregate_combine"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_combine(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_finalize",
-            wire::params_schema_for("aggregate_finalize"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_finalize(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_destructor",
-            wire::params_schema_for("aggregate_destructor"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_destructor(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_window_init",
-            wire::params_schema_for("aggregate_window_init"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window_init(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_window",
-            wire::params_schema_for("aggregate_window"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_window_batch",
-            wire::params_schema_for("aggregate_window_batch"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_window_batch(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_window_destructor",
-            wire::params_schema_for("aggregate_window_destructor"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| d.handle_aggregate_window_destructor(req))
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_streaming_open",
-            wire::params_schema_for("aggregate_streaming_open"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_open(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_streaming_chunk",
-            wire::params_schema_for("aggregate_streaming_chunk"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_chunk(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "aggregate_streaming_close",
-            wire::params_schema_for("aggregate_streaming_close"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_aggregate_streaming_close(req)),
-        ));
-    }
-
-    // --- table buffering ---
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_buffering_process",
-            wire::params_schema_for("table_buffering_process"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_process(req, ctx)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_buffering_combine",
-            wire::params_schema_for("table_buffering_combine"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_combine(req, ctx)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_buffering_destructor",
-            wire::params_schema_for("table_buffering_destructor"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_destructor(req)),
-        ));
-    }
-
-    register_void(srv, &disp, "catalog_transaction_commit");
-    register_void(srv, &disp, "catalog_transaction_rollback");
-    register_void(srv, &disp, "catalog_detach");
-
-    // --- catalog-mutating DDL: served by a stored (DDL-capable) catalog;
-    //     for a declarative catalog accepted (pins the wire contract) then
-    //     rejected with `catalog is read-only` ---
-    for name in [
-        "catalog_create",
-        "catalog_drop",
-        "catalog_schema_create",
-        "catalog_schema_drop",
-        "catalog_table_create",
-        "catalog_table_drop",
-        "catalog_table_rename",
-        "catalog_table_comment_set",
-        "catalog_table_column_add",
-        "catalog_table_column_drop",
-        "catalog_table_column_rename",
-        "catalog_table_column_type_change",
-        "catalog_table_column_default_set",
-        "catalog_table_column_default_drop",
-        "catalog_table_column_comment_set",
-        "catalog_table_not_null_set",
-        "catalog_table_not_null_drop",
-        "catalog_view_create",
-        "catalog_view_drop",
-        "catalog_view_rename",
-        "catalog_view_comment_set",
-        "catalog_macro_create",
-        "catalog_macro_drop",
-        "catalog_index_create",
-        "catalog_index_drop",
-    ] {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            name,
-            wire::params_schema_for(name),
-            // Void on success (vgi-python declares these `-> None`).
-            Arc::new(arrow_schema::Schema::empty()),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_read_only(req)))
-            },
-        ));
-    }
-
-    // --- schema discovery ---
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schemas",
-            wire::params_schema_for("catalog_schemas"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_catalog_schemas(req))
-                })
-            },
-        ));
-    }
-    {
-        // Protocol 2.1.0: the whole catalog in one call. Served always; the
-        // client calls it only when `catalog_attach` advertises
-        // `supports_catalog_contents`.
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_contents",
-            wire::params_schema_for("catalog_contents"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_catalog_contents(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schema_get",
-            wire::params_schema_for("catalog_schema_get"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_schema_get(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schema_contents_functions",
-            wire::params_schema_for("catalog_schema_contents_functions"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_contents_functions(req))
-                })
-            },
-        ));
-    }
-
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schema_contents_views",
-            wire::params_schema_for("catalog_schema_contents_views"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_contents_views(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schema_contents_macros",
-            wire::params_schema_for("catalog_schema_contents_macros"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_contents_macros(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_schema_contents_tables",
-            wire::params_schema_for("catalog_schema_contents_tables"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_contents_tables(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_table_get",
-            wire::params_schema_for("catalog_table_get"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_table_get(req)))
-            },
-        ));
-    }
-    {
-        // Legacy scan-function resolution for non-inlined function-backed
-        // tables. The response is a FLAT `ScanFunctionResult` batch (not the
-        // `{result: binary}` envelope), matching the C++ extractor.
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_table_scan_function_get",
-            wire::params_schema_for("catalog_table_scan_function_get"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_table_scan_function_get(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_table_scan_branches_get",
-            wire::params_schema_for("catalog_table_scan_branches_get"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_table_scan_branches_get(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_table_column_statistics_get",
-            wire::params_schema_for("catalog_table_column_statistics_get"),
-            wire::nullable_result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_table_column_statistics_get(req))
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_function_statistics",
-            wire::params_schema_for("table_function_statistics"),
-            wire::nullable_result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| d.handle_table_function_statistics(req, ctx))
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_function_cardinality",
-            wire::params_schema_for("table_function_cardinality"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.handle_table_function_cardinality(req, ctx)
-                })
-            },
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_function_plan",
-            wire::params_schema_for("table_function_plan"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_table_function_plan(req, ctx)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "table_function_dynamic_to_string",
-            wire::params_schema_for("table_function_dynamic_to_string"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.handle_table_function_dynamic_to_string(req)
-                })
-            },
-        ));
-    }
-
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_catalogs",
-            wire::params_schema_for("catalog_catalogs"),
-            wire::result_binary_schema(),
-            move |req, ctx| d.with_opened(req, ctx, |req| d.handle_catalog_catalogs(req)),
-        ));
-    }
-    {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            "catalog_copy_from_formats",
-            wire::params_schema_for("catalog_copy_from_formats"),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_catalog_copy_from_formats(req))
-                })
-            },
-        ));
-    }
-
-    register_unimplemented(srv);
-
-    // --- discovery methods that return empty lists for now ---
-    for name in [
-        "catalog_schema_contents_indexes",
-        "catalog_view_get",
-        "catalog_macro_get",
-        "catalog_index_get",
-    ] {
-        let d = disp.clone();
-        srv.register(vgi_rpc::MethodInfo::unary(
-            name,
-            wire::params_schema_for(name),
-            wire::result_binary_schema(),
-            move |req, ctx| {
-                d.with_opened(req, ctx, |req| {
-                    d.stored_or(req, || d.handle_empty_items(req))
-                })
-            },
-        ));
-    }
+    super::vgi_service::register(srv, disp);
 }
 
 /// `vgi.v2` methods this SDK registers but does not implement.
 ///
 /// The protocol is the unit of optionality: every SDK hosts every `vgi.v2`
 /// method with the reference's schemas, so reflection reports one protocol
-/// hash everywhere. A method this port cannot serve is still registered (its
-/// params and result schemas are part of that hash) and answers every call
-/// with `UNIMPLEMENTED` / `method_not_implemented` -- never a silent success.
+/// hash everywhere. These keep the generated [`VgiService`] default and
+/// answer every call with `UNIMPLEMENTED` / `method_not_implemented` -- never
+/// a silent success.
 ///
 /// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
 /// table; this port's catalogs are read-only for DML.
@@ -534,29 +41,174 @@ pub const UNIMPLEMENTED_METHODS: &[&str] = &[
     "catalog_table_delete_function_get",
 ];
 
-/// The error every [`UNIMPLEMENTED_METHODS`] call answers with.
-pub fn not_implemented(method: &str) -> vgi_rpc::RpcError {
-    vgi_rpc::RpcError::method_not_implemented(format!("{method} is not implemented by this worker"))
-}
+type Answer = Result<Option<RecordBatch>>;
 
-fn register_unimplemented(srv: &mut RpcServer) {
-    for &name in UNIMPLEMENTED_METHODS {
-        srv.register(vgi_rpc::MethodInfo::unary(
-            name,
-            wire::params_schema_for(name),
-            wire::result_binary_schema(),
-            move |_req, _ctx| Err(not_implemented(name)),
-        ));
+impl Dispatcher {
+    /// A catalog RPC: opened, then served by the stored catalog its attach
+    /// names, or by `handler` for the declarative catalogs.
+    fn catalog_rpc(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+        handler: impl FnOnce(&Self, &Request) -> Answer,
+    ) -> Answer {
+        self.with_opened(req, ctx, |req| self.stored_or(req, || handler(self, req)))
     }
 }
 
-fn register_void(srv: &mut RpcServer, disp: &Arc<Dispatcher>, name: &str) {
-    let d = disp.clone();
-    let empty = Arc::new(arrow_schema::Schema::empty());
-    srv.register(vgi_rpc::MethodInfo::unary(
-        name.to_string(),
-        wire::params_schema_for(name),
-        empty,
-        move |req, ctx| d.with_opened(req, ctx, |req| d.stored_or(req, || d.handle_void(req))),
-    ));
+/// Methods served by [`Dispatcher::catalog_rpc`].
+macro_rules! catalog_rpcs {
+    ($($method:ident => $handler:ident),* $(,)?) => {$(
+        fn $method(&self, req: &Request, ctx: &CallContext) -> Answer {
+            self.catalog_rpc(req, ctx, Self::$handler)
+        }
+    )*};
+}
+
+/// Methods whose handler needs only the opened request.
+macro_rules! opened_rpcs {
+    ($($method:ident => $handler:ident),* $(,)?) => {$(
+        fn $method(&self, req: &Request, ctx: &CallContext) -> Answer {
+            self.with_opened(req, ctx, |req| self.$handler(req))
+        }
+    )*};
+}
+
+/// Methods whose handler needs the opened request and the call context.
+macro_rules! opened_ctx_rpcs {
+    ($($method:ident => $handler:ident),* $(,)?) => {$(
+        fn $method(&self, req: &Request, ctx: &CallContext) -> Answer {
+            self.with_opened(req, ctx, |req| self.$handler(req, ctx))
+        }
+    )*};
+}
+
+impl VgiService for Dispatcher {
+    // --- core: bind (unary) + init (dynamic stream) ---
+    opened_ctx_rpcs! {
+        bind => handle_bind,
+    }
+
+    fn init(&self, req: &Request, ctx: &CallContext) -> Result<StreamResult> {
+        self.with_opened(req, ctx, |req| self.handle_init(req, ctx))
+    }
+
+    /// HTTP continuations rebuild the (stateless) exchange handler from an
+    /// AEAD state token.
+    fn decode_init_state(&self, state: &[u8]) -> Result<StreamStateKind> {
+        self.decode_init_exchange_state(state)
+    }
+
+    // --- catalog handshake: the attach and transaction handles a result
+    //     mints are sealed for the caller ---
+    fn catalog_attach(&self, req: &Request, ctx: &CallContext) -> Answer {
+        let result = self.with_opened(req, ctx, |opened| {
+            self.handle_catalog_attach_as(opened, &ctx.auth)
+        })?;
+        self.seal_result(req, ctx, result)
+    }
+
+    fn catalog_transaction_begin(&self, req: &Request, ctx: &CallContext) -> Answer {
+        let result = self.catalog_rpc(req, ctx, Self::handle_transaction_begin)?;
+        self.seal_result(req, ctx, result)
+    }
+
+    catalog_rpcs! {
+        catalog_version => handle_catalog_version,
+        catalog_transaction_commit => handle_void,
+        catalog_transaction_rollback => handle_void,
+        catalog_detach => handle_void,
+    }
+
+    // --- aggregates ---
+    opened_ctx_rpcs! {
+        aggregate_bind => handle_aggregate_bind,
+    }
+    opened_rpcs! {
+        aggregate_update => handle_aggregate_update,
+        aggregate_combine => handle_aggregate_combine,
+        aggregate_finalize => handle_aggregate_finalize,
+        aggregate_destructor => handle_aggregate_destructor,
+        aggregate_window_init => handle_aggregate_window_init,
+        aggregate_window => handle_aggregate_window,
+        aggregate_window_batch => handle_aggregate_window_batch,
+        aggregate_window_destructor => handle_aggregate_window_destructor,
+        aggregate_streaming_open => handle_aggregate_streaming_open,
+        aggregate_streaming_chunk => handle_aggregate_streaming_chunk,
+        aggregate_streaming_close => handle_aggregate_streaming_close,
+    }
+
+    // --- table buffering ---
+    opened_ctx_rpcs! {
+        table_buffering_process => handle_buffering_process,
+        table_buffering_combine => handle_buffering_combine,
+    }
+    opened_rpcs! {
+        table_buffering_destructor => handle_buffering_destructor,
+    }
+
+    // --- table functions ---
+    opened_ctx_rpcs! {
+        table_function_statistics => handle_table_function_statistics,
+        table_function_cardinality => handle_table_function_cardinality,
+        table_function_plan => handle_table_function_plan,
+    }
+    opened_rpcs! {
+        table_function_dynamic_to_string => handle_table_function_dynamic_to_string,
+        catalog_catalogs => handle_catalog_catalogs,
+    }
+
+    // --- catalog-mutating DDL: served by a stored (DDL-capable) catalog; for
+    //     a declarative catalog accepted (pins the wire contract) then
+    //     rejected with `catalog is read-only` ---
+    catalog_rpcs! {
+        catalog_create => handle_read_only,
+        catalog_drop => handle_read_only,
+        catalog_schema_create => handle_read_only,
+        catalog_schema_drop => handle_read_only,
+        catalog_table_create => handle_read_only,
+        catalog_table_drop => handle_read_only,
+        catalog_table_rename => handle_read_only,
+        catalog_table_comment_set => handle_read_only,
+        catalog_table_column_add => handle_read_only,
+        catalog_table_column_drop => handle_read_only,
+        catalog_table_column_rename => handle_read_only,
+        catalog_table_column_type_change => handle_read_only,
+        catalog_table_column_default_set => handle_read_only,
+        catalog_table_column_default_drop => handle_read_only,
+        catalog_table_column_comment_set => handle_read_only,
+        catalog_table_not_null_set => handle_read_only,
+        catalog_table_not_null_drop => handle_read_only,
+        catalog_view_create => handle_read_only,
+        catalog_view_drop => handle_read_only,
+        catalog_view_rename => handle_read_only,
+        catalog_view_comment_set => handle_read_only,
+        catalog_macro_create => handle_read_only,
+        catalog_macro_drop => handle_read_only,
+        catalog_index_create => handle_read_only,
+        catalog_index_drop => handle_read_only,
+    }
+
+    // --- schema discovery ---
+    catalog_rpcs! {
+        catalog_schemas => handle_catalog_schemas,
+        // Protocol 2.1.0: the whole catalog in one call. The client calls it
+        // only when `catalog_attach` advertises `supports_catalog_contents`.
+        catalog_contents => handle_catalog_contents,
+        catalog_schema_get => handle_schema_get,
+        catalog_schema_contents_functions => handle_contents_functions,
+        catalog_schema_contents_views => handle_contents_views,
+        catalog_schema_contents_macros => handle_contents_macros,
+        catalog_schema_contents_tables => handle_contents_tables,
+        catalog_table_get => handle_table_get,
+        catalog_table_scan_function_get => handle_table_scan_function_get,
+        catalog_table_scan_branches_get => handle_table_scan_branches_get,
+        catalog_table_column_statistics_get => handle_table_column_statistics_get,
+        catalog_copy_from_formats => handle_catalog_copy_from_formats,
+        // Discovery a declarative catalog answers with an empty listing.
+        catalog_schema_contents_indexes => handle_empty_items,
+        catalog_view_get => handle_empty_items,
+        catalog_macro_get => handle_empty_items,
+        catalog_index_get => handle_empty_items,
+    }
 }

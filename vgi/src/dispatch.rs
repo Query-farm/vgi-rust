@@ -1918,9 +1918,12 @@ impl Dispatcher {
     }
 
     /// Rebuild a stateless exchange stream from its HTTP-continuation blob.
-    /// Registered as the `init` method's state decoder so a pooled HTTP
+    /// Serves `init`'s state decoder (`VgiService::decode_init_state`) so a pooled HTTP
     /// worker can resume a scalar / table-in-out exchange from an AEAD token.
-    pub fn decode_init_state(&self, bytes: &[u8]) -> Result<vgi_rpc::stream::StreamStateKind> {
+    pub fn decode_init_exchange_state(
+        &self,
+        bytes: &[u8],
+    ) -> Result<vgi_rpc::stream::StreamStateKind> {
         let blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
         let output_schema = ipc::read_schema(&blob.output_schema)?;
         let filter_schema = if blob.filter_schema.is_empty() {
