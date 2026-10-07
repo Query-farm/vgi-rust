@@ -45,7 +45,11 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# start_worker <logfile> <env=val>...  -> echoes the announced base URL
+# start_worker <logfile> <env=val>...  -> sets STARTED_URL to the announced base URL
+#
+# Call it directly, never as `$(start_worker ...)`: a command substitution runs
+# in a subshell, so the PIDS entry it appends would be lost (cleanup would leave
+# the server running) and its `exit 1` would not stop this script.
 start_worker() {
   local log="$1"; shift
   : > "$log"
@@ -63,7 +67,7 @@ start_worker() {
     sleep 0.25
   done
   [[ -n "$port" ]] || { echo "[http-harness] worker failed to announce PORT ($log)" >&2; cat "$log" >&2; exit 1; }
-  echo "http://localhost:$port"
+  STARTED_URL="http://localhost:$port"
 }
 
 : > "$CACHE/worker.log"
@@ -74,13 +78,18 @@ ZSTD_ENV="VGI_HTTP_DISABLE_ZSTD=${VGI_HTTP_DISABLE_ZSTD:-}"
 # identity-isolation test can attach the same worker as alice and as bob; an
 # absent/unknown token still resolves to anonymous, so no other test 401s.
 # The bearer_auth tests run separately against W_BEARER below.
-W_EXAMPLE=$(start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" \
-  "VGI_OPTIONAL_BEARER_TOKENS=vgi-test-alice=alice,vgi-test-bob=bob")
+start_worker "$CACHE/example.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" \
+  "VGI_OPTIONAL_BEARER_TOKENS=vgi-test-alice=alice,vgi-test-bob=bob"
+W_EXAMPLE="$STARTED_URL"
 # Bearer-protected example server (rejects anonymous) for bearer_auth/*.
-W_BEARER=$(start_worker "$CACHE/bearer.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" "VGI_BEARER_TOKENS=test-secret-token=test-principal")
-W_VERSIONED=$(start_worker "$CACHE/versioned.log" "VGI_WORKER_CATALOG_NAME=versioned" "$ZSTD_ENV")
-W_VERSIONED_TABLES=$(start_worker "$CACHE/versioned_tables.log" "VGI_WORKER_CATALOG_NAME=versioned_tables" "$ZSTD_ENV")
-W_ATTACH_OPTIONS=$(start_worker "$CACHE/attach_options.log" "VGI_WORKER_CATALOG_NAME=attach_options" "$ZSTD_ENV")
+start_worker "$CACHE/bearer.log" "VGI_WORKER_CATALOG_NAME=example" "$ZSTD_ENV" "VGI_BEARER_TOKENS=test-secret-token=test-principal"
+W_BEARER="$STARTED_URL"
+start_worker "$CACHE/versioned.log" "VGI_WORKER_CATALOG_NAME=versioned" "$ZSTD_ENV"
+W_VERSIONED="$STARTED_URL"
+start_worker "$CACHE/versioned_tables.log" "VGI_WORKER_CATALOG_NAME=versioned_tables" "$ZSTD_ENV"
+W_VERSIONED_TABLES="$STARTED_URL"
+start_worker "$CACHE/attach_options.log" "VGI_WORKER_CATALOG_NAME=attach_options" "$ZSTD_ENV"
+W_ATTACH_OPTIONS="$STARTED_URL"
 
 echo "[http-harness] example=$W_EXAMPLE versioned=$W_VERSIONED vtables=$W_VERSIONED_TABLES attach_options=$W_ATTACH_OPTIONS"
 
