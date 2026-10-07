@@ -41,7 +41,17 @@ Dropped at staging (covered by the locally-built `unittest` in the `vgi` repo):
 - `nested_type_combinations.test` — segfaults the standalone runner.
 - `expression_filter.test` — its `EXPLAIN` assertion renders the spatial
   predicate's WKT differently under the prebuilt DuckDB/spatial build.
-- http lane only: `projection_pushdown_repro.test`.
+
+Nothing else is dropped on the http lane: `projection_pushdown_repro.test`
+and `database_worker/package.test` both run there.
+
+## No error-message skips
+
+Given no `--test-config`, DuckDB's sqllogictest runner turns any error whose
+text contains "HTTP" or "Unable to connect" into a SKIP — over the HTTP
+transport, every worker error. Every suite invocation (here and in
+`scripts/run_tests.sh` / `scripts/run_http_tests.sh`) passes the VGI checkout's
+`test/configs/no_error_skip.json`, which skips on nothing.
 
 ## Executed-case floor
 

@@ -28,6 +28,13 @@ STAGE="${STAGE:-$(mktemp -d)}"
 TRANSPORT="${TRANSPORT:-stdio}"
 INTEGRATION="$VGI_SRC/test/sql/integration"
 [ -d "$INTEGRATION" ] || { echo "::error::no test/sql/integration under VGI_SRC=$VGI_SRC"; exit 1; }
+# DuckDB's sqllogictest runner, given no --test-config, turns every error whose
+# text contains "HTTP" or "Unable to connect" into a SKIP (exit 0). Over the
+# HTTP transport every worker error contains "HTTP", so real failures were
+# reported as skips. The VGI checkout ships a config that skips on nothing
+# (test/configs/no_error_skip.json); every suite invocation below passes it.
+TEST_CONFIG="$VGI_SRC/test/configs/no_error_skip.json"
+[ -f "$TEST_CONFIG" ] || { echo "::error::no $TEST_CONFIG under VGI_SRC=$VGI_SRC"; exit 1; }
 
 # Windows (Git Bash) has no AF_UNIX, and the prebuilt runner cannot exec a shell
 # catalog wrapper as a subprocess LOCATION, so it runs the main worker only.
@@ -70,13 +77,10 @@ if [ "$TRANSPORT" = "http" ]; then
   # reached the worker. Fixed in vgi-rpc-rust 52b702d, which is contained in
   # the published vgi-rpc the workspace pins. Verified 2026-08-21 against this
   # SDK's own http worker: 52/52 assertions pass. Exclusion removed.
-  # database_worker/package.test packages an executable wrapper around
-  # VGI_TEST_WORKER. On this lane that value is an HTTP URL, not an executable;
-  # the direct-exec lifecycle is covered by the stdio and launch lanes.
-  HTTP_SKIP=(
-    -not -name 'projection_pushdown_repro.test'
-    -not -path './database_worker/package.test'
-  )
+  # database_worker/package.test is NOT dropped: its packaged wrapper runs
+  # VGI_DATABASE_PACKAGE_WORKER (exported below as the worker binary) before
+  # falling back to VGI_TEST_WORKER, so it runs on this lane too.
+  HTTP_SKIP=()
 fi
 # The native-branch fixtures (multi_branch_*, required_filters_native)
 # used to stage and read parquet/csv from POSIX `/tmp/...` paths the worker's
@@ -322,7 +326,7 @@ esac
 run_unittest() {
   local log unittest_rc=0
   log="$(mktemp)"
-  "$HAYBARN_UNITTEST" "$@" 2>&1 | tee "$log"
+  "$HAYBARN_UNITTEST" --test-config "$TEST_CONFIG" "$@" 2>&1 | tee "$log"
   # Read PIPESTATUS immediately: any command in between (including `|| true`)
   # overwrites it and would silently swallow every real test failure.
   unittest_rc="${PIPESTATUS[0]}"

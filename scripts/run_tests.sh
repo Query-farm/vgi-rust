@@ -15,11 +15,17 @@
 
 set -uo pipefail
 
-VGI_RUST="/Users/rusty/Development/vgi-rust"
-VGI_EXT="/Users/rusty/Development/vgi"
-UNITTEST="$VGI_EXT/build/release/test/unittest"
-BIN="$VGI_RUST/target/release/vgi-example-worker"
-CACHE="/tmp/vgi-rust-test-cache"
+VGI_RUST="${VGI_RUST:-$(cd "$(dirname "$0")/.." && pwd)}"
+VGI_EXT="${VGI_EXT:-$HOME/Development/vgi}"
+UNITTEST="${UNITTEST:-$VGI_EXT/build/release/test/unittest}"
+BIN="${BIN:-$VGI_RUST/target/release/vgi-example-worker}"
+# DuckDB's sqllogictest runner, given no --test-config, turns every error whose
+# text contains "HTTP" or "Unable to connect" into a SKIP -- over the HTTP
+# transport that is every worker error. The extension ships a config that
+# skips on nothing; pass it to every unittest invocation.
+TEST_CONFIG="$VGI_EXT/test/configs/no_error_skip.json"
+[[ -f "$TEST_CONFIG" ]] || { echo "missing $TEST_CONFIG (vgi extension checkout too old?)" >&2; exit 1; }
+CACHE="${CACHE:-/tmp/vgi-rust-test-cache}"
 mkdir -p "$CACHE"
 
 # Scratch dir the native-branch fixtures (read_parquet / read_csv / iceberg_scan
@@ -93,6 +99,9 @@ else
   TEST_WORKER="$WRAP"
 fi
 
+# VGI_TEST_BEARER_TOKEN is deliberately NOT set: bearer_auth/* gates on it and
+# ATTACHes with a bearer_token, which the client rejects at bind on a non-HTTP
+# LOCATION. Those tests run on the HTTP lane (scripts/run_http_tests.sh).
 echo "[harness] running: ${ARGS[*]}"
 env \
   "${LAUNCHER_ENV[@]}" \
@@ -102,8 +111,7 @@ env \
   VGI_VERSIONED_TABLES_WORKER="$W_VERSIONED_TABLES" \
   VGI_ATTACH_OPTIONS_WORKER="$W_ATTACH_OPTIONS" \
   VGI_BAD_PROTOCOL_WORKER="$W_BAD_PROTOCOL" \
-  VGI_TEST_BEARER_TOKEN="test-secret-token" \
-  "$UNITTEST" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
+  "$UNITTEST" --test-config "$TEST_CONFIG" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
 RC=$?
 
 grep -E '^\[[0-9]+/[0-9]+\].*test/sql/integration' "$CACHE/run.log" >/dev/null 2>&1

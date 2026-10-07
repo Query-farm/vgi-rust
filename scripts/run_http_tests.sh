@@ -14,11 +14,17 @@
 
 set -uo pipefail
 
-VGI_RUST="/Users/rusty/Development/vgi-rust"
-VGI_EXT="/Users/rusty/Development/vgi"
-UNITTEST="$VGI_EXT/build/release/test/unittest"
-BIN="$VGI_RUST/target/release/vgi-example-worker"
-CACHE="/tmp/vgi-rust-http-cache"
+VGI_RUST="${VGI_RUST:-$(cd "$(dirname "$0")/.." && pwd)}"
+VGI_EXT="${VGI_EXT:-$HOME/Development/vgi}"
+UNITTEST="${UNITTEST:-$VGI_EXT/build/release/test/unittest}"
+BIN="${BIN:-$VGI_RUST/target/release/vgi-example-worker}"
+# DuckDB's sqllogictest runner, given no --test-config, turns every error whose
+# text contains "HTTP" or "Unable to connect" into a SKIP -- over the HTTP
+# transport that is every worker error. The extension ships a config that
+# skips on nothing; pass it to every unittest invocation.
+TEST_CONFIG="$VGI_EXT/test/configs/no_error_skip.json"
+[[ -f "$TEST_CONFIG" ]] || { echo "missing $TEST_CONFIG (vgi extension checkout too old?)" >&2; exit 1; }
+CACHE="${CACHE:-/tmp/vgi-rust-http-cache}"
 mkdir -p "$CACHE"
 
 # Scratch dir the native-branch fixtures and their .test COPY-TO targets must
@@ -93,6 +99,9 @@ else
         "~test/sql/integration/table_in_out/echo/nested_type_combinations.test")
 fi
 
+# database_worker/package.test packages an executable wrapper that runs
+# VGI_DATABASE_PACKAGE_WORKER (falling back to VGI_TEST_WORKER, an http:// URL
+# on this lane, which cannot be exec'd), so hand it the worker binary.
 echo "[http-harness] running: ${ARGS[*]}"
 env \
   VGI_TEST_BRANCH_DIR="$BRANCH_DIR" \
@@ -102,8 +111,9 @@ env \
   VGI_VERSIONED_TABLES_HTTP_WORKER="$W_VERSIONED_TABLES" \
   VGI_ATTACH_OPTIONS_HTTP_WORKER="$W_ATTACH_OPTIONS" \
   VGI_TEST_BEARER_TOKEN="test-secret-token" \
+  VGI_DATABASE_PACKAGE_WORKER="$BIN" \
   VGI_HTTP_DISABLE_ZSTD="${VGI_HTTP_DISABLE_ZSTD:-}" \
-  "$UNITTEST" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
+  "$UNITTEST" --test-config "$TEST_CONFIG" "${ARGS[@]}" > "$CACHE/run.log" 2>&1
 RC=$?
 
 # bearer_auth/* against the protected server (only in a full run).
@@ -111,7 +121,7 @@ if [[ $# -eq 0 ]]; then
   env \
     VGI_TEST_WORKER="$W_BEARER" \
     VGI_TEST_BEARER_TOKEN="test-secret-token" \
-    "$UNITTEST" "test/sql/integration/bearer_auth/*" >> "$CACHE/run.log" 2>&1
+    "$UNITTEST" --test-config "$TEST_CONFIG" "test/sql/integration/bearer_auth/*" >> "$CACHE/run.log" 2>&1
   RC=$(( RC | $? ))
 fi
 
