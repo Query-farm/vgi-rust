@@ -50,6 +50,11 @@ jobs:
       - name: cargo build (example worker)
         run: cargo build -p vgi-example-worker
 
+      # The `vgi.v2` surface must hash to the reference's: drift in any method
+      # registration, schema, field order or nullability fails here.
+      - name: cargo test (vgi.v2 surface + wire name)
+        run: cargo test -p vgi --all-features --test vgi_v2_surface --test protocol_name
+
       - name: cargo test --doc (vgi)
         run: cargo test --doc -p vgi --all-features
 

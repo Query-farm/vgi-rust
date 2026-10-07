@@ -110,6 +110,26 @@ pub fn result_batch_from_bytes(bytes: &[u8]) -> Result<RecordBatch> {
         .map_err(|e| RpcError::runtime_error(format!("build result envelope: {e}")))
 }
 
+/// The `{result: binary?}` envelope schema: the same `result` column, but
+/// nullable. The reference declares the two statistics methods
+/// (`table_function_statistics`, `catalog_table_column_statistics_get`) as
+/// returning `bytes | None`, and the `vgi.v2` protocol hash covers nullability.
+pub fn nullable_result_binary_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "result",
+        DataType::Binary,
+        true,
+    )]))
+}
+
+/// Wrap already-serialized IPC bytes in the nullable `{result: binary?}`
+/// envelope (see [`nullable_result_binary_schema`]).
+pub fn nullable_result_batch_from_bytes(bytes: &[u8]) -> Result<RecordBatch> {
+    let arr = BinaryArray::from(vec![bytes]);
+    RecordBatch::try_new(nullable_result_binary_schema(), vec![Arc::new(arr)])
+        .map_err(|e| RpcError::runtime_error(format!("build result envelope: {e}")))
+}
+
 /// The `{result: binary}` envelope wrapping an empty (0-column) response —
 /// used by methods whose response DTO has no fields (aggregate update/combine).
 pub fn empty_result_batch() -> Result<RecordBatch> {

@@ -3458,7 +3458,7 @@ impl Dispatcher {
             .and_then(|f| f.statistics(&bp))
             .unwrap_or_default();
         let bytes = crate::statistics::serialize_column_statistics(&stats)?;
-        Ok(Some(wire::result_batch_from_bytes(&bytes)?))
+        Ok(Some(wire::nullable_result_batch_from_bytes(&bytes)?))
     }
 
     /// Per-column optimizer statistics for a table. Returns the sparse-union
@@ -3473,7 +3473,7 @@ impl Dispatcher {
             .map(|t| t.statistics.clone())
             .unwrap_or_default();
         let bytes = crate::statistics::serialize_column_statistics(&stats)?;
-        Ok(Some(wire::result_batch_from_bytes(&bytes)?))
+        Ok(Some(wire::nullable_result_batch_from_bytes(&bytes)?))
     }
 
     /// Multi-branch scan resolution. A single-source table returns one branch
@@ -4200,7 +4200,9 @@ impl Dispatcher {
     pub fn handle_buffering_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingDestructorRequest = boxed(req)?;
         self.store.clear(&dto.execution_id.0);
-        Ok(None)
+        // An empty `TableBufferingDestructorResponse`, in the `{result:
+        // binary}` envelope the reference declares (not a void method).
+        Ok(Some(wire::empty_result_batch()?))
     }
 
     // -- aggregate RPCs ----------------------------------------------------

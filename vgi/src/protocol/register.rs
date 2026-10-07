@@ -37,6 +37,10 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             wire::params_schema_for("init"),
             move |req, ctx| d.with_opened(req, ctx, |req| d.handle_init(req, ctx)),
         )
+        // The stream's header is a `GlobalInitResponse`. Declared because the
+        // reference declares it and the `vgi.v2` protocol hash covers it; the
+        // generated schema fixes the field order the emitted header must use.
+        .header_schema(vgi_protocol::generated::protocol_schemas::global_init_response_schema())
         // HTTP continuations rebuild the (stateless) exchange handler from an
         // AEAD state token; without a decoder the server 500s on /init/exchange.
         .with_state_decoder(Arc::new(move |bytes: &[u8]| dd.decode_init_state(bytes)));
@@ -218,11 +222,10 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     }
     {
         let d = disp.clone();
-        let empty = Arc::new(arrow_schema::Schema::empty());
         srv.register(vgi_rpc::MethodInfo::unary(
             "table_buffering_destructor",
             wire::params_schema_for("table_buffering_destructor"),
-            empty,
+            wire::result_binary_schema(),
             move |req, ctx| d.with_opened(req, ctx, |req| d.handle_buffering_destructor(req)),
         ));
     }
@@ -414,7 +417,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         srv.register(vgi_rpc::MethodInfo::unary(
             "catalog_table_column_statistics_get",
             wire::params_schema_for("catalog_table_column_statistics_get"),
-            wire::result_binary_schema(),
+            wire::nullable_result_binary_schema(),
             move |req, ctx| {
                 d.with_opened(req, ctx, |req| {
                     d.stored_or(req, || d.handle_table_column_statistics_get(req))
@@ -427,7 +430,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         srv.register(vgi_rpc::MethodInfo::unary(
             "table_function_statistics",
             wire::params_schema_for("table_function_statistics"),
-            wire::result_binary_schema(),
+            wire::nullable_result_binary_schema(),
             move |req, ctx| {
                 d.with_opened(req, ctx, |req| d.handle_table_function_statistics(req, ctx))
             },
@@ -492,6 +495,8 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
         ));
     }
 
+    register_unimplemented(srv);
+
     // --- discovery methods that return empty lists for now ---
     for name in [
         "catalog_schema_contents_indexes",
@@ -509,6 +514,38 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
                     d.stored_or(req, || d.handle_empty_items(req))
                 })
             },
+        ));
+    }
+}
+
+/// `vgi.v2` methods this SDK registers but does not implement.
+///
+/// The protocol is the unit of optionality: every SDK hosts every `vgi.v2`
+/// method with the reference's schemas, so reflection reports one protocol
+/// hash everywhere. A method this port cannot serve is still registered (its
+/// params and result schemas are part of that hash) and answers every call
+/// with `UNIMPLEMENTED` / `method_not_implemented` -- never a silent success.
+///
+/// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
+/// table; this port's catalogs are read-only for DML.
+pub const UNIMPLEMENTED_METHODS: &[&str] = &[
+    "catalog_table_insert_function_get",
+    "catalog_table_update_function_get",
+    "catalog_table_delete_function_get",
+];
+
+/// The error every [`UNIMPLEMENTED_METHODS`] call answers with.
+pub fn not_implemented(method: &str) -> vgi_rpc::RpcError {
+    vgi_rpc::RpcError::method_not_implemented(format!("{method} is not implemented by this worker"))
+}
+
+fn register_unimplemented(srv: &mut RpcServer) {
+    for &name in UNIMPLEMENTED_METHODS {
+        srv.register(vgi_rpc::MethodInfo::unary(
+            name,
+            wire::params_schema_for(name),
+            wire::result_binary_schema(),
+            move |_req, _ctx| Err(not_implemented(name)),
         ));
     }
 }

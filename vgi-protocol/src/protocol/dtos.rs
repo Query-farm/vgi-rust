@@ -696,11 +696,15 @@ pub struct ScanSplit {
 }
 
 /// `GlobalInitResponse` — the streaming header for `init`.
+///
+/// Field order is the reference's (`execution_id`, `opaque_data`,
+/// `max_workers`): `init` declares this as its header schema, which the
+/// `vgi.v2` protocol hash covers, so the emitted header must match it.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct GlobalInitResponse {
     pub execution_id: Bytes,
-    pub max_workers: i64,
     pub opaque_data: Option<Bytes>,
+    pub max_workers: i64,
 }
 
 // ---------------------------------------------------------------------------
