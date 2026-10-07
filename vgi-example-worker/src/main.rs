@@ -29,6 +29,7 @@ mod scalar;
 mod secret_cache;
 mod table;
 mod table_in_out;
+mod ticket_probe;
 mod twin_catalogs;
 
 use vgi::Worker;
@@ -105,6 +106,10 @@ fn main() {
         // ... and the same name in the `main` schema of two *catalogs*, where
         // only the attachment tells them apart.
         twin_catalogs::register(&mut worker);
+        // ticket_probe: attach tickets (vgi.attach_tickets.v1) -- one plain and
+        // one secret attach option whose effect a table reveals. Served by
+        // every SDK's fixture worker; see ticket_probe.rs.
+        ticket_probe::register(&mut worker);
         // The six catalog_contents fixture catalogs (contents_probe / _broken /
         // _legacy / _memory / _reval / _hash) the cross-SDK
         // catalog_contents*.test files attach. See contents_fixtures.rs.
@@ -153,12 +158,61 @@ fn host_conformance_protocols(worker: &mut Worker) {
     worker.hosted_protocols(|| {
         vec![vgi_rpc::conformance_secondary::conformance_secondary_protocol()]
     });
+    if !std::env::args().any(|arg| arg == "--identity") {
+        if let Some(auth) = optional_test_bearers() {
+            worker.authenticate(auth);
+        }
+    }
     if std::env::args().any(|arg| arg == "--identity") {
         worker.authenticate(std::sync::Arc::new(fixture::authenticate_from_headers));
         worker.resolve_token(fixture::conformance_resolve_token);
         worker.mint_grant(fixture::conformance_mint_grant);
         worker.introspect_principals([fixture::INTROSPECTOR_PRINCIPAL]);
     }
+}
+
+/// The fixture's optional test bearers (`VGI_OPTIONAL_BEARER_TOKENS`,
+/// `token=principal,…`, e.g. `vgi-test-alice=alice,vgi-test-bob=bob`).
+///
+/// Mirrors vgi-python's fixture HTTP server: a known token is a **fresh login**
+/// (it stamps `auth_time` = now), so a client can call `issue_grant` with
+/// nothing but a bearer DuckDB can send -- which the attach-ticket tests need.
+/// A `Bearer vgig1.…` is not ours: it stays anonymous here so the sealed-grant
+/// authenticator vgi-rpc appends after this one gets it. No token, a blank one
+/// or an unknown one is anonymous, never a 401 from this callback.
+fn optional_test_bearers() -> Option<vgi_rpc::Authenticate> {
+    let raw = std::env::var("VGI_OPTIONAL_BEARER_TOKENS").ok()?;
+    let tokens: std::collections::HashMap<String, String> = raw
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(t, p)| (t.trim().to_string(), p.trim().to_string()))
+        .collect();
+    assert!(
+        !tokens.is_empty(),
+        "VGI_OPTIONAL_BEARER_TOKENS is set but contains no `token=principal` pair"
+    );
+    Some(std::sync::Arc::new(
+        move |req: &vgi_rpc::AuthRequest<'_>| {
+            let token = req
+                .header("authorization")
+                .and_then(|h| {
+                    h.strip_prefix("Bearer ")
+                        .or_else(|| h.strip_prefix("bearer "))
+                })
+                .map(str::trim);
+            Ok(match token.and_then(|t| tokens.get(t)) {
+                Some(principal) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    vgi_rpc::AuthContext::for_principal("bearer", principal.clone())
+                        .with_claim("auth_time", now.to_string())
+                }
+                None => vgi_rpc::AuthContext::anonymous(),
+            })
+        },
+    ))
 }
 
 /// Serve the example catalog behind the local Iroh HTTP bridge used by the

@@ -517,6 +517,14 @@ impl Worker {
     /// HTTP worker generates a random key at startup -- values then do not
     /// survive a restart, and clients re-attach. Any length; normalized as
     /// every vgi-rpc envelope key is. Rotating it invalidates every value.
+    ///
+    /// Only an explicitly configured key (this, or `VGI_SIGNING_KEY`) enables
+    /// attach tickets ([`crate::attach_ticket`]): an HTTP worker with such a
+    /// key **and** the ability to issue grants ([`grant_keys`](Self::grant_keys),
+    /// `VGI_RPC_GRANT_KEYS` / `--grant-key`, or [`mint_grant`](Self::mint_grant))
+    /// hosts `vgi.attach_tickets.v1` and redeems `vgi_attach_ticket` at
+    /// `catalog_attach`. A generated key seals values but never enables
+    /// tickets: every ticket would die on restart.
     pub fn signing_key(&mut self, key: impl Into<Vec<u8>>) {
         self.signing_key = Some(key.into());
     }
@@ -553,6 +561,7 @@ impl Worker {
             Some(hook) => validated_hosted_protocols(hook()),
             None => Vec::new(),
         };
+        check_reserved_attach_options(&self.disp);
         let mut disp = self.disp;
         if transport.authenticates_callers() {
             // An unset VGI_SIGNING_KEY never means "don't seal": generate one.
@@ -572,6 +581,7 @@ impl Worker {
                 });
             disp.opaque = Some(crate::opaque::OpaqueSealer::new(key));
         }
+        let mut tickets: Option<(Vec<u8>, Option<i64>)> = None;
         let identity = if transport.authenticates_callers() {
             // Explicit keys win; otherwise the environment. A malformed key
             // stops the worker rather than running with a key it misread.
@@ -581,6 +591,27 @@ impl Worker {
                     std::process::exit(1);
                 })
             });
+            // Attach tickets: the key is configured, never generated (this SDK
+            // has no generated key), so every ticket survives a restart.
+            let signing_key = self.signing_key.clone().or_else(|| {
+                std::env::var(crate::attach_ticket::SIGNING_KEY_ENV)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(String::into_bytes)
+            });
+            if let Some(key) = signing_key {
+                disp.ticket_key = Some(key.clone());
+                // Hosted only when a ticket is usable: a grant must be
+                // issuable for the same principal.
+                if grant_keys.is_some() || self.mint_grant.is_some() {
+                    let max_ttl = crate::attach_ticket::resolve_ticket_max_ttl(grant_keys.as_ref())
+                        .unwrap_or_else(|err| {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        });
+                    tickets = Some((key, max_ttl));
+                }
+            }
             build_identity(
                 self.resolve_token.clone(),
                 self.mint_grant.clone(),
@@ -590,6 +621,15 @@ impl Worker {
         } else {
             None
         };
+        let disp = Arc::new(disp);
+        let mut extra = extra;
+        if let Some((key, max_ttl)) = tickets {
+            extra.push(crate::attach_ticket::attach_tickets_protocol(
+                disp.clone(),
+                key,
+                max_ttl,
+            ));
+        }
         let mut builder = RpcServer::builder()
             .server_id(server_id)
             .protocol_name(VGI_PROTOCOL_NAME)
@@ -609,7 +649,6 @@ impl Worker {
         let mut srv = builder
             .try_build()
             .unwrap_or_else(|err| panic!("{HOOK_NAME}: {}", err.message));
-        let disp = Arc::new(disp);
         register::register(&mut srv, disp.clone());
         (srv, disp)
     }
@@ -827,6 +866,22 @@ impl Worker {
     pub fn serve_reader_writer<R: std::io::Read, W: std::io::Write>(self, mut r: R, mut w: W) {
         let (server, _disp) = self.build_parts(ServeTransport::Pipe);
         std::sync::Arc::new(server).serve(&mut r, &mut w);
+    }
+}
+
+/// Refuse to start when any catalog declares the reserved attach-option name
+/// (`vgi_attach_ticket`, any letter case): the framework reads that option as
+/// an attach ticket before catalog code runs, so the catalog could never see it.
+fn check_reserved_attach_options(disp: &Dispatcher) {
+    for (catalog, specs) in disp.all_attach_option_specs() {
+        for name in crate::catalog::attach_option_names(&specs) {
+            if name.eq_ignore_ascii_case(crate::catalog::RESERVED_ATTACH_OPTION) {
+                panic!(
+                    "catalog {catalog:?}: {}",
+                    crate::catalog::reserved_attach_option_error(&name).message
+                );
+            }
+        }
     }
 }
 
@@ -1142,6 +1197,124 @@ mod hosting_tests {
         let mut worker = Worker::new();
         worker.hosted_protocols(|| vec![ping("example.A.v1"), ping("example.A.v1")]);
         let _ = worker.build_server();
+    }
+
+    fn grant_keys() -> vgi_rpc::grants::GrantKeys {
+        vgi_rpc::grants::GrantKeys::new([vec![0x11; 32]], "t", 3600, 60).unwrap()
+    }
+
+    fn hosts_tickets(worker: Worker, transport: ServeTransport) -> bool {
+        worker
+            .build_server_for(transport)
+            .hosted_protocol_names()
+            .contains(&crate::attach_ticket::ATTACH_TICKETS_PROTOCOL_NAME)
+    }
+
+    /// Spec §5.1: HTTP, an explicitly configured key, and a way to issue
+    /// grants -- all three, or the protocol is absent.
+    #[test]
+    fn attach_tickets_are_hosted_only_with_a_key_grants_and_http() {
+        let full = || {
+            let mut w = Worker::new();
+            w.signing_key(b"configured".to_vec());
+            w.grant_keys(grant_keys());
+            w
+        };
+        assert!(hosts_tickets(full(), ServeTransport::Http));
+        for transport in [
+            ServeTransport::Pipe,
+            ServeTransport::Unix,
+            ServeTransport::Tcp,
+            ServeTransport::Iroh,
+        ] {
+            assert!(!hosts_tickets(full(), transport), "{transport:?}");
+        }
+        // A worker minting its own grants qualifies too.
+        let mut minting = Worker::new();
+        minting.signing_key(b"configured".to_vec());
+        minting.mint_grant(|_principal, _purpose, _scopes, _ttl| {
+            Err(vgi_rpc::token_identity::grant_refused("not in this test"))
+        });
+        assert!(hosts_tickets(minting, ServeTransport::Http));
+        // No way to issue a grant: a ticket would be useless.
+        if std::env::var(vgi_rpc::grants::GRANT_KEYS_ENV).is_err() {
+            let mut no_grants = Worker::new();
+            no_grants.signing_key(b"configured".to_vec());
+            assert!(!hosts_tickets(no_grants, ServeTransport::Http));
+        }
+        // No configured key.
+        if std::env::var(crate::attach_ticket::SIGNING_KEY_ENV).is_err() {
+            let mut no_key = Worker::new();
+            no_key.grant_keys(grant_keys());
+            assert!(!hosts_tickets(no_key, ServeTransport::Http));
+        }
+    }
+
+    #[test]
+    fn attach_tickets_are_listed_after_the_hook_protocols() {
+        let mut w = Worker::new();
+        w.signing_key(b"configured".to_vec());
+        w.grant_keys(grant_keys());
+        w.hosted_protocols(|| vec![ping("example.A.v1")]);
+        let names: Vec<String> = w
+            .build_server_for(ServeTransport::Http)
+            .hosted_protocol_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            names[..3],
+            [
+                "vgi.v2",
+                "example.A.v1",
+                crate::attach_ticket::ATTACH_TICKETS_PROTOCOL_NAME
+            ]
+        );
+    }
+
+    /// A spec record naming `vgi_attach_ticket` (in any letter case) that
+    /// bypassed the serializer still stops the worker at startup.
+    #[test]
+    #[should_panic(expected = "reserved name")]
+    fn a_catalog_declaring_the_reserved_option_does_not_start() {
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "name",
+                arrow_schema::DataType::Utf8,
+                false,
+            )])),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["VGI_Attach_Ticket"]))
+                    as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut w = Worker::new();
+        w.set_catalog(crate::catalog::CatalogModel {
+            name: "c".into(),
+            attach_option_specs: vec![crate::ipc::write_batch(&batch).unwrap()],
+            ..Default::default()
+        });
+        let _ = w.build_server();
+    }
+
+    #[test]
+    fn the_serializer_refuses_the_reserved_option_in_any_case() {
+        for name in [
+            "vgi_attach_ticket",
+            "VGI_ATTACH_TICKET",
+            "Vgi_Attach_Ticket",
+        ] {
+            let err = crate::catalog::serialize_attach_option_spec(
+                name,
+                "",
+                &arrow_schema::DataType::Utf8,
+                None,
+                false,
+            )
+            .unwrap_err();
+            assert!(err.message.contains("reserved name"), "{name}: {err}");
+        }
     }
 
     #[test]

@@ -360,6 +360,11 @@ pub struct Dispatcher {
     /// that authenticates callers (HTTP); `None` on the OS-owned transports.
     /// See [`crate::opaque`].
     pub(crate) opaque: Option<crate::opaque::OpaqueSealer>,
+    /// The key `vgi_attach_ticket`s open under ([`crate::attach_ticket`]):
+    /// the explicitly configured `VGI_SIGNING_KEY`, set only for an HTTP
+    /// worker. `None` everywhere else, where every ticket is
+    /// `attach_ticket_invalid`.
+    pub(crate) ticket_key: Option<Vec<u8>>,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -405,6 +410,7 @@ impl Dispatcher {
             exec_counter: AtomicU64::new(1),
             stored: Vec::new(),
             opaque: None,
+            ticket_key: None,
         }
     }
 
@@ -2200,6 +2206,45 @@ impl Dispatcher {
         paths
     }
 
+    /// The attach options catalog `name` declares, if this worker serves a
+    /// catalog of that name (primary, secondary or stored) -- what
+    /// `seal_attach` validates a ticket's options against.
+    pub(crate) fn attach_option_specs_of(&self, name: &str) -> Option<Vec<Vec<u8>>> {
+        let primary = if self.catalog.name.is_empty() {
+            &self.catalog_name
+        } else {
+            &self.catalog.name
+        };
+        if primary == name {
+            return Some(self.catalog.attach_option_specs.clone());
+        }
+        if let Some(sec) = self.secondary.iter().find(|c| c.name == name) {
+            return Some(sec.attach_option_specs.clone());
+        }
+        self.stored
+            .iter()
+            .find(|c| c.name() == name)
+            .map(|c| c.discovery_model().attach_option_specs)
+    }
+
+    /// Every catalog this worker serves, with the attach options it declares.
+    pub(crate) fn all_attach_option_specs(&self) -> Vec<(String, Vec<Vec<u8>>)> {
+        let mut out = vec![(
+            self.catalog.name.clone(),
+            self.catalog.attach_option_specs.clone(),
+        )];
+        for sec in &self.secondary {
+            out.push((sec.name.clone(), sec.attach_option_specs.clone()));
+        }
+        for stored in &self.stored {
+            out.push((
+                stored.name().to_string(),
+                stored.discovery_model().attach_option_specs,
+            ));
+        }
+        out
+    }
+
     /// `catalog_catalogs` — discovery: advertise this worker's catalog plus
     /// its version metadata so clients can inspect before attaching.
     pub fn handle_catalog_catalogs(&self, _req: &Request) -> Result<Option<RecordBatch>> {
@@ -2216,7 +2261,33 @@ impl Dispatcher {
     }
 
     pub fn handle_catalog_attach(&self, req: &Request) -> Result<Option<RecordBatch>> {
-        let dto: CatalogAttachRequest = boxed(req)?;
+        self.handle_catalog_attach_as(req, &vgi_rpc::AuthContext::anonymous())
+    }
+
+    /// `catalog_attach` for the caller `auth`.
+    ///
+    /// A `vgi_attach_ticket` option is redeemed first, before any routing or
+    /// catalog code: the catalog the ticket seals -- not the name on the
+    /// request -- decides which catalog (primary, secondary or stored) serves
+    /// the attach, and the restored options go through the same required-option
+    /// checks as typed ones. See [`crate::attach_ticket::redeem_attach_ticket`].
+    pub fn handle_catalog_attach_as(
+        &self,
+        req: &Request,
+        auth: &vgi_rpc::AuthContext,
+    ) -> Result<Option<RecordBatch>> {
+        let mut dto: CatalogAttachRequest = boxed(req)?;
+        if let Some(restored) = crate::attach_ticket::redeem_attach_ticket(
+            &dto,
+            self.ticket_key.as_deref(),
+            auth,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+        )? {
+            dto = restored;
+        }
         // A stored (DDL-capable) catalog: every attach is a fresh private
         // session whose state lives in shared storage.
         if let Some(stored) = self.stored.iter().find(|c| c.name() == dto.name) {
@@ -2256,7 +2327,17 @@ impl Dispatcher {
         // per-session scope id carried back on every request as the storage
         // scope (so two ATTACH sessions of the same catalog stay isolated).
         if let Some(sec) = self.secondary.iter().find(|c| c.name == dto.name) {
-            let scope = self.next_execution_id();
+            let mut scope = self.next_execution_id();
+            debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
+            if let Some(hook) = &sec.attach_payload {
+                let options = dto
+                    .options
+                    .as_ref()
+                    .filter(|b| !b.0.is_empty())
+                    .map(|b| ipc::read_batch(&b.0))
+                    .transpose()?;
+                scope.extend_from_slice(&hook(options.as_ref())?);
+            }
             let result = CatalogAttachResult {
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
@@ -5236,6 +5317,19 @@ fn split_group_ids(batch: &RecordBatch) -> Result<(Int64Array, Vec<ArrayRef>)> {
 const SEC_MARKER: &[u8] = b"\x00sec\x00";
 
 /// Encode a secondary-catalog attach blob from its name + per-session scope id.
+/// Length of [`Dispatcher::next_execution_id`]: `"vgi-exec-"` + pid (4) +
+/// nanos (8) + counter (8).
+const EXECUTION_ID_LEN: usize = 9 + 4 + 8 + 8;
+
+/// The bytes a secondary catalog's
+/// [`attach_payload`](crate::catalog::CatalogModel::attach_payload) hook
+/// returned for the attach `attach_opaque_data` belongs to, or `None` when the
+/// blob is not a secondary attach.
+pub fn secondary_attach_payload(attach_opaque_data: &[u8]) -> Option<Vec<u8>> {
+    let (_, scope) = decode_secondary_opaque(attach_opaque_data)?;
+    scope.get(EXECUTION_ID_LEN..).map(<[u8]>::to_vec)
+}
+
 fn encode_secondary_opaque(name: &str, scope: &[u8]) -> Vec<u8> {
     let mut v = SEC_MARKER.to_vec();
     v.extend_from_slice(name.as_bytes());

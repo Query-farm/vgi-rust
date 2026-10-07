@@ -51,7 +51,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
             wire::params_schema_for("catalog_attach"),
             wire::result_binary_schema(),
             move |req, ctx| {
-                let result = d.with_opened(req, ctx, |opened| d.handle_catalog_attach(opened))?;
+                let result = d.with_opened(req, ctx, |opened| {
+                    d.handle_catalog_attach_as(opened, &ctx.auth)
+                })?;
                 d.seal_result(req, ctx, result)
             },
         ));

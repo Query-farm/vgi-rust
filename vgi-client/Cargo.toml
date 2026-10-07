@@ -73,7 +73,7 @@ vgi = { path = "../vgi" }
 # Only to prove the blocking HTTP path survives an ambient async runtime, which
 # is how every async consumer reaches this client.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# The HTTP tests (http_under_tokio, opaque_sealing_e2e) drive a real worker over
+# The HTTP tests (http_under_tokio, opaque_sealing_e2e, attach_ticket_e2e) drive a real worker over
 # HTTP, which needs a concrete backend under `HttpClient`. The library leaves
 # the backend to its consumer; the tests pick reqwest.
 vgi-rpc-client = { workspace = true, features = ["reqwest"] }

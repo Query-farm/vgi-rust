@@ -131,3 +131,66 @@ With either active, a request carrying an `Authorization` header that nothing
 accepts is refused (401) -- including under `VGI_OPTIONAL_BEARER_TOKENS`, which
 otherwise answers anonymous for unknown tokens. A request with no credential at
 all is still anonymous.
+
+## Attach tickets: `vgi.attach_tickets.v1`
+
+A ticket seals a user's ATTACH -- catalog name, options (secret ones included),
+version specs -- so a runner holding that user's **grant** can reattach later
+without ever seeing an option. The grant says *who*; the ticket says *what*.
+Normative spec: vgi-python `docs/protocol/vgi-attach-tickets.md`; the format is
+pinned byte for byte by `vgi/testdata/attach_ticket_vectors.json`, which the
+unit tests in `vgi::attach_ticket` consume.
+
+```bash
+export VGI_SIGNING_KEY='<any stable value>'           # or worker.signing_key(...)
+export VGI_RPC_GRANT_KEYS="$(head -c 32 /dev/urandom | base64)"
+my-worker --http
+```
+
+- **Hosting.** The protocol is hosted on HTTP only, and only when the worker has
+  a signing key (`VGI_SIGNING_KEY` or `Worker::signing_key`) **and** can issue
+  grants (grant keys, or `Worker::mint_grant`). Otherwise it is absent, which a
+  client learns from `vgi_rpc.Reflection.v1` `list_protocols`. This SDK never
+  generates a signing key, so every key is a configured one and tickets
+  survive restarts; rotating it invalidates every ticket.
+- **`seal_attach(SealAttachRequest) -> AttachTicket`** (version `1.0.0`): seals
+  the *caller's* attach of `catalog_name` with `options` (the Arrow IPC options
+  record, as `catalog_attach` carries it) into `vgia1.…` text. Anonymous callers
+  get `action_denied`; no fresh login is needed. Options are checked against
+  the catalog's declared attach options (unknown, missing-required, the
+  reserved name, over 16 KiB, `ttl_seconds < 0` → `invalid_request` with one
+  `BadRequest` violation each). The lifetime is capped at the grant maximum
+  (`VGI_RPC_GRANT_MAX_TTL_SECONDS` / the grant keys'); `ttl_seconds = 0` asks
+  for that maximum, and with none the ticket does not expire
+  (`expires_at = +inf`).
+- **Redemption.** A `catalog_attach` whose options contain `vgi_attach_ticket`
+  (any letter case) is replaced, before routing and before any catalog code,
+  by the attach the ticket seals: the sealed catalog name (the request's name
+  is ignored), options and version specs, keeping the request's
+  `client_capabilities`. Any other option beside the ticket is
+  `invalid_request`. The ticket opens only under the caller's principal --
+  `attach_ticket_invalid` otherwise, indistinguishable from a forgery -- and
+  only within its lifetime (60 s skew; `attach_ticket_expired`). On a worker
+  with no signing key (every transport but keyed HTTP) every ticket is
+  `attach_ticket_invalid`.
+- **Reserved name.** `vgi_attach_ticket` cannot be declared as an attach
+  option: `serialize_attach_option_spec_with_flags` refuses it, and a worker
+  whose catalogs advertise it anyway panics at startup.
+- **Never logged.** Neither the ticket nor a restored option appears in an
+  error message.
+
+```sql
+-- runner, authenticated by the user's grant
+ATTACH 'anything' AS sales (TYPE vgi, LOCATION 'https://worker',
+    bearer_token '<grant>', vgi_attach_ticket '<ticket>');
+```
+
+The example worker serves the cross-SDK `ticket_probe` catalog (`region`,
+default `'us-east-1'`; `api_key`, required and secret; table `main.probe`
+returning `region` and the first 12 hex characters of `sha256(api_key)`).
+Under `VGI_OPTIONAL_BEARER_TOKENS` its test bearers count as fresh logins
+(`auth_time` = now), so `vgi-test-alice` / `vgi-test-bob` can call
+`issue_grant` directly. A secondary catalog that needs its attach options at
+query time can do the same as `ticket_probe`: set
+`CatalogModel::attach_payload` and read it back with
+`vgi::catalog::secondary_attach_payload`.

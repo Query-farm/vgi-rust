@@ -120,6 +120,7 @@
 
 pub mod aggregate;
 pub mod arguments;
+pub mod attach_ticket;
 pub mod buffering;
 
 pub mod catalog;

@@ -14,6 +14,8 @@ use crate::ipc;
 use crate::protocol::dtos::{FunctionInfo, RequiredSecret, SchemaInfo};
 use crate::protocol::enums;
 
+pub use crate::dispatch::secondary_attach_payload;
+
 /// The default schema name every registered function lives under.
 pub const MAIN_SCHEMA: &str = "main";
 
@@ -133,6 +135,21 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     ipc::write_batch(&batch)
 }
 
+/// The attach-option name reserved for attach tickets
+/// ([`crate::attach_ticket`]): the framework reads it before any catalog code
+/// runs, so no catalog may declare an option with this name, compared
+/// case-insensitively. [`serialize_attach_option_spec_with_flags`] refuses it,
+/// and a worker whose catalogs advertise it anyway refuses to start.
+pub const RESERVED_ATTACH_OPTION: &str = "vgi_attach_ticket";
+
+/// The error for declaring the reserved attach-option name.
+pub(crate) fn reserved_attach_option_error(name: &str) -> vgi_rpc::RpcError {
+    vgi_rpc::RpcError::value_error(format!(
+        "Attach option {name:?} uses the reserved name {RESERVED_ATTACH_OPTION:?}: the framework \
+         reads it as an attach ticket before any catalog code runs. Rename the option."
+    ))
+}
+
 /// Declaration flags for one ATTACH option, passed to
 /// [`serialize_attach_option_spec_with_flags`].
 ///
@@ -234,6 +251,9 @@ pub fn serialize_attach_option_spec_with_flags(
     flags: AttachOptionFlags,
 ) -> Result<Vec<u8>> {
     let AttachOptionFlags { required, secret } = flags;
+    if name.eq_ignore_ascii_case(RESERVED_ATTACH_OPTION) {
+        return Err(reserved_attach_option_error(name));
+    }
     if required && default.is_some() {
         return Err(vgi_rpc::RpcError::runtime_error(format!(
             "Attach option '{name}' is required but also declares a default; an option \
@@ -304,6 +324,24 @@ pub fn required_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
 /// skipped, and an absent or null `secret` column means "not secret".
 pub fn secret_attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
     flagged_attach_option_names(specs, "secret")
+}
+
+/// Names of every option a catalog declares, in declaration order, read back
+/// out of its serialized [`serialize_attach_option_spec_with_flags`] records.
+/// An unreadable spec is skipped.
+pub fn attach_option_names(specs: &[Vec<u8>]) -> Vec<String> {
+    use arrow_array::{Array, StringArray};
+    specs
+        .iter()
+        .filter_map(|raw| {
+            let batch = ipc::read_batch(raw).ok()?;
+            let col = batch
+                .column_by_name("name")?
+                .as_any()
+                .downcast_ref::<StringArray>()?;
+            (batch.num_rows() > 0 && !col.is_null(0)).then(|| col.value(0).to_string())
+        })
+        .collect()
 }
 
 /// Names of the specs whose boolean column `flag` is present, non-null and true.
@@ -864,6 +902,10 @@ pub fn schema_info(
 // Declarative catalog model (views / macros / function-backed tables)
 // ---------------------------------------------------------------------------
 
+/// See [`CatalogModel::attach_payload`].
+pub type AttachPayloadHook =
+    std::sync::Arc<dyn Fn(Option<&arrow_array::RecordBatch>) -> Result<Vec<u8>> + Send + Sync>;
+
 /// A declarative catalog: named schemas with views, macros, and tables.
 #[derive(Default, Clone)]
 pub struct CatalogModel {
@@ -906,6 +948,13 @@ pub struct CatalogModel {
     /// When set, `catalog_attach` merges the user `options` over it and encodes
     /// the result into `attach_opaque_data` (`<16-byte id>\0<ipc>`).
     pub attach_options_default_batch: Option<Vec<u8>>,
+    /// Secondary catalogs only ([`crate::Worker::register_secondary_catalog`]):
+    /// called at attach, after required-option validation, with the request's
+    /// one-row options record (`None` when there are none). The bytes it
+    /// returns ride in this attach's `attach_opaque_data`, and functions read
+    /// them back with [`secondary_attach_payload`]. `None` (the default): the
+    /// attach carries no payload.
+    pub attach_payload: Option<AttachPayloadHook>,
     /// Registered function names this catalog additionally asks the client to
     /// publish into its *global* (catalog-independent) namespace, prefixed with
     /// [`global_function_prefix`](Self::global_function_prefix). Advertised via

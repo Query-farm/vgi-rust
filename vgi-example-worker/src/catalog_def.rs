@@ -1239,6 +1239,7 @@ pub fn versioned() -> CatalogModel {
         npm_version_resolution: false,
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
+        attach_payload: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
         global_functions: Vec::new(),
@@ -1340,6 +1341,7 @@ pub fn versioned_tables() -> CatalogModel {
         npm_version_resolution: true,
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
+        attach_payload: None,
         version_schemas,
         global_functions: Vec::new(),
         global_function_prefix: String::new(),
@@ -1380,6 +1382,7 @@ pub fn build() -> CatalogModel {
         npm_version_resolution: false,
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
+        attach_payload: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
         // Global-function registration probes, one per function type, so the
