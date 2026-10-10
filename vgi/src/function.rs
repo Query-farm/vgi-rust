@@ -253,7 +253,8 @@ impl ArgSpec {
 }
 
 /// Validate each spec's type bound against the input schema. Errors (value
-/// error) naming the failed bound, matching Python's `SchemaValidationError`.
+/// error, code `INVALID_ARGUMENT`) naming the failed bound, matching Python's
+/// `SchemaValidationError`.
 pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>) -> Result<()> {
     let Some(schema) = input_schema else {
         return Ok(());
@@ -267,7 +268,7 @@ pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>)
         }
         if let Some(field) = schema.fields().get(spec.position as usize) {
             if !(bound.pred)(field.data_type()) {
-                return Err(vgi_rpc::RpcError::value_error(format!(
+                return Err(crate::errors::invalid_argument(format!(
                     "{}: argument {} of type {} does not satisfy {}",
                     bound.name,
                     spec.name,
@@ -286,9 +287,9 @@ pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>)
 /// range (`ge`/`le`/`gt`/`lt`), and `pattern` constraints are validated once
 /// here — mirroring the Python SDK, so a discovered constraint (surfaced via
 /// `vgi_function_arguments()`) is actually binding. A violating value returns an
-/// `RpcError::value_error`; a null const value skips its value constraints, and
-/// column (non-const) arguments are not enforced here (type bounds are
-/// [`validate_type_bounds`]'s job).
+/// `RpcError::value_error` coded `INVALID_ARGUMENT`; a null const value skips
+/// its value constraints, and column (non-const) arguments are not enforced
+/// here (type bounds are [`validate_type_bounds`]'s job).
 pub fn validate_arg_constraints(
     specs: &[ArgSpec],
     args: &crate::arguments::Arguments,
@@ -368,7 +369,7 @@ pub fn validate_arg_constraints(
 }
 
 fn constraint_err(spec: &ArgSpec, detail: &str) -> vgi_rpc::RpcError {
-    vgi_rpc::RpcError::value_error(format!("argument {}: {}", spec.name, detail))
+    crate::errors::invalid_argument(format!("argument {}: {}", spec.name, detail))
 }
 
 /// Format a numeric bound, trimming a trailing `.0` (matches the `vgi_range` text).
@@ -843,6 +844,28 @@ mod constraint_tests {
         assert!(validate_arg_constraints(&specs, &args_i64(5)).is_ok());
         assert!(validate_arg_constraints(&specs, &args_i64(99)).is_err());
         assert!(validate_arg_constraints(&specs, &args_i64(-1)).is_err());
+        let err = validate_arg_constraints(&specs, &args_i64(99)).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+    }
+
+    #[test]
+    fn type_bound_violation_is_invalid_argument() {
+        fn is_int64(t: &arrow_schema::DataType) -> bool {
+            *t == arrow_schema::DataType::Int64
+        }
+        let specs = vec![ArgSpec::any_column("value", 0, "").with_bound(TypeBound {
+            name: "is_int64",
+            pred: is_int64,
+        })];
+        let schema: SchemaRef =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        let err = validate_type_bounds(&specs, Some(&schema)).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+        assert_eq!(err.error_type, "ValueError");
     }
 
     #[test]

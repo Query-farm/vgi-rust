@@ -186,7 +186,7 @@ impl StoredCatalog {
         match events.next().transpose()? {
             Some(Event::Attached) => {}
             _ => {
-                return Err(RpcError::value_error(format!(
+                return Err(crate::errors::not_found(format!(
                     "catalog '{}' is not attached (unknown or detached session)",
                     self.name
                 )))
@@ -350,7 +350,8 @@ impl StoredCatalog {
                 Err(RpcError::value_error(format!(
                     "catalog '{}' stores table metadata only; its tables have no rows to scan",
                     self.name
-                )))
+                ))
+                .with_code(crate::errors::Code::Unimplemented))
             }
             "catalog_contents" => {
                 let params: p::CatalogContentsParams = wire::from_batch(&req.batch)?;
@@ -450,7 +451,8 @@ impl StoredCatalog {
             other => Err(RpcError::value_error(format!(
                 "catalog '{}' does not support {other}",
                 self.name
-            ))),
+            ))
+            .with_code(crate::errors::Code::Unimplemented)),
         }
     }
 
@@ -501,7 +503,7 @@ impl OnConflict {
             "error" | "" => Ok(OnConflict::Error),
             "ignore" => Ok(OnConflict::Ignore),
             "replace" => Ok(OnConflict::Replace),
-            other => Err(RpcError::value_error(format!(
+            other => Err(crate::errors::invalid_argument(format!(
                 "unknown on_conflict '{other}' (expected error, ignore or replace)"
             ))),
         }
@@ -674,7 +676,9 @@ impl State {
         self.schemas
             .iter_mut()
             .find(|s| same_path(&s.path, path))
-            .ok_or_else(|| RpcError::value_error(format!("Schema '{}' not found", path.join("."))))
+            .ok_or_else(|| {
+                crate::errors::not_found(format!("Schema '{}' not found", path.join(".")))
+            })
     }
 
     fn table_items(&self, path: &[String]) -> Result<Vec<Bytes>> {
@@ -734,10 +738,12 @@ impl State {
                 on_conflict,
             } => {
                 if path.is_empty() {
-                    return Err(RpcError::value_error("schema path must not be empty"));
+                    return Err(crate::errors::invalid_argument(
+                        "schema path must not be empty",
+                    ));
                 }
                 if path.len() > 1 && self.schema(&path[..path.len() - 1]).is_none() {
-                    return Err(RpcError::value_error(format!(
+                    return Err(crate::errors::not_found(format!(
                         "Schema '{}' not found",
                         path[..path.len() - 1].join(".")
                     )));
@@ -770,7 +776,7 @@ impl State {
                     return if *ignore_not_found {
                         Ok(false)
                     } else {
-                        Err(RpcError::value_error(format!(
+                        Err(crate::errors::not_found(format!(
                             "Schema '{}' not found",
                             path.join(".")
                         )))
@@ -916,7 +922,7 @@ fn drop_named<T>(
         if ignore_not_found {
             Ok(false)
         } else {
-            Err(RpcError::value_error(format!(
+            Err(crate::errors::not_found(format!(
                 "{kind} '{}.{name}' not found",
                 path.join(".")
             )))
@@ -1354,10 +1360,9 @@ mod tests {
             transaction_opaque_data: None,
         })
         .unwrap();
-        let err = s
-            .call("catalog_view_rename", batch)
-            .unwrap_err()
-            .to_string();
+        let err = s.call("catalog_view_rename", batch).unwrap_err();
+        assert_eq!(err.error_code(), "UNIMPLEMENTED", "{err}");
+        let err = err.to_string();
         assert!(
             err.contains("does not support catalog_view_rename"),
             "{err}"
@@ -1438,6 +1443,7 @@ mod tests {
         // The declarative primary is still read-only.
         let err = view(&Bytes::from(b"example".to_vec()), "x").unwrap_err();
         assert!(err.to_string().contains("read-only"));
+        assert_eq!(err.error_code(), "FAILED_PRECONDITION", "{err}");
 
         let catalogs = d
             .handle_catalog_catalogs(&request(

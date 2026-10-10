@@ -662,11 +662,11 @@ impl Dispatcher {
         let cands = self
             .aggregates
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Aggregate, name, cands.len(), call)?;
         idxs.first()
             .map(|&i| cands[i].clone())
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))
     }
 
     pub fn register_scalar(&mut self, f: Arc<dyn ScalarFunction>) {
@@ -772,7 +772,7 @@ impl Dispatcher {
         let cands = self
             .tableinouts
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::TableInOut, name, cands.len(), call)?;
         // Blended (input_from_args) overloads resolve by input-column count /
         // type against their declared positional args (which are the input
@@ -784,7 +784,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -813,11 +815,11 @@ impl Dispatcher {
         let cands = self
             .buffering
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Buffering, name, cands.len(), call)?;
         idxs.first()
             .map(|&i| cands[i].clone())
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))
     }
 
     fn resolve_table(
@@ -830,7 +832,7 @@ impl Dispatcher {
         let cands = self
             .tables
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Table, name, cands.len(), call)?;
         let pick = crate::overload::resolve_overload(
             idxs.len(),
@@ -838,7 +840,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -916,7 +920,7 @@ impl Dispatcher {
                 .collect();
             elsewhere.sort();
             elsewhere.dedup();
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::not_found(format!(
                 "Function '{name}' is not declared in schema '{}' of catalog '{}'. \
                  It is declared in: {}",
                 schema.join("."),
@@ -929,7 +933,7 @@ impl Dispatcher {
             .filter(|&i| home(i).is_some_and(|h| h.in_catalog(call.catalog)))
             .collect();
         if in_catalog.is_empty() {
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::not_found(format!(
                 "Function '{name}' is not declared in catalog '{}'",
                 call.catalog
             )));
@@ -941,7 +945,7 @@ impl Dispatcher {
         schemas.sort_unstable();
         schemas.dedup();
         if schemas.len() > 1 {
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::invalid_argument(format!(
                 "Ambiguous function call '{name}': declared in more than one schema of \
                  catalog '{}' ({}) — qualify the call with a schema to disambiguate",
                 call.catalog,
@@ -992,7 +996,7 @@ impl Dispatcher {
         let cands = self
             .scalars
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Scalar, name, cands.len(), call)?;
         let pick = crate::overload::resolve_overload(
             idxs.len(),
@@ -1000,7 +1004,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -2631,7 +2637,7 @@ impl Dispatcher {
             } else {
                 match (&dto.implementation_version, &cat.implementation_version) {
                     (Some(req), Some(have)) if req != have => {
-                        return Err(RpcError::value_error(format!(
+                        return Err(crate::errors::invalid_argument(format!(
                         "Unsupported implementation_version {req:?}; this worker serves {have:?}"
                     )));
                     }
@@ -2650,7 +2656,7 @@ impl Dispatcher {
             )?)
         } else if let Some(req) = &dto.data_version_spec {
             if !cat.supported_data_versions.contains(req) {
-                return Err(RpcError::value_error(format!(
+                return Err(crate::errors::invalid_argument(format!(
                     "Unsupported data_version_spec {req:?}; this worker serves one of {:?}",
                     cat.supported_data_versions
                 )));
@@ -3119,7 +3125,7 @@ impl Dispatcher {
             .schema_for_req(req, &schema_path)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
-                RpcError::value_error(format!(
+                crate::errors::not_found(format!(
                     "Unknown table: '{}.{table_name}'",
                     schema_path.join(".")
                 ))
@@ -3491,7 +3497,7 @@ impl Dispatcher {
             .schema_for_req(req, &schema_path)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
-                RpcError::value_error(format!(
+                crate::errors::not_found(format!(
                     "Unknown table: '{}.{table_name}'",
                     schema_path.join(".")
                 ))
@@ -4667,7 +4673,7 @@ impl Dispatcher {
     /// read-only, so the request is accepted (proving the wire contract is
     /// intact) and rejected with a clear `catalog is read-only` error.
     pub fn handle_read_only(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        Err(RpcError::runtime_error("catalog is read-only"))
+        Err(crate::errors::failed_precondition("catalog is read-only"))
     }
 }
 

@@ -143,6 +143,13 @@ so `DETACH demo; ATTACH 'demo' (...)` (or a fresh session) picks up a new build.
   (`demo.main.upper_case`) or run `USE demo;`.
 - **Runtime / type errors** — errors returned from `process` (and bind-time
   `argument_specs` type checks) surface directly in DuckDB's error message.
+- **Telling bad input from a bug** — every error carries a gRPC-style code
+  (`vgi_rpc.error_code`). The SDK codes its own: bad arguments and type-bound
+  failures are `INVALID_ARGUMENT`, unknown functions / tables / schemas are
+  `NOT_FOUND`, writes to a read-only catalog are `FAILED_PRECONDITION`,
+  unsupported operations are `UNIMPLEMENTED`; anything else is `UNKNOWN`. Use
+  `vgi::errors::{invalid_argument, not_found, failed_precondition,
+  unimplemented}` to code your own worker's errors the same way.
 
 ## Function types
 

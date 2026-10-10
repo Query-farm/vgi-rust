@@ -1040,7 +1040,7 @@ pub fn resolve_version_npm(
         .collect();
     sorted.sort();
     let unsupported = || {
-        vgi_rpc::RpcError::value_error(format!(
+        crate::errors::invalid_argument(format!(
             "Unsupported {label} {spec:?}; this worker serves {supported:?}"
         ))
     };
@@ -1245,7 +1245,7 @@ impl CatTable {
             // the AT clause themselves (carried on the bind request), so the
             // catalog leaves the schema/scan unchanged (pass-through).
             if has_at && self.branches.is_none() && !self.supports_time_travel {
-                return Err(vgi_rpc::RpcError::value_error(
+                return Err(crate::errors::unimplemented(
                     "this table does not support time travel",
                 ));
             }
@@ -1257,20 +1257,18 @@ impl CatTable {
             Some("VERSION") => {
                 let want: i64 = at_value
                     .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT VERSION value"))?;
+                    .ok_or_else(|| crate::errors::invalid_argument("invalid AT VERSION value"))?;
                 self.time_travel
                     .iter()
                     .find(|t| t.version == want)
                     .map(Some)
-                    .ok_or_else(|| {
-                        vgi_rpc::RpcError::value_error(format!("Unknown version: {want}"))
-                    })
+                    .ok_or_else(|| crate::errors::not_found(format!("Unknown version: {want}")))
             }
             Some("TIMESTAMP") => {
                 let year: i32 = at_value
                     .and_then(|v| v.get(..4))
                     .and_then(|y| y.parse().ok())
-                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT TIMESTAMP value"))?;
+                    .ok_or_else(|| crate::errors::invalid_argument("invalid AT TIMESTAMP value"))?;
                 self.time_travel
                     .iter()
                     .filter(|t| t.timestamp_year.is_some_and(|ty| ty <= year))
@@ -1283,12 +1281,12 @@ impl CatTable {
                             .filter_map(|t| t.timestamp_year)
                             .min()
                             .unwrap_or(0);
-                        vgi_rpc::RpcError::value_error(format!(
+                        crate::errors::not_found(format!(
                             "No version exists at timestamp {at_value:?}: table did not exist before {min_year}"
                         ))
                     })
             }
-            Some(other) => Err(vgi_rpc::RpcError::value_error(format!(
+            Some(other) => Err(crate::errors::invalid_argument(format!(
                 "Unsupported at_unit: {other:?}"
             ))),
         }
@@ -2245,7 +2243,7 @@ impl std::error::Error for MissingAttachOptions {}
 
 impl From<MissingAttachOptions> for vgi_rpc::RpcError {
     fn from(e: MissingAttachOptions) -> Self {
-        vgi_rpc::RpcError::value_error(e.to_string())
+        crate::errors::invalid_argument(e.to_string())
     }
 }
 

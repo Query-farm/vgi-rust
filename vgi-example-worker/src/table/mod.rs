@@ -78,6 +78,7 @@ fn schema_value() -> SchemaRef {
 
 /// Validate `sequence`/`make_series` args: count must be non-NULL; batch_size
 /// and increment, when supplied, must be non-NULL and (for batch_size) >= 1.
+/// Every rejection is a bad argument, so each is coded `INVALID_ARGUMENT`.
 fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
     use arrow_array::Array;
     // count (positional 0) is required and must not be NULL.
@@ -91,12 +92,14 @@ fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
         })
         .unwrap_or(true);
     if count_null {
-        return Err(RpcError::value_error("sequence: count cannot be NULL"));
+        return Err(vgi::errors::invalid_argument(
+            "sequence: count cannot be NULL",
+        ));
     }
     for name in ["batch_size", "increment"] {
         if let Some(arr) = a.named.get(name) {
             if arr.is_null(0) {
-                return Err(RpcError::value_error(format!(
+                return Err(vgi::errors::invalid_argument(format!(
                     "sequence: {name} cannot be NULL"
                 )));
             }
@@ -104,12 +107,16 @@ fn validate_sequence_args(a: &vgi::arguments::Arguments) -> Result<()> {
     }
     if let Some(bs) = a.named_i64("batch_size") {
         if bs < 1 {
-            return Err(RpcError::value_error("sequence: batch_size must be >= 1"));
+            return Err(vgi::errors::invalid_argument(
+                "sequence: batch_size must be >= 1",
+            ));
         }
     }
     if let Some(inc) = a.named_i64("increment") {
         if inc < 1 {
-            return Err(RpcError::value_error("sequence: increment must be >= 1"));
+            return Err(vgi::errors::invalid_argument(
+                "sequence: increment must be >= 1",
+            ));
         }
     }
     Ok(())

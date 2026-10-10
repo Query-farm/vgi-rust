@@ -128,6 +128,7 @@ pub mod catalog_contents;
 pub mod copy_from;
 pub mod copy_to;
 pub mod dispatch;
+pub mod errors;
 pub mod function;
 pub mod numeric;
 pub mod opaque;
