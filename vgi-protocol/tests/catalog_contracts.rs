@@ -12,6 +12,35 @@ use vgi_protocol::generated::protocol_types::{
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
+#[test]
+fn column_request_params_preserve_raw_targets_and_nullable_fields() {
+    use vgi_protocol::generated::request_params::*;
+    macro_rules! check {
+        ($ty:ty, $operation:literal) => {
+            for (variant, path) in [("literal", vec!["a.b"]), ("nested", vec!["a", "b.\"quoted"])] {
+                let name = format!("{}_{}", $operation, variant);
+                let value: $ty = round_trip(&name);
+                assert_eq!(value.column_path, path);
+                assert_eq!(value.schema_path, ["one.two", "nested"]);
+                assert_eq!(value.transaction_opaque_data.is_some(), variant == "nested");
+                let original = StreamReader::try_new(Cursor::new(fixture(&name)), None)
+                    .unwrap().next().unwrap().unwrap();
+                assert_eq!(to_batch(value).unwrap(), original, "{name}");
+            }
+        };
+    }
+    check!(CatalogTableColumnAddParams, "column_add");
+    check!(CatalogTableColumnDropParams, "column_drop");
+    check!(CatalogTableColumnRenameParams, "column_rename");
+    check!(CatalogTableColumnTypeChangeParams, "column_type_change");
+    check!(CatalogTableColumnDefaultSetParams, "column_default_set");
+    check!(CatalogTableColumnDefaultDropParams, "column_default_drop");
+    check!(CatalogTableColumnCommentSetParams, "column_comment_set");
+    check!(CatalogTableNotNullSetParams, "not_null_set");
+    check!(CatalogTableNotNullDropParams, "not_null_drop");
+}
+
+
 fn fixture(name: &str) -> Vec<u8> {
     let corpus: serde_json::Value =
         serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
