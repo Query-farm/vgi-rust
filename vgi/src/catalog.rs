@@ -1561,6 +1561,9 @@ pub fn table_info(
         required_filters: t.required_filters.clone(),
         column_statistics: Some(Bytes::from(Vec::new())),
         bind_result: Some(Bytes::from(Vec::new())),
+
+        options: None,
+        layout: None,
     })
 }
 
@@ -2166,7 +2169,7 @@ mod tests {
             .iter()
             .find(|f| f.name() == "required_filters")
             .expect("required_filters field present");
-        assert_eq!(rf, fields.last().unwrap(), "must be the trailing field");
+        assert_eq!(rf, &fields[20], "required_filters retains its wire position");
         let arrow_schema::DataType::List(inner) = rf.data_type() else {
             panic!("required_filters is not a List, got {:?}", rf.data_type());
         };

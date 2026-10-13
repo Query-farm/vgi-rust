@@ -7,6 +7,7 @@ use arrow_ipc::writer::StreamWriter;
 use base64::Engine;
 use vgi_protocol::generated::protocol_types::{
     CatalogCapabilities, OptionChanges, OptionDefinitions, OptionState, RequiredFilterPaths,
+    SortKey, SqlExpression, TableLayout, TableLayoutChange,
 };
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
@@ -81,4 +82,47 @@ fn capability_profiles_and_option_definitions_round_trip() {
     assert_eq!(definitions.defaults.0, fixture("values"));
     assert_eq!(definitions.create_names, ["optional", "record"]);
     assert_eq!(definitions.alter_names, ["optional"]);
+}
+
+#[test]
+fn layouts_preserve_keys_orders_and_clear_versus_unchanged() {
+    let expr: SqlExpression = round_trip("expression");
+    assert_eq!(expr.schema_path, ["one.two", "nested"]);
+    let key: SortKey = round_trip("sort_key");
+    assert_eq!(key.expression.0, fixture("expression"));
+    assert_eq!(key.direction.0, "DESC");
+    assert_eq!(key.null_order.0, "FIRST");
+    let layout: TableLayout = round_trip("layout");
+    assert_eq!(layout.partition_by[0].0, fixture("expression"));
+    assert_eq!(layout.sorted_by[0].0, fixture("sort_key"));
+    assert_eq!(layout.coverage.0, "ALL_ROWS");
+    let empty: TableLayout = round_trip("empty_layout");
+    assert!(empty.partition_by.is_empty() && empty.sorted_by.is_empty());
+    let change: TableLayoutChange = round_trip("layout_change");
+    assert_eq!(change.mode.0, "REWRITE");
+    assert!(change.partition_by.unwrap().is_empty());
+    assert_eq!(change.sorted_by.unwrap()[0].0, fixture("sort_key"));
+    let clear: TableLayoutChange = round_trip("layout_clear");
+    assert_eq!(clear.mode.0, "FUTURE_WRITES");
+    assert!(clear.partition_by.is_none());
+    assert!(clear.sorted_by.unwrap().is_empty());
+}
+
+#[test]
+fn table_records_preserve_optional_metadata() {
+    use vgi_protocol::protocol::dtos::{TableCreateRequest, TableInfo};
+    let create: TableCreateRequest = round_trip("table_create");
+    assert_eq!(create.options.unwrap().0, fixture("values"));
+    assert_eq!(create.layout.unwrap().0, fixture("layout"));
+    assert_eq!(create.comment.as_deref(), Some("kept"));
+    let old: TableCreateRequest = round_trip("table_create_legacy");
+    assert!(
+        old.comment.is_none()
+            && old.tags.is_none()
+            && old.options.is_none()
+            && old.layout.is_none()
+    );
+    let info: TableInfo = round_trip("table_info");
+    assert_eq!(info.options.unwrap().0, fixture("state"));
+    assert_eq!(info.layout.unwrap().0, fixture("layout"));
 }

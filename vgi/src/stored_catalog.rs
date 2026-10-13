@@ -396,6 +396,15 @@ impl StoredCatalog {
                 let boxed: p::CatalogTableCreateParams = wire::from_batch(&req.batch)?;
                 let q: TableCreateRequest =
                     wire::from_batch(&crate::ipc::read_batch(&boxed.request.0)?)?;
+                if q.comment.is_some()
+                    || q.tags.is_some()
+                    || q.options.is_some()
+                    || q.layout.is_some()
+                {
+                    return Err(RpcError::method_not_implemented(
+                        "catalog_table_create requires negotiated table profiles",
+                    ));
+                }
                 // Reject a malformed schema now rather than on every listing.
                 crate::ipc::read_schema(&q.columns.0)?;
                 self.mutate(
@@ -1047,6 +1056,11 @@ mod tests {
                 primary_key_constraints: Vec::new(),
                 foreign_key_constraints: Vec::new(),
                 transaction_opaque_data: None,
+
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
             })
             .unwrap();
             let batch = wire::to_batch(p::CatalogTableCreateParams {

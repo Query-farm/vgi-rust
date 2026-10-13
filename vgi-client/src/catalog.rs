@@ -1763,6 +1763,9 @@ mod attach_option_tests {
             column_statistics: None,
             bind_result: None,
             required_filters: Vec::new(),
+
+            options: None,
+            layout: None,
         }
     }
 
@@ -2338,6 +2341,9 @@ mod load_catalog_tests {
             column_statistics: None,
             bind_result: None,
             required_filters: Vec::new(),
+
+            options: None,
+            layout: None,
         };
         let index = IndexInfo {
             comment: None,

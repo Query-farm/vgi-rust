@@ -1151,6 +1151,8 @@ pub struct TableInfo {
     /// every group must be satisfied. Empty = no enforcement. Wire type
     /// `list<list<utf8>>`. Trailing field of the C++ protocol's TableInfo.
     pub required_filters: Vec<Vec<String>>,
+    pub options: Option<Bytes>,
+    pub layout: Option<Bytes>,
 }
 
 /// `ViewInfo` item.
@@ -1218,6 +1220,10 @@ pub struct TableCreateRequest {
     pub primary_key_constraints: Vec<Vec<i32>>,
     pub foreign_key_constraints: Vec<Bytes>,
     pub transaction_opaque_data: Option<Bytes>,
+    pub comment: Option<String>,
+    pub tags: Option<StrMap>,
+    pub options: Option<Bytes>,
+    pub layout: Option<Bytes>,
 }
 
 /// `ScanFunctionResult` — names the table function that scans a catalog table.
