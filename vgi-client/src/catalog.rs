@@ -1060,6 +1060,19 @@ impl VgiClient {
         definition: &str,
         on_conflict: OnConflict,
     ) -> Result<()> {
+        self.view_create_with_aliases(cat, schema_path, name, definition, on_conflict, &[])
+    }
+
+    /// Create a view with ordered raw output aliases.
+    pub fn view_create_with_aliases(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        definition: &str,
+        on_conflict: OnConflict,
+        aliases: &[String],
+    ) -> Result<()> {
         call_unit(
             self.transport_mut(),
             "catalog_view_create",
@@ -1068,6 +1081,7 @@ impl VgiClient {
                 schema_path: schema_path.to_vec(),
                 name: name.to_string(),
                 definition: definition.to_string(),
+                aliases: Some(aliases.to_vec()),
                 on_conflict: on_conflict.dict(),
                 transaction_opaque_data: cat.txn(),
             },

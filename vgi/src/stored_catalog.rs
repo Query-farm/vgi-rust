@@ -445,6 +445,7 @@ impl StoredCatalog {
                         path: q.schema_path,
                         name: q.name,
                         definition: q.definition,
+                        aliases: q.aliases.unwrap_or_default(),
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
                     },
                 )?;
@@ -557,6 +558,9 @@ enum Event {
         path: Vec<String>,
         name: String,
         definition: String,
+        // Events written before alias support only had SELECT-derived output names.
+        #[serde(default)]
+        aliases: Vec<String>,
         on_conflict: OnConflict,
     },
     ViewDrop {
@@ -598,6 +602,7 @@ impl StoredTable {
 struct StoredView {
     name: String,
     definition: String,
+    aliases: Vec<String>,
 }
 
 impl StoredView {
@@ -609,6 +614,7 @@ impl StoredView {
             schema_path: path.to_vec(),
             definition: self.definition.clone(),
             column_comments: Vec::new(),
+            aliases: self.aliases.clone(),
         }
     }
 }
@@ -872,11 +878,13 @@ impl State {
                 path,
                 name,
                 definition,
+                aliases,
                 on_conflict,
             } => {
                 let view = StoredView {
                     name: name.clone(),
                     definition: definition.clone(),
+                    aliases: aliases.clone(),
                 };
                 let schema = self.schema_mut(path)?;
                 if schema.table(name).is_some() {
@@ -1019,6 +1027,7 @@ mod tests {
                 schema_path: path(&["main"]),
                 name: name.to_string(),
                 definition: "SELECT 1 AS x".to_string(),
+                aliases: Some(vec!["a.b".to_string()]),
                 on_conflict: DictString(on_conflict.to_string()),
                 transaction_opaque_data: None,
             })
@@ -1140,6 +1149,7 @@ mod tests {
         let views: Vec<ViewInfo> = s.list("catalog_schema_contents_views", &["main"]);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].name, "v1");
+        assert_eq!(views[0].aliases, ["a.b"]);
         let tables: Vec<TableInfo> = s.list("catalog_schema_contents_tables", &["main"]);
         assert_eq!(tables[0].name, "t1");
         assert_eq!(tables[0].not_null_constraints, vec![0]);
@@ -1249,6 +1259,20 @@ mod tests {
         let state = other.load(&s.store, &s.session).unwrap();
         assert_eq!(state.version, 2);
         assert_eq!(state.schema(&path(&["main"])).unwrap().views.len(), 1);
+        assert_eq!(state.schema(&path(&["main"])).unwrap().views[0].aliases, ["a.b"]);
+    }
+
+    #[test]
+    fn pre_alias_event_logs_retain_query_derived_names() {
+        let s = Session::new(StoredCatalog::new("mem"));
+        let event: Event = serde_json::from_str(
+            r#"{"ViewCreate":{"path":["main"],"name":"old","definition":"SELECT 1 AS x","on_conflict":"Error"}}"#,
+        ).unwrap();
+        s.cat.append(&s.store, &s.session, &event).unwrap();
+        let state = s.cat.load(&s.store, &s.session).unwrap();
+        let view = &state.schema(&path(&["main"])).unwrap().views[0];
+        assert_eq!(view.definition, "SELECT 1 AS x");
+        assert!(view.aliases.is_empty());
     }
 
     /// A conflicting DDL appended by a racing writer is skipped on replay,
@@ -1260,6 +1284,7 @@ mod tests {
             path: path(&["main"]),
             name: "v".to_string(),
             definition: "SELECT 1".to_string(),
+            aliases: vec!["a.b".to_string()],
             on_conflict: OnConflict::Error,
         };
         s.cat.append(&s.store, &s.session, &ev).unwrap();
@@ -1421,6 +1446,7 @@ mod tests {
                 schema_path: path(&["main"]),
                 name: name.to_string(),
                 definition: "SELECT 1".to_string(),
+                aliases: None,
                 on_conflict: DictString("error".to_string()),
                 transaction_opaque_data: None,
             })

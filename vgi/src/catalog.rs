@@ -1106,6 +1106,7 @@ pub struct CatSchema {
 pub struct CatView {
     pub name: String,
     pub definition: String,
+    pub aliases: Vec<String>,
     pub comment: Option<String>,
     pub tags: Vec<(String, String)>,
     pub column_comments: Vec<(String, String)>,
@@ -1449,6 +1450,7 @@ pub fn view_info(schema_path: &[String], v: &CatView) -> crate::protocol::dtos::
         schema_path: schema_path.to_vec(),
         definition: v.definition.clone(),
         column_comments: v.column_comments.clone(),
+        aliases: v.aliases.clone(),
     }
 }
 

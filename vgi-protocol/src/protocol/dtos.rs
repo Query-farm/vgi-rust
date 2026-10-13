@@ -1162,6 +1162,7 @@ pub struct ViewInfo {
     pub schema_path: SchemaPath,
     pub definition: String,
     pub column_comments: StrMap,
+    pub aliases: Vec<String>,
 }
 
 /// `MacroInfo` item.
