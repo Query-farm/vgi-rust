@@ -24,3 +24,7 @@ vgi-rpc = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+
+[dev-dependencies]
+base64 = "0.22"
+serde_json = { workspace = true }
