@@ -31,7 +31,7 @@ use vgi_rpc::wire::{StreamReader, StreamWriter};
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
 const REFERENCE_VGI_V2_HASH: &str =
-    "9e1ed05cdcc6e812f9a6cfda36ecaa699005e30680e511489109180251ee6872";
+    "b1db9b01e3c78a746e627fe18a4e0e0c191389dce42f15368427067f071cdecc";
 
 /// The reference's method count, for a readable failure before the hash.
 const REFERENCE_VGI_V2_METHODS: usize = 77;

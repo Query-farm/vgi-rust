@@ -438,6 +438,9 @@ impl StoredCatalog {
             }
             "catalog_view_create" => {
                 let q: p::CatalogViewCreateParams = wire::from_batch(&req.batch)?;
+                if q.security != "regular" {
+                    return Err(RpcError::value_error("view security mode is unsupported"));
+                }
                 self.mutate(
                     store,
                     session,
@@ -615,6 +618,7 @@ impl StoredView {
             definition: self.definition.clone(),
             column_comments: Vec::new(),
             aliases: self.aliases.clone(),
+            security: "regular".into(),
         }
     }
 }
@@ -980,6 +984,31 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn unsupported_view_security_does_not_mutate_or_append_an_event() {
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_view("v", "ERROR").unwrap();
+        let before = session.version();
+        for security in ["barrier", "unknown", ""] {
+            for on_conflict in ["ERROR", "IGNORE", "REPLACE"] {
+                let batch = wire::to_batch(p::CatalogViewCreateParams {
+                    attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                    schema_path: path(&["main"]),
+                    name: "v".into(),
+                    definition: "SELECT 2".into(),
+                    aliases: None,
+                    security: security.into(),
+                    on_conflict: DictString(on_conflict.into()),
+                    transaction_opaque_data: None,
+                })
+                .unwrap();
+                let err = session.call("catalog_view_create", batch).unwrap_err();
+                assert!(err.to_string().contains("security"));
+            }
+        }
+        assert_eq!(session.version(), before);
+    }
+
     struct Session {
         cat: StoredCatalog,
         store: MemoryStorage,
@@ -1028,6 +1057,7 @@ mod tests {
                 name: name.to_string(),
                 definition: "SELECT 1 AS x".to_string(),
                 aliases: Some(vec!["a.b".to_string()]),
+                security: "regular".into(),
                 on_conflict: DictString(on_conflict.to_string()),
                 transaction_opaque_data: None,
             })
@@ -1447,6 +1477,7 @@ mod tests {
                 name: name.to_string(),
                 definition: "SELECT 1".to_string(),
                 aliases: None,
+                security: "regular".into(),
                 on_conflict: DictString("error".to_string()),
                 transaction_opaque_data: None,
             })

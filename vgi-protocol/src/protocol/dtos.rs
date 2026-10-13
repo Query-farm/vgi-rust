@@ -1163,6 +1163,7 @@ pub struct ViewInfo {
     pub definition: String,
     pub column_comments: StrMap,
     pub aliases: Vec<String>,
+    pub security: String,
 }
 
 /// `MacroInfo` item.

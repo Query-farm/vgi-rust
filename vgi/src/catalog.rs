@@ -1102,14 +1102,29 @@ pub struct CatSchema {
     pub tables: Vec<CatTable>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct CatView {
     pub name: String,
     pub definition: String,
     pub aliases: Vec<String>,
+    pub security: String,
     pub comment: Option<String>,
     pub tags: Vec<(String, String)>,
     pub column_comments: Vec<(String, String)>,
+}
+
+impl Default for CatView {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            definition: String::new(),
+            aliases: Vec::new(),
+            security: "regular".into(),
+            comment: None,
+            tags: Vec::new(),
+            column_comments: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -1451,6 +1466,7 @@ pub fn view_info(schema_path: &[String], v: &CatView) -> crate::protocol::dtos::
         definition: v.definition.clone(),
         column_comments: v.column_comments.clone(),
         aliases: v.aliases.clone(),
+        security: v.security.clone(),
     }
 }
 

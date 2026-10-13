@@ -169,3 +169,12 @@ fn views_preserve_ordered_raw_aliases() {
     let implicit: ViewInfo = round_trip("view_info_implicit");
     assert!(implicit.aliases.is_empty());
 }
+
+#[test]
+fn view_security_survives_codec_round_trip() {
+    use vgi_protocol::protocol::dtos::ViewInfo;
+    let regular: ViewInfo = round_trip("view_info");
+    let barrier: ViewInfo = round_trip("view_info_barrier");
+    assert_eq!(regular.security, "regular");
+    assert_eq!(barrier.security, "barrier");
+}

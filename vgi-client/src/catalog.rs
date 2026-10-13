@@ -1082,6 +1082,7 @@ impl VgiClient {
                 name: name.to_string(),
                 definition: definition.to_string(),
                 aliases: Some(aliases.to_vec()),
+                security: "regular".into(),
                 on_conflict: on_conflict.dict(),
                 transaction_opaque_data: cat.txn(),
             },

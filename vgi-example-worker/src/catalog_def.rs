@@ -260,6 +260,7 @@ fn view(name: &str, def: &str) -> CatView {
         tags: Vec::new(),
         column_comments: Vec::new(),
         aliases: Vec::new(),
+        security: "regular".into(),
     }
 }
 fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
