@@ -2342,6 +2342,8 @@ impl Dispatcher {
                 scope.extend_from_slice(&hook(options.as_ref())?);
             }
             let result = CatalogAttachResult {
+                catalog_capabilities: None,
+                selected_capabilities: None,
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
                 supports_time_travel: sec.supports_time_travel,
@@ -2440,6 +2442,8 @@ impl Dispatcher {
                 self.attach_bytes()
             };
         let result = CatalogAttachResult {
+            catalog_capabilities: None,
+            selected_capabilities: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
             supports_time_travel: self.catalog.supports_time_travel,

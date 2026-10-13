@@ -730,6 +730,7 @@ pub struct ClientCapabilities {
     pub catalogs: Vec<String>,
     pub can_stream: bool,
     pub filter_encodings: Vec<String>,
+    pub catalog: Option<Bytes>,
 }
 
 /// Request for `table_function_cardinality` / `table_function_statistics`
@@ -1085,6 +1086,7 @@ pub struct SchemaInfo {
     pub attach_opaque_data: Bytes,
     pub path: SchemaPath,
     pub estimated_object_count: Option<IntMap>,
+    pub options: Option<Bytes>,
 }
 
 /// One `examples` entry of `FunctionInfo`.

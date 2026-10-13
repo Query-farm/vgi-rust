@@ -5,7 +5,9 @@ use std::io::Cursor;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use base64::Engine;
-use vgi_protocol::generated::protocol_types::{OptionChanges, OptionState, RequiredFilterPaths};
+use vgi_protocol::generated::protocol_types::{
+    CatalogCapabilities, OptionChanges, OptionDefinitions, OptionState, RequiredFilterPaths,
+};
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
@@ -60,4 +62,23 @@ fn paths_preserve_literal_names_and_or_groups() {
     );
     let empty: RequiredFilterPaths = round_trip("empty_paths");
     assert!(empty.groups.is_empty());
+}
+
+#[test]
+fn capability_profiles_and_option_definitions_round_trip() {
+    let capabilities: CatalogCapabilities = round_trip("capabilities");
+    assert_eq!(capabilities.read, ["vgi.schema.options.read.v1"]);
+    assert_eq!(capabilities.ddl, ["vgi.schema.options.create.v1"]);
+    assert!(capabilities.write.is_empty());
+    let empty: CatalogCapabilities = round_trip("empty_capabilities");
+    assert!(
+        empty.read.is_empty()
+            && empty.ddl.is_empty()
+            && empty.write.is_empty()
+            && empty.transaction.is_empty()
+    );
+    let definitions: OptionDefinitions = round_trip("definitions");
+    assert_eq!(definitions.defaults.0, fixture("values"));
+    assert_eq!(definitions.create_names, ["optional", "record"]);
+    assert_eq!(definitions.alter_names, ["optional"]);
 }

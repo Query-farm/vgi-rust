@@ -890,6 +890,7 @@ pub fn schema_info(
     attach_opaque_data: &[u8],
 ) -> SchemaInfo {
     SchemaInfo {
+        options: None,
         comment: comment.map(|s| s.to_string()),
         tags: Vec::new(),
         attach_opaque_data: Bytes::from(attach_opaque_data.to_vec()),

@@ -238,6 +238,8 @@ impl StoredCatalog {
         self.append(store, session, &Event::Attached)?;
         let state = self.load(store, session)?;
         Ok(CatalogAttachResult {
+            catalog_capabilities: None,
+            selected_capabilities: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: false,
             supports_time_travel: false,
@@ -360,6 +362,11 @@ impl StoredCatalog {
             }
             "catalog_schema_create" => {
                 let q: p::CatalogSchemaCreateParams = wire::from_batch(&req.batch)?;
+                if q.options.is_some() {
+                    return Err(RpcError::method_not_implemented(
+                        "catalog_schema_create requires negotiated vgi.schema.options.create.v1",
+                    ));
+                }
                 self.mutate(
                     store,
                     session,
@@ -1051,6 +1058,7 @@ mod tests {
 
         fn create_schema(&self, schema: &[&str]) -> Result<Option<RecordBatch>> {
             let batch = wire::to_batch(p::CatalogSchemaCreateParams {
+                options: None,
                 attach_opaque_data: Bytes::from(b"attach".to_vec()),
                 path: path(schema),
                 on_conflict: DictString("error".to_string()),
