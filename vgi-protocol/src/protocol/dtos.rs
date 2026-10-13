@@ -1145,12 +1145,10 @@ pub struct TableInfo {
     pub cardinality_max: InlineI64,
     pub column_statistics: Option<Bytes>,
     pub bind_result: Option<Bytes>,
-    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
-    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
-    /// A group is satisfied when any one of its member paths has a WHERE filter;
-    /// every group must be satisfied. Empty = no enforcement. Wire type
-    /// `list<list<utf8>>`. Trailing field of the C++ protocol's TableInfo.
-    pub required_filters: Vec<Vec<String>>,
+    /// AND-of-OR groups of raw component paths (`list<list<list<utf8>>>`).
+    /// Dots and quotes are literal; prefix satisfaction compares components.
+    /// A child does not satisfy its parent. Empty means no requirements.
+    pub required_filters: Vec<Vec<Vec<String>>>,
     pub options: Option<Bytes>,
     pub layout: Option<Bytes>,
 }

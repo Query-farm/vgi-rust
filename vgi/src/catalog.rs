@@ -1162,13 +1162,10 @@ pub struct CatTable {
     /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
     /// matching the request's `at_value` (or the highest version when absent).
     pub time_travel: Vec<TimeTravelVersion>,
-    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
-    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
-    /// A group is satisfied when any one of its member paths carries a WHERE
-    /// filter; every group must be satisfied. A single-path group is a plain
-    /// mandatory filter; a multi-path group `["ticker", "cik"]` means "one of".
-    /// Empty = no enforcement. Surfaced in `TableInfo.required_filters`.
-    pub required_filters: Vec<Vec<String>>,
+    /// AND-of-OR groups of raw component paths (`list<list<list<utf8>>>`).
+    /// Dots and quotes are literal; prefix satisfaction compares components.
+    /// A child does not satisfy its parent. Empty means no requirements.
+    pub required_filters: Vec<Vec<Vec<String>>>,
     /// Accept `AT` clauses even without declared `time_travel` versions: the
     /// backing function reads the AT clause itself (carried on the bind request)
     /// rather than the catalog resolving it to a version. Mirrors the Python
@@ -1478,32 +1475,42 @@ pub fn scan_function_result(
     })
 }
 
-/// Validate a table's `required_filters` (CNF). Each OR-group must be
-/// non-empty, must contain no empty strings, and the leading dotted segment of
-/// every path must name a real column on the table. Struct subfield validity is
-/// left to DuckDB's binder (the descriptor doesn't unpack STRUCT subfields).
+/// Validate every raw path against the complete schema, without name rewriting.
 fn validate_required_filters(
     name: &str,
     columns: &SchemaRef,
-    required_filters: &[Vec<String>],
+    required_filters: &[Vec<Vec<String>>],
 ) -> Result<()> {
+    let invalid = |message: &str| {
+        vgi_rpc::RpcError::value_error(format!("Table '{name}': required_filters {message}"))
+    };
     for group in required_filters {
         if group.is_empty() {
-            return Err(vgi_rpc::RpcError::value_error(format!(
-                "Table '{name}': required_filters must not contain empty groups"
-            )));
+            return Err(invalid("must not contain empty groups"));
         }
+        let mut seen = std::collections::HashSet::new();
         for path in group {
             if path.is_empty() {
-                return Err(vgi_rpc::RpcError::value_error(format!(
-                    "Table '{name}': required_filters must not contain empty strings"
-                )));
+                return Err(invalid("must not contain empty paths"));
             }
-            let head = path.split('.').next().unwrap_or(path);
-            if columns.field_with_name(head).is_err() {
-                return Err(vgi_rpc::RpcError::value_error(format!(
-                    "Table '{name}': required_filters path '{path}' references unknown column '{head}'"
-                )));
+            if !seen.insert(path) {
+                return Err(invalid("contains duplicate paths"));
+            }
+            let mut fields = columns.fields();
+            for (i, part) in path.iter().enumerate() {
+                if part.is_empty() || part.contains('\0') {
+                    return Err(invalid("must not contain empty strings or NUL"));
+                }
+                let matches: Vec<_> = fields.iter().filter(|f| f.name() == part).collect();
+                if matches.len() != 1 {
+                    return Err(invalid("references unknown column or ambiguous component"));
+                }
+                if i + 1 < path.len() {
+                    match matches[0].data_type() {
+                        arrow_schema::DataType::Struct(children) => fields = children,
+                        _ => return Err(invalid("has a non-struct parent")),
+                    }
+                }
             }
         }
     }
@@ -2131,7 +2138,7 @@ mod tests {
             .is_empty());
     }
 
-    fn ab_table(required: Vec<Vec<String>>) -> CatTable {
+    fn ab_table(required: Vec<Vec<Vec<String>>>) -> CatTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, true),
             Field::new("b", DataType::Int64, true),
@@ -2146,21 +2153,21 @@ mod tests {
         use crate::protocol::dtos::TableInfo;
         // A CNF requirement: (a AND one-of(a,b)) — a singleton group plus a
         // genuine OR-group. Verifies the trailing `required_filters` field
-        // survives the list<list<utf8>> wire round-trip intact.
+        // survives the list<list<list<utf8>>> wire round-trip intact.
         let t = ab_table(vec![
-            vec!["a".to_string()],
-            vec!["a".to_string(), "b".to_string()],
+            vec![vec!["a".to_string()]],
+            vec![vec!["a".to_string()], vec!["b".to_string()]],
         ]);
         let info = table_info(&path("data"), &t, None).expect("table_info");
         assert_eq!(
             info.required_filters,
             vec![
-                vec!["a".to_string()],
-                vec!["a".to_string(), "b".to_string()]
+                vec![vec!["a".to_string()]],
+                vec![vec!["a".to_string()], vec!["b".to_string()]]
             ]
         );
 
-        // The wire schema for the field must be list<list<utf8>>.
+        // The wire schema for the field must be list<list<list<utf8>>>.
         let dt = TableInfo::arrow_data_type();
         let arrow_schema::DataType::Struct(fields) = dt else {
             panic!("TableInfo is not a struct");
@@ -2169,14 +2176,20 @@ mod tests {
             .iter()
             .find(|f| f.name() == "required_filters")
             .expect("required_filters field present");
-        assert_eq!(rf, &fields[20], "required_filters retains its wire position");
+        assert_eq!(
+            rf, &fields[20],
+            "required_filters retains its wire position"
+        );
         let arrow_schema::DataType::List(inner) = rf.data_type() else {
             panic!("required_filters is not a List, got {:?}", rf.data_type());
         };
         let arrow_schema::DataType::List(leaf) = inner.data_type() else {
             panic!("required_filters inner is not a List");
         };
-        assert_eq!(leaf.data_type(), &DataType::Utf8);
+        let arrow_schema::DataType::List(component) = leaf.data_type() else {
+            panic!("path is not a List");
+        };
+        assert_eq!(component.data_type(), &DataType::Utf8);
 
         // Full DTO round-trip through the flat batch.
         let batch = crate::wire::to_batch(info).expect("to_batch");
@@ -2184,8 +2197,8 @@ mod tests {
         assert_eq!(
             back.required_filters,
             vec![
-                vec!["a".to_string()],
-                vec!["a".to_string(), "b".to_string()]
+                vec![vec!["a".to_string()]],
+                vec![vec!["a".to_string()], vec!["b".to_string()]]
             ]
         );
     }
@@ -2199,24 +2212,23 @@ mod tests {
 
     #[test]
     fn test_required_filters_rejects_empty_string() {
-        let t = ab_table(vec![vec!["".to_string()]]);
+        let t = ab_table(vec![vec![vec!["".to_string()]]]);
         let err = table_info(&path("data"), &t, None).expect_err("empty string must be rejected");
         assert!(err.to_string().contains("empty strings"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_unknown_column() {
-        let t = ab_table(vec![vec!["nope".to_string()]]);
+        let t = ab_table(vec![vec![vec!["nope".to_string()]]]);
         let err = table_info(&path("data"), &t, None).expect_err("unknown column must be rejected");
         assert!(err.to_string().contains("unknown column"), "got: {err}");
     }
 
     #[test]
-    fn test_required_filters_accepts_struct_subfield_head() {
-        // A dotted path's leading segment ('a') is a real column; the subfield
-        // ('x') is left to DuckDB's binder — validation must accept it.
-        let t = ab_table(vec![vec!["a.x".to_string()]]);
-        assert!(table_info(&path("data"), &t, None).is_ok());
+    fn test_required_filters_rejects_non_struct_parent() {
+        // A valid top-level name does not make traversal through a scalar valid.
+        let t = ab_table(vec![vec![vec!["a".to_string(), "x".to_string()]]]);
+        assert!(table_info(&path("data"), &t, None).is_err());
     }
 }
 
