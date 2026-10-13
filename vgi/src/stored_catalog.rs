@@ -438,6 +438,15 @@ impl StoredCatalog {
             }
             "catalog_view_create" => {
                 let q: p::CatalogViewCreateParams = wire::from_batch(&req.batch)?;
+                if q.column_comments.as_ref().is_some_and(|comments| {
+                    comments
+                        .iter()
+                        .any(|(name, _)| name.is_empty() || name.contains('\0'))
+                }) {
+                    return Err(RpcError::value_error(
+                        "view column comments require raw output identifiers",
+                    ));
+                }
                 if q.security != "regular" {
                     return Err(RpcError::value_error("view security mode is unsupported"));
                 }
@@ -449,7 +458,48 @@ impl StoredCatalog {
                         name: q.name,
                         definition: q.definition,
                         aliases: q.aliases.unwrap_or_default(),
+                        comment: q.comment,
+                        tags: q.tags.unwrap_or_default(),
+                        column_comments: q.column_comments.unwrap_or_default(),
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
+                    },
+                )?;
+                Ok(None)
+            }
+            "catalog_view_column_comment_set" => {
+                let q: p::CatalogViewColumnCommentSetParams = wire::from_batch(&req.batch)?;
+                if q.column_path.len() != 1
+                    || q.column_path[0].is_empty()
+                    || q.column_path[0].contains('\0')
+                {
+                    return Err(RpcError::value_error(
+                        "view column comments require one raw output identifier",
+                    ));
+                }
+                self.mutate(
+                    store,
+                    session,
+                    Event::ViewCommentSet {
+                        path: q.schema_path,
+                        name: q.name,
+                        column: Some(q.column_path[0].clone()),
+                        comment: q.comment,
+                        ignore_not_found: q.ignore_not_found,
+                    },
+                )?;
+                Ok(None)
+            }
+            "catalog_view_comment_set" => {
+                let q: p::CatalogViewCommentSetParams = wire::from_batch(&req.batch)?;
+                self.mutate(
+                    store,
+                    session,
+                    Event::ViewCommentSet {
+                        path: q.schema_path,
+                        name: q.name,
+                        column: None,
+                        comment: q.comment,
+                        ignore_not_found: q.ignore_not_found,
                     },
                 )?;
                 Ok(None)
@@ -564,7 +614,20 @@ enum Event {
         // Events written before alias support only had SELECT-derived output names.
         #[serde(default)]
         aliases: Vec<String>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        tags: Vec<(String, String)>,
+        #[serde(default)]
+        column_comments: Vec<(String, String)>,
         on_conflict: OnConflict,
+    },
+    ViewCommentSet {
+        path: Vec<String>,
+        name: String,
+        column: Option<String>,
+        comment: Option<String>,
+        ignore_not_found: bool,
     },
     ViewDrop {
         path: Vec<String>,
@@ -606,17 +669,20 @@ struct StoredView {
     name: String,
     definition: String,
     aliases: Vec<String>,
+    comment: Option<String>,
+    tags: Vec<(String, String)>,
+    column_comments: Vec<(String, String)>,
 }
 
 impl StoredView {
     fn info(&self, path: &[String]) -> ViewInfo {
         ViewInfo {
-            comment: None,
-            tags: Vec::new(),
+            comment: self.comment.clone(),
+            tags: self.tags.clone(),
             name: self.name.clone(),
             schema_path: path.to_vec(),
             definition: self.definition.clone(),
-            column_comments: Vec::new(),
+            column_comments: self.column_comments.clone(),
             aliases: self.aliases.clone(),
             security: "regular".into(),
         }
@@ -883,12 +949,18 @@ impl State {
                 name,
                 definition,
                 aliases,
+                comment,
+                tags,
+                column_comments,
                 on_conflict,
             } => {
                 let view = StoredView {
                     name: name.clone(),
                     definition: definition.clone(),
                     aliases: aliases.clone(),
+                    comment: comment.clone(),
+                    tags: tags.clone(),
+                    column_comments: column_comments.clone(),
                 };
                 let schema = self.schema_mut(path)?;
                 if schema.table(name).is_some() {
@@ -912,6 +984,32 @@ impl State {
                         Ok(true)
                     }
                 }
+            }
+            Event::ViewCommentSet {
+                path,
+                name,
+                column,
+                comment,
+                ignore_not_found,
+            } => {
+                let schema = self.schema_mut(path)?;
+                let Some(view) = schema.views.iter_mut().find(|v| same(&v.name, name)) else {
+                    if *ignore_not_found {
+                        return Ok(false);
+                    }
+                    return Err(RpcError::value_error(format!(
+                        "View with name '{name}' does not exist"
+                    )));
+                };
+                if let Some(column) = column {
+                    view.column_comments.retain(|(key, _)| key != column);
+                    if let Some(value) = comment {
+                        view.column_comments.push((column.clone(), value.clone()));
+                    }
+                } else {
+                    view.comment = comment.clone();
+                }
+                Ok(true)
             }
             Event::ViewDrop {
                 path,
@@ -998,6 +1096,9 @@ mod tests {
                     definition: "SELECT 2".into(),
                     aliases: None,
                     security: security.into(),
+                    comment: None,
+                    tags: None,
+                    column_comments: None,
                     on_conflict: DictString(on_conflict.into()),
                     transaction_opaque_data: None,
                 })
@@ -1058,6 +1159,9 @@ mod tests {
                 definition: "SELECT 1 AS x".to_string(),
                 aliases: Some(vec!["a.b".to_string()]),
                 security: "regular".into(),
+                comment: None,
+                tags: None,
+                column_comments: None,
                 on_conflict: DictString(on_conflict.to_string()),
                 transaction_opaque_data: None,
             })
@@ -1289,7 +1393,10 @@ mod tests {
         let state = other.load(&s.store, &s.session).unwrap();
         assert_eq!(state.version, 2);
         assert_eq!(state.schema(&path(&["main"])).unwrap().views.len(), 1);
-        assert_eq!(state.schema(&path(&["main"])).unwrap().views[0].aliases, ["a.b"]);
+        assert_eq!(
+            state.schema(&path(&["main"])).unwrap().views[0].aliases,
+            ["a.b"]
+        );
     }
 
     #[test]
@@ -1311,6 +1418,9 @@ mod tests {
     fn replay_skips_a_ddl_that_lost_a_race() {
         let s = Session::new(StoredCatalog::new("mem"));
         let ev = Event::ViewCreate {
+            comment: None,
+            tags: Vec::new(),
+            column_comments: Vec::new(),
             path: path(&["main"]),
             name: "v".to_string(),
             definition: "SELECT 1".to_string(),
@@ -1478,6 +1588,9 @@ mod tests {
                 definition: "SELECT 1".to_string(),
                 aliases: None,
                 security: "regular".into(),
+                comment: None,
+                tags: None,
+                column_comments: None,
                 on_conflict: DictString("error".to_string()),
                 transaction_opaque_data: None,
             })

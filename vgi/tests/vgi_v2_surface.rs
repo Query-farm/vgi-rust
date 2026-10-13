@@ -24,17 +24,17 @@ use vgi_rpc::metadata::{
 };
 use vgi_rpc::wire::{StreamReader, StreamWriter};
 
-/// The reference `vgi.v2` protocol hash: vgi-python 0.43.0, 77 methods.
+/// The reference `vgi.v2` protocol hash: vgi-python 0.43.0, 78 methods.
 ///
 /// Changes only with `vgi.v2`'s protocol version (currently 2.1.0, see
 /// `VGI_PROTOCOL_VERSION`). If this fails, this port's surface drifted from
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
 const REFERENCE_VGI_V2_HASH: &str =
-    "b1db9b01e3c78a746e627fe18a4e0e0c191389dce42f15368427067f071cdecc";
+    "18fc1d304bafc3ea667bc77e20dbbd0028444ec7587cca7f03a428067942a4f7";
 
 /// The reference's method count, for a readable failure before the hash.
-const REFERENCE_VGI_V2_METHODS: usize = 77;
+const REFERENCE_VGI_V2_METHODS: usize = 78;
 
 #[test]
 fn vgi_v2_hash_equals_the_reference() {

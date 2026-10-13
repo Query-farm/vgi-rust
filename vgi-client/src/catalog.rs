@@ -22,6 +22,15 @@ use vgi_rpc::{Bytes, DictString};
 use crate::client::VgiClient;
 use crate::wire_call::{call, call_batch, call_items, call_unit, envelope};
 
+/// Metadata supplied when creating or replacing a regular view.
+#[derive(Clone, Debug, Default)]
+pub struct ViewCreateOptions {
+    pub aliases: Vec<String>,
+    pub comment: Option<String>,
+    pub tags: Vec<(String, String)>,
+    pub column_comments: Vec<(String, String)>,
+}
+
 /// One attach-time option advertised by a catalog during discovery.
 ///
 /// The wire carries the type as an IPC schema and the default as an optional
@@ -1073,6 +1082,29 @@ impl VgiClient {
         on_conflict: OnConflict,
         aliases: &[String],
     ) -> Result<()> {
+        self.view_create_with_options(
+            cat,
+            schema_path,
+            name,
+            definition,
+            on_conflict,
+            &ViewCreateOptions {
+                aliases: aliases.to_vec(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Create a regular view, retaining empty comments and raw output names.
+    pub fn view_create_with_options(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        definition: &str,
+        on_conflict: OnConflict,
+        options: &ViewCreateOptions,
+    ) -> Result<()> {
         call_unit(
             self.transport_mut(),
             "catalog_view_create",
@@ -1081,9 +1113,37 @@ impl VgiClient {
                 schema_path: schema_path.to_vec(),
                 name: name.to_string(),
                 definition: definition.to_string(),
-                aliases: Some(aliases.to_vec()),
+                aliases: Some(options.aliases.clone()),
                 security: "regular".into(),
+                comment: options.comment.clone(),
+                tags: Some(options.tags.clone()),
+                column_comments: Some(options.column_comments.clone()),
                 on_conflict: on_conflict.dict(),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
+    }
+
+    /// Set or clear a comment on one raw view output identifier.
+    pub fn view_column_comment_set(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        column_path: &[String],
+        comment: Option<&str>,
+        ignore_not_found: bool,
+    ) -> Result<()> {
+        call_unit(
+            self.transport_mut(),
+            "catalog_view_column_comment_set",
+            p::CatalogViewColumnCommentSetParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_path: schema_path.to_vec(),
+                name: name.into(),
+                column_path: column_path.to_vec(),
+                comment: comment.map(str::to_owned),
+                ignore_not_found,
                 transaction_opaque_data: cat.txn(),
             },
         )

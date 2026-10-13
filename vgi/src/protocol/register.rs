@@ -183,6 +183,7 @@ impl VgiService for Dispatcher {
         catalog_view_drop => handle_read_only,
         catalog_view_rename => handle_read_only,
         catalog_view_comment_set => handle_read_only,
+        catalog_view_column_comment_set => handle_read_only,
         catalog_macro_create => handle_read_only,
         catalog_macro_drop => handle_read_only,
         catalog_index_create => handle_read_only,
