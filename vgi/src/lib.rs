@@ -129,6 +129,7 @@ pub mod copy_from;
 pub mod copy_to;
 pub mod dispatch;
 pub mod errors;
+mod window_cache;
 pub mod function;
 pub mod numeric;
 pub mod opaque;

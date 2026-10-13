@@ -31,6 +31,21 @@ drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 HTTP producer batching and worker-visible response budgets are covered in
 [`docs/response-budgets.md`](docs/response-budgets.md).
 
+Window evaluation retains decoded Arrow partitions in each dispatcher's LRU cache, avoiding
+repeated storage reads and IPC decoding for successive frames. The cache defaults to 256 entries
+and 256 MiB of accounted Arrow buffers, schemas, and filter masks. Set
+`VGI_WINDOW_CACHE_MAX_BYTES` before starting the worker to change the byte budget; `0` disables
+retention. Oversized or evicted partitions remain available through shared `FunctionStorage`.
+Window destruction removes the local partition, and aggregate destruction clears the local
+execution. Other worker processes have independent caches. On admission and partition
+destruction, a worker checks the small shared schema records to evict copies whose destructor
+ran elsewhere; cache hits do not read storage. Idle workers can retain copies until their next
+admission or eviction, subject to the per-worker budget.
+This bounds retained cache data, not total worker RSS or buffers still held by active requests.
+Retained capacity can exceed logical payload size: the benchmarked decoder gives a 128 MiB
+string partition a 256 MiB backing allocation before metadata. That partition exceeds the
+default budget; `VGI_WINDOW_CACHE_MAX_BYTES=402653184` (384 MiB) allows it to be retained.
+
 ## Why a worker instead of a C++ extension?
 
 | Traditional DuckDB extension | VGI worker |

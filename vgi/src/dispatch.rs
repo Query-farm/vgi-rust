@@ -24,6 +24,7 @@ use crate::protocol::dtos::*;
 use crate::storage::{default_storage, FunctionStorage};
 use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
+use crate::window_cache::{CachedWindowPartition, WindowPartitionCache};
 use crate::wire;
 
 /// The `projection_repro` reproducer app — a distinct catalog served by the
@@ -285,6 +286,7 @@ pub struct Dispatcher {
     pub aggregates: HashMap<String, Vec<Arc<dyn AggregateFunction>>>,
     /// Shared cross-process state store (buffering + aggregate).
     pub store: Arc<dyn FunctionStorage>,
+    window_partitions: WindowPartitionCache,
     /// Declarative catalog (views / macros / function-backed tables).
     pub catalog: catalog::CatalogModel,
     /// Additional catalogs this worker serves (MetaWorker model). Each is
@@ -393,6 +395,7 @@ impl Dispatcher {
             buffering: HashMap::new(),
             aggregates: HashMap::new(),
             store: default_storage(),
+            window_partitions: WindowPartitionCache::from_env(),
             catalog: catalog::CatalogModel::default(),
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
@@ -4378,6 +4381,7 @@ impl Dispatcher {
     pub fn handle_aggregate_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateDestructorRequest = boxed(req)?;
         self.store.clear(&dto.execution_id.0);
+        self.window_partitions.clear_execution(&dto.execution_id.0);
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -4387,8 +4391,32 @@ impl Dispatcher {
         format!("win_{partition_id}_{suffix}").into_bytes()
     }
 
+    fn prune_completed_window_partitions(&self) {
+        // The output schema is small and is deleted with the partition. Check
+        // on admission/destruction, never on a hot cache hit. This reclaims
+        // copies whose destructor ran in another pooled worker, without
+        // fetching the partition payload or adding new storage/wire fields.
+        self.window_partitions.prune(|exec, partition| {
+            self.store
+                .kv_get(exec, &Self::win_key(partition, "o"))
+                .is_some()
+        });
+    }
+
     pub fn handle_aggregate_window_init(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateWindowInitRequest = boxed(req)?;
+        self.prune_completed_window_partitions();
+        let generation = self
+            .window_partitions
+            .remove(&dto.execution_id.0, dto.partition_id);
+        // Decode once, before publishing state, then retain the immutable Arrow
+        // buffers just as the Python dispatcher does. Storage is still needed
+        // for another pooled worker, a restart, or an oversized/cache-evicted entry.
+        let cached = Arc::new(Self::decode_window_partition(
+            &dto.partition_batch.0,
+            &dto.output_schema.0,
+            dto.filter_mask.as_ref().map(|m| m.0.as_slice()),
+        )?);
         // Cache the partition (input columns + output schema + filter mask) so
         // the window / window_batch calls — possibly in another pooled worker —
         // can evaluate frames against it.
@@ -4408,8 +4436,41 @@ impl Dispatcher {
                 &Self::win_key(dto.partition_id, "m"),
                 &m.0,
             );
+        } else {
+            self.store
+                .kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, "m"));
         }
+        self.window_partitions.insert_if_current(
+            &dto.execution_id.0,
+            dto.partition_id,
+            cached,
+            generation,
+        );
         Ok(Some(wire::empty_result_batch()?))
+    }
+
+    fn decode_window_partition(
+        pb: &[u8],
+        os: &[u8],
+        mask: Option<&[u8]>,
+    ) -> Result<CachedWindowPartition> {
+        let partition = ipc::read_batch(pb)?;
+        let output_schema = ipc::read_schema(os)?;
+        let mask = mask.filter(|bytes| !bytes.is_empty()).map(|bytes| {
+            (0..partition.num_rows())
+                .map(|i| {
+                    bytes
+                        .get(i / 8)
+                        .map(|byte| byte & (1 << (i % 8)) != 0)
+                        .unwrap_or(true)
+                })
+                .collect()
+        });
+        Ok(CachedWindowPartition {
+            partition,
+            output_schema,
+            mask,
+        })
     }
 
     /// Load the cached partition + output schema for a window call.
@@ -4417,7 +4478,13 @@ impl Dispatcher {
         &self,
         exec: &[u8],
         partition_id: i64,
-    ) -> Result<(RecordBatch, SchemaRef, Option<Vec<bool>>)> {
+    ) -> Result<Arc<CachedWindowPartition>> {
+        let (cached, _) = self.window_partitions.lookup(exec, partition_id);
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        self.prune_completed_window_partitions();
+        let (_, generation) = self.window_partitions.lookup(exec, partition_id);
         let pb = self
             .store
             .kv_get(exec, &Self::win_key(partition_id, "p"))
@@ -4430,26 +4497,15 @@ impl Dispatcher {
             .store
             .kv_get(exec, &Self::win_key(partition_id, "o"))
             .ok_or_else(|| RpcError::runtime_error("aggregate_window: missing output schema"))?;
-        let partition = ipc::read_batch(&pb)?;
-        let output_schema = ipc::read_schema(&os)?;
-        // `filter_mask` is an Arrow packed-bit boolean buffer (LSB-first),
-        // length == partition row count. Empty/absent means "all rows valid".
-        let n = partition.num_rows();
-        let mask = self
-            .store
-            .kv_get(exec, &Self::win_key(partition_id, "m"))
-            .filter(|b| !b.is_empty())
-            .map(|bytes| {
-                (0..n)
-                    .map(|i| {
-                        bytes
-                            .get(i / 8)
-                            .map(|byte| byte & (1 << (i % 8)) != 0)
-                            .unwrap_or(true)
-                    })
-                    .collect::<Vec<bool>>()
-            });
-        Ok((partition, output_schema, mask))
+        let mask = self.store.kv_get(exec, &Self::win_key(partition_id, "m"));
+        let cached = Arc::new(Self::decode_window_partition(&pb, &os, mask.as_deref())?);
+        self.window_partitions.insert_if_current(
+            exec,
+            partition_id,
+            Arc::clone(&cached),
+            generation,
+        );
+        Ok(cached)
     }
 
     pub fn handle_aggregate_window(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -4458,16 +4514,20 @@ impl Dispatcher {
             &dto.function_name,
             self.unary_scope(None, dto.schema_path.as_deref()),
         )?;
-        let (partition, output_schema, mask) =
-            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        let cached = self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         let frames: Vec<(i64, i64)> = dto
             .frame_starts
             .iter()
             .zip(dto.frame_ends.iter())
             .map(|(&s, &e)| (s, e))
             .collect();
-        let col = f.window(&partition, &output_schema, &[frames], mask.as_deref())?;
-        let batch = RecordBatch::try_new(output_schema, vec![col])
+        let col = f.window(
+            &cached.partition,
+            &cached.output_schema,
+            &[frames],
+            cached.mask.as_deref(),
+        )?;
+        let batch = RecordBatch::try_new(Arc::clone(&cached.output_schema), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(wire::to_result_batch(AggregateWindowResponse {
             result_batch: Bytes::from(ipc::write_batch(&batch)?),
@@ -4480,8 +4540,7 @@ impl Dispatcher {
             &dto.function_name,
             self.unary_scope(None, dto.schema_path.as_deref()),
         )?;
-        let (partition, output_schema, mask) =
-            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        let cached = self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         // Split the flattened (start,end) arrays into per-row sub-frame lists.
         let mut frames: Vec<Vec<(i64, i64)>> = Vec::with_capacity(dto.count as usize);
         let mut off = 0usize;
@@ -4496,8 +4555,13 @@ impl Dispatcher {
             }
             frames.push(subs);
         }
-        let col = f.window(&partition, &output_schema, &frames, mask.as_deref())?;
-        let batch = RecordBatch::try_new(output_schema, vec![col])
+        let col = f.window(
+            &cached.partition,
+            &cached.output_schema,
+            &frames,
+            cached.mask.as_deref(),
+        )?;
+        let batch = RecordBatch::try_new(Arc::clone(&cached.output_schema), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(wire::to_result_batch(AggregateWindowResponse {
             result_batch: Bytes::from(ipc::write_batch(&batch)?),
@@ -4510,6 +4574,9 @@ impl Dispatcher {
             self.store
                 .kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, sfx));
         }
+        self.window_partitions
+            .remove(&dto.execution_id.0, dto.partition_id);
+        self.prune_completed_window_partitions();
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -5433,6 +5500,10 @@ fn normalize_function_type(t: &str) -> Option<String> {
     let short = lower.strip_suffix("_function").unwrap_or(&lower);
     Some(short.to_string())
 }
+
+#[cfg(test)]
+#[path = "window_cache_tests.rs"]
+mod window_partition_tests;
 
 #[cfg(test)]
 mod buffering_schema_tests {
