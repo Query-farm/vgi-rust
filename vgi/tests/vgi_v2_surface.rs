@@ -15,26 +15,26 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch};
-use vgi::protocol::register::{not_implemented, UNIMPLEMENTED_METHODS};
-use vgi::worker::Worker;
 use vgi::VGI_PROTOCOL_NAME;
+use vgi::protocol::register::{UNIMPLEMENTED_METHODS, not_implemented};
+use vgi::worker::Worker;
 use vgi_rpc::metadata::{
     ERROR_CODE_KEY, ERROR_KIND_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY, PROTOCOL_VERSION_KEY,
     REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
 };
 use vgi_rpc::wire::{StreamReader, StreamWriter};
 
-/// The reference `vgi.v2` protocol hash: vgi-python 0.43.0, 82 methods.
+/// The reference `vgi.v2` protocol hash: vgi-python 0.43.0, 83 methods.
 ///
 /// Changes only with `vgi.v2`'s protocol version (currently 2.1.0, see
 /// `VGI_PROTOCOL_VERSION`). If this fails, this port's surface drifted from
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
 const REFERENCE_VGI_V2_HASH: &str =
-    "28cf2ae30b6cf07dbd4db602e4972611319b993fb073b27de456b6fcf341dc00";
+    "a81e4c5fb450665c3e4991333ba8a404b6482a345269bc3df5b1c02680d71bea";
 
 /// The reference's method count, for a readable failure before the hash.
-const REFERENCE_VGI_V2_METHODS: usize = 82;
+const REFERENCE_VGI_V2_METHODS: usize = 83;
 
 #[test]
 fn vgi_v2_hash_equals_the_reference() {
@@ -113,8 +113,8 @@ fn unimplemented_methods_answer_unimplemented() {
 /// A one-row, schema-valid params batch for `method`: every column non-null
 /// (a placeholder value), every nullable column null.
 fn well_formed_params(method: &str) -> RecordBatch {
-    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::StringArray;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_schema::DataType;
     let schema = vgi::wire::params_schema_for(method);
     let columns: Vec<ArrayRef> = schema

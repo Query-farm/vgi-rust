@@ -417,10 +417,11 @@ mod backfill_tests {
         let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
         assert!(!legacy);
         assert_eq!(out.num_columns(), 3);
-        assert!(out
-            .column_by_name("argument_names")
-            .expect("column added")
-            .is_null(0));
+        assert!(
+            out.column_by_name("argument_names")
+                .expect("column added")
+                .is_null(0)
+        );
     }
 
     #[test]
@@ -439,11 +440,13 @@ mod backfill_tests {
             .downcast_ref::<arrow_array::BooleanArray>()
             .expect("boolean column");
         assert!(!supports_splits.value(0));
-        assert!(!output
-            .schema()
-            .field_with_name("supports_splits")
-            .unwrap()
-            .is_nullable());
+        assert!(
+            !output
+                .schema()
+                .field_with_name("supports_splits")
+                .unwrap()
+                .is_nullable()
+        );
     }
 }
 
@@ -1124,11 +1127,8 @@ pub struct TableInfo {
     pub schema_path: SchemaPath,
     /// IPC-serialized Arrow schema of the table columns.
     pub columns: Bytes,
-    pub not_null_constraints: Vec<i32>,
-    pub unique_constraints: Vec<Vec<i32>>,
-    pub check_constraints: Vec<String>,
-    pub primary_key_constraints: Vec<Vec<i32>>,
-    pub foreign_key_constraints: Vec<Bytes>,
+    pub constraints: Vec<Bytes>,
+    pub definition_revision: Option<Bytes>,
     /// Maximum result mode for each supported operation. Missing means unsupported;
     /// values are ordered `count < rows < changes`.
     pub write_result_modes: StrMap,
@@ -1216,11 +1216,7 @@ pub struct TableCreateRequest {
     pub columns: Bytes,
     /// `error` / `ignore` / `replace` — dictionary-encoded on the wire.
     pub on_conflict: DictString,
-    pub not_null_constraints: Vec<i32>,
-    pub unique_constraints: Vec<Vec<i32>>,
-    pub check_constraints: Vec<String>,
-    pub primary_key_constraints: Vec<Vec<i32>>,
-    pub foreign_key_constraints: Vec<Bytes>,
+    pub constraint_definitions: Vec<Bytes>,
     pub transaction_opaque_data: Option<Bytes>,
     pub comment: Option<String>,
     pub tags: Option<StrMap>,

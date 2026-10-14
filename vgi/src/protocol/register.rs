@@ -18,7 +18,7 @@ use vgi_rpc::{CallContext, Request, Result, RpcServer, StreamResult};
 
 use crate::dispatch::Dispatcher;
 
-pub use super::vgi_service::{not_implemented, VgiService};
+pub use super::vgi_service::{VgiService, not_implemented};
 
 /// Register all VGI methods against `srv`, backed by `disp`.
 pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
@@ -36,6 +36,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
 /// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
 /// table; this port's catalogs are read-only for DML.
 pub const UNIMPLEMENTED_METHODS: &[&str] = &[
+    "catalog_table_constraints_apply",
     "catalog_table_insert_function_get",
     "catalog_table_update_function_get",
     "catalog_table_delete_function_get",

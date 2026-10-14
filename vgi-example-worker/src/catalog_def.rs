@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::canonical_constraints::{check, constraint, foreign_key, set_constraints};
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::{DataType, Field, Schema};
 use vgi::arguments::Arguments;
@@ -675,17 +676,45 @@ fn data_tables() -> Vec<CatTable> {
                     ),
                 ],
             );
-            // V3 constraints (current): NOT NULL id/name, PK id, UNIQUE email,
-            // FK department_id → data.departments(id).
-            t.not_null = vec![0, 1];
-            t.primary_key = vec![vec![0]];
-            t.unique = vec![vec![2]];
-            t.foreign_keys = vec![vgi::catalog::ForeignKey {
-                referenced_schema_path: None,
-                columns: vec!["department_id".to_string()],
-                referenced_table: "departments".to_string(),
-                referenced_columns: vec!["id".to_string()],
-            }];
+            // Current fixture declarations are metadata-only; historical AT
+            // snapshots reject until the fixture supplies version-owned records.
+            set_constraints(
+                &mut t,
+                vec![
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.primary",
+                        "PRIMARY_KEY",
+                        &["id"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.id.required",
+                        "NOT_NULL",
+                        &["id"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.name.required",
+                        "NOT_NULL",
+                        &["name"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.email.unique",
+                        "UNIQUE",
+                        &["email"],
+                    ),
+                    foreign_key(
+                        "versioned_constraints",
+                        "fixture.versioned.department.foreign",
+                        &["department_id"],
+                        "departments",
+                        "fixture.departments.primary",
+                        &["id"],
+                    ),
+                ],
+            );
             t
         },
         // Function-backed time-travel + filter pushdown. Reads AT at init via the
@@ -1124,10 +1153,40 @@ fn data_tables() -> Vec<CatTable> {
         ),
     ];
     departments = scan(departments, "departments_scan");
-    departments.primary_key = vec![vec![0]];
-    departments.not_null = vec![0, 1];
-    departments.unique = vec![vec![1]];
-    departments.check = vec!["budget >= 0".to_string()];
+    set_constraints(
+        &mut departments,
+        vec![
+            constraint(
+                "departments",
+                "fixture.departments.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.name.required",
+                "NOT_NULL",
+                &["name"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.name.unique",
+                "UNIQUE",
+                &["name"],
+            ),
+            check(
+                "departments",
+                "fixture.departments.budget.check",
+                "budget >= 0",
+            ),
+        ],
+    );
     tables.push(departments);
 
     // products: defaults + column comments.
@@ -1153,8 +1212,23 @@ fn data_tables() -> Vec<CatTable> {
         "Product table with column defaults",
     );
     products = scan(products, "products_scan");
-    products.primary_key = vec![vec![0]];
-    products.not_null = vec![0];
+    set_constraints(
+        &mut products,
+        vec![
+            constraint(
+                "products",
+                "fixture.products.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "products",
+                "fixture.products.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+        ],
+    );
     products.statistics = vec![
         stat("id", StatValue::Int64(1), StatValue::Int64(100), 100),
         CatColStat {
@@ -1192,15 +1266,49 @@ fn data_tables() -> Vec<CatTable> {
         "Employee table with FK to departments",
     );
     employees = scan(employees, "employees_scan");
-    employees.primary_key = vec![vec![0]];
-    employees.not_null = vec![0, 1, 2];
-    employees.unique = vec![vec![2]];
-    employees.foreign_keys = vec![vgi::catalog::ForeignKey {
-        referenced_schema_path: None,
-        columns: vec!["department_id".to_string()],
-        referenced_table: "departments".to_string(),
-        referenced_columns: vec!["id".to_string()],
-    }];
+    set_constraints(
+        &mut employees,
+        vec![
+            constraint(
+                "employees",
+                "fixture.employees.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.name.required",
+                "NOT_NULL",
+                &["name"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.email.required",
+                "NOT_NULL",
+                &["email"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.email.unique",
+                "UNIQUE",
+                &["email"],
+            ),
+            foreign_key(
+                "employees",
+                "fixture.employees.department.foreign",
+                &["department_id"],
+                "departments",
+                "fixture.departments.primary",
+                &["id"],
+            ),
+        ],
+    );
     tables.push(employees);
 
     // projects: composite PK, NOT NULL, FK→departments.
@@ -1214,14 +1322,43 @@ fn data_tables() -> Vec<CatTable> {
         "Projects with composite PK and FK to departments",
     );
     projects = scan(projects, "projects_scan");
-    projects.primary_key = vec![vec![0, 1]];
-    projects.not_null = vec![0, 1, 2];
-    projects.foreign_keys = vec![vgi::catalog::ForeignKey {
-        referenced_schema_path: None,
-        columns: vec!["department_id".to_string()],
-        referenced_table: "departments".to_string(),
-        referenced_columns: vec!["id".to_string()],
-    }];
+    set_constraints(
+        &mut projects,
+        vec![
+            constraint(
+                "projects",
+                "fixture.projects.primary",
+                "PRIMARY_KEY",
+                &["department_id", "project_code"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.department.required",
+                "NOT_NULL",
+                &["department_id"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.code.required",
+                "NOT_NULL",
+                &["project_code"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.title.required",
+                "NOT_NULL",
+                &["title"],
+            ),
+            foreign_key(
+                "projects",
+                "fixture.projects.department.foreign",
+                &["department_id"],
+                "departments",
+                "fixture.departments.primary",
+                &["id"],
+            ),
+        ],
+    );
     tables.push(projects);
 
     // Schema-disambiguation probe (table dispatch): same registered table

@@ -43,13 +43,14 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use vgi_protocol::generated::request_params as p;
 use vgi_rpc::{Bytes, DictString, Request, Result, RpcError};
 
 use crate::catalog;
 use crate::catalog_contents::{
-    finish, CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest,
+    CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest, finish,
 };
 use crate::protocol::dtos::{
     CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
@@ -189,7 +190,7 @@ impl StoredCatalog {
                 return Err(RpcError::value_error(format!(
                     "catalog '{}' is not attached (unknown or detached session)",
                     self.name
-                )))
+                )));
             }
         }
         let mut state = State::new();
@@ -214,11 +215,7 @@ impl StoredCatalog {
     }
 
     fn reported_version(&self, state: &State) -> i64 {
-        if self.versioned {
-            state.version
-        } else {
-            0
-        }
+        if self.versioned { state.version } else { 0 }
     }
 
     // -----------------------------------------------------------------------
@@ -397,7 +394,8 @@ impl StoredCatalog {
                 let boxed: p::CatalogTableCreateParams = wire::from_batch(&req.batch)?;
                 let q: TableCreateRequest =
                     wire::from_batch(&crate::ipc::read_batch(&boxed.request.0)?)?;
-                if q.comment.is_some()
+                if !q.constraint_definitions.is_empty()
+                    || q.comment.is_some()
                     || q.tags.is_some()
                     || q.options.is_some()
                     || q.layout.is_some()
@@ -406,8 +404,8 @@ impl StoredCatalog {
                         "catalog_table_create requires negotiated table profiles",
                     ));
                 }
-                // Reject a malformed schema now rather than on every listing.
-                crate::ipc::read_schema(&q.columns.0)?;
+                // Reject malformed or unauthorized NOT NULL claims before effects.
+                require_unconstrained_columns(crate::ipc::read_schema(&q.columns.0)?.as_ref())?;
                 self.mutate(
                     store,
                     session,
@@ -415,10 +413,10 @@ impl StoredCatalog {
                         path: q.schema_path,
                         name: q.name,
                         columns: q.columns.0.to_vec(),
-                        not_null: q.not_null_constraints,
-                        unique: q.unique_constraints,
-                        check: q.check_constraints,
-                        primary_key: q.primary_key_constraints,
+                        not_null: Vec::new(),
+                        unique: Vec::new(),
+                        check: Vec::new(),
+                        primary_key: Vec::new(),
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
                     },
                 )?;
@@ -1062,10 +1060,48 @@ fn drop_named<T>(
     }
 }
 
+// Empty canonical definitions authorize no SQL user-field nullability claims.
+fn require_unconstrained_columns(schema: &Schema) -> Result<()> {
+    fn visit(field: &Field, top: bool, depth: usize) -> Result<()> {
+        if depth > 64 {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: column nesting exceeds supported depth",
+            ));
+        }
+        if top && field.metadata().contains_key("is_row_id") {
+            return Ok(());
+        }
+        if field
+            .metadata()
+            .keys()
+            .any(|key| key == "ARROW:extension:name" || key.starts_with("vgi.logical_type."))
+        {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: logical column types require negotiation",
+            ));
+        }
+        if !field.is_nullable() {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: nonnullable user columns require canonical constraints",
+            ));
+        }
+        if let DataType::Struct(children) = field.data_type() {
+            for child in children {
+                visit(child, false, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+    for field in schema.fields() {
+        visit(field, true, 0)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog_contents::{catalog_contents_digest, CatalogContentsResult};
+    use crate::catalog_contents::{CatalogContentsResult, catalog_contents_digest};
     use crate::storage::MemoryStorage;
     use arrow_schema::{DataType, Field, Schema};
 
@@ -1194,11 +1230,7 @@ mod tests {
                 name: name.to_string(),
                 columns: Bytes::from(crate::ipc::write_schema(&columns).unwrap()),
                 on_conflict: DictString("error".to_string()),
-                not_null_constraints: vec![0],
-                unique_constraints: Vec::new(),
-                check_constraints: Vec::new(),
-                primary_key_constraints: Vec::new(),
-                foreign_key_constraints: Vec::new(),
+                constraint_definitions: Vec::new(),
                 transaction_opaque_data: None,
 
                 options: None,
@@ -1270,6 +1302,77 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_constraints_reject_before_replacement() {
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_table(&["main"], "t").unwrap();
+        let before = session.version();
+        for on_conflict in ["ERROR", "IGNORE", "REPLACE"] {
+            let inner = wire::to_batch(TableCreateRequest {
+                attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                schema_path: path(&["main"]),
+                name: "t".into(),
+                columns: Bytes::from(Vec::new()),
+                on_conflict: DictString(on_conflict.into()),
+                constraint_definitions: vec![Bytes::from(vec![1])],
+                transaction_opaque_data: None,
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogTableCreateParams {
+                request: Bytes::from(crate::ipc::write_batch(&inner).unwrap()),
+            })
+            .unwrap();
+            let err = session.call("catalog_table_create", batch).unwrap_err();
+            assert!(err.to_string().contains("profiles"));
+        }
+        for field in [
+            Field::new("a", DataType::Utf8, false),
+            Field::new(
+                "record",
+                DataType::Struct(vec![Field::new("a", DataType::Utf8, false)].into()),
+                true,
+            ),
+        ] {
+            let inner = wire::to_batch(TableCreateRequest {
+                attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                schema_path: path(&["main"]),
+                name: "t".into(),
+                columns: Bytes::from(crate::ipc::write_schema(&Schema::new(vec![field])).unwrap()),
+                on_conflict: DictString("REPLACE".into()),
+                constraint_definitions: vec![],
+                transaction_opaque_data: None,
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogTableCreateParams {
+                request: Bytes::from(crate::ipc::write_batch(&inner).unwrap()),
+            })
+            .unwrap();
+            assert!(
+                session
+                    .call("catalog_table_create", batch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("nonnullable")
+            );
+        }
+        assert_eq!(session.version(), before);
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "t");
+        assert!(tables[0].constraints.is_empty());
+        let columns = crate::ipc::read_schema(&tables[0].columns.0).unwrap();
+        assert_eq!(columns.field(0).data_type(), &DataType::Int32);
+        assert_eq!(columns.fields().len(), 2);
+    }
+
+    #[test]
     fn starts_empty_and_versions_every_change() {
         let s = Session::new(StoredCatalog::new("mem"));
         assert_eq!(s.version(), 1);
@@ -1287,7 +1390,7 @@ mod tests {
         assert_eq!(views[0].aliases, ["a.b"]);
         let tables: Vec<TableInfo> = s.list("catalog_schema_contents_tables", &["main"]);
         assert_eq!(tables[0].name, "t1");
-        assert_eq!(tables[0].not_null_constraints, vec![0]);
+        assert!(tables[0].constraints.is_empty());
         let cols = crate::ipc::read_schema(&tables[0].columns.0).unwrap();
         assert_eq!(cols.field(0).data_type(), &DataType::Int32);
 

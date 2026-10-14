@@ -76,9 +76,9 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     };
 
     let name = Arc::new(StringArray::from(vec![model.name.clone()])) as ArrayRef;
-    let impl_ver = Arc::new(StringArray::from(vec![model
-        .implementation_version
-        .clone()])) as ArrayRef;
+    let impl_ver = Arc::new(StringArray::from(vec![
+        model.implementation_version.clone(),
+    ])) as ArrayRef;
     let data_ver = Arc::new(StringArray::from(vec![model.data_version_spec.clone()])) as ArrayRef;
 
     // attach_option_specs: list<binary>, one list of the serialized specs.
@@ -774,7 +774,7 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
             Schema::new(vec![
-                Field::new("result", DataType::Null, false).with_metadata(m)
+                Field::new("result", DataType::Null, false).with_metadata(m),
             ])
         }
     };
@@ -862,12 +862,9 @@ pub fn aggregate_function_info(
         (None, Err(_)) => {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
-            Arc::new(Schema::new(vec![Field::new(
-                "result",
-                DataType::Null,
-                false,
-            )
-            .with_metadata(m)]))
+            Arc::new(Schema::new(vec![
+                Field::new("result", DataType::Null, false).with_metadata(m),
+            ]))
         }
     };
     fi.output_schema = Bytes::from(ipc::write_schema_ref(&out)?);
@@ -1147,6 +1144,9 @@ pub struct CatMacro {
 /// A function-backed catalog table: scanned by `scan_function(scan_args)`.
 #[derive(Clone)]
 pub struct CatTable {
+    /// Explicit canonical ConstraintInfo IPC records, with provider-owned identities.
+    pub constraints: Vec<Bytes>,
+    pub definition_revision: Option<Bytes>,
     pub name: String,
     pub columns: SchemaRef,
     pub scan_function: String,
@@ -1202,6 +1202,8 @@ pub struct CatTable {
 impl Default for CatTable {
     fn default() -> Self {
         Self {
+            constraints: Vec::new(),
+            definition_revision: None,
             name: String::new(),
             columns: std::sync::Arc::new(arrow_schema::Schema::empty()),
             scan_function: String::new(),
@@ -1382,6 +1384,8 @@ impl CatTable {
         cardinality: Option<i64>,
     ) -> Self {
         CatTable {
+            constraints: Vec::new(),
+            definition_revision: None,
             name: name.to_string(),
             columns,
             scan_function: scan_function.to_string(),
@@ -1541,6 +1545,16 @@ pub fn table_info(
     scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
+    if !t.not_null.is_empty()
+        || !t.unique.is_empty()
+        || !t.primary_key.is_empty()
+        || !t.check.is_empty()
+        || !t.foreign_keys.is_empty()
+    {
+        return Err(vgi_rpc::RpcError::method_not_implemented(
+            "legacy constraint metadata requires explicit canonical records",
+        ));
+    }
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
     //
@@ -1566,15 +1580,8 @@ pub fn table_info(
         name: t.name.clone(),
         schema_path: schema_path.to_vec(),
         columns: Bytes::from(ipc::write_schema_ref(&t.columns)?),
-        not_null_constraints: t.not_null.clone(),
-        unique_constraints: t.unique.clone(),
-        check_constraints: t.check.clone(),
-        primary_key_constraints: t.primary_key.clone(),
-        foreign_key_constraints: t
-            .foreign_keys
-            .iter()
-            .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema_path, fk)?)))
-            .collect::<Result<Vec<_>>>()?,
+        constraints: t.constraints.clone(),
+        definition_revision: t.definition_revision.clone(),
         write_result_modes: Vec::new(),
         supports_column_statistics: !t.statistics.is_empty(),
         scan_function: Some(Bytes::from(scan)),
@@ -1771,9 +1778,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("without a registered Rust evaluator"));
+        assert!(
+            err.to_string()
+                .contains("without a registered Rust evaluator")
+        );
     }
 
     /// A minimal scalar whose `metadata()` advertises SQL examples.
@@ -1999,18 +2007,22 @@ mod tests {
     #[test]
     fn test_constraint_keys_encode_typed_values() {
         // Numeric choices and default encode as JSON scalars/arrays (not strings).
-        let specs = vec![ArgSpec::const_arg("level", 0, "int64", "Level")
-            .with_choices([1, 2, 3])
-            .with_default(2)];
+        let specs = vec![
+            ArgSpec::const_arg("level", 0, "int64", "Level")
+                .with_choices([1, 2, 3])
+                .with_default(2),
+        ];
         let schema = build_arg_schema(&specs);
         let meta = schema.field(0).metadata();
         assert_eq!(meta.get("vgi_choices").map(String::as_str), Some("[1,2,3]"));
         assert_eq!(meta.get("vgi_default").map(String::as_str), Some("2"));
 
         // Boolean and list defaults encode faithfully.
-        let specs = vec![ArgSpec::const_arg("flag", -1, "boolean", "Flag")
-            .with_default(true)
-            .with_choices([true, false])];
+        let specs = vec![
+            ArgSpec::const_arg("flag", -1, "boolean", "Flag")
+                .with_default(true)
+                .with_choices([true, false]),
+        ];
         let schema = build_arg_schema(&specs);
         let meta = schema.field(0).metadata();
         assert_eq!(meta.get("vgi_default").map(String::as_str), Some("true"));
@@ -2097,12 +2109,14 @@ mod tests {
         let decoded = ipc::read_schema(&bytes).expect("read arguments_schema");
         let docs = macro_parameter_docs_from_schema(&decoded);
         assert_eq!(docs.len(), 2);
-        assert!(docs
-            .iter()
-            .any(|(n, d)| n == "val" && d == "Value to clamp"),);
-        assert!(docs
-            .iter()
-            .any(|(n, d)| n == "hi" && d == "Upper bound — µ ≥ note"),);
+        assert!(
+            docs.iter()
+                .any(|(n, d)| n == "val" && d == "Value to clamp"),
+        );
+        assert!(
+            docs.iter()
+                .any(|(n, d)| n == "hi" && d == "Upper bound — µ ≥ note"),
+        );
         assert!(
             !docs.iter().any(|(n, _)| n == "lo"),
             "undocumented parameter must not appear in the decoded docs",
@@ -2149,12 +2163,13 @@ mod tests {
         );
         // And the DTO carries empty bytes (older readers unaffected).
         let info = macro_info(&path("main"), &m);
-        assert!(info
-            .arguments_schema
-            .as_ref()
-            .expect("arguments_schema column present")
-            .0
-            .is_empty());
+        assert!(
+            info.arguments_schema
+                .as_ref()
+                .expect("arguments_schema column present")
+                .0
+                .is_empty()
+        );
     }
 
     fn ab_table(required: Vec<Vec<Vec<String>>>) -> CatTable {
@@ -2165,6 +2180,19 @@ mod tests {
         let mut t = CatTable::new("rff", schema, "rff_scan", Vec::new(), None, Some(3));
         t.required_filters = required;
         t
+    }
+
+    #[test]
+    fn legacy_constraints_are_not_silently_converted() {
+        let mut table = ab_table(vec![]);
+        table.not_null = vec![0];
+        assert!(table_info(&path("data"), &table, None).is_err());
+        table.not_null.clear();
+        table.constraints = vec![Bytes::from(vec![1, 2])];
+        table.definition_revision = Some(Bytes::from(vec![0, 255]));
+        let info = table_info(&path("data"), &table, None).unwrap();
+        assert_eq!(info.constraints[0].0, vec![1, 2]);
+        assert_eq!(info.definition_revision.unwrap().0, vec![0, 255]);
     }
 
     #[test]
@@ -2196,7 +2224,7 @@ mod tests {
             .find(|f| f.name() == "required_filters")
             .expect("required_filters field present");
         assert_eq!(
-            rf, &fields[20],
+            rf, &fields[17],
             "required_filters retains its wire position"
         );
         let arrow_schema::DataType::List(inner) = rf.data_type() else {
@@ -2550,17 +2578,19 @@ mod attach_option_secret_tests {
     #[test]
     fn required_plus_default_is_still_refused_when_secret() {
         let default: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
-        assert!(serialize_attach_option_spec_with_flags(
-            "both",
-            "",
-            &DataType::Utf8,
-            Some(&default),
-            AttachOptionFlags {
-                required: true,
-                secret: true,
-            },
-        )
-        .is_err());
+        assert!(
+            serialize_attach_option_spec_with_flags(
+                "both",
+                "",
+                &DataType::Utf8,
+                Some(&default),
+                AttachOptionFlags {
+                    required: true,
+                    secret: true,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

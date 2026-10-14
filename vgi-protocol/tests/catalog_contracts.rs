@@ -267,6 +267,29 @@ fn table_records_preserve_optional_metadata() {
     let info: TableInfo = round_trip("table_info");
     assert_eq!(info.options.unwrap().0, fixture("state"));
     assert_eq!(info.layout.unwrap().0, fixture("layout"));
+    assert_eq!(create.constraint_definitions.len(), 1);
+    assert!(old.constraint_definitions.is_empty());
+    assert_eq!(info.definition_revision.unwrap().0, b"revision\0\xff");
+    assert_eq!(info.constraints.len(), 1);
+    fn nested<T: VgiArrow>(bytes: &[u8]) -> T {
+        let batch = StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        from_batch(&batch).unwrap()
+    }
+    let constraint: vgi_protocol::generated::protocol_types::ConstraintInfo =
+        nested(&info.constraints[0].0);
+    assert_eq!(constraint.definition.0, create.constraint_definitions[0].0);
+    let reference: CatalogObjectRef = nested(&constraint.r#ref.0);
+    assert_eq!(reference.name, "fixture-stable-key");
+    let definition: vgi_protocol::generated::protocol_types::ConstraintDefinition =
+        nested(&constraint.definition.0);
+    assert_eq!(
+        definition.column_paths,
+        vec![vec!["record".to_string(), "a.b".to_string()]]
+    );
 }
 
 #[test]

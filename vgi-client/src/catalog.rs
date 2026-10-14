@@ -3,8 +3,8 @@
 //! Attaching a catalog and discovering what it holds.
 
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
     Arc,
+    atomic::{AtomicU8, Ordering},
 };
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
@@ -960,7 +960,7 @@ impl VgiClient {
                         source: CatalogLoadSource::CatalogContents,
                         not_modified: false,
                         fallback_reason: None,
-                    })
+                    });
                 }
                 Err(e) => {
                     reason = e.message;
@@ -1824,11 +1824,8 @@ mod attach_option_tests {
             name: "numbers".to_string(),
             schema_path: vec!["data".to_string()],
             columns: Bytes(Vec::new()),
-            not_null_constraints: Vec::new(),
-            unique_constraints: Vec::new(),
-            check_constraints: Vec::new(),
-            primary_key_constraints: Vec::new(),
-            foreign_key_constraints: Vec::new(),
+            constraints: Vec::new(),
+            definition_revision: None,
             write_result_modes: Vec::new(),
             supports_column_statistics: false,
             scan_function: Some(Bytes(Vec::new())),
@@ -1991,10 +1988,12 @@ mod setting_spec_tests {
             vec![Arc::new(StringArray::from(vec!["seven"]))],
         )
         .unwrap();
-        assert!(SettingSpec::decode(&encoded_setting(Some(&default)))
-            .unwrap_err()
-            .message
-            .contains("does not match"));
+        assert!(
+            SettingSpec::decode(&encoded_setting(Some(&default)))
+                .unwrap_err()
+                .message
+                .contains("does not match")
+        );
     }
 }
 
@@ -2062,9 +2061,11 @@ mod macro_default_tests {
 
     #[test]
     fn empty_macro_defaults_are_absent() {
-        assert!(decode_macro_defaults(&info(&["x"], None))
-            .unwrap()
-            .is_empty());
+        assert!(
+            decode_macro_defaults(&info(&["x"], None))
+                .unwrap()
+                .is_empty()
+        );
         let mut empty = info(&["x"], None);
         empty.parameter_default_values = Some(Bytes::from(Vec::new()));
         assert!(decode_macro_defaults(&empty).unwrap().is_empty());
@@ -2092,10 +2093,12 @@ mod macro_default_tests {
                 vec![Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef],
             )),
         );
-        assert!(decode_macro_defaults(&two_rows)
-            .unwrap_err()
-            .message
-            .contains("one row"));
+        assert!(
+            decode_macro_defaults(&two_rows)
+                .unwrap_err()
+                .message
+                .contains("one row")
+        );
 
         let unknown = info(
             &["lo"],
@@ -2104,10 +2107,12 @@ mod macro_default_tests {
                 vec![Arc::new(Int64Array::from(vec![0])) as ArrayRef],
             )),
         );
-        assert!(decode_macro_defaults(&unknown)
-            .unwrap_err()
-            .message
-            .contains("unknown parameter"));
+        assert!(
+            decode_macro_defaults(&unknown)
+                .unwrap_err()
+                .message
+                .contains("unknown parameter")
+        );
 
         let duplicate = info(
             &["lo"],
@@ -2119,10 +2124,12 @@ mod macro_default_tests {
                 ],
             )),
         );
-        assert!(decode_macro_defaults(&duplicate)
-            .unwrap_err()
-            .message
-            .contains("duplicate default"));
+        assert!(
+            decode_macro_defaults(&duplicate)
+                .unwrap_err()
+                .message
+                .contains("duplicate default")
+        );
     }
 }
 
@@ -2290,10 +2297,11 @@ mod load_catalog_tests {
         let (mut client, log) = client(vec![full(2, None, vec![entry(&["main"], &["other"])])]);
         let snap = client.load_catalog(&attached(true), None).unwrap();
         assert_eq!(snap.source, CatalogLoadSource::PerSchema);
-        assert!(snap
-            .fallback_reason
-            .unwrap()
-            .contains("differs from its SchemaInfo.path"));
+        assert!(
+            snap.fallback_reason
+                .unwrap()
+                .contains("differs from its SchemaInfo.path")
+        );
         assert_eq!(calls(&log), ["catalog_contents", "catalog_schemas"]);
     }
 
@@ -2323,10 +2331,11 @@ mod load_catalog_tests {
         ]);
         let snap = c.load_catalog(&attached(true), Some(&previous)).unwrap();
         assert_eq!(snap.source, CatalogLoadSource::PerSchema);
-        assert!(snap
-            .fallback_reason
-            .unwrap()
-            .contains("older than the known version 5"));
+        assert!(
+            snap.fallback_reason
+                .unwrap()
+                .contains("older than the known version 5")
+        );
         assert_eq!(
             calls(&log),
             ["catalog_contents", "catalog_contents", "catalog_schemas"]
@@ -2404,11 +2413,8 @@ mod load_catalog_tests {
                 )]))
                 .unwrap(),
             ),
-            not_null_constraints: Vec::new(),
-            unique_constraints: Vec::new(),
-            check_constraints: Vec::new(),
-            primary_key_constraints: Vec::new(),
-            foreign_key_constraints: Vec::new(),
+            constraints: Vec::new(),
+            definition_revision: None,
             write_result_modes: Vec::new(),
             supports_column_statistics: false,
             scan_function: None,

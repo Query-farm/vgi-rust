@@ -5,8 +5,8 @@
 //! methods).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -21,7 +21,7 @@ use crate::catalog;
 use crate::function::{BindParams, ProcessParams, ScalarFunction};
 use crate::ipc;
 use crate::protocol::dtos::*;
-use crate::storage::{default_storage, FunctionStorage};
+use crate::storage::{FunctionStorage, default_storage};
 use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
 use crate::wire;
@@ -2626,24 +2626,25 @@ impl Dispatcher {
         let cat = &self.catalog;
         // Implementation version: npm-resolved against the supported set when
         // opted in, else exact-match against the single declared version.
-        let resolved_impl =
-            if cat.npm_version_resolution && !cat.supported_implementation_versions.is_empty() {
-                Some(catalog::resolve_version_npm(
-                    dto.implementation_version.as_deref(),
-                    &cat.supported_implementation_versions,
-                    cat.implementation_version.as_deref().unwrap_or(""),
-                    "implementation_version",
-                )?)
-            } else {
-                match (&dto.implementation_version, &cat.implementation_version) {
-                    (Some(req), Some(have)) if req != have => {
-                        return Err(RpcError::value_error(format!(
+        let resolved_impl = if cat.npm_version_resolution
+            && !cat.supported_implementation_versions.is_empty()
+        {
+            Some(catalog::resolve_version_npm(
+                dto.implementation_version.as_deref(),
+                &cat.supported_implementation_versions,
+                cat.implementation_version.as_deref().unwrap_or(""),
+                "implementation_version",
+            )?)
+        } else {
+            match (&dto.implementation_version, &cat.implementation_version) {
+                (Some(req), Some(have)) if req != have => {
+                    return Err(RpcError::value_error(format!(
                         "Unsupported implementation_version {req:?}; this worker serves {have:?}"
                     )));
-                    }
-                    (_, have) => have.clone(),
                 }
-            };
+                (_, have) => have.clone(),
+            }
+        };
         // Data version: npm-style resolution when opted in, else exact-match.
         let resolved_data = if cat.supported_data_versions.is_empty() {
             None
@@ -2970,7 +2971,7 @@ impl Dispatcher {
         req: &Request,
         if_none_match: Option<&str>,
     ) -> Result<CatalogContentsResponse> {
-        use crate::catalog_contents::{finish, CatalogContentsRequest};
+        use crate::catalog_contents::{CatalogContentsRequest, finish};
         let cat = self.active_catalog(req);
         let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
         let build = || self.build_contents(req, cat);
@@ -3013,11 +3014,7 @@ impl Dispatcher {
             // `Some(0)` is a hard guarantee; an absent count means "unknown".
             let has = |kind: &str| !counts.iter().any(|(k, n)| k == kind && *n == 0);
             let kind = |present: bool, items: &dyn Fn() -> Result<Vec<Bytes>>| {
-                if present {
-                    items()
-                } else {
-                    Ok(Vec::new())
-                }
+                if present { items() } else { Ok(Vec::new()) }
             };
             let schema = catalog::serialize_items(vec![info])?
                 .pop()
@@ -3156,6 +3153,11 @@ impl Dispatcher {
                 // Constraints are defined against the current schema; drop them
                 // for historical versions whose columns differ.
                 if !t.is_current_version(v.version) {
+                    if !t.constraints.is_empty() {
+                        return Err(RpcError::method_not_implemented(
+                            "canonical constraints require version-specific provider snapshots",
+                        ));
+                    }
                     tt.not_null.clear();
                     tt.primary_key.clear();
                     tt.unique.clear();
@@ -5435,6 +5437,71 @@ fn normalize_function_type(t: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod canonical_constraint_version_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::generated::protocol_types::{
+        CatalogObjectRef, ConstraintDefinition, ConstraintInfo,
+    };
+
+    fn record<T: vgi_rpc::VgiArrow>(value: T) -> Bytes {
+        Bytes::from(ipc::write_batch(&wire::to_batch(value).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn current_constraint_records_are_not_reused_for_historical_snapshots() {
+        let columns = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let mut table = catalog::CatTable::new("t", columns.clone(), "scan", vec![], None, None);
+        table.time_travel = [1, 2]
+            .into_iter()
+            .map(|version| catalog::TimeTravelVersion {
+                version,
+                columns: columns.clone(),
+                scan_function: "scan".into(),
+                scan_arguments: vec![],
+                timestamp_year: Some(2020 + version as i32),
+            })
+            .collect();
+        table.constraints = vec![record(ConstraintInfo {
+            r#ref: record(CatalogObjectRef {
+                kind: "constraint".into(),
+                schema_path: vec!["main".into()],
+                name: "stable-current-key".into(),
+                owner_table: Some("t".into()),
+            }),
+            definition: record(ConstraintDefinition {
+                kind: vgi_rpc::DictString("NOT_NULL".into()),
+                column_paths: vec![vec!["a".into()]],
+                declared_name: None,
+                check_expression: None,
+                foreign_key: None,
+            }),
+            enforcement: vgi_rpc::DictString("METADATA_ONLY".into()),
+            validation: vgi_rpc::DictString("UNVALIDATED".into()),
+            referenced_constraint: None,
+        })];
+        table.definition_revision = Some(Bytes::from(b"current-revision".to_vec()));
+        for (unit, value) in [(None, None), (Some("VERSION"), Some("2"))] {
+            let current = Dispatcher::at_version(&table, unit, value).unwrap();
+            let info = catalog::table_info(&["main".into()], &current, None).unwrap();
+            assert_eq!(info.constraints[0].0, table.constraints[0].0);
+            assert_eq!(info.definition_revision.unwrap().0, b"current-revision");
+        }
+        let error = Dispatcher::at_version(&table, Some("VERSION"), Some("1"));
+        assert!(
+            error
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("version-specific provider snapshots")
+        );
+        // Tables without canonical claims retain ordinary historical selection.
+        table.constraints.clear();
+        assert!(Dispatcher::at_version(&table, Some("VERSION"), Some("1")).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod buffering_schema_tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
@@ -5582,9 +5649,10 @@ mod buffering_schema_tests {
         let d = Dispatcher::new("test");
         let exec = format!("test-error-{}", std::process::id()).into_bytes();
         d.store.clear(&exec);
-        assert!(d
-            .buffering_output_schema(&exec, &FixedOutput, None)
-            .is_err());
+        assert!(
+            d.buffering_output_schema(&exec, &FixedOutput, None)
+                .is_err()
+        );
     }
 }
 
@@ -5958,14 +6026,15 @@ mod scope_tests {
         assert_eq!(matched, vec![0]);
 
         let sibling = vec!["analytics".to_string(), "finance".to_string()];
-        assert!(d
-            .scoped_indices(
+        assert!(
+            d.scoped_indices(
                 FnKind::Scalar,
                 "f",
                 1,
                 CallScope::qualified("cat", &sibling),
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     /// Naming a schema the function does not live in is an error that reports
@@ -6050,15 +6119,17 @@ mod scope_tests {
         // pre-1.1.0 peer: no bind it sends can name a schema
         assert!(CallScope::for_bind("cat", None, "f", false, false, true).is_ok());
         // a named schema always resolves exactly
-        assert!(CallScope::for_bind(
-            "cat",
-            Some(path("main").as_slice()),
-            "f",
-            false,
-            false,
-            false
-        )
-        .is_ok());
+        assert!(
+            CallScope::for_bind(
+                "cat",
+                Some(path("main").as_slice()),
+                "f",
+                false,
+                false,
+                false
+            )
+            .is_ok()
+        );
     }
 
     /// The hidden-function allowance is recognised from the worker's own
@@ -6336,8 +6407,8 @@ mod catalog_contents_tests {
 
     use super::*;
     use crate::catalog_contents::{
-        catalog_contents_digest, CatalogContentsEtag, CatalogContentsProvider,
-        CatalogContentsRequest, CatalogContentsResult,
+        CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest,
+        CatalogContentsResult, catalog_contents_digest,
     };
     use crate::function::{ArgSpec, FunctionMetadata};
     use arrow_schema::{DataType, Field, Schema};

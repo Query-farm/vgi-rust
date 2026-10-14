@@ -14,6 +14,7 @@ mod accumulate;
 mod aggregate;
 mod attach_options;
 mod buffering;
+mod canonical_constraints;
 mod catalog_def;
 mod contents_fixtures;
 mod contents_reval;
