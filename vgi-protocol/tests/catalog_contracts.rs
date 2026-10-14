@@ -6,8 +6,8 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use base64::Engine;
 use vgi_protocol::generated::protocol_types::{
-    CatalogCapabilities, OptionChanges, OptionDefinitions, OptionState, RequiredFilterPaths,
-    SortKey, SqlExpression, TableLayout, TableLayoutChange,
+    CatalogCapabilities, CatalogMetadataChanges, OptionChanges, OptionDefinitions, OptionState,
+    RequiredFilterPaths, SortKey, SqlExpression, TableLayout, TableLayoutChange,
 };
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
@@ -177,4 +177,29 @@ fn view_security_survives_codec_round_trip() {
     let barrier: ViewInfo = round_trip("view_info_barrier");
     assert_eq!(regular.security, "regular");
     assert_eq!(barrier.security, "barrier");
+}
+
+#[test]
+fn metadata_patches_preserve_comment_presence_and_literal_tags() {
+    let patch: CatalogMetadataChanges = round_trip("metadata_patch");
+    assert!(patch.set_comment);
+    assert_eq!(patch.comment.as_deref(), Some(""));
+    assert_eq!(patch.remove_tags, ["old", "OLD"]);
+    assert_eq!(
+        patch.set_tags,
+        vec![
+            ("a.b".into(), "".into()),
+            ("__proto__".into(), "literal".into()),
+            ("".into(), "empty-key".into())
+        ]
+    );
+    let clear: CatalogMetadataChanges = round_trip("metadata_clear_comment");
+    assert!(clear.set_comment && clear.comment.is_none() && clear.set_tags.is_empty());
+    let noop: CatalogMetadataChanges = round_trip("metadata_noop");
+    assert!(
+        !noop.set_comment
+            && noop.comment.is_none()
+            && noop.set_tags.is_empty()
+            && noop.remove_tags.is_empty()
+    );
 }
