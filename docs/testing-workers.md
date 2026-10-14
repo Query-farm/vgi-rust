@@ -6,7 +6,7 @@ schemas; you do not need DuckDB for the basic tests.
 
 ```toml
 [dev-dependencies]
-vgi-client = { version = "0.43", default-features = false, features = ["testing"] }
+vgi-client = { version = "0.44", default-features = false, features = ["testing"] }
 arrow-array = "60"
 arrow-schema = "60"
 arrow-select = "60"

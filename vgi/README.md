@@ -46,10 +46,10 @@ example below needs):
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.35"
-vgi-rpc = "0.25"
-arrow-array = "59"
-arrow-schema = "59"
+vgi = "0.44"
+vgi-rpc = "0.31"
+arrow-array = "60"
+arrow-schema = "60"
 ```
 
 **2. Write a function and serve it:**
