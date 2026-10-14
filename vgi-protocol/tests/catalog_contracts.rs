@@ -6,8 +6,9 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use base64::Engine;
 use vgi_protocol::generated::protocol_types::{
-    CatalogCapabilities, CatalogMetadataChanges, OptionChanges, OptionDefinitions, OptionState,
-    RequiredFilterPaths, SortKey, SqlExpression, TableLayout, TableLayoutChange,
+    CatalogCapabilities, CatalogMetadataChanges, CatalogObjectRef, DependencySnapshot,
+    ObjectDependency, OptionChanges, OptionDefinitions, OptionState, RequiredFilterPaths, SortKey,
+    SqlExpression, TableLayout, TableLayoutChange,
 };
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
@@ -202,4 +203,24 @@ fn metadata_patches_preserve_comment_presence_and_literal_tags() {
             && noop.set_tags.is_empty()
             && noop.remove_tags.is_empty()
     );
+}
+
+#[test]
+fn dependency_records_preserve_nested_identity_and_graph_payloads() {
+    let table: CatalogObjectRef = round_trip("object_ref");
+    assert_eq!(table.schema_path, ["one.two", "nested"]);
+    assert_eq!(table.name, "table.\"name");
+    assert!(table.owner_table.is_none());
+    let trigger: CatalogObjectRef = round_trip("trigger_ref");
+    assert_eq!(trigger.owner_table.as_deref(), Some(table.name.as_str()));
+    let edge: ObjectDependency = round_trip("object_dependency");
+    assert_eq!(edge.kind, "owned");
+    assert_eq!(edge.subject, vgi_rpc::Bytes(fixture("object_ref")));
+    assert_eq!(edge.dependent, vgi_rpc::Bytes(fixture("trigger_ref")));
+    let graph: DependencySnapshot = round_trip("dependency_snapshot");
+    assert_eq!(graph.catalog_version, 42);
+    assert_eq!(graph.objects.len(), 4);
+    assert_eq!(graph.dependencies.len(), 3);
+    let empty: DependencySnapshot = round_trip("empty_dependency_snapshot");
+    assert!(empty.objects.is_empty() && empty.dependencies.is_empty());
 }
