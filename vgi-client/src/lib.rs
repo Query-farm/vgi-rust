@@ -71,6 +71,8 @@ pub mod location;
 pub mod pool;
 pub mod retry;
 pub mod scan;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod transport;
 pub mod wire_call;
 

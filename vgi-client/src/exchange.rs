@@ -34,7 +34,7 @@ use vgi_rpc::{Bytes, DictString};
 
 use crate::catalog::AttachedCatalog;
 use crate::client::VgiClient;
-use crate::scan::{BindSpec, BoundFunction, Scan, ScanOptions};
+use crate::scan::{check_batch_schema, project_schema, BindSpec, BoundFunction, Scan, ScanOptions};
 use crate::transport::ExchangeStream;
 use crate::wire_call::{call, envelope};
 
@@ -59,7 +59,9 @@ fn conditional_request_metadata(opts: &ScanOptions) -> Option<vgi_rpc::wire::Met
 pub struct Exchange<'a> {
     stream: Box<dyn ExchangeStream + 'a>,
     header: GlobalInitResponse,
+    function: String,
     schema: SchemaRef,
+    emitted_schema: SchemaRef,
     parent_rows: Option<Vec<i32>>,
     last_cache_control: Option<CacheControl>,
     first_input_metadata: Option<vgi_rpc::wire::Metadata>,
@@ -73,7 +75,7 @@ impl Exchange<'_> {
         &self.header.execution_id
     }
 
-    /// The output schema, as resolved at bind.
+    /// The requested output schema after projection, excluding filter-only columns.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -116,8 +118,31 @@ impl Exchange<'_> {
         match response? {
             None => Ok(None),
             Some((batch, md)) => {
-                update_answer_metadata(&mut self.parent_rows, &mut self.last_cache_control, &md)?;
-                Ok(Some(batch))
+                let result = (|| {
+                    check_batch_schema(&self.function, &self.emitted_schema, &batch)?;
+                    update_answer_metadata(
+                        &mut self.parent_rows,
+                        &mut self.last_cache_control,
+                        &md,
+                    )?;
+                    let keep = self.schema.fields().len();
+                    if keep == batch.num_columns() {
+                        Ok(batch)
+                    } else {
+                        // ScanOptions puts requested columns before filter-only
+                        // columns, so trimming preserves the requested order.
+                        batch.project(&(0..keep).collect::<Vec<_>>()).map_err(|error| {
+                            RpcError::runtime_error(format!(
+                                "function `{}`: could not drop filter-only exchange columns: {error}",
+                                self.function,
+                            ))
+                        })
+                    }
+                })();
+                if result.is_err() {
+                    self.connection_reusable.store(false, Ordering::Release);
+                }
+                result.map(Some)
             }
         }
     }
@@ -316,6 +341,9 @@ impl VgiClient {
         bound: &BoundFunction,
         opts: &ScanOptions,
     ) -> Result<Exchange<'a>> {
+        let schema = project_schema(bound.output_schema(), opts.projection.as_deref())?;
+        let emitted_schema =
+            project_schema(bound.output_schema(), opts.wire_projection().as_deref())?;
         let request = bound.init_request(opts, Some(phase::INPUT), None);
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
@@ -340,11 +368,12 @@ impl VgiClient {
                 return Err(error);
             }
         };
-        let schema = bound.output_schema().clone();
         Ok(Exchange {
             stream,
             header,
+            function: bound.function_name().to_owned(),
             schema,
+            emitted_schema,
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: conditional_request_metadata(opts),
@@ -500,6 +529,9 @@ impl VgiClient {
         phase_name: &str,
         finalize_state_id: Option<Bytes>,
     ) -> Result<Scan<'a>> {
+        let schema = project_schema(bound.output_schema(), opts.projection.as_deref())?;
+        let emitted_schema =
+            project_schema(bound.output_schema(), opts.wire_projection().as_deref())?;
         let mut request = bound.init_request(opts, Some(phase_name), finalize_state_id);
         // A finalize is a producer stream. The worker selects tick mode by the
         // *absence* of an input schema, so it must not be echoed back here even
@@ -509,12 +541,13 @@ impl VgiClient {
             request: envelope(request)?,
         })?;
         let connection_reusable = self.exchange_reuse_guard();
-        Scan::open(
+        Scan::open_projected(
             self.transport_mut(),
             &params,
             conditional_request_metadata(opts),
             bound.function_name(),
-            bound.output_schema().clone(),
+            schema,
+            emitted_schema,
             connection_reusable,
         )
     }
@@ -639,7 +672,9 @@ mod tests {
                 max_workers: 1,
                 opaque_data: None,
             },
+            function: "stub".to_owned(),
             schema: Arc::new(Schema::empty()),
+            emitted_schema: Arc::new(Schema::empty()),
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: None,

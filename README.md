@@ -178,6 +178,9 @@ so `DETACH demo; ATTACH 'demo' (...)` (or a fresh session) picks up a new build.
 
 Each trait is small: `name`, `metadata`, `argument_specs`, an `on_bind` to resolve
 the output schema, and `process` (or the buffering / aggregate lifecycle methods).
+See [filter ownership and typed pruning](docs/filtering-and-pruning.md) for safe
+external-data scans using `FilterHandling::Sdk` and partial-column candidate masks.
+
 Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets,
 bearer auth, and a cross-process state store are handled for you.
 
@@ -249,9 +252,16 @@ table, table-in-out, buffering, aggregate, and catalog-backed tables/views.
 
 ## Testing your own worker
 
-The fastest check is to call your function from a DuckDB session (see "Your first
-worker"). For automated tests, drive the worker from Rust with `vgi-rpc`'s client,
-or shell out to a DuckDB session from your test harness.
+Enable `vgi-client`'s optional `testing` feature to test your worker through
+attach, bind, and scan. `TestWorker` launches your binary; `ScanResult` compares
+typed schemas and row multisets, preserving duplicates and NULLs. Typed filter
+fixtures and `check_pushdown` compare a pushed scan with an independent reference,
+including projection and filter-only columns.
+
+See [Testing your worker](docs/testing-workers.md) for setup, expected-row and
+pushdown tests, boundary fixtures, and CI commands. The
+[external-data example](examples/external-data/) includes runnable subprocess
+tests. DuckDB remains useful as an independent SQL reference for conformance.
 
 ## Running the SDK's integration suite (contributors)
 

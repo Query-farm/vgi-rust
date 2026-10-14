@@ -1417,7 +1417,8 @@ impl Dispatcher {
                     input_schema: input_schema.clone(),
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
-                let auto_apply = f.metadata().auto_apply_filters;
+                let filter_handling = f.metadata().filter_handling()?;
+                let auto_apply = filter_handling == crate::FilterHandling::Sdk;
                 let join_keys: Vec<Vec<u8>> = dto
                     .join_keys
                     .as_ref()
@@ -1434,6 +1435,7 @@ impl Dispatcher {
                         )
                     })
                     .transpose()?;
+                filter_handling.validate_filters(current_filters.as_ref())?;
                 let filters = auto_apply.then(|| current_filters.clone()).flatten();
                 let producer = f.finalize_producer(&bparams, fsid)?;
                 // A buffering source drains a possibly multi-batch result, and
@@ -1458,7 +1460,7 @@ impl Dispatcher {
                     inner: producer,
                     current_filters,
                     filters,
-                    project_to: None,
+                    project_to: Some(output_schema.clone()),
                     resume_blob,
                     conditional_checked: false,
                     filter_history: Default::default(),
@@ -1577,7 +1579,8 @@ impl Dispatcher {
                 call,
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
-            let auto_apply = f.metadata().auto_apply_filters;
+            let filter_handling = f.metadata().filter_handling()?;
+            let auto_apply = filter_handling == crate::FilterHandling::Sdk;
             let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
             let parsed_filters = params
                 .pushdown_filters
@@ -1590,6 +1593,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
+            filter_handling.validate_filters(parsed_filters.as_ref())?;
             params.current_pushdown_filters = parsed_filters.clone();
             // FINALIZE phase: flush accumulated state as a producer stream.
             if phase == crate::protocol::enums::phase::FINALIZE {
@@ -1598,7 +1602,21 @@ impl Dispatcher {
                     max_workers: 1,
                     opaque_data: None,
                 })?;
-                let batches = f.finish(&params)?;
+                // Enforce the same filtering contract on flush output as on
+                // ordinary exchange output. Persist the final wire batches so
+                // HTTP continuations do not need columns already projected out.
+                let filters = auto_apply.then_some(parsed_filters.as_ref()).flatten();
+                let batches = f
+                    .finish(&params)?
+                    .into_iter()
+                    .map(|batch| {
+                        let batch = match filters {
+                            Some(filters) => filters.apply(&batch)?,
+                            None => batch,
+                        };
+                        crate::table_in_out::project_batch(&batch, &output_schema)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 // Over HTTP a producer gets ONE batch per response, so a flush
                 // of more than one batch needs a continuation — and until this
                 // was wired it got a hard error instead ("emits more than one
@@ -1741,7 +1759,8 @@ impl Dispatcher {
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let max_workers = f.max_workers(&bp);
-            let auto_apply = f.metadata().auto_apply_filters;
+            let filter_handling = f.metadata().filter_handling()?;
+            let auto_apply = filter_handling == crate::FilterHandling::Sdk;
             let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
             let parsed_filters = params
                 .pushdown_filters
@@ -1754,6 +1773,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
+            filter_handling.validate_filters(parsed_filters.as_ref())?;
             params.current_pushdown_filters = parsed_filters.clone();
             // Primary init (no execution_id on the request) runs the global
             // OnInit hook once — e.g. to push a parallel-scan work queue.
@@ -2062,7 +2082,7 @@ impl Dispatcher {
                     inner: producer,
                     current_filters,
                     filters,
-                    project_to: None,
+                    project_to: Some(output_schema.clone()),
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
                     filter_history,
@@ -5067,13 +5087,24 @@ impl ExchangeState for TableInOutExchangeState {
         // with the Python SDK's `empty_batch` padding. Without it the client
         // blocks forever on ReadDataBatch.
         if collected.items.is_empty() {
-            collected.emit(RecordBatch::new_empty(out.schema()));
+            out.emit(RecordBatch::new_empty(out.schema()))?;
+            return Ok(());
         }
-        for (batch, metadata) in collected.items {
+        for (batch, mut metadata) in collected.items {
             let batch = match &self.filters {
-                Some(f) => f.apply(&batch)?,
+                Some(f) => {
+                    let keep = f.evaluate(&batch)?;
+                    crate::table_in_out::filter_parent_rows(
+                        &mut metadata,
+                        &keep,
+                        input.num_rows(),
+                    )?;
+                    arrow_select::filter::filter_record_batch(&batch, &keep)
+                        .map_err(|e| RpcError::runtime_error(e.to_string()))?
+                }
                 None => batch,
             };
+            let batch = crate::table_in_out::project_batch(&batch, &out.schema())?;
             match metadata {
                 Some(md) => out.emit_with_metadata(batch, md)?,
                 None => out.emit(batch)?,

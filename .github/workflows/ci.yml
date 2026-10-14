@@ -55,6 +55,15 @@ jobs:
       - name: cargo test (vgi.v2 surface + wire name)
         run: cargo test -p vgi --all-features --test vgi_v2_surface --test protocol_name
 
+      - name: cargo test (SDK filtering, pruning, diagnostics)
+        run: cargo test -p vgi --all-features --lib
+
+      - name: cargo test (worker testing kit and diagnostic delivery)
+        run: cargo test -p vgi-client --no-default-features --features testing --lib --test testing_kit --test execution_diagnostics
+
+      - name: cargo test (external-data worker over stdio)
+        run: cargo test -p vgi-external-data-worker
+
       - name: cargo test --doc (vgi)
         run: cargo test --doc -p vgi --all-features
 

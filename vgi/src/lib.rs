@@ -127,9 +127,9 @@ pub mod catalog;
 pub mod catalog_contents;
 pub mod copy_from;
 pub mod copy_to;
+pub mod diagnostics;
 pub mod dispatch;
 pub mod errors;
-mod window_cache;
 pub mod function;
 pub mod numeric;
 pub mod opaque;
@@ -147,6 +147,7 @@ pub mod table_function;
 pub mod table_in_out;
 pub mod transport;
 pub mod wasm_worker;
+mod window_cache;
 pub mod worker;
 
 // The wire protocol lives in `vgi-protocol` so a client can speak VGI without
@@ -183,7 +184,7 @@ mod function_shape_dispatch_tests;
 
 pub use dispatch::FunctionScope;
 pub use function::{
-    ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FunctionExample, FunctionMetadata,
-    ProcessParams, ScalarFunction,
+    ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FilterHandling, FunctionExample,
+    FunctionMetadata, ProcessParams, ScalarFunction,
 };
 pub use worker::{HostedProtocolsHook, ServeTransport, Worker, INTROSPECT_PRINCIPALS_ENV};

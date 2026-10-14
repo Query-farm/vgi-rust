@@ -1,0 +1,19 @@
+[package]
+name = "vgi-external-data-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "A small, tested VGI worker over partitioned local JSONL files"
+publish = false
+
+[dependencies]
+vgi = { path = "../../vgi", default-features = false }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+vgi-client = { path = "../../vgi-client", default-features = false, features = ["testing"] }
+arrow-select.workspace = true

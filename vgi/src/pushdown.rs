@@ -15,6 +15,9 @@ use vgi_rpc::{Result, RpcError};
 
 use crate::ipc;
 
+mod pruning;
+pub use pruning::{ColumnDomain, NonNullDomain};
+
 const ENCODING: &str = "vgi.filters.v2";
 const VERSION: &str = "2";
 const SEMANTICS: &str = "vgi.duckdb.standard.v1";
@@ -110,6 +113,8 @@ pub struct PushdownFilters {
     output_schema: SchemaRef,
 }
 
+/// Legacy integer-only convenience bounds. Prefer [`PushdownFilters::column_domain`]
+/// for pruning: it preserves Arrow types, exclusive endpoints, and NULLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnBounds {
     pub min: Option<i64>,
@@ -296,6 +301,10 @@ struct Identity {
 }
 
 impl PushdownFilters {
+    pub(crate) fn has_required_predicates(&self) -> bool {
+        !self.required_ids.is_empty()
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         Self::parse_with_join_keys(bytes, &[])
     }
@@ -1468,8 +1477,8 @@ fn fold_bool(children: &[Expr], batch: &RecordBatch, and: bool) -> Result<Boolea
 }
 
 fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result<BooleanArray> {
-    let left = dictionary_values(left)?;
-    let right = dictionary_values(right)?;
+    let left = sql_float_values(dictionary_values(left)?);
+    let right = sql_float_values(dictionary_values(right)?);
     let (left, right) = broadcast(&left, &right)?;
     let result = match op {
         "eq" => arrow_ord::cmp::eq(&left, &right),
@@ -1484,6 +1493,49 @@ fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result<Boolean
         _ => return Err(value_error("unknown comparison operator")),
     };
     result.map_err(cvt)
+}
+
+// DuckDB standard semantics equate both signed zeros and all NaN payloads.
+// Arrow's comparison kernels use IEEE totalOrder, so canonicalize these two
+// equivalence classes before calling them. Keep the original float width.
+fn sql_float_values(array: ArrayRef) -> ArrayRef {
+    if let Some(values) = array.as_any().downcast_ref::<arrow_array::Float64Array>() {
+        Arc::new(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|v| {
+                        if v == 0.0 {
+                            0.0
+                        } else if v.is_nan() {
+                            f64::NAN
+                        } else {
+                            v
+                        }
+                    })
+                })
+                .collect::<arrow_array::Float64Array>(),
+        )
+    } else if let Some(values) = array.as_any().downcast_ref::<arrow_array::Float32Array>() {
+        Arc::new(
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|v| {
+                        if v == 0.0 {
+                            0.0
+                        } else if v.is_nan() {
+                            f32::NAN
+                        } else {
+                            v
+                        }
+                    })
+                })
+                .collect::<arrow_array::Float32Array>(),
+        )
+    } else {
+        array
+    }
 }
 
 fn distinct(left: &ArrayRef, right: &ArrayRef, distinct: bool) -> Result<BooleanArray> {
@@ -1597,11 +1649,11 @@ fn in_list(column: &ArrayRef, values: &ArrayRef) -> Result<BooleanArray> {
     for index in 0..values.len() {
         result = or_kleene(
             &result,
-            &arrow_ord::cmp::eq(
+            &compare_arrays(
                 &column,
                 &repeat_scalar(&values.slice(index, 1), column.len())?,
-            )
-            .map_err(cvt)?,
+                "eq",
+            )?,
         )?;
     }
     Ok(result)
@@ -1616,7 +1668,9 @@ fn logical_value_type(data_type: &DataType) -> &DataType {
 
 fn dictionary_values(array: &ArrayRef) -> Result<ArrayRef> {
     match array.data_type() {
-        DataType::Dictionary(_, value_type) => arrow_cast::cast(array, value_type).map_err(cvt),
+        DataType::Dictionary(..) => {
+            arrow_cast::cast(array, logical_value_type(array.data_type())).map_err(cvt)
+        }
         _ => Ok(array.clone()),
     }
 }

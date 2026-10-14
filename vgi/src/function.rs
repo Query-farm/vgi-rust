@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, SchemaRef};
-use vgi_rpc::Result;
+use vgi_rpc::{Result, RpcError};
 
 pub use crate::protocol::dtos::{
     EvaluationContextCapability, FilterFunctionCapability, FunctionExample,
@@ -410,6 +410,38 @@ fn const_in_choices(
     })
 }
 
+/// Who enforces every required pushed predicate before returning rows.
+///
+/// Pruning only rules out impossible candidates. It never fulfills this
+/// responsibility by itself, even if a pruning result looks exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterHandling {
+    /// The function does not accept pushed filters; the engine filters rows.
+    Disabled,
+    /// The SDK applies exact filters to producer output before projection.
+    /// Emit every column needed by the filter, including filter-only columns.
+    Sdk,
+    /// The worker guarantees exact evaluation of every accepted required
+    /// predicate. Unsupported predicates must fail, never be silently ignored.
+    Worker,
+}
+
+impl FilterHandling {
+    pub(crate) fn validate_filters(
+        self,
+        filters: Option<&crate::pushdown::PushdownFilters>,
+    ) -> Result<()> {
+        if self == Self::Disabled
+            && filters.is_some_and(|filters| filters.has_required_predicates())
+        {
+            return Err(RpcError::value_error(
+                "function with FilterHandling::Disabled cannot accept required pushed filters",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Optimizer- and discovery-facing function metadata (`FunctionInfo`).
 #[derive(Debug, Clone)]
 pub struct FunctionMetadata {
@@ -432,9 +464,12 @@ pub struct FunctionMetadata {
     /// parameters in signature order; a present null is an explicit NULL.
     pub parameter_default_values: Option<arrow_array::RecordBatch>,
     pub projection_pushdown: bool,
+    /// Accept pushed predicates. Prefer [`Self::with_filter_handling`] to set
+    /// this together with the exact-filtering responsibility. Setting this
+    /// alone is rejected: it must have an SDK or worker filtering owner.
     pub filter_pushdown: bool,
     pub sampling_pushdown: bool,
-    /// Worker-side: auto-apply pushed-down filters to emitted batches.
+    /// Legacy switch for SDK filtering. Prefer [`Self::with_filter_handling`].
     pub auto_apply_filters: bool,
     /// Filter Encoding v2 semantic profiles implemented by this function.
     pub filter_semantic_profiles: Vec<String>,
@@ -454,9 +489,10 @@ pub struct FunctionMetadata {
     /// Without it, the division lives behind an opaque worker-side queue and a
     /// retry reads neither what it read before nor what it missed.
     pub supports_splits: bool,
-    /// Declares that the worker applies every pushed filter EXACTLY, so the
-    /// engine may drop its own copy rather than re-filtering. Wrong answers if
-    /// declared falsely — leave it false unless certain.
+    /// Legacy declaration that the worker enforces every pushed filter exactly.
+    /// SDK filtering also publishes this guarantee automatically. A false value
+    /// does NOT guarantee the engine retains a residual filter after pushdown.
+    /// Prefer [`Self::with_filter_handling`] to declare an explicit owner.
     pub filters_exactly_applied: bool,
     /// Declares addressable positions in the data, for incremental and
     /// streaming reads. The engine owns the checkpoint; this declares only that
@@ -504,6 +540,43 @@ pub struct FunctionMetadata {
     /// positionally for varargs); named args stay bind-time scalars on
     /// `ProcessParams::arguments`. Surfaced as `FunctionInfo.input_from_args`.
     pub input_from_args: bool,
+}
+
+impl FunctionMetadata {
+    /// Configure filter acceptance and exact evaluation together.
+    ///
+    /// Existing `filter_pushdown: true, auto_apply_filters: true` declarations
+    /// remain valid and mean [`FilterHandling::Sdk`]. Workers using manual
+    /// filtering must explicitly select [`FilterHandling::Worker`] (or set the
+    /// legacy `filters_exactly_applied` flag). An ownerless declaration fails at
+    /// discovery/init instead of silently returning unfiltered rows.
+    #[must_use]
+    pub fn with_filter_handling(mut self, handling: FilterHandling) -> Self {
+        self.filter_pushdown = handling != FilterHandling::Disabled;
+        self.auto_apply_filters = handling == FilterHandling::Sdk;
+        self.filters_exactly_applied = handling != FilterHandling::Disabled;
+        self
+    }
+
+    /// Resolve and validate the filtering contract, including legacy flags.
+    pub fn filter_handling(&self) -> Result<FilterHandling> {
+        if !self.filter_pushdown {
+            if self.auto_apply_filters || self.filters_exactly_applied {
+                return Err(RpcError::value_error(
+                    "filter ownership requires filter_pushdown; use with_filter_handling",
+                ));
+            }
+            Ok(FilterHandling::Disabled)
+        } else if self.auto_apply_filters {
+            Ok(FilterHandling::Sdk)
+        } else if self.filters_exactly_applied {
+            Ok(FilterHandling::Worker)
+        } else {
+            Err(RpcError::value_error(
+                "filter_pushdown requires an exact-filtering owner; use with_filter_handling(FilterHandling::Sdk) or FilterHandling::Worker",
+            ))
+        }
+    }
 }
 
 impl Default for FunctionMetadata {

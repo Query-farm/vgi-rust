@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
 use vgi_rpc::{Result, RpcError};
 
@@ -111,8 +111,8 @@ pub trait TableInOutFunction: Send + Sync {
             opaque_data: Vec::new(),
         })
     }
-    /// Transform one input batch into output batches. Default: project the
-    /// input to the (possibly narrowed) output schema by column name. A
+    /// Transform one input batch into output batches. Default: pass through
+    /// the input; the dispatcher filters and then projects it by column name. A
     /// distributed/accumulating function persists partial state to
     /// `params.storage` here and returns an empty batch.
     ///
@@ -127,8 +127,8 @@ pub trait TableInOutFunction: Send + Sync {
     /// of writers; state overwritten in place must not share a key between two
     /// connections. `substream_partial_sum` in the example worker is the
     /// pattern.
-    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
-        Ok(vec![project_batch(batch, &params.output_schema)?])
+    fn process(&self, _params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(vec![batch.clone()])
     }
 
     /// Transform one input batch, emitting through `out` — the metadata-capable
@@ -182,11 +182,157 @@ pub fn project_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBa
             }
         }
     }
-    RecordBatch::try_new(schema.clone(), cols)
-        .map_err(|e| RpcError::runtime_error(format!("project batch: {e}")))
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        cols,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| RpcError::runtime_error(format!("project batch: {e}")))
 }
 
 /// Build an `Arc<Schema>`.
 pub fn arc(s: Schema) -> Arc<Schema> {
     Arc::new(s)
+}
+
+/// Preserve row correlation when SDK filtering changes an exchange's output.
+pub(crate) fn filter_parent_rows(
+    metadata: &mut Option<HashMap<String, String>>,
+    keep: &BooleanArray,
+    input_rows: usize,
+) -> Result<()> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let selected = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == Some(true)).then_some(index))
+        .collect::<Vec<_>>();
+    let encoded = metadata
+        .as_ref()
+        .and_then(|m| m.get(PARENT_ROW_METADATA_KEY));
+    let parents = if let Some(encoded) = encoded {
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| RpcError::value_error("invalid parent_rows base64"))?;
+        if bytes.len() % 4 != 0 || bytes.len() / 4 != keep.len() {
+            return Err(RpcError::value_error(
+                "parent_rows length differs from unfiltered output",
+            ));
+        }
+        let parents = bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        if parents.iter().any(|p| *p < 0 || *p as usize >= input_rows) {
+            return Err(RpcError::value_error(
+                "parent_rows index outside input batch",
+            ));
+        }
+        Some(parents)
+    } else {
+        None
+    };
+    if selected.is_empty() {
+        if let Some(metadata) = metadata {
+            metadata.remove(PARENT_ROW_METADATA_KEY);
+        }
+        return Ok(());
+    }
+    if selected.len() == keep.len() {
+        return Ok(());
+    }
+    if parents.is_none() && keep.len() != input_rows {
+        return Err(RpcError::value_error(
+            "SDK filtering changes an unannotated table-in-out batch with non-identity cardinality; emit explicit parent_rows with TableInOutOutput::emit_with",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(selected.len() * 4);
+    for index in selected {
+        let parent = match &parents {
+            Some(parents) => parents[index],
+            None => i32::try_from(index)
+                .map_err(|_| RpcError::value_error("parent_rows index exceeds int32"))?,
+        };
+        bytes.extend_from_slice(&parent.to_le_bytes());
+    }
+    metadata
+        .get_or_insert_with(HashMap::new)
+        .insert(PARENT_ROW_METADATA_KEY.into(), STANDARD.encode(bytes));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn zero_column_projection_preserves_rows() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let projected = project_batch(&batch, &Arc::new(Schema::empty())).unwrap();
+        assert_eq!(projected.num_columns(), 0);
+        assert_eq!(projected.num_rows(), 3);
+    }
+
+    fn parent_metadata(parents: &[i32]) -> Option<HashMap<String, String>> {
+        Some(HashMap::from([
+            ("custom".into(), "preserved".into()),
+            (
+                PARENT_ROW_METADATA_KEY.into(),
+                crate::partition::base64_encode(
+                    &parents
+                        .iter()
+                        .flat_map(|p| p.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn sdk_filter_selects_explicit_and_identity_parent_rows() {
+        let keep = BooleanArray::from(vec![Some(false), Some(true), None, Some(true)]);
+        let mut explicit = parent_metadata(&[1, 0, 2, 1]);
+        filter_parent_rows(&mut explicit, &keep, 3).unwrap();
+        assert_eq!(explicit, parent_metadata(&[0, 1]));
+        let mut identity = None;
+        filter_parent_rows(&mut identity, &keep, 4).unwrap();
+        assert_eq!(
+            identity.unwrap()[PARENT_ROW_METADATA_KEY],
+            parent_metadata(&[1, 3]).unwrap()[PARENT_ROW_METADATA_KEY]
+        );
+        filter_parent_rows(
+            &mut explicit,
+            &BooleanArray::from(vec![Some(false), None]),
+            3,
+        )
+        .unwrap();
+        assert!(!explicit
+            .as_ref()
+            .unwrap()
+            .contains_key(PARENT_ROW_METADATA_KEY));
+        assert_eq!(explicit.unwrap()["custom"], "preserved");
+    }
+
+    #[test]
+    fn sdk_filter_rejects_malformed_or_ambiguous_parent_rows() {
+        let keep = BooleanArray::from(vec![false, true, true]);
+        assert!(filter_parent_rows(&mut parent_metadata(&[0, 1]), &keep, 3).is_err());
+        assert!(filter_parent_rows(&mut parent_metadata(&[0, -1, 1]), &keep, 3).is_err());
+        assert!(filter_parent_rows(&mut parent_metadata(&[0, 3, 1]), &keep, 3).is_err());
+        let mut malformed = Some(HashMap::from([(
+            PARENT_ROW_METADATA_KEY.into(),
+            "%%%".into(),
+        )]));
+        assert!(filter_parent_rows(&mut malformed, &keep, 3).is_err());
+        // Two surviving rows do not mean the original three rows were a 1:1
+        // transformation of the two input rows.
+        assert!(filter_parent_rows(&mut None, &keep, 2).is_err());
+    }
 }

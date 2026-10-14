@@ -352,13 +352,11 @@ pub struct ScanOptions {
     /// Indices into the bind output schema that [`Self::pushdown_filters`]
     /// references but [`Self::projection`] does not ask for.
     ///
-    /// A pushed filter is keyed by its column's position in the PROJECTED set,
-    /// while an engine is free to push a predicate on a column the query never
-    /// selects — `SELECT a FROM t WHERE b > 1` is the whole case. Left alone,
-    /// the filter's key names some other column and a worker that honours it
-    /// filters on the wrong data. So the init asks for the UNION, projection
-    /// first, and the extra columns are dropped from each batch before it
-    /// reaches the caller: [`Scan::schema`] still reports the projection alone.
+    /// Filter Encoding v2 references columns by their ORIGINAL bind-schema
+    /// index and name, independent of projection. For `SELECT a FROM t WHERE
+    /// b > 1`, the worker still needs `b` to enforce the predicate. Init asks
+    /// for the union, projection first, and extra columns are dropped from
+    /// each returned batch: [`Scan::schema`] reports the projection alone.
     ///
     /// Ignored when `projection` is `None`, because every column is being
     /// emitted already.
@@ -405,12 +403,12 @@ pub struct ScanOptions {
 /// The projection to put on the wire: the requested columns, then any
 /// filter-only column, in first-reference order.
 ///
-/// Order is load-bearing twice over. The requested columns come FIRST so
+/// The requested columns come FIRST so
 /// trimming a batch back to what the caller asked for is a prefix slice — get
 /// that wrong and one column's values are read out of another's slot, which
 /// nothing downstream can catch because both are the right length and often the
-/// right type. And a filter's key is its column's position in THIS list, which
-/// is what [`ScanOptions::wire_index_of`] computes.
+/// right type. Filter Encoding v2 column references keep their original bind
+/// indices; they are never remapped to this list.
 ///
 /// `None` projection means "emit everything", so there is nothing to add: the
 /// filter's columns are already there, and turning `None` into a list would
@@ -438,7 +436,8 @@ impl ScanOptions {
     }
 
     /// Where `column` (an index into the bind output schema) lands in the
-    /// projected set — the index a pushed filter must be keyed by.
+    /// projected batch. This is NOT a Filter Encoding v2 column index: filter
+    /// expressions must retain the original bind-schema index and name.
     ///
     /// `None` when the scan projects everything, in which case a filter keeps
     /// the bind-schema index it already has.
@@ -708,7 +707,7 @@ impl Drop for Scan<'_> {
 }
 
 /// Narrow `schema` to `ids`, or hand it back whole when there is no projection.
-fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> {
+pub(crate) fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> {
     let Some(ids) = ids else {
         return Ok(Arc::clone(schema));
     };
@@ -740,7 +739,7 @@ fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> 
 /// them, so a nullability difference here would be this client's own doing
 /// rather than the worker's — and rejecting on it would fail scans that are
 /// perfectly correct.
-fn check_batch_schema(
+pub(crate) fn check_batch_schema(
     function: &str,
     expected: &arrow_schema::Schema,
     batch: &RecordBatch,

@@ -624,6 +624,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
 
 /// Apply common metadata fields onto a `FunctionInfo`.
 fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> {
+    let filtering = meta.filter_handling()?;
     if !meta.additional_filter_functions.is_empty()
         || !meta.runtime_filter_algorithms.is_empty()
         || !meta.filter_evaluation_contexts.is_empty()
@@ -656,7 +657,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> 
     }
     fi.supports_batch_index = meta.supports_batch_index;
     fi.supports_splits = meta.supports_splits;
-    fi.filters_exactly_applied = meta.filters_exactly_applied;
+    fi.filters_exactly_applied = filtering != crate::FilterHandling::Disabled;
     fi.supports_positions = meta.supports_positions;
     fi.split_token_ttl_seconds = meta.split_token_ttl_seconds;
     if let Some(pk) = &meta.partition_kind {
@@ -1705,12 +1706,60 @@ mod tests {
     }
 
     #[test]
+    fn filter_ownership_is_validated_and_sdk_guarantee_is_published() {
+        use crate::FilterHandling;
+        for owner in [
+            FilterHandling::Disabled,
+            FilterHandling::Sdk,
+            FilterHandling::Worker,
+        ] {
+            let meta = FunctionMetadata::default().with_filter_handling(owner);
+            assert_eq!(meta.filter_handling().unwrap(), owner);
+            let mut info = default_function_info("f", "table");
+            apply_metadata(&mut info, &meta).unwrap();
+            assert_eq!(
+                info.filter_pushdown,
+                (owner != FilterHandling::Disabled).then_some(true)
+            );
+            assert_eq!(
+                info.filters_exactly_applied,
+                owner != FilterHandling::Disabled
+            );
+        }
+        let legacy_sdk = FunctionMetadata {
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        };
+        let mut info = default_function_info("f", "table");
+        apply_metadata(&mut info, &legacy_sdk).unwrap();
+        assert!(info.filters_exactly_applied);
+        assert_eq!(legacy_sdk.filter_handling().unwrap(), FilterHandling::Sdk);
+
+        for (pushdown, auto, exact) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let invalid = FunctionMetadata {
+                filter_pushdown: pushdown,
+                auto_apply_filters: auto,
+                filters_exactly_applied: exact,
+                ..Default::default()
+            };
+            let err = apply_metadata(&mut info, &invalid).unwrap_err();
+            assert!(err.to_string().contains("filter"));
+        }
+    }
+
+    #[test]
     fn filtering_defaults_to_the_standard_v1_semantic_profile_only() {
         let mut filtering = default_function_info("f", "table");
         apply_metadata(
             &mut filtering,
             &FunctionMetadata {
                 filter_pushdown: true,
+                auto_apply_filters: true,
                 ..Default::default()
             },
         )
