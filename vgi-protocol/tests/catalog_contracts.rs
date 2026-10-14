@@ -328,8 +328,8 @@ fn macro_parameter_and_overload_codecs_preserve_typed_defaults_and_expressions()
 }
 
 #[test]
-fn logical_type_and_opaque_macro_batches_preserve_metadata_and_scalar_envelopes() {
-    use arrow_array::{Array, BinaryArray};
+fn logical_type_and_opaque_macro_batches_preserve_metadata_and_variant_bytes() {
+    use arrow_array::{Array, BinaryArray, StructArray};
     use arrow_schema::DataType;
     for name in [
         "logical_tuple",
@@ -368,42 +368,66 @@ fn logical_type_and_opaque_macro_batches_preserve_metadata_and_scalar_envelopes(
         if name == "logical_struct" {
             assert!(marker.is_none());
         }
-        if name == "logical_variant_sql_null" {
-            assert!(restored.column(0).is_null(0));
-        }
-        if [
-            "logical_variant_null",
-            "logical_variant_absent",
-            "logical_variant_null_member",
-        ]
-        .contains(&name)
-        {
-            assert_eq!(marker.map(String::as_str), Some("variant"));
-            let column = restored
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap();
-            assert!(!column.is_null(0));
-            let inner = StreamReader::try_new(Cursor::new(column.value(0)), None)
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap();
-            if name == "logical_variant_null" {
-                assert_eq!(inner.schema().field(0).data_type(), &DataType::Null);
-            } else {
-                let inner_schema = inner.schema();
-                let DataType::Struct(fields) = inner_schema.field(0).data_type() else {
-                    panic!("object identity lost");
+        if name.starts_with("logical_variant_") {
+            let field = schema.field(0);
+            assert!(marker.is_none());
+            assert_eq!(
+                field
+                    .metadata()
+                    .get("ARROW:extension:name")
+                    .map(String::as_str),
+                Some("arrow.parquet.variant")
+            );
+            assert_eq!(
+                field
+                    .metadata()
+                    .get("ARROW:extension:metadata")
+                    .map(String::as_str),
+                Some("")
+            );
+            let DataType::Struct(fields) = field.data_type() else {
+                panic!("variant carrier is not a struct");
+            };
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name(), "metadata");
+            assert!(!fields[0].is_nullable());
+            assert_eq!(fields[1].name(), "value");
+            assert!(fields[1].is_nullable());
+            assert_eq!(
+                restored.column(0).is_null(0),
+                name == "logical_variant_sql_null"
+            );
+            if name != "logical_variant_sql_null" {
+                let column = restored
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let (metadata, value): (&[u8], &[u8]) = match name {
+                    "logical_variant_null" => (&[1, 0, 0], &[0]),
+                    "logical_variant_absent" => (&[1, 0, 0], &[2, 0, 0]),
+                    _ => (
+                        &[1, 1, 0, 7, b'p', b'r', b'e', b's', b'e', b'n', b't'],
+                        &[2, 1, 0, 0, 1, 0],
+                    ),
                 };
                 assert_eq!(
-                    fields.len(),
-                    if name == "logical_variant_absent" {
-                        0
-                    } else {
-                        1
-                    }
+                    column
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap()
+                        .value(0),
+                    metadata
+                );
+                assert_eq!(
+                    column
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap()
+                        .value(0),
+                    value
                 );
             }
         }
