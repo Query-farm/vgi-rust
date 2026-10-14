@@ -14,6 +14,73 @@ use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
 #[test]
+fn column_expression_metadata_retains_ipc_bytes() {
+    let mut reader =
+        StreamReader::try_new(Cursor::new(fixture("column_expression_metadata")), None).unwrap();
+    let source = reader.next().unwrap().unwrap();
+    let mut encoded = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut encoded, &source.schema()).unwrap();
+        writer.write(&source).unwrap();
+        writer.finish().unwrap();
+    }
+    let batch = StreamReader::try_new(Cursor::new(encoded), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch, source);
+    for (index, key, name) in [
+        (0, "vgi.column.default.v1", "column_default_expression"),
+        (1, "vgi.column.generated.v1", "column_generated_expression"),
+    ] {
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&batch.schema().field(index).metadata()[key])
+                .unwrap(),
+            fixture(name)
+        );
+    }
+    assert_eq!(
+        batch.schema().field(1).metadata()["vgi.column.generation.v1"],
+        "virtual"
+    );
+}
+
+#[test]
+fn canonical_constraints_preserve_all_fields_through_typed_codecs() {
+    use vgi_protocol::generated::protocol_types::*;
+    fn check<T: VgiArrow>(name: &str) {
+        let value: T = round_trip(name);
+        let original = StreamReader::try_new(Cursor::new(fixture(name)), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(to_batch(value).unwrap(), original, "{name}");
+    }
+    check::<SqlStatement>("sql_statement");
+    check::<CatalogObjectRef>("constraint_ref");
+    check::<ForeignKeyDefinition>("foreign_key_definition");
+    check::<ConstraintDefinition>("constraint_definition_not_null");
+    check::<ConstraintDefinition>("constraint_definition_unique");
+    check::<ConstraintDefinition>("constraint_definition_primary");
+    check::<ConstraintDefinition>("constraint_definition_check");
+    check::<ConstraintDefinition>("constraint_definition_foreign");
+    check::<ConstraintInfo>("constraint_info");
+    check::<ConstraintInfo>("constraint_info_untrusted");
+    check::<ConstraintChange>("constraint_change_add");
+    check::<ConstraintChange>("constraint_change_drop");
+    check::<ConstraintChange>("constraint_change_rename");
+    check::<ConstraintChange>("constraint_change_unname");
+    check::<ConstraintChange>("constraint_change_replace");
+    check::<ConstraintSnapshot>("constraint_snapshot");
+    check::<ConstraintSnapshot>("constraint_snapshot_empty");
+    check::<ConstraintsApplyRequest>("constraints_apply");
+    check::<ConstraintsApplyRequest>("constraints_apply_autocommit");
+}
+
+#[test]
 fn query_parameter_batches_preserve_mapping_metadata_and_empty_rows() {
     use arrow_array::Array;
     use arrow_schema::DataType;
