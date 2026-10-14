@@ -285,3 +285,127 @@ fn query_records_preserve_nested_contracts() {
     let declined: CatalogQueryPrepareResult = round_trip("query_declined");
     assert!(declined.prepared_query_token.is_none());
 }
+
+#[test]
+fn macro_parameter_and_overload_codecs_preserve_typed_defaults_and_expressions() {
+    use vgi_protocol::generated::protocol_types::{MacroOverload, MacroParameter};
+    for name in [
+        "macro_parameter",
+        "macro_parameter_expression",
+        "macro_parameter_untyped",
+    ] {
+        let original = StreamReader::try_new(Cursor::new(fixture(name)), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let restored: MacroParameter = round_trip(name);
+        assert_eq!(to_batch(restored).unwrap(), original, "{name}");
+    }
+    let parameter: MacroParameter = round_trip("macro_parameter");
+    assert!(parameter.declared_type.is_some() && parameter.default_value.is_some());
+    assert!(parameter.default_expression.is_none());
+    let parameter: MacroParameter = round_trip("macro_parameter_expression");
+    assert!(parameter.declared_type.is_some() && parameter.default_expression.is_some());
+    assert!(parameter.default_value.is_none());
+    let parameter: MacroParameter = round_trip("macro_parameter_untyped");
+    assert!(parameter.declared_type.is_none() && parameter.default_value.is_none());
+    let overload: MacroOverload = round_trip("macro_overload");
+    assert_eq!(
+        overload
+            .parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["x", "fallback", "scale"]
+    );
+    let original = StreamReader::try_new(Cursor::new(fixture("macro_overload")), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(to_batch(overload).unwrap(), original);
+}
+
+#[test]
+fn logical_type_and_opaque_macro_batches_preserve_metadata_and_scalar_envelopes() {
+    use arrow_array::{Array, BinaryArray};
+    use arrow_schema::DataType;
+    for name in [
+        "logical_tuple",
+        "logical_struct",
+        "logical_variant_sql_null",
+        "logical_variant_null",
+        "logical_variant_absent",
+        "logical_variant_null_member",
+        "macro_create",
+        "macro_create_legacy",
+        "macro_info",
+        "macro_info_legacy",
+    ] {
+        let original = StreamReader::try_new(Cursor::new(fixture(name)), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &original.schema()).unwrap();
+            writer.write(&original).unwrap();
+            writer.finish().unwrap();
+        }
+        let restored = StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored, original, "{name}");
+        let schema = restored.schema();
+        let marker = schema.field(0).metadata().get("vgi.logical_type.v1");
+        if name == "logical_tuple" {
+            assert_eq!(marker.map(String::as_str), Some("tuple"));
+        }
+        if name == "logical_struct" {
+            assert!(marker.is_none());
+        }
+        if name == "logical_variant_sql_null" {
+            assert!(restored.column(0).is_null(0));
+        }
+        if [
+            "logical_variant_null",
+            "logical_variant_absent",
+            "logical_variant_null_member",
+        ]
+        .contains(&name)
+        {
+            assert_eq!(marker.map(String::as_str), Some("variant"));
+            let column = restored
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert!(!column.is_null(0));
+            let inner = StreamReader::try_new(Cursor::new(column.value(0)), None)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            if name == "logical_variant_null" {
+                assert_eq!(inner.schema().field(0).data_type(), &DataType::Null);
+            } else {
+                let inner_schema = inner.schema();
+                let DataType::Struct(fields) = inner_schema.field(0).data_type() else {
+                    panic!("object identity lost");
+                };
+                assert_eq!(
+                    fields.len(),
+                    if name == "logical_variant_absent" {
+                        0
+                    } else {
+                        1
+                    }
+                );
+            }
+        }
+    }
+}

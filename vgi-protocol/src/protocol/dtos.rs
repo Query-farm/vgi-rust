@@ -1184,9 +1184,10 @@ pub struct MacroInfo {
     /// the parameter's description (UTF-8, presence-only — omitted when
     /// undocumented). Mirrors the per-argument doc channel functions expose via
     /// `FunctionInfo.arguments`. Empty means the worker supplied no per-parameter
-    /// docs (older workers); readers fall back to `parameters` for names. Appended
-    /// last for consistency with the reference wire contract.
+    /// docs (older workers); readers fall back to `parameters` for names.
     pub arguments_schema: Option<Bytes>,
+    /// Complete overload family. The legacy catalog adapter supplies None.
+    pub overloads: Option<Vec<crate::generated::protocol_types::MacroOverload>>,
 }
 
 /// `IndexInfo` item (`catalog_schema_contents_indexes`, and

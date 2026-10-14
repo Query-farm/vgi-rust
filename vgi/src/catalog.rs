@@ -1612,6 +1612,7 @@ pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos
         arguments_schema: Some(Bytes::from(
             build_macro_arguments_schema(m).unwrap_or_default(),
         )),
+        overloads: None,
     }
 }
 

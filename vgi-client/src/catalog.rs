@@ -2020,6 +2020,7 @@ mod macro_default_tests {
             }),
             definition: "val".to_string(),
             arguments_schema: None,
+            overloads: None,
         }
     }
 
