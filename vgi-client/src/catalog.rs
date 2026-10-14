@@ -731,6 +731,7 @@ impl VgiClient {
     /// Attach a catalog by name, returning the handle every later call needs.
     pub fn attach(&mut self, name: &str, options: AttachOptions) -> Result<AttachedCatalog> {
         let capabilities = ClientCapabilities {
+            query_pushdown: None,
             catalog: None,
             engine: "vgi-rust".to_string(),
             native_formats: Vec::new(),
@@ -1788,6 +1789,7 @@ mod attach_option_tests {
         let info = CatalogAttachResult {
             catalog_capabilities: None,
             selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes(vec![1]),
             supports_transactions: false,
             supports_time_travel: false,
@@ -2250,6 +2252,7 @@ mod load_catalog_tests {
         let info = CatalogAttachResult {
             catalog_capabilities: None,
             selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes(vec![1]),
             supports_transactions: false,
             supports_time_travel: false,

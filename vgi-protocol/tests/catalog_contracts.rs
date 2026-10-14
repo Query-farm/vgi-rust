@@ -14,6 +14,46 @@ use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
 #[test]
+fn query_parameter_batches_preserve_mapping_metadata_and_empty_rows() {
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+    for name in ["query_parameters", "query_empty_parameters"] {
+        let mut reader = StreamReader::try_new(Cursor::new(fixture(name)), None).unwrap();
+        let original = reader.next().unwrap().unwrap();
+        assert!(reader.next().is_none());
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &original.schema()).unwrap();
+            writer.write(&original).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
+        let restored = reader.next().unwrap().unwrap();
+        assert!(reader.next().is_none());
+        assert_eq!(restored, original);
+        assert_eq!(restored.num_rows(), 1);
+        assert_eq!(
+            restored.schema().metadata()["vgi.query.parameters.v1"],
+            if name == "query_empty_parameters" {
+                "positional"
+            } else {
+                "named"
+            }
+        );
+        if name == "query_empty_parameters" {
+            assert_eq!(restored.num_columns(), 0);
+        } else {
+            assert!(restored.column(0).is_null(0));
+            let schema = restored.schema();
+            let DataType::Struct(fields) = schema.field(1).data_type() else {
+                panic!("struct parameter lost")
+            };
+            assert_eq!(fields[0].metadata()["nested"], "retained");
+        }
+    }
+}
+
+#[test]
 fn column_request_params_preserve_raw_targets_and_nullable_fields() {
     use vgi_protocol::generated::request_params::*;
     macro_rules! check {
@@ -223,4 +263,25 @@ fn dependency_records_preserve_nested_identity_and_graph_payloads() {
     assert_eq!(graph.dependencies.len(), 3);
     let empty: DependencySnapshot = round_trip("empty_dependency_snapshot");
     assert!(empty.objects.is_empty() && empty.dependencies.is_empty());
+}
+
+#[test]
+fn query_records_preserve_nested_contracts() {
+    use vgi_protocol::generated::protocol_types::*;
+    let _: ClientQueryCapabilities = round_trip("query_offer");
+    let _: QueryCapabilities = round_trip("query_capabilities");
+    let _: QueryEvaluationContext = round_trip("query_context");
+    let _: QueryObjectReference = round_trip("query_object_reference");
+    let _: CatalogQueryPrepareRequest = round_trip("query_prepare");
+    let _: CatalogQueryPrepareResult = round_trip("query_accepted");
+    let _: CatalogQueryPrepareResult = round_trip("query_declined");
+    let request: CatalogQueryPrepareRequest = round_trip("query_prepare");
+    assert_eq!(request.evaluation_context.timezone, "UTC");
+    assert_eq!(
+        request.referenced_objects[0].object.schema_path,
+        ["one.two", "nested"]
+    );
+    assert_eq!(request.catalog_version, Some(0));
+    let declined: CatalogQueryPrepareResult = round_trip("query_declined");
+    assert!(declined.prepared_query_token.is_none());
 }

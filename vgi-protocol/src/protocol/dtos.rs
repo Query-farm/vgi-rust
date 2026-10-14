@@ -731,6 +731,7 @@ pub struct ClientCapabilities {
     pub can_stream: bool,
     pub filter_encodings: Vec<String>,
     pub catalog: Option<Bytes>,
+    pub query_pushdown: Option<crate::generated::protocol_types::ClientQueryCapabilities>,
 }
 
 /// Request for `table_function_cardinality` / `table_function_statistics`

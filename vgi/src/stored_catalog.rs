@@ -240,6 +240,7 @@ impl StoredCatalog {
         Ok(CatalogAttachResult {
             catalog_capabilities: None,
             selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: false,
             supports_time_travel: false,

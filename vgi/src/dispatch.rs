@@ -2344,6 +2344,7 @@ impl Dispatcher {
             let result = CatalogAttachResult {
                 catalog_capabilities: None,
                 selected_capabilities: None,
+                query_pushdown: None,
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
                 supports_time_travel: sec.supports_time_travel,
@@ -2444,6 +2445,7 @@ impl Dispatcher {
         let result = CatalogAttachResult {
             catalog_capabilities: None,
             selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
             supports_time_travel: self.catalog.supports_time_travel,
