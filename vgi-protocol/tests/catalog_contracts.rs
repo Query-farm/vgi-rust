@@ -14,6 +14,43 @@ use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
 #[test]
+fn typed_indexes_preserve_raw_paths_context_and_options() {
+    use vgi_protocol::generated::protocol_types::{IndexDefinition, IndexKey};
+    let column: IndexKey = round_trip("index_key_column");
+    let nested: IndexKey = round_trip("index_key_nested");
+    assert_eq!(column.column_path.unwrap(), ["a.b"]);
+    assert_eq!(nested.column_path.unwrap(), ["record", "a.b"]);
+    let expression: IndexKey = round_trip("index_key_expression");
+    assert!(expression.expression.is_some());
+    let definition: IndexDefinition = round_trip("index_definition");
+    let _: IndexDefinition = round_trip("index_definition_primary");
+    assert_eq!(definition.keys[0].0, fixture("index_key_column"));
+    assert_eq!(definition.keys[1].0, fixture("index_key_expression"));
+    assert_eq!(definition.options.0, fixture("values"));
+    let info: vgi_protocol::protocol::dtos::IndexInfo = round_trip("index_info");
+    assert_eq!(info.definition.0, fixture("index_definition"));
+    assert_eq!(info.options.0, fixture("state"));
+    for name in ["index_create", "index_create_cross_schema"] {
+        let source = StreamReader::try_new(Cursor::new(fixture(name)), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.schema(),
+            vgi_protocol::generated::protocol_schemas::index_create_request_schema()
+        );
+        let definition = source
+            .column_by_name("definition")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        assert_eq!(definition.value(0), fixture("index_definition"));
+    }
+}
+
+#[test]
 fn column_expression_metadata_retains_ipc_bytes() {
     let mut reader =
         StreamReader::try_new(Cursor::new(fixture("column_expression_metadata")), None).unwrap();

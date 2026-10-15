@@ -36,6 +36,7 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
 /// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
 /// table; this port's catalogs are read-only for DML.
 pub const UNIMPLEMENTED_METHODS: &[&str] = &[
+    "catalog_index_option_definitions",
     "catalog_table_constraints_apply",
     "catalog_table_insert_function_get",
     "catalog_table_update_function_get",

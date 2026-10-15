@@ -2435,11 +2435,8 @@ mod load_catalog_tests {
             tags: Vec::new(),
             name: "ix".to_string(),
             schema_path: vec!["main".to_string()],
-            table_name: "t".to_string(),
-            index_type: "ART".to_string(),
-            constraint_type: DictString("NONE".to_string()),
-            expressions: vec!["x".to_string()],
-            options: Vec::new(),
+            definition: Bytes(vec![1, 2, 3]),
+            options: Bytes(vec![4, 5, 6]),
         };
         let enc = |b: RecordBatch| Bytes(ipc::write_batch(&b).unwrap());
         let mut e = entry(&["main"], &["main"]);

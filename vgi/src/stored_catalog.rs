@@ -1302,6 +1302,56 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_typed_indexes_preserve_catalog_version_and_objects() {
+        use base64::Engine;
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
+        let fixture = |name: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(corpus["records"][name].as_str().unwrap())
+                .unwrap()
+        };
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_table(&["main"], "t").unwrap();
+        let before = session.version();
+        let before_tables: Vec<TableInfo> =
+            session.list("catalog_schema_contents_tables", &["main"]);
+        let create = wire::to_batch(p::CatalogIndexCreateParams {
+            request: Bytes(fixture("index_create")),
+        })
+        .unwrap();
+        assert!(session.call("catalog_index_create", create).is_err());
+        let drop = wire::to_batch(p::CatalogIndexDropParams {
+            attach_opaque_data: Bytes(b"attach".to_vec()),
+            schema_path: path(&["main"]),
+            name: "t".into(),
+            ignore_not_found: true,
+            cascade: true,
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        assert!(session.call("catalog_index_drop", drop).is_err());
+        let options = wire::to_batch(p::CatalogIndexOptionDefinitionsParams {
+            attach_opaque_data: Bytes(b"attach".to_vec()),
+            table: Bytes(fixture("object_ref")),
+            algorithm: "ART".into(),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        assert!(
+            session
+                .call("catalog_index_option_definitions", options)
+                .is_err()
+        );
+        assert_eq!(session.version(), before);
+        let after_tables: Vec<TableInfo> =
+            session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(after_tables.len(), 1);
+        assert_eq!(after_tables[0].name, before_tables[0].name);
+        assert_eq!(after_tables[0].columns.0, before_tables[0].columns.0);
+    }
+
+    #[test]
     fn unsupported_constraints_reject_before_replacement() {
         let session = Session::new(StoredCatalog::new("mem"));
         session.create_table(&["main"], "t").unwrap();

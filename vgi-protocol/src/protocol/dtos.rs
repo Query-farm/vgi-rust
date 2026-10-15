@@ -1198,12 +1198,10 @@ pub struct IndexInfo {
     pub tags: StrMap,
     pub name: String,
     pub schema_path: SchemaPath,
-    pub table_name: String,
-    pub index_type: String,
-    /// `UNIQUE` / `PRIMARY` / `FOREIGN` / `NONE` — dictionary-encoded on the wire.
-    pub constraint_type: DictString,
-    pub expressions: Vec<String>,
-    pub options: StrMap,
+    /// Complete canonical IndexDefinition IPC, without interpreting SQL or options.
+    pub definition: Bytes,
+    /// Effective typed options and explicit override names (OptionState IPC).
+    pub options: Bytes,
 }
 
 /// Boxed request of `catalog_table_create` (`CREATE TABLE` on a DDL-capable
