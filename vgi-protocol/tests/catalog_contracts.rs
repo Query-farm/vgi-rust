@@ -382,6 +382,42 @@ fn dependency_records_preserve_nested_identity_and_graph_payloads() {
     assert_eq!(trigger.owner_table.as_deref(), Some(table.name.as_str()));
     let edge: ObjectDependency = round_trip("object_dependency");
     assert_eq!(edge.kind, "owned");
+    assert!(edge.blocks_alter);
+    assert!(edge.subject_column_paths.is_none());
+    assert!(edge.dependent_column_path.is_none());
+    let membership: ObjectDependency = round_trip("dependency_membership");
+    assert!(!membership.blocks_alter);
+    assert!(membership.subject_column_paths.is_none());
+    assert!(membership.dependent_column_path.is_none());
+    let literal: ObjectDependency = round_trip("dependency_column_literal");
+    assert!(literal.blocks_alter);
+    assert_eq!(literal.subject_column_paths.unwrap(), [vec!["a.b"]]);
+    assert!(literal.dependent_column_path.is_none());
+    let nested: ObjectDependency = round_trip("dependency_column_nested");
+    assert_eq!(
+        nested.subject_column_paths.unwrap(),
+        [vec!["record", "a.b"]]
+    );
+    let generated: ObjectDependency = round_trip("dependency_generated");
+    assert_eq!(generated.dependent, generated.subject);
+    assert_eq!(generated.dependent_column_path.unwrap(), ["generated"]);
+    assert_eq!(
+        generated.subject_column_paths.unwrap(),
+        [vec!["a.b"], vec!["record", "a.b"]]
+    );
+    let chain: ObjectDependency = round_trip("dependency_generated_chain");
+    assert_eq!(chain.dependent_column_path.unwrap(), ["second.generated"]);
+    assert_eq!(chain.subject_column_paths.unwrap(), [vec!["generated"]]);
+    let columns: DependencySnapshot = round_trip("dependency_column_snapshot");
+    assert_eq!(
+        columns.dependencies,
+        [
+            vgi_rpc::Bytes(fixture("dependency_column_literal")),
+            vgi_rpc::Bytes(fixture("dependency_generated")),
+            vgi_rpc::Bytes(fixture("dependency_generated_chain"))
+        ]
+    );
+
     assert_eq!(edge.subject, vgi_rpc::Bytes(fixture("object_ref")));
     assert_eq!(edge.dependent, vgi_rpc::Bytes(fixture("trigger_ref")));
     let graph: DependencySnapshot = round_trip("dependency_snapshot");
