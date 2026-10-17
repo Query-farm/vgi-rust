@@ -855,7 +855,7 @@ fn start_grant_server() -> (u16, Arc<std::sync::Mutex<Option<Option<String>>>>) 
 }
 
 /// The grant loop, end to end over HTTP: a freshly logged-in user mints a
-/// sealed grant through `vgi_rpc.Identity.v1`'s `issue_grant`, and a vgi.v2
+/// sealed grant through `vgi_rpc.Identity.v2`'s `issue_grant`, and a vgi.v2
 /// call presenting it as `Bearer <grant>` runs authenticated as that user.
 #[test]
 fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {

@@ -65,7 +65,7 @@ pub type HostedProtocolsHook = Arc<dyn Fn() -> Vec<HostedProtocol> + Send + Sync
 
 /// The transport a worker's server is built for.
 ///
-/// Only [`ServeTransport::Http`] changes what is hosted (`vgi_rpc.Identity.v1`,
+/// Only [`ServeTransport::Http`] changes what is hosted (`vgi_rpc.Identity.v2`,
 /// when opted in); the rest are named so the decision is made in one place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServeTransport {
@@ -84,7 +84,7 @@ pub enum ServeTransport {
 
 impl ServeTransport {
     /// Transports that authenticate their callers, and so may host
-    /// `vgi_rpc.Identity.v1`: its allowlist is a list of *principals*, which
+    /// `vgi_rpc.Identity.v2`: its allowlist is a list of *principals*, which
     /// a transport without caller identity cannot check.
     fn authenticates_callers(self) -> bool {
         matches!(self, ServeTransport::Http)
@@ -96,7 +96,7 @@ impl ServeTransport {
 pub const SIGNING_KEY_ENV: &str = "VGI_SIGNING_KEY";
 
 /// Environment variable naming the principals allowed to call
-/// `vgi_rpc.Identity.v1`'s `introspect_token`, comma-separated.
+/// `vgi_rpc.Identity.v2`'s `introspect_token`, comma-separated.
 pub const INTROSPECT_PRINCIPALS_ENV: &str = "VGI_INTROSPECT_PRINCIPALS";
 
 impl Default for Worker {
@@ -391,7 +391,7 @@ impl Worker {
     /// A returned name that is malformed, repeats another, is `vgi.v2`, or
     /// claims the reserved `vgi_rpc.` prefix stops the worker at startup with
     /// an error naming this hook. Framework protocols are never supplied here:
-    /// reflection is always hosted, and `vgi_rpc.Identity.v1` is enabled with
+    /// reflection is always hosted, and `vgi_rpc.Identity.v2` is enabled with
     /// [`resolve_token`](Self::resolve_token) / [`mint_grant`](Self::mint_grant).
     ///
     /// ```
@@ -419,7 +419,7 @@ impl Worker {
         self.hosted_protocols = Some(Arc::new(hook));
     }
 
-    /// Opt into `vgi_rpc.Identity.v1`'s `introspect_token`: resolve an opaque
+    /// Opt into `vgi_rpc.Identity.v2`'s `introspect_token`: resolve an opaque
     /// bearer credential to the principal it authenticates as.
     ///
     /// For a reverse proxy that terminates the only public listener and must
@@ -451,7 +451,7 @@ impl Worker {
         self.resolve_token = Some(Arc::new(hook));
     }
 
-    /// Opt into `vgi_rpc.Identity.v1`'s `issue_grant`: mint a standing
+    /// Opt into `vgi_rpc.Identity.v2`'s `issue_grant`: mint a standing
     /// delegation credential for the calling user.
     ///
     /// The hook receives `(principal, purpose, scopes, ttl_seconds)`; the
@@ -482,10 +482,10 @@ impl Worker {
         self.introspect_principals = Some(principals.into_iter().map(Into::into).collect());
     }
 
-    /// Configure sealed grants (vgi-rpc's IDENTITY_V1_SPEC §9).
+    /// Configure sealed grants (vgi-rpc's IDENTITY_V2_SPEC §9).
     ///
     /// With grant keys, the worker's HTTP server mints sealed grants through
-    /// `vgi_rpc.Identity.v1`'s `issue_grant` -- unless the worker set its own
+    /// `vgi_rpc.Identity.v2`'s `issue_grant` -- unless the worker set its own
     /// [`mint_grant`](Self::mint_grant) -- and accepts them back as ordinary
     /// `Authorization: Bearer` credentials: automation presenting a grant is
     /// authenticated as the user it was minted for, with `domain = "grant"`.
@@ -500,7 +500,7 @@ impl Worker {
 
     /// Authenticate HTTP callers with `authenticate` instead of the
     /// environment-derived bearer configuration (`VGI_BEARER_TOKENS` /
-    /// `VGI_OPTIONAL_BEARER_TOKENS`). `vgi_rpc.Identity.v1` needs an
+    /// `VGI_OPTIONAL_BEARER_TOKENS`). `vgi_rpc.Identity.v2` needs an
     /// authenticated caller -- the introspector allowlist names principals --
     /// so a worker opting into identity normally sets this too.
     pub fn authenticate(&mut self, authenticate: vgi_rpc::Authenticate) {
@@ -540,7 +540,7 @@ impl Worker {
     /// The one construction path every transport uses: `vgi.v2`, then the
     /// [`hosted_protocols`](Self::hosted_protocols) (every transport), then
     /// `vgi_rpc.Reflection.v1` (every transport), then -- on HTTP, when opted
-    /// in -- `vgi_rpc.Identity.v1`.
+    /// in -- `vgi_rpc.Identity.v2`.
     pub fn build_server_for(self, transport: ServeTransport) -> RpcServer {
         self.build_parts(transport).0
     }
@@ -898,7 +898,7 @@ fn validated_hosted_protocols(protocols: Vec<HostedProtocol>) -> Vec<HostedProto
             panic!(
                 "{HOOK_NAME}: entry {index} is named {name:?}, which claims the reserved \
                  {:?} prefix. Framework protocols are not supplied through this hook: \
-                 reflection is hosted automatically, and vgi_rpc.Identity.v1 is enabled with \
+                 reflection is hosted automatically, and vgi_rpc.Identity.v2 is enabled with \
                  Worker::resolve_token and/or Worker::mint_grant.",
                 vgi_rpc::binding::RESERVED_PROTOCOL_PREFIX
             );
@@ -922,7 +922,7 @@ fn validated_hosted_protocols(protocols: Vec<HostedProtocol>) -> Vec<HostedProto
     protocols
 }
 
-/// Build `vgi_rpc.Identity.v1`, or `None` when the worker set neither hook --
+/// Build `vgi_rpc.Identity.v2`, or `None` when the worker set neither hook --
 /// in which case the protocol is not hosted at all. Absent beats
 /// routed-and-refusing: it is what keeps a dependency upgrade from growing a
 /// credential-to-identity oracle on every existing worker.
@@ -979,7 +979,7 @@ fn resolve_introspect_principals(explicit: Option<Vec<String>>) -> Result<Vec<St
     if principals.is_empty() {
         return Err(format!(
             "Error: this worker sets Worker::resolve_token, which hosts the\n  \
-             vgi_rpc.Identity.v1 protocol, but no introspector allowlist was\n  \
+             vgi_rpc.Identity.v2 protocol, but no introspector allowlist was\n  \
              configured. Set {INTROSPECT_PRINCIPALS_ENV} (comma-separated) or call\n  \
              Worker::introspect_principals.\n\n  \
              There is no permissive default on purpose: introspection is a\n  \
@@ -1351,7 +1351,7 @@ mod hosting_tests {
             .contains(&vgi_rpc::token_identity::IDENTITY_PROTOCOL_NAME));
     }
 
-    /// Grant keys host `vgi_rpc.Identity.v1` (sealed `issue_grant`) on HTTP
+    /// Grant keys host `vgi_rpc.Identity.v2` (sealed `issue_grant`) on HTTP
     /// only, with no allowlist needed; a worker's own `mint_grant` keeps
     /// priority, and the keys still make HTTP accept grants.
     #[test]

@@ -147,7 +147,7 @@ fn catalog_contents_enabled() -> bool {
 /// existing fixture function changes, and `vgi.v2` dispatch cannot be
 /// affected because requests route on their protocol key.
 ///
-/// With `--identity`, the worker also opts into `vgi_rpc.Identity.v1` (HTTP
+/// With `--identity`, the worker also opts into `vgi_rpc.Identity.v2` (HTTP
 /// only) under the fixed `IDENTITY_CONFORMANCE_FIXTURE.md` policy, including
 /// the auth-unavailable token and purpose, and authenticates callers from the
 /// fixture's `X-Conformance-Principal` / `X-Conformance-Auth-Time` headers.

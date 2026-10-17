@@ -42,6 +42,9 @@ sha2 = "0.10"
 # and ids. Both already in the lock file through vgi-rpc's `crypto` feature.
 base64 = "0.22"
 rand = "0.8"
+# `AttachTicket.expires_at` is a `vgi_rpc::UtcTimestamp` (a chrono instant).
+# Already in the lock file through vgi-rpc.
+chrono = { version = "0.4", default-features = false }
 vgi-protocol = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

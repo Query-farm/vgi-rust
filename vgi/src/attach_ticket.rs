@@ -4,7 +4,7 @@
 //! that user (`vgi.attach_tickets.v1`).
 //!
 //! A ticket is the *what* half of an unattended session; a sealed grant
-//! (`vgi_rpc.Identity.v1` `issue_grant`) is the *who*. While the user is
+//! (`vgi_rpc.Identity.v2` `issue_grant`) is the *who*. While the user is
 //! attached and logged in, a client asks the worker to seal the options it
 //! attached with -- secret ones included -- into a ticket only this worker can
 //! open ([`seal_attach`](ATTACH_TICKETS_PROTOCOL_NAME)). Later a runner holding
@@ -41,7 +41,7 @@ use base64::Engine as _;
 use vgi_protocol::protocol::dtos::CatalogAttachRequest;
 use vgi_rpc::error_model::{Code, ErrorDetail, FieldViolation, PreconditionViolation};
 use vgi_rpc::server::HostedProtocol;
-use vgi_rpc::{AuthContext, Bytes, MethodInfo, Result, RpcError, VgiArrow};
+use vgi_rpc::{AuthContext, Bytes, MethodInfo, Result, RpcError, UtcTimestamp, VgiArrow};
 
 use crate::dispatch::Dispatcher;
 use crate::ipc;
@@ -59,7 +59,12 @@ pub const ATTACH_TICKET_OPTION: &str = crate::catalog::RESERVED_ATTACH_OPTION;
 pub const ATTACH_TICKETS_PROTOCOL_NAME: &str = "vgi.attach_tickets.v1";
 
 /// Declared version of [`ATTACH_TICKETS_PROTOCOL_NAME`].
-pub const ATTACH_TICKETS_PROTOCOL_VERSION: &str = "1.0.0";
+///
+/// `2.0.0` made [`AttachTicket::expires_at`] a nullable
+/// `timestamp[us, tz="UTC"]` (null = no expiry); `1.0.0` carried a float64 of
+/// unix seconds with `+inf` for "no expiry". The exact major.minor check
+/// rejects a peer on the other side of that change with a version error.
+pub const ATTACH_TICKETS_PROTOCOL_VERSION: &str = "2.0.0";
 
 /// The envelope's version byte, fixed by this format and independent of any
 /// other envelope's.
@@ -575,8 +580,19 @@ pub struct SealAttachRequest {
 pub struct AttachTicket {
     /// The `vgia1.` text. Not a credential, but never logged.
     pub ticket: String,
-    /// Unix seconds after which the worker refuses it; `+inf` for no expiry.
-    pub expires_at: f64,
+    /// The UTC instant after which the worker refuses it, on the wire as a
+    /// nullable `timestamp[us, tz="UTC"]`; `None` (null) when the worker sets
+    /// no maximum lifetime.
+    pub expires_at: Option<UtcTimestamp>,
+}
+
+/// The wire expiry for a sealed lifetime: the claims' `expires_at` seconds,
+/// `0` meaning none, become a UTC instant or `None`.
+pub fn ticket_expiry(expires_at_seconds: i64) -> Option<UtcTimestamp> {
+    if expires_at_seconds == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(expires_at_seconds, 0).map(UtcTimestamp)
 }
 
 /// `seal_attach`'s params: one non-null `request` binary column.
@@ -739,11 +755,7 @@ pub(crate) fn seal_attach(
     })?;
     Ok(AttachTicket {
         ticket,
-        expires_at: if expires_at == 0 {
-            f64::INFINITY
-        } else {
-            expires_at as f64
-        },
+        expires_at: ticket_expiry(expires_at),
     })
 }
 
@@ -1097,6 +1109,39 @@ mod vector_tests {
         let err =
             redeem_attach_ticket(&request, Some(b"k"), &auth_for(Some("alice")), 0.0).unwrap_err();
         assert_eq!(err.error_kind.as_deref(), Some("attach_ticket_invalid"));
+    }
+
+    /// `AttachTicket.expires_at` is a nullable `timestamp[us, tz="UTC"]`:
+    /// null for no expiry (protocol 1.0.0's `+inf`), else the sealed second.
+    #[test]
+    fn attach_ticket_expiry_is_a_nullable_utc_timestamp() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::TimestampMicrosecondType;
+
+        let schema = wire::flat_schema::<AttachTicket>();
+        let field = schema.field_with_name("expires_at").unwrap();
+        assert_eq!(
+            field.data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(field.is_nullable());
+        assert_eq!(ATTACH_TICKETS_PROTOCOL_VERSION, "2.0.0");
+
+        let column = |expires_at: i64| {
+            let batch = wire::to_batch(AttachTicket {
+                ticket: "vgia1.x".into(),
+                expires_at: ticket_expiry(expires_at),
+            })
+            .unwrap();
+            batch.column_by_name("expires_at").unwrap().clone()
+        };
+        assert!(column(0).is_null(0), "no lifetime is null, not +inf");
+        // 2030-01-01T00:00:00Z.
+        let at = column(1_893_456_000);
+        assert_eq!(
+            at.as_primitive::<TimestampMicrosecondType>().value(0),
+            1_893_456_000_000_000
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ jobs:
   # `conformance.Secondary.v1` -- deliberately non-alphabetical, so a server
   # that sorts its listing fails -- the secondary passes the routing,
   # error-model and traceback groups, and over HTTP the fixture's opted-in
-  # `vgi_rpc.Identity.v1` passes the identity groups. Run on every transport
+  # `vgi_rpc.Identity.v2` passes the identity groups. Run on every transport
   # the worker serves.
   #
   # The suite comes from vgi-rpc-python `main`, unpinned by design (the same

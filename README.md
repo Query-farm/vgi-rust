@@ -206,7 +206,7 @@ HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
 Every transport hosts `vgi.v2`, `vgi_rpc.Reflection.v1`, and any protocols the
 worker adds with `Worker::hosted_protocols`; HTTP additionally hosts
-`vgi_rpc.Identity.v1` when the worker sets `Worker::resolve_token` and/or
+`vgi_rpc.Identity.v2` when the worker sets `Worker::resolve_token` and/or
 `Worker::mint_grant`; with a grant key (`--grant-key` / `VGI_RPC_GRANT_KEYS`)
 it mints sealed grants and accepts them back as bearer credentials. With a
 grant source and a signing key (`VGI_SIGNING_KEY`), HTTP also hosts
