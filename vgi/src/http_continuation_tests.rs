@@ -225,6 +225,8 @@ fn init_body_for_schema(
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         // The extension names the owning schema on every bind (protocol 1.1.0);
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
@@ -684,6 +686,8 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         resolved_secrets_provided,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         // The extension names the owning schema on every bind (protocol 1.1.0);
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
@@ -1026,6 +1030,8 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("count".to_string())]),
     };

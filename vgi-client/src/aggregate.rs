@@ -382,13 +382,12 @@ impl VgiClient {
             row_count: partition_batch.num_rows() as i64,
             partition_batch: Bytes(ipc::write_batch(partition_batch)?),
             output_schema: agg.raw_output_schema.clone(),
-            // `filter_mask`, `frame_stats` and `all_valid` are non-nullable
-            // `binary` in the canonical `AggregateWindowInitRequest`: "none"
-            // is the empty byte string (every worker treats it as no filter /
-            // zeroed stats / unknown validity), never a null.
-            filter_mask: Some(Bytes(Vec::new())),
-            frame_stats: Some(Bytes(Vec::new())),
-            all_valid: Some(Bytes(Vec::new())),
+            // Non-nullable `binary` in the canonical request: "none" is the
+            // empty byte string (no filter / unknown stats / unknown validity).
+            filter_mask: Bytes(Vec::new()),
+            frame_stats: Bytes(Vec::new()),
+            all_valid: Bytes(Vec::new()),
+            attach_opaque_data: None,
             schema_path: agg.schema_path.clone(),
         };
         call_unit(
@@ -424,6 +423,7 @@ impl VgiClient {
             rid: row,
             frame_starts: frames.iter().map(|f| f.0).collect(),
             frame_ends: frames.iter().map(|f| f.1).collect(),
+            attach_opaque_data: None,
             schema_path: part.schema_path.clone(),
         };
         let response: AggregateWindowResponse = call(
@@ -464,6 +464,7 @@ impl VgiClient {
             frames_per_row: frames_per_row.to_vec(),
             frame_starts: frames.iter().map(|f| f.0).collect(),
             frame_ends: frames.iter().map(|f| f.1).collect(),
+            attach_opaque_data: None,
             schema_path: part.schema_path.clone(),
         };
         let response: AggregateWindowResponse = call(
@@ -482,6 +483,7 @@ impl VgiClient {
             function_name: part.function_name.clone(),
             execution_id: part.execution_id.clone(),
             partition_id: part.partition_id,
+            attach_opaque_data: None,
             schema_path: part.schema_path.clone(),
         };
         call_unit(

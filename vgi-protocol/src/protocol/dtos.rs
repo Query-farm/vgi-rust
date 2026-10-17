@@ -122,6 +122,15 @@ pub struct BindRequest {
     /// init. Additive nullable columns — the C++ always emits them.
     pub at_unit: Option<String>,
     pub at_value: Option<String>,
+    /// `COPY ... FROM` context, present only when the bind opens a custom
+    /// COPY-FROM reader. A nested struct column, like Python's
+    /// `CopyFromContext`. The DuckDB extension omits the column entirely for an
+    /// ordinary bind; [`backfill_bind_request`] appends a null one so the
+    /// by-name decode still succeeds.
+    pub copy_from: Option<CopyFromContext>,
+    /// `COPY ... TO` context, present only when the bind opens a custom COPY-TO
+    /// sink. Same omission/backfill rules as [`Self::copy_from`].
+    pub copy_to: Option<CopyToContext>,
     /// Catalog schema that owns the function being bound. The extension sets it
     /// from the schema entry the function was registered into, so a name
     /// declared in two schemas of one catalog resolves to the right
@@ -134,13 +143,6 @@ pub struct BindRequest {
     /// declared name, unnamed varargs are `None`, and named varargs retain the
     /// caller-provided name. Outer `None` means names are unavailable.
     pub argument_names: Option<Vec<Option<String>>>,
-    // NOTE: the `copy_from` / `copy_to` struct columns are intentionally NOT
-    // derived fields here. The C++ extension only appends them to the
-    // BindRequest schema for a COPY ... FROM / COPY ... TO scan (omitting them
-    // entirely for ordinary binds — matching Python's match-by-name /
-    // default-None semantics). The `VgiArrow` derive would reject the missing
-    // column, so they are read out-of-band via [`read_copy_from`] /
-    // [`read_copy_to`] from the request batch. See `dispatch.rs`.
 }
 
 /// Backfill the [`BindRequest`] columns a *newer* protocol revision added, so a
@@ -165,7 +167,17 @@ pub fn backfill_bind_request(
         arrow_schema::DataType::Utf8,
         true,
     )));
-    let batch = ensure_nullable_columns(batch, &[("argument_names", names_type)])?;
+    let batch = ensure_nullable_columns(
+        batch,
+        &[
+            ("argument_names", names_type),
+            (
+                "copy_from",
+                <CopyFromContext as VgiArrow>::arrow_data_type(),
+            ),
+            ("copy_to", <CopyToContext as VgiArrow>::arrow_data_type()),
+        ],
+    )?;
     Ok((batch, legacy_peer))
 }
 
@@ -225,6 +237,29 @@ pub fn ensure_schema_path(
 pub fn backfill_plan_request(batch: arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
     use arrow_schema::DataType;
 
+    // `filters_complete` is a non-nullable `bool = True`: an omitted column
+    // takes the default, not null.
+    let batch = if batch.column_by_name("filters_complete").is_none() {
+        let rows = batch.num_rows();
+        let mut fields: Vec<arrow_schema::Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let mut columns = batch.columns().to_vec();
+        fields.push(arrow_schema::Field::new(
+            "filters_complete",
+            DataType::Boolean,
+            false,
+        ));
+        columns.push(Arc::new(arrow_array::BooleanArray::from(vec![true; rows])));
+        arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+            .map_err(|e| RpcError::type_error(format!("backfill plan request: {e}")))?
+    } else {
+        batch
+    };
+
     ensure_nullable_columns(
         batch,
         &[
@@ -252,7 +287,6 @@ pub fn backfill_plan_request(batch: arrow_array::RecordBatch) -> Result<arrow_ar
             ("max_splits_per_response", DataType::Int64),
             ("cursor", DataType::Binary),
             ("refined_filters", DataType::LargeBinary),
-            ("filters_complete", DataType::Boolean),
             ("start_position", DataType::Binary),
             ("end_position", DataType::Binary),
             ("order_by_column_name", DataType::Utf8),
@@ -411,12 +445,13 @@ mod backfill_tests {
     }
 
     /// A 1.1.0 peer already sends schema_path; only the newer argument-names
-    /// column is synthesized, without changing the legacy-peer classification.
+    /// column and the COPY-only `copy_from` / `copy_to` columns are
+    /// synthesized, without changing the legacy-peer classification.
     #[test]
     fn present_column_is_left_alone() {
         let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
         assert!(!legacy);
-        assert_eq!(out.num_columns(), 3);
+        assert_eq!(out.num_columns(), 5);
         assert!(out
             .column_by_name("argument_names")
             .expect("column added")
@@ -488,6 +523,9 @@ pub struct BindResponse {
 /// `InitRequest` — carried IPC-serialized inside the `request` binary column
 /// of `init`. `bind_call` is itself an IPC-serialized [`BindRequest`] (Python
 /// serializes nested dataclasses as binary), decoded separately.
+///
+/// Fields are declared in the canonical Python `InitRequest` order, so the
+/// derived schema is exactly the generated one (see `tests/request_dto_parity.rs`).
 #[derive(Debug, Clone, VgiArrow)]
 pub struct InitRequest {
     pub bind_call: Bytes,
@@ -496,7 +534,20 @@ pub struct InitRequest {
     pub projection_ids: Option<Vec<i64>>,
     pub pushdown_filters: Option<LargeBytes>,
     pub join_keys: Option<Vec<LargeBytes>>,
+    /// The framework-stamped split envelopes this init redeems.
+    ///
+    /// A LIST, though DuckDB always sends exactly one: DataFusion's
+    /// `partition_count()` IS its concurrency, so it bin-packs at planning time
+    /// and must read a whole group per partition — without the list that is N
+    /// sequential inits per partition. A worker handed several concatenates
+    /// them into one stream in the order given.
+    pub split_tokens: Option<Vec<LargeBytes>>,
+    /// A plain fetch limit, distinct from `order_by_limit` (which is a field OF
+    /// the Top-N hint). Always `None` from DuckDB — `TableFunctionInitInput`
+    /// carries no limit; DataFusion supplies it via `TableProvider::scan`.
+    pub row_limit: Option<i64>,
     pub phase: Option<DictString>,
+    pub finalize_state_id: Option<Bytes>,
     pub execution_id: Option<Bytes>,
     pub init_opaque_data: Option<Bytes>,
     /// Per-substream identity for parallel streaming table-in-out functions.
@@ -520,19 +571,6 @@ pub struct InitRequest {
     pub order_by_limit: Option<i64>,
     pub tablesample_percentage: Option<f64>,
     pub tablesample_seed: Option<i64>,
-    pub finalize_state_id: Option<Bytes>,
-    /// The framework-stamped split envelopes this init redeems.
-    ///
-    /// A LIST, though DuckDB always sends exactly one: DataFusion's
-    /// `partition_count()` IS its concurrency, so it bin-packs at planning time
-    /// and must read a whole group per partition — without the list that is N
-    /// sequential inits per partition. A worker handed several concatenates
-    /// them into one stream in the order given.
-    pub split_tokens: Option<Vec<LargeBytes>>,
-    /// A plain fetch limit, distinct from `order_by_limit` (which is a field OF
-    /// the Top-N hint). Always `None` from DuckDB — `TableFunctionInitInput`
-    /// carries no limit; DataFusion supplies it via `TableProvider::scan`.
-    pub row_limit: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,10 +609,12 @@ pub struct TableFunctionPlanRequest {
     /// checkpointed and must survive restarts, upgrades and key rotation.
     pub cursor: Option<Bytes>,
     /// Narrows FUTURE splits only; splits already emitted under a looser filter
-    /// stay valid. `filters_complete = Some(false)` says more narrowing may
+    /// stay valid. `filters_complete = false` says more narrowing may
     /// arrive, so a worker may hold splits back.
     pub refined_filters: Option<LargeBytes>,
-    pub filters_complete: Option<bool>,
+    /// Non-nullable, default `true` (Python `filters_complete: bool = True`);
+    /// [`backfill_plan_request`] supplies `true` when a peer omits it.
+    pub filters_complete: bool,
     /// The range in the DATA. A null `end_position` means "as of now": the
     /// worker resolves the frontier and reports it back.
     pub start_position: Option<Bytes>,
@@ -756,9 +796,13 @@ pub struct AggregateWindowInitRequest {
     pub row_count: i64,
     pub partition_batch: Bytes,
     pub output_schema: Bytes,
-    pub filter_mask: Option<Bytes>,
-    pub frame_stats: Option<Bytes>,
-    pub all_valid: Option<Bytes>,
+    /// Packed-bit bool mask from a `FILTER (WHERE ...)` clause; empty = none.
+    pub filter_mask: Bytes,
+    /// DuckDB's frame statistics as 4× little-endian int64; empty = unknown.
+    pub frame_stats: Bytes,
+    /// One byte per input column; empty = unknown.
+    pub all_valid: Bytes,
+    pub attach_opaque_data: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
@@ -775,6 +819,7 @@ pub struct AggregateWindowRequest {
     pub rid: i64,
     pub frame_starts: Vec<i64>,
     pub frame_ends: Vec<i64>,
+    pub attach_opaque_data: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
@@ -793,6 +838,7 @@ pub struct AggregateWindowBatchRequest {
     pub frames_per_row: Vec<i64>,
     pub frame_starts: Vec<i64>,
     pub frame_ends: Vec<i64>,
+    pub attach_opaque_data: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
@@ -812,6 +858,7 @@ pub struct AggregateWindowDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
     pub partition_id: i64,
+    pub attach_opaque_data: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.
@@ -1410,6 +1457,8 @@ pub struct TableBufferingCombineResponse {
 pub struct TableBufferingDestructorRequest {
     pub function_name: String,
     pub execution_id: Bytes,
+    pub attach_opaque_data: Option<Bytes>,
+    pub transaction_id: Option<Bytes>,
     /// Catalog schema that declares the function. A name is unique only within
     /// a schema, so this is what lets the worker resolve `(schema, name)` on an
     /// RPC that re-resolves by name; `None` when the caller names no schema.

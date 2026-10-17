@@ -309,6 +309,8 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
+            copy_from: None,
+            copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
         };

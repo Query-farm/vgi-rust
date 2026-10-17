@@ -221,6 +221,8 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("value".to_string())]),
     };

@@ -850,6 +850,8 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
+            copy_from: None,
+            copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
         };
@@ -1303,7 +1305,7 @@ impl VgiClient {
                 max_splits_per_response: opts.max_splits_per_response,
                 cursor: cursor.clone(),
                 refined_filters: opts.refined_filters.clone().map(LargeBytes),
-                filters_complete: Some(opts.filters_complete.unwrap_or(true)),
+                filters_complete: opts.filters_complete.unwrap_or(true),
                 start_position: opts.start_position.clone().map(Bytes),
                 end_position: opts.end_position.clone().map(Bytes),
                 order_by_column_name: opts.order_by.as_ref().map(|o| o.column.clone()),
@@ -2300,7 +2302,7 @@ mod tests {
         assert_eq!(requests[1].cursor.as_ref().unwrap().0, b"next");
         assert_eq!(requests[0].join_keys.as_ref().unwrap()[0].0, b"keys");
         assert_eq!(requests[0].max_splits_per_response, Some(1));
-        assert_eq!(requests[0].filters_complete, Some(false));
+        assert!(!requests[0].filters_complete);
         assert_eq!(requests[0].order_by_column_name.as_deref(), Some("c"));
         assert_eq!(requests[0].tablesample_seed, Some(42));
 

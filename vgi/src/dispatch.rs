@@ -4435,7 +4435,7 @@ impl Dispatcher {
         let cached = Arc::new(Self::decode_window_partition(
             &dto.partition_batch.0,
             &dto.output_schema.0,
-            dto.filter_mask.as_ref().map(|m| m.0.as_slice()),
+            Some(dto.filter_mask.0.as_slice()),
         )?);
         // Cache the partition (input columns + output schema + filter mask) so
         // the window / window_batch calls — possibly in another pooled worker —
@@ -4450,11 +4450,11 @@ impl Dispatcher {
             &Self::win_key(dto.partition_id, "o"),
             &dto.output_schema.0,
         );
-        if let Some(m) = &dto.filter_mask {
+        if !dto.filter_mask.0.is_empty() {
             self.store.kv_put(
                 &dto.execution_id.0,
                 &Self::win_key(dto.partition_id, "m"),
-                &m.0,
+                &dto.filter_mask.0,
             );
         } else {
             self.store
@@ -5381,6 +5381,20 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
             true,
         )));
         crate::protocol::dtos::ensure_nullable_columns(batch, &[("argument_names", names_type)])?
+    } else if req.method == "table_buffering_destructor" {
+        // Optional columns of the canonical request that older peers omit.
+        crate::protocol::dtos::ensure_nullable_columns(
+            batch,
+            &[
+                ("attach_opaque_data", arrow_schema::DataType::Binary),
+                ("transaction_id", arrow_schema::DataType::Binary),
+            ],
+        )?
+    } else if req.method.starts_with("aggregate_window") {
+        crate::protocol::dtos::ensure_nullable_columns(
+            batch,
+            &[("attach_opaque_data", arrow_schema::DataType::Binary)],
+        )?
     } else {
         batch
     };

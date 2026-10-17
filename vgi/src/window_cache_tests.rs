@@ -82,9 +82,10 @@ fn init(dispatcher: &Dispatcher, exec: &[u8], id: i64, mask: Option<Vec<u8>>) {
             row_count: 3,
             partition_batch: Bytes::from(ipc::write_batch(&partition).unwrap()),
             output_schema: Bytes::from(ipc::write_schema_ref(&partition.schema()).unwrap()),
-            filter_mask: mask.map(Bytes::from),
-            frame_stats: None,
-            all_valid: None,
+            filter_mask: Bytes::from(mask.unwrap_or_default()),
+            frame_stats: Bytes::from(Vec::new()),
+            all_valid: Bytes::from(Vec::new()),
+            attach_opaque_data: None,
             schema_path: None,
         }))
         .unwrap();
@@ -159,6 +160,7 @@ fn reinit_and_destructors_release_partitions_and_masks() {
             function_name: "test".into(),
             execution_id: Bytes::from(b"exec".to_vec()),
             partition_id: 1,
+            attach_opaque_data: None,
             schema_path: None,
         }))
         .unwrap();
@@ -195,6 +197,7 @@ fn another_workers_destructor_is_observed_on_next_admission() {
             function_name: "test".into(),
             execution_id: Bytes::from(b"exec".to_vec()),
             partition_id: 1,
+            attach_opaque_data: None,
             schema_path: None,
         }))
         .unwrap();
