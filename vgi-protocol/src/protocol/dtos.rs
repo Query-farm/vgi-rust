@@ -661,9 +661,9 @@ pub struct PartitionTransform {
 pub struct SortField {
     /// Output-schema column that is ordered.
     pub column: String,
-    /// `asc` or `desc`.
+    /// `OrderByDirection` member name: `ASC` or `DESC`.
     pub direction: DictString,
-    /// `nulls_first` or `nulls_last`.
+    /// `OrderByNullOrder` member name: `NULLS_FIRST` or `NULLS_LAST`.
     pub nulls: DictString,
 }
 
@@ -1535,14 +1535,14 @@ mod federation_tests {
 
         let sort = SortField {
             column: "event_time".to_string(),
-            direction: DictString("desc".to_string()),
-            nulls: DictString("nulls_last".to_string()),
+            direction: DictString("DESC".to_string()),
+            nulls: DictString("NULLS_LAST".to_string()),
         };
         let batch = crate::wire::to_batch(sort).unwrap();
         let back: SortField = crate::wire::from_batch(&batch).unwrap();
         assert_eq!(back.column, "event_time");
-        assert_eq!(back.direction.0, "desc");
-        assert_eq!(back.nulls.0, "nulls_last");
+        assert_eq!(back.direction.0, "DESC");
+        assert_eq!(back.nulls.0, "NULLS_LAST");
     }
 
     #[test]

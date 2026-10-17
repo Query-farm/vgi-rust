@@ -5521,8 +5521,13 @@ fn opt_schema(field: &Option<Bytes>) -> Result<Option<SchemaRef>> {
     }
 }
 
-/// Normalize a DuckDB function-type filter (`"SCALAR_FUNCTION"`, `"scalar"`,
-/// …) to the short lowercase form; `None` means "no filter".
+/// Normalize a function-type value to the short lowercase form used for
+/// internal matching; `None` means "no filter".
+///
+/// Accepts the canonical wire spellings — a `FunctionType` member name
+/// (`"SCALAR"`, `"TABLE_BUFFERING"`, as `BindRequest.function_type` carries) or
+/// a `SchemaObjectType` member name (`"SCALAR_FUNCTION"`, as the listing
+/// `type` filter carries) — and, leniently, the legacy lower-case forms.
 fn normalize_function_type(t: &str) -> Option<String> {
     if t.is_empty() {
         return None;
@@ -5929,15 +5934,15 @@ mod scope_tests {
         assert_eq!(
             identity,
             vec![
-                ("before", "data".to_string(), "scalar", "before"),
-                ("overloaded", "main".to_string(), "scalar", "int overload"),
+                ("before", "data".to_string(), "SCALAR", "before"),
+                ("overloaded", "main".to_string(), "SCALAR", "int overload"),
                 (
                     "overloaded",
                     "data".to_string(),
-                    "scalar",
+                    "SCALAR",
                     "string overload"
                 ),
-                ("after", "main".to_string(), "scalar", "after"),
+                ("after", "main".to_string(), "SCALAR", "after"),
             ]
         );
     }

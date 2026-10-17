@@ -16,6 +16,7 @@ use vgi_protocol::protocol::dtos::{
     FunctionInfo, IndexInfo, MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult,
     SchemaContents, SchemaInfo, TableInfo, ViewInfo,
 };
+use vgi_protocol::protocol::enums;
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
 
@@ -581,9 +582,9 @@ impl OnConflict {
     fn dict(self) -> DictString {
         DictString(
             match self {
-                Self::Error => "error",
-                Self::Ignore => "ignore",
-                Self::Replace => "replace",
+                Self::Error => enums::on_conflict::ERROR,
+                Self::Ignore => enums::on_conflict::IGNORE,
+                Self::Replace => enums::on_conflict::REPLACE,
             }
             .to_string(),
         )
@@ -1531,6 +1532,19 @@ fn validate_scan_branches(branches: &[ScanBranch]) -> Result<()> {
 }
 
 #[cfg(test)]
+mod enum_wire_tests {
+    use super::*;
+
+    /// `on_conflict` is Python's `OnConflict`: member names on the wire.
+    #[test]
+    fn on_conflict_is_a_python_member_name() {
+        assert_eq!(OnConflict::Error.dict().0, "ERROR");
+        assert_eq!(OnConflict::Ignore.dict().0, "IGNORE");
+        assert_eq!(OnConflict::Replace.dict().0, "REPLACE");
+    }
+}
+
+#[cfg(test)]
 mod attach_option_tests {
     use std::sync::{Arc, Mutex};
 
@@ -1930,7 +1944,7 @@ mod macro_default_tests {
             tags: Vec::new(),
             name: "clamp".to_string(),
             schema_path: vec!["main".to_string()],
-            macro_type: DictString("scalar".to_string()),
+            macro_type: DictString(enums::macro_type::SCALAR.to_string()),
             parameters: parameters.iter().map(|value| value.to_string()).collect(),
             parameter_default_values: defaults.map(|batch| {
                 Bytes::from(vgi_protocol::ipc::write_batch(&batch).expect("encode defaults"))
@@ -2340,7 +2354,7 @@ mod load_catalog_tests {
             schema_path: vec!["main".to_string()],
             table_name: "t".to_string(),
             index_type: "ART".to_string(),
-            constraint_type: DictString("NONE".to_string()),
+            constraint_type: DictString(enums::index_constraint_type::NONE.to_string()),
             expressions: vec!["x".to_string()],
             options: Vec::new(),
         };

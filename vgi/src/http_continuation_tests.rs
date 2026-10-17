@@ -216,7 +216,7 @@ fn init_body_for_schema(
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         input_schema: None,
         settings: None,
         secrets: None,
@@ -675,7 +675,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table_buffering".to_string()),
+        function_type: DictString("TABLE_BUFFERING".to_string()),
         input_schema: None,
         settings: None,
         secrets: None,
@@ -1015,7 +1015,7 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         // A table-in-out bind carries the input schema; FINALIZE reuses the
         // same bind call the INPUT phase used.
         input_schema: Some(Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap())),

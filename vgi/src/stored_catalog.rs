@@ -1039,7 +1039,7 @@ mod tests {
                 schema_path: path(schema),
                 name: name.to_string(),
                 columns: Bytes::from(crate::ipc::write_schema(&columns).unwrap()),
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 not_null_constraints: vec![0],
                 unique_constraints: Vec::new(),
                 check_constraints: Vec::new(),
@@ -1059,7 +1059,7 @@ mod tests {
             let batch = wire::to_batch(p::CatalogSchemaCreateParams {
                 attach_opaque_data: Bytes::from(b"attach".to_vec()),
                 path: path(schema),
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 comment: Some("made here".to_string()),
                 tags: None,
                 transaction_opaque_data: None,
@@ -1404,7 +1404,7 @@ mod tests {
                 schema_path: path(&["main"]),
                 name: name.to_string(),
                 definition: "SELECT 1".to_string(),
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 transaction_opaque_data: None,
             })
             .unwrap();

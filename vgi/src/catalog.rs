@@ -1569,10 +1569,10 @@ pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos
         tags: Vec::new(),
         name: m.name.clone(),
         schema_path: schema_path.to_vec(),
-        macro_type: DictString(if m.table_macro {
-            "table".into()
+        macro_type: enums::dict(if m.table_macro {
+            enums::macro_type::TABLE
         } else {
-            "scalar".into()
+            enums::macro_type::SCALAR
         }),
         parameters: m.parameters.clone(),
         parameter_default_values: Some(Bytes::from(
@@ -1880,6 +1880,53 @@ mod tests {
         let mut table = default_function_info("bad", enums::function_type::TABLE);
         let err = apply_argument_monotonicity(&mut table, &declared, &args, false).unwrap_err();
         assert!(err.to_string().contains("only valid for scalar"));
+    }
+
+    /// The raw dictionary value of one enum column in a serialized item.
+    fn wire_enum(item: &Bytes, column: &str) -> String {
+        use arrow_array::{cast::AsArray, types::Int16Type};
+        let batch = ipc::read_batch(&item.0).unwrap();
+        let col = batch.column_by_name(column).unwrap();
+        let dict = col.as_dictionary::<Int16Type>();
+        let values = dict.values().as_string::<i32>();
+        values.value(dict.keys().value(0) as usize).to_string()
+    }
+
+    /// `FunctionInfo.function_type` and `MacroInfo.macro_type` cross the wire
+    /// as the Python enum member NAME. vgi-rust used to write the lower-case
+    /// `.value` (`"scalar"`, `"table"`, …), which the DuckDB extension's strict
+    /// generated decoders reject.
+    #[test]
+    fn function_and_macro_types_are_python_member_names() {
+        for (ft, wire) in [
+            (enums::function_type::SCALAR, "SCALAR"),
+            (enums::function_type::TABLE, "TABLE"),
+            (enums::function_type::TABLE_BUFFERING, "TABLE_BUFFERING"),
+            (enums::function_type::AGGREGATE, "AGGREGATE"),
+        ] {
+            let items = serialize_items(vec![default_function_info("f", ft)]).unwrap();
+            assert_eq!(wire_enum(&items[0], "function_type"), wire);
+            assert_eq!(wire_enum(&items[0], "partition_kind"), "NOT_PARTITIONED");
+            assert_eq!(
+                wire_enum(&items[0], "order_dependent"),
+                "NOT_ORDER_DEPENDENT"
+            );
+            assert_eq!(
+                wire_enum(&items[0], "distinct_dependent"),
+                "NOT_DISTINCT_DEPENDENT"
+            );
+        }
+        for (table_macro, wire) in [(false, "SCALAR"), (true, "TABLE")] {
+            let m = CatMacro {
+                name: "m".to_string(),
+                parameters: vec!["a".to_string()],
+                definition: "a".to_string(),
+                table_macro,
+                ..Default::default()
+            };
+            let items = serialize_items(vec![macro_info(&path("main"), &m)]).unwrap();
+            assert_eq!(wire_enum(&items[0], "macro_type"), wire);
+        }
     }
 
     #[test]

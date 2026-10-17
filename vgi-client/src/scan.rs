@@ -26,6 +26,7 @@ use vgi_protocol::protocol::dtos::{
     GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse, ScanSplit, SortField,
     TableFunctionPlanRequest,
 };
+use vgi_protocol::protocol::enums;
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString, LargeBytes, VgiArrow};
@@ -63,14 +64,16 @@ pub enum FunctionType {
 }
 
 impl FunctionType {
-    /// The wire spelling.
+    /// The wire spelling: the Python `FunctionType` **member name**.
+    ///
+    /// `FunctionType` has no table-in-out member — a streaming table-in-out
+    /// function binds as `TABLE`, exactly as the DuckDB extension sends it.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Table => "table",
-            Self::TableBuffering => "table_buffering",
-            Self::TableInOut => "table_in_out",
-            Self::Scalar => "scalar",
-            Self::Aggregate => "aggregate",
+            Self::Table | Self::TableInOut => enums::function_type::TABLE,
+            Self::TableBuffering => enums::function_type::TABLE_BUFFERING,
+            Self::Scalar => enums::function_type::SCALAR,
+            Self::Aggregate => enums::function_type::AGGREGATE,
         }
     }
 }
@@ -298,8 +301,8 @@ pub enum SortDirection {
 impl SortDirection {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Ascending => "asc",
-            Self::Descending => "desc",
+            Self::Ascending => enums::order_by_direction::ASC,
+            Self::Descending => enums::order_by_direction::DESC,
         }
     }
 }
@@ -316,8 +319,8 @@ pub enum NullOrder {
 impl NullOrder {
     fn as_str(self) -> &'static str {
         match self {
-            Self::First => "nulls_first",
-            Self::Last => "nulls_last",
+            Self::First => enums::order_by_null_order::NULLS_FIRST,
+            Self::Last => enums::order_by_null_order::NULLS_LAST,
         }
     }
 }
@@ -1198,8 +1201,14 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
 
     for sort in plan.sort_order.iter().flatten() {
         if bound.output_schema().field_with_name(&sort.column).is_err()
-            || !matches!(sort.direction.0.as_str(), "asc" | "desc")
-            || !matches!(sort.nulls.0.as_str(), "nulls_first" | "nulls_last")
+            || !matches!(
+                sort.direction.0.as_str(),
+                enums::order_by_direction::ASC | enums::order_by_direction::DESC
+            )
+            || !matches!(
+                sort.nulls.0.as_str(),
+                enums::order_by_null_order::NULLS_FIRST | enums::order_by_null_order::NULLS_LAST
+            )
         {
             return Err(RpcError::runtime_error(format!(
                 "function `{}`: invalid sort field for column `{}` ({}, {})",
@@ -1405,6 +1414,22 @@ mod tests {
                 .map(|(n, t)| Field::new(*n, t.clone(), true))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// `BindRequest.function_type`, `InitRequest.order_by_direction` /
+    /// `order_by_null_order` are Python enums: the wire carries the member
+    /// NAME. There is no `TABLE_IN_OUT` member — table-in-out binds as `TABLE`.
+    #[test]
+    fn enum_wire_spellings_are_python_member_names() {
+        assert_eq!(FunctionType::Table.as_str(), "TABLE");
+        assert_eq!(FunctionType::TableInOut.as_str(), "TABLE");
+        assert_eq!(FunctionType::TableBuffering.as_str(), "TABLE_BUFFERING");
+        assert_eq!(FunctionType::Scalar.as_str(), "SCALAR");
+        assert_eq!(FunctionType::Aggregate.as_str(), "AGGREGATE");
+        assert_eq!(SortDirection::Ascending.as_str(), "ASC");
+        assert_eq!(SortDirection::Descending.as_str(), "DESC");
+        assert_eq!(NullOrder::First.as_str(), "NULLS_FIRST");
+        assert_eq!(NullOrder::Last.as_str(), "NULLS_LAST");
     }
 
     #[test]
@@ -2130,8 +2155,8 @@ mod tests {
             })?;
             let sort = wire::to_batch(SortField {
                 column: "c".to_string(),
-                direction: DictString("asc".to_string()),
-                nulls: DictString("nulls_last".to_string()),
+                direction: DictString(enums::order_by_direction::ASC.to_string()),
+                nulls: DictString(enums::order_by_null_order::NULLS_LAST.to_string()),
             })?;
             let response = PlanResponse {
                 splits: vec![Bytes(ipc::write_batch(&split)?)],

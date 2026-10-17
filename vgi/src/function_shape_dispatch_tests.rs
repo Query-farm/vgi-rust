@@ -210,7 +210,7 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         input_schema: input_schema
             .map(|s| Bytes::from(ipc::write_schema(s).unwrap()))
             .or(None),
