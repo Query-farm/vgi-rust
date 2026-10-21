@@ -283,9 +283,9 @@ impl CatalogContentsResponse {
             let schema = target(&mut schemas, &paths, &row.schema_path)?;
             let kind = row.function_type.0.as_str();
             let items = match kind {
-                "scalar" | "SCALAR_FUNCTION" => &mut schema.scalar_functions,
-                "aggregate" | "AGGREGATE_FUNCTION" => &mut schema.aggregate_functions,
-                "table" | "table_buffering" | "table_in_out" | "TABLE_FUNCTION" => {
+                "SCALAR" | "scalar" | "SCALAR_FUNCTION" => &mut schema.scalar_functions,
+                "AGGREGATE" | "aggregate" | "AGGREGATE_FUNCTION" => &mut schema.aggregate_functions,
+                "TABLE" | "TABLE_BUFFERING" | "table" | "table_buffering" | "table_in_out" | "TABLE_FUNCTION" => {
                     &mut schema.table_functions
                 }
                 _ => {
@@ -299,8 +299,8 @@ impl CatalogContentsResponse {
         for row in decode_collection::<MacroInfo>(self.macros.as_ref())? {
             let schema = target(&mut schemas, &paths, &row.schema_path)?;
             let items = match row.macro_type.0.as_str() {
-                "scalar" | "SCALAR_MACRO" => &mut schema.scalar_macros,
-                "table" | "TABLE_MACRO" => &mut schema.table_macros,
+                "SCALAR" | "scalar" | "SCALAR_MACRO" => &mut schema.scalar_macros,
+                "TABLE" | "table" | "TABLE_MACRO" => &mut schema.table_macros,
                 other => {
                     return Err(RpcError::type_error(format!(
                         "unsupported catalog macro type {other}"
