@@ -524,7 +524,7 @@ impl Dispatcher {
 
     /// The stored catalog and session a request's `attach_opaque_data` names,
     /// with the raw handle.
-    fn stored_session(
+    pub(crate) fn stored_session(
         &self,
         req: &Request,
     ) -> Option<(&crate::stored_catalog::StoredCatalog, Vec<u8>, Vec<u8>)> {
@@ -2216,7 +2216,7 @@ impl Dispatcher {
     /// The catalog active for a request, decoded from its `attach_opaque_data`
     /// (a secondary catalog when the secondary marker is present, else the
     /// primary). See [`decode_secondary_opaque`].
-    fn active_catalog<'a>(&'a self, req: &Request) -> &'a catalog::CatalogModel {
+    pub(crate) fn active_catalog<'a>(&'a self, req: &Request) -> &'a catalog::CatalogModel {
         if let Some((name, _)) = read_binary_col(req, "attach_opaque_data")
             .as_deref()
             .and_then(decode_secondary_opaque)
@@ -2740,7 +2740,7 @@ impl Dispatcher {
     /// `SPLIT_SNAPSHOT_EXPIRED` is "re-run the query", which re-plans, mints the
     /// same mismatch and fails again. A livelock returning no rows, blaming the
     /// data for moving when it has not.
-    const CATALOG_VERSION: i64 = 1;
+    pub(crate) const CATALOG_VERSION: i64 = 1;
 
     /// The live anchor a split token must still name.
     fn split_live_anchor(&self) -> Vec<u8> {
@@ -2932,12 +2932,7 @@ impl Dispatcher {
             let cached = self.cached_contents(req, key)?;
             if let (Some(etag), Some(inm)) = (&cached.etag, &if_none_match) {
                 if etag == inm {
-                    return Ok(Some(wire::to_result_batch(CatalogContentsResponse {
-                        catalog_version: Self::CATALOG_VERSION,
-                        etag: Some(etag.clone()),
-                        not_modified: true,
-                        schemas: Vec::new(),
-                    })?));
+                    return Ok(Some(wire::to_result_batch(CatalogContentsResponse::unchanged(Self::CATALOG_VERSION, etag.clone()))?));
                 }
             }
             return Ok(Some(cached.response.clone()));
@@ -5487,7 +5482,7 @@ fn read_string_list_col(req: &Request, name: &str) -> Result<Vec<String>> {
 }
 
 /// Read a nullable string column's row-0 value, if present and non-null.
-fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
+pub(crate) fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
     let col = req.column(name)?;
     if col.is_null(0) {
         return None;
@@ -5496,7 +5491,7 @@ fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
 }
 
 /// Read a (binary) column's row-0 bytes from a request, if present and non-null.
-fn read_binary_col(req: &Request, name: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_binary_col(req: &Request, name: &str) -> Option<Vec<u8>> {
     let col = req.column(name)?;
     col.as_any()
         .downcast_ref::<arrow_array::BinaryArray>()
@@ -6681,7 +6676,7 @@ mod catalog_contents_tests {
         let resp = contents(&d);
         assert_eq!(resp.catalog_version, Dispatcher::CATALOG_VERSION);
         let paths: Vec<Vec<String>> = resp
-            .schemas
+            .schema_contents().unwrap()
             .iter()
             .map(|sc| decode::<SchemaInfo>(&sc.schema).path)
             .collect();
@@ -6690,7 +6685,7 @@ mod catalog_contents_tests {
             [path(&["data"]), path(&["main"]), path(&["data", "deep"])]
         );
         // The struct's `path` names the schema without decoding SchemaInfo.
-        let named: Vec<Vec<String>> = resp.schemas.iter().map(|sc| sc.path.clone()).collect();
+        let named: Vec<Vec<String>> = resp.schema_contents().unwrap().iter().map(|sc| sc.path.clone()).collect();
         assert_eq!(named, paths);
         // No provider and no content hash: no etag, never not_modified.
         assert_eq!(resp.etag, None);
@@ -6707,7 +6702,7 @@ mod catalog_contents_tests {
         .unwrap();
         let mut listed = items(d.handle_catalog_schemas(&request("catalog_schemas", batch)));
         let mut bulk: Vec<Bytes> = contents(&d)
-            .schemas
+            .schema_contents().unwrap()
             .iter()
             .map(|sc| sc.schema.clone())
             .collect();
@@ -6725,7 +6720,7 @@ mod catalog_contents_tests {
     fn every_kind_equals_its_per_schema_rpc_byte_for_byte() {
         let d = dispatcher();
         let mut non_empty = 0;
-        for sc in &contents(&d).schemas {
+        for sc in &contents(&d).schema_contents().unwrap() {
             let path = decode::<SchemaInfo>(&sc.schema).path;
             let bulk = [
                 &sc.tables,
@@ -6771,10 +6766,10 @@ mod catalog_contents_tests {
     /// ordered `Vec` of pairs.
     #[test]
     fn items_encode_deterministically() {
-        let first = catalog_contents_digest(&contents(&dispatcher()).schemas);
+        let first = catalog_contents_digest(&contents(&dispatcher()).schema_contents().unwrap());
         for _ in 0..8 {
             assert_eq!(
-                catalog_contents_digest(&contents(&dispatcher()).schemas),
+                catalog_contents_digest(&contents(&dispatcher()).schema_contents().unwrap()),
                 first
             );
         }
@@ -6788,7 +6783,7 @@ mod catalog_contents_tests {
         let resp = contents_if(&d, Some("anything")).unwrap();
         assert!(!resp.not_modified);
         assert_eq!(resp.etag, None);
-        assert_eq!(resp.schemas.len(), 3);
+        assert_eq!(resp.schema_contents().unwrap().len(), 3);
     }
 
     /// A generation-counter provider that counts how often it builds.
@@ -6824,12 +6819,12 @@ mod catalog_contents_tests {
         let full = contents(&d);
         let etag = full.etag.clone().expect("the provider returns an etag");
         assert!(!full.not_modified);
-        assert_eq!(full.schemas.len(), 3);
+        assert_eq!(full.schema_contents().unwrap().len(), 3);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         let same = contents_if(&d, Some(&etag)).unwrap();
         assert!(same.not_modified);
-        assert!(same.schemas.is_empty());
+        assert!(same.schema_contents().unwrap().is_empty());
         assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
         assert_eq!(same.catalog_version, Dispatcher::CATALOG_VERSION);
         assert_eq!(
@@ -6841,7 +6836,7 @@ mod catalog_contents_tests {
         let stale = contents_if(&d, Some("gen-stale")).unwrap();
         assert!(!stale.not_modified);
         assert_eq!(stale.etag.as_deref(), Some(etag.as_str()));
-        assert_eq!(stale.schemas.len(), 3);
+        assert_eq!(stale.schema_contents().unwrap().len(), 3);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
@@ -6893,15 +6888,15 @@ mod catalog_contents_tests {
         let d = hashed();
         let full = contents(&d);
         let etag = full.etag.clone().expect("content-hash sets an etag");
-        assert_eq!(etag, catalog_contents_digest(&full.schemas));
+        assert_eq!(etag, crate::catalog_contents::catalog_response_digest(&full));
         for _ in 0..4 {
             assert_eq!(contents(&hashed()).etag.as_deref(), Some(etag.as_str()));
         }
         let same = contents_if(&d, Some(&etag)).unwrap();
-        assert!(same.not_modified && same.schemas.is_empty());
+        assert!(same.not_modified && same.schema_contents().unwrap().is_empty());
         let other = contents_if(&d, Some("0000")).unwrap();
         assert!(!other.not_modified);
-        assert_eq!(other.schemas.len(), 3);
+        assert_eq!(other.schema_contents().unwrap().len(), 3);
     }
 
     /// An attach-independent catalog is built once and its encoded response
@@ -6933,7 +6928,7 @@ mod catalog_contents_tests {
 
         let etag = contents(&d).etag.unwrap();
         let same = contents_if(&d, Some(&etag)).unwrap();
-        assert!(same.not_modified && same.schemas.is_empty());
+        assert!(same.not_modified && same.schema_contents().unwrap().is_empty());
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         d.register_scalar(Arc::new(Probe("s_later")));
@@ -7054,7 +7049,7 @@ mod catalog_contents_tests {
         d.catalog_contents = false;
         assert!(!attach(&d).supports_catalog_contents);
         // Still served: the flag only tells the client it may call it.
-        assert_eq!(contents(&d).schemas.len(), 3);
+        assert_eq!(contents(&d).schema_contents().unwrap().len(), 3);
     }
 
     fn attach_named(d: &Dispatcher, name: &str) -> CatalogAttachResult {

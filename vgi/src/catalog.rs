@@ -888,12 +888,11 @@ pub fn main_schema_info(attach_opaque_data: &[u8]) -> SchemaInfo {
 pub fn schema_info(
     path: &[String],
     comment: Option<&str>,
-    attach_opaque_data: &[u8],
+    _attach_opaque_data: &[u8],
 ) -> SchemaInfo {
     SchemaInfo {
         comment: comment.map(|s| s.to_string()),
         tags: Vec::new(),
-        attach_opaque_data: Bytes::from(attach_opaque_data.to_vec()),
         path: path.to_vec(),
         estimated_object_count: None,
     }
@@ -979,6 +978,9 @@ pub struct CatalogModel {
     /// when the catalog returns no etag of its own, the SHA-256 of the snapshot.
     /// Off by default.
     pub catalog_contents_etag: crate::catalog_contents::CatalogContentsEtag,
+    /// Optional immutable catalog publication policy. Authorization precedes every cache lookup.
+    #[cfg(feature = "catalog-publication")]
+    pub snapshot_policy: Option<std::sync::Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>>,
     /// Whether this catalog's `catalog_contents` depends on nothing but the
     /// worker's registrations: not on the attach (its options, data version or
     /// session) nor on the caller. Lets the dispatcher build the response once
@@ -2659,5 +2661,47 @@ mod attach_option_secret_tests {
         let specs = vec![ipc::write_batch(&batch).unwrap()];
         assert!(secret_attach_option_names(&specs).is_empty());
         assert_eq!(required_attach_option_names(&specs), vec!["legacy"]);
+    }
+}
+
+#[cfg(test)]
+mod binary_dictionary_tests {
+    use super::*;
+    use arrow_array::{Array, DictionaryArray, types::Int32Type};
+    #[test]
+    fn function_binary_dictionaries_preserve_content_nulls_and_replacements() {
+        let rows = (0..7).map(|i| {
+            let mut function = default_function_info(&format!("f{i}"), "scalar");
+            function.schema_path = vec![if i % 2 == 0 { "main" } else { "other" }.into()];
+            function.arguments = Bytes(vec![0xff, 0, if i < 3 { 0x80 } else { 0x81 }]);
+            function.output_schema = Bytes(vec![]);
+            function.parameter_default_values = match i % 3 { 0 => None, 1 => Some(Bytes(vec![])), _ => Some(Bytes(vec![0xff, 0])) };
+            function
+        }).collect::<Vec<_>>();
+        let singleton = crate::wire::to_batch(rows[0].clone()).unwrap();
+        let dictionary = singleton.column_by_name("arguments").unwrap().as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap();
+        assert_eq!(dictionary.values().len(), 1);
+        let single: FunctionInfo = crate::wire::from_batch(&singleton).unwrap();
+        assert_eq!(single.arguments, rows[0].arguments);
+        // An index referencing a null dictionary value is distinct from empty bytes.
+        for field_name in ["parameter_default_values", "arguments"] {
+            let mut columns = singleton.columns().to_vec();
+            let index = singleton.schema().index_of(field_name).unwrap();
+            let values = std::sync::Arc::new(arrow_array::BinaryArray::from(vec![None::<&[u8]>]));
+            let null_value = DictionaryArray::<Int32Type>::try_new(arrow_array::Int32Array::from(vec![0]), values).unwrap();
+            columns[index] = std::sync::Arc::new(null_value);
+            let batch = arrow_array::RecordBatch::try_new(singleton.schema(), columns).unwrap();
+            let bytes = Bytes(crate::ipc::write_batch(&batch).unwrap());
+            let decoded = vgi_protocol::catalog::decode_collection::<FunctionInfo>(Some(&bytes));
+            if field_name == "arguments" { assert!(decoded.is_err()); }
+            else { assert!(decoded.unwrap()[0].parameter_default_values.is_none()); }
+        }
+        let stream = vgi_protocol::catalog::encode_collection_with_batch_size(rows.clone(), 3).unwrap().unwrap();
+        let mut reader = vgi_rpc::wire::StreamReader::new(std::io::Cursor::new(&stream.0)).unwrap();
+        let (first, _) = reader.read_next().unwrap().unwrap();
+        let dictionary = first.column_by_name("arguments").unwrap().as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap();
+        assert_eq!(dictionary.values().len(), 1, "equal independent byte buffers deduplicate");
+        let decoded = vgi_protocol::catalog::decode_collection::<FunctionInfo>(Some(&stream)).unwrap();
+        assert_eq!(format!("{rows:?}"), format!("{decoded:?}"));
     }
 }

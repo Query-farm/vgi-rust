@@ -16,7 +16,7 @@ categories = ["database", "api-bindings"]
 all-features = true
 
 [features]
-default = ["sqlite", "transport-http"]
+default = ["sqlite", "transport-http", "catalog-publication"]
 # Durable single-file SQLite storage backend (bundles libsqlite3 — compiles C).
 sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
@@ -27,7 +27,10 @@ http-storage = ["dep:ureq", "dep:bincode"]
 # the wasm worker serves over stdio (and, on wasip2, raw TCP).
 transport-http = ["dep:tokio", "vgi-rpc/http"]
 
+catalog-publication = ["vgi-rpc/external", "dep:zstd"]
+
 [dependencies]
+zstd = { version = "0.13", optional = true }
 # `crypto` (XChaCha20-Poly1305 seal/open) is enabled unconditionally, NOT via
 # `transport-http`: split tokens (`src/split_token.rs`) are a core feature that
 # must work on every transport, wasm included. It carries no server stack —

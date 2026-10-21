@@ -189,12 +189,45 @@ impl VgiService for Dispatcher {
         catalog_index_drop => handle_read_only,
     }
 
+    fn catalog_contents(&self, req: &Request, ctx: &CallContext) -> Answer {
+        self.with_opened(req, ctx, |opened| {
+            #[cfg(feature = "catalog-publication")]
+            if let Some((catalog, attach, session)) = self.stored_session(opened) {
+                if let Some(policy) = &catalog.snapshot_policy {
+                    use crate::catalog_snapshot::{SnapshotRequest, SnapshotDelivery};
+                    let scope = crate::dispatch::read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+                    let version = catalog.snapshot_version(self.store.as_ref(), &session)?;
+                    let request = SnapshotRequest { attachment_scope: &scope, attach_opaque_data: &attach, catalog_version: version };
+                    let inm = crate::dispatch::read_opt_string_col(opened, "if_none_match");
+                    return match policy.serve(&request, inm.as_deref(), || catalog.contents(self.store.as_ref(), &attach, &session, None))? {
+                        SnapshotDelivery::Inline(value) => Ok(Some(crate::wire::to_result_batch(value)?)),
+                        SnapshotDelivery::Published(reference) => { ctx.respond_with_external_ref(reference); Ok(None) }
+                    };
+                }
+            }
+            self.stored_or(opened, || {
+                #[cfg(feature = "catalog-publication")]
+                if let Some(policy) = &self.active_catalog(opened).snapshot_policy {
+                    use crate::catalog_snapshot::{SnapshotRequest, SnapshotDelivery};
+                    let attach = crate::dispatch::read_binary_col(opened, "attach_opaque_data").unwrap_or_default();
+                    let inm = crate::dispatch::read_opt_string_col(opened, "if_none_match");
+                    let scope = crate::dispatch::read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+                    let request = SnapshotRequest { attachment_scope: &scope, attach_opaque_data: &attach, catalog_version: Self::CATALOG_VERSION };
+                    return match policy.serve(&request, inm.as_deref(), || self.catalog_contents_response(opened, None))? {
+                        SnapshotDelivery::Inline(value) => Ok(Some(crate::wire::to_result_batch(value)?)),
+                        SnapshotDelivery::Published(reference) => { ctx.respond_with_external_ref(reference); Ok(None) }
+                    };
+                }
+                self.handle_catalog_contents(opened)
+            })
+        })
+    }
+
     // --- schema discovery ---
     catalog_rpcs! {
         catalog_schemas => handle_catalog_schemas,
         // Protocol 2.1.0: the whole catalog in one call. The client calls it
         // only when `catalog_attach` advertises `supports_catalog_contents`.
-        catalog_contents => handle_catalog_contents,
         catalog_schema_get => handle_schema_get,
         catalog_schema_contents_functions => handle_contents_functions,
         catalog_schema_contents_views => handle_contents_views,

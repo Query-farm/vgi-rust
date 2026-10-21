@@ -79,6 +79,8 @@ pub struct StoredCatalog {
     supports_catalog_contents: bool,
     contents_provider: Option<Arc<dyn CatalogContentsProvider>>,
     catalog_contents_etag: CatalogContentsEtag,
+    #[cfg(feature = "catalog-publication")]
+    pub(crate) snapshot_policy: Option<Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>>,
 }
 
 impl std::fmt::Debug for StoredCatalog {
@@ -104,6 +106,8 @@ impl StoredCatalog {
             supports_catalog_contents: true,
             contents_provider: None,
             catalog_contents_etag: CatalogContentsEtag::None,
+            #[cfg(feature = "catalog-publication")]
+            snapshot_policy: None,
         }
     }
 
@@ -139,6 +143,16 @@ impl StoredCatalog {
     pub fn catalog_contents_etag(mut self, etag: CatalogContentsEtag) -> Self {
         self.catalog_contents_etag = etag;
         self
+    }
+
+    /// Publish catalog metadata through the configured durable repository.
+    #[cfg(feature = "catalog-publication")]
+    pub fn snapshot_policy(mut self, policy: Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>) -> Self {
+        self.snapshot_policy = Some(policy); self
+    }
+    #[cfg(feature = "catalog-publication")]
+    pub(crate) fn snapshot_version(&self, store: &dyn FunctionStorage, session: &[u8]) -> Result<i64> {
+        Ok(self.reported_version(&self.load(store, session)?))
     }
 
     /// The name the catalog is attached by.
@@ -944,7 +958,7 @@ fn drop_named<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog_contents::{catalog_contents_digest, CatalogContentsResult};
+    use crate::catalog_contents::CatalogContentsResult;
     use crate::storage::MemoryStorage;
     use arrow_schema::{DataType, Field, Schema};
 
@@ -1269,8 +1283,8 @@ mod tests {
         let c = s.contents(None);
         assert_eq!(c.catalog_version, 0);
         assert_eq!(c.etag, None);
-        assert_eq!(c.schemas.len(), 1);
-        assert_eq!(c.schemas[0].views.len(), 1);
+        assert_eq!(c.schema_contents().unwrap().len(), 1);
+        assert_eq!(c.schema_contents().unwrap()[0].views.len(), 1);
     }
 
     struct Generation;
@@ -1294,7 +1308,7 @@ mod tests {
         assert_eq!(first.etag.as_deref(), Some("gen-1"));
         assert_eq!(first.catalog_version, 1);
         let again = s.contents(Some("gen-1"));
-        assert!(again.not_modified && again.schemas.is_empty());
+        assert!(again.not_modified && again.schema_contents().unwrap().is_empty());
         s.create_view("v", "error").unwrap();
         let changed = s.contents(Some("gen-1"));
         assert!(!changed.not_modified);
@@ -1309,7 +1323,7 @@ mod tests {
         );
         let first = s.contents(None);
         let etag = first.etag.clone().unwrap();
-        assert_eq!(etag, catalog_contents_digest(&first.schemas));
+        assert_eq!(etag, crate::catalog_contents::catalog_response_digest(&first));
         assert!(s.contents(Some(&etag)).not_modified);
         s.create_view("v", "error").unwrap();
         let changed = s.contents(Some(&etag));
@@ -1324,7 +1338,7 @@ mod tests {
         s.create_table(&["main"], "t").unwrap();
         s.create_schema(&["s2"]).unwrap();
         let c = s.contents(None);
-        let paths: Vec<_> = c.schemas.iter().map(|s| s.path.clone()).collect();
+        let paths: Vec<_> = c.schema_contents().unwrap().iter().map(|s| s.path.clone()).collect();
         assert_eq!(paths, vec![path(&["main"]), path(&["s2"])]);
         let tables = |schema: &[&str]| {
             let batch = wire::to_batch(p::CatalogSchemaContentsTablesParams {
@@ -1341,10 +1355,10 @@ mod tests {
             .unwrap();
             r.items
         };
-        assert_eq!(c.schemas[0].tables, tables(&["main"]));
-        assert_eq!(c.schemas[0].views.len(), 1);
+        assert_eq!(c.schema_contents().unwrap()[0].tables, tables(&["main"]));
+        assert_eq!(c.schema_contents().unwrap()[0].views.len(), 1);
         let info: SchemaInfo =
-            wire::from_batch(&crate::ipc::read_batch(&c.schemas[1].schema.0).unwrap()).unwrap();
+            wire::from_batch(&crate::ipc::read_batch(&c.schema_contents().unwrap()[1].schema.0).unwrap()).unwrap();
         assert_eq!(info.comment.as_deref(), Some("made here"));
     }
 

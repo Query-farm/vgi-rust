@@ -217,12 +217,7 @@ pub fn finish(
     catalog_version: i64,
     etag_mode: CatalogContentsEtag,
 ) -> Result<CatalogContentsResponse> {
-    let not_modified = |etag: String| CatalogContentsResponse {
-        catalog_version,
-        etag: Some(etag),
-        not_modified: true,
-        schemas: Vec::new(),
-    };
+    let not_modified = |etag| CatalogContentsResponse::unchanged(catalog_version, etag);
     if result.not_modified {
         return match (result.etag, if_none_match) {
             (Some(etag), Some(inm)) if etag == inm => {
@@ -244,21 +239,23 @@ pub fn finish(
     validate_paths(&schemas)?;
     // Parents before children (stable: siblings keep the catalog's order).
     schemas.sort_by_key(|s| s.path.len());
-    let etag = match (result.etag, etag_mode) {
-        (None, CatalogContentsEtag::ContentHash) => Some(catalog_contents_digest(&schemas)),
-        (etag, _) => etag,
-    };
-    if let (Some(etag), Some(inm)) = (&etag, if_none_match) {
-        if etag == inm {
-            return Ok(not_modified(etag.clone()));
-        }
+    if result.etag.as_deref().is_some() && result.etag.as_deref() == if_none_match {
+        return Ok(not_modified(result.etag.unwrap()));
     }
-    Ok(CatalogContentsResponse {
-        catalog_version,
-        etag,
-        not_modified: false,
-        schemas,
-    })
+    let mut response = vgi_protocol::catalog::from_schema_contents(catalog_version, result.etag, &schemas)?;
+    if response.etag.is_none() && etag_mode == CatalogContentsEtag::ContentHash {
+        response.etag = Some(catalog_response_digest(&response));
+    }
+    if response.etag.as_deref().is_some() && response.etag.as_deref() == if_none_match { return Ok(not_modified(response.etag.unwrap())); }
+    Ok(response)
+}
+
+/// Hash the exact six streams and catalog generation, independent of the ETag field.
+pub fn catalog_response_digest(response: &CatalogContentsResponse) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"vgi.catalog.contents.2.2\0"); digest.update(response.catalog_version.to_le_bytes());
+    for stream in response.streams() { match stream { None => digest.update([0]), Some(value) => {digest.update([1]);digest.update((value.0.len() as u64).to_le_bytes());digest.update(&value.0);} } }
+    digest.finalize().iter().map(|b|format!("{b:02x}")).collect()
 }
 
 /// Paths are unique, each equals the `SchemaInfo.path` inside its `schema`
@@ -396,7 +393,7 @@ mod tests {
         assert!(!resp.not_modified);
         assert_eq!(resp.etag.as_deref(), Some("e1"));
         assert_eq!(resp.catalog_version, 7);
-        let paths: Vec<_> = resp.schemas.iter().map(|s| s.path.join(".")).collect();
+        let paths: Vec<_> = resp.schema_contents().unwrap().iter().map(|s| s.path.join(".")).collect();
         assert_eq!(paths, ["main", "a", "a.b"]);
     }
 
@@ -411,7 +408,7 @@ mod tests {
         .unwrap();
         assert!(!resp.not_modified);
         assert_eq!(resp.etag, None);
-        assert_eq!(resp.schemas.len(), 1);
+        assert_eq!(resp.schema_contents().unwrap().len(), 1);
     }
 
     #[test]
@@ -426,7 +423,7 @@ mod tests {
         assert!(resp.not_modified);
         assert_eq!(resp.etag.as_deref(), Some("e1"));
         assert_eq!(resp.catalog_version, 3);
-        assert!(resp.schemas.is_empty());
+        assert!(resp.schema_contents().unwrap().is_empty());
     }
 
     #[test]
@@ -438,7 +435,7 @@ mod tests {
             NONE,
         )
         .unwrap();
-        assert!(ok.not_modified && ok.schemas.is_empty());
+        assert!(ok.not_modified && ok.schema_contents().unwrap().is_empty());
         assert_eq!(ok.etag.as_deref(), Some("e1"));
         // A different etag, or no if_none_match at all.
         assert!(finish(
@@ -468,7 +465,7 @@ mod tests {
         let snapshot = || vec![entry(&["main"]), entry(&["main", "sub"])];
         let full = finish(CatalogContentsResult::full(snapshot(), None), None, 1, HASH).unwrap();
         let etag = full.etag.clone().expect("content-hash sets an etag");
-        assert_eq!(etag, catalog_contents_digest(&full.schemas));
+        assert_eq!(etag, catalog_response_digest(&full));
         assert_eq!(etag.len(), 64);
         // Same snapshot, same etag → not_modified.
         let again = finish(
@@ -478,7 +475,7 @@ mod tests {
             HASH,
         )
         .unwrap();
-        assert!(again.not_modified && again.schemas.is_empty());
+        assert!(again.not_modified && again.schema_contents().unwrap().is_empty());
         assert_eq!(again.etag.as_deref(), Some(etag.as_str()));
         // A different snapshot hashes differently.
         let other = finish(

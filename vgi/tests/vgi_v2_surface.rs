@@ -26,7 +26,7 @@ use vgi_rpc::wire::{StreamReader, StreamWriter};
 
 /// The reference `vgi.v2` protocol hash: vgi-python 0.43.0, 72 methods.
 ///
-/// Changes only with `vgi.v2`'s protocol version (currently 2.1.0, see
+/// Changes only with `vgi.v2`'s protocol version (currently 2.2.0, see
 /// `VGI_PROTOCOL_VERSION`). If this fails, this port's surface drifted from
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
@@ -38,7 +38,7 @@ const REFERENCE_VGI_V2_METHODS: usize = 72;
 
 #[test]
 fn vgi_v2_hash_equals_the_reference() {
-    assert_eq!(vgi::VGI_PROTOCOL_VERSION, "2.1.0");
+    assert_eq!(vgi::VGI_PROTOCOL_VERSION, "2.2.0");
     let server = Worker::new().build_server();
     assert_eq!(server.protocol_name(), VGI_PROTOCOL_NAME);
     assert_eq!(

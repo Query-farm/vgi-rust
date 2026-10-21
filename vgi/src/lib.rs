@@ -125,6 +125,10 @@ pub mod buffering;
 
 pub mod catalog;
 pub mod catalog_contents;
+#[cfg(feature = "catalog-publication")]
+pub mod catalog_snapshot;
+#[cfg(feature = "catalog-publication")]
+pub mod catalog_snapshot_s3;
 pub mod copy_from;
 pub mod copy_to;
 pub mod diagnostics;

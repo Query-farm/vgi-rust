@@ -1129,7 +1129,6 @@ pub struct ItemsResult {
 pub struct SchemaInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
-    pub attach_opaque_data: Bytes,
     pub path: SchemaPath,
     pub estimated_object_count: Option<IntMap>,
 }
@@ -1303,8 +1302,8 @@ pub struct EvaluationContextCapability {
     pub provider_fingerprint: Option<String>,
 }
 
+crate::function_metadata::function_info! {
 /// `FunctionInfo` item — describes a function to DuckDB.
-#[derive(Debug, Clone, VgiArrow)]
 pub struct FunctionInfo {
     pub comment: Option<String>,
     pub tags: StrMap,
@@ -1362,6 +1361,7 @@ pub struct FunctionInfo {
     pub input_from_args: bool,
     pub required_settings: Vec<String>,
     pub required_secrets: Vec<RequiredSecret>,
+}
 }
 
 /// `CopyFromFormatInfo` item — a custom `COPY ... FROM` format advertised by a
