@@ -26,6 +26,8 @@ set -uo pipefail  # not -e: the suite exit code is managed explicitly (`|| rc=$?
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STAGE="${STAGE:-$(mktemp -d)}"
 TRANSPORT="${TRANSPORT:-stdio}"
+# A matching native runner already links vgi/httpfs/json/parquet.
+RUNNER_LINKS_EXTENSIONS="${RUNNER_LINKS_EXTENSIONS:-0}"
 INTEGRATION="$VGI_SRC/test/sql/integration"
 [ -d "$INTEGRATION" ] || { echo "::error::no test/sql/integration under VGI_SRC=$VGI_SRC"; exit 1; }
 # DuckDB's sqllogictest runner, given no --test-config, turns every error whose
@@ -98,8 +100,12 @@ if ! ( cd "$INTEGRATION" || exit 1
        -not -name 'expression_filter.test' \
        ${HTTP_SKIP[@]+"${HTTP_SKIP[@]}"} ${WIN_SKIP[@]+"${WIN_SKIP[@]}"} | while read -r f; do
     mkdir -p "$STAGE/test/sql/integration/$(dirname "$f")" || exit 1
-    awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" \
-        > "$STAGE/test/sql/integration/$f" || exit 1
+    if [ "$RUNNER_LINKS_EXTENSIONS" = "1" ]; then
+      cp "$f" "$STAGE/test/sql/integration/$f" || exit 1
+    else
+      awk -v http="$AWK_HTTP" -f "$HERE/preprocess-require.awk" "$f" \
+          > "$STAGE/test/sql/integration/$f" || exit 1
+    fi
   done ); then
   echo "::error::failed to stage the VGI test corpus" >&2
   exit 1
@@ -255,6 +261,7 @@ cd "$STAGE" || {
   exit 1
 }
 
+if [ "$RUNNER_LINKS_EXTENSIONS" != "1" ]; then
 echo "Warming the extension cache (vgi from community, dependencies from core) ..."
 mkdir -p "$STAGE/test" || exit 1
 cat > "$STAGE/test/_warm.test" <<'EOF'
@@ -278,6 +285,7 @@ EOF
 "$HAYBARN_UNITTEST" --test-dir "$STAGE" "test/_warm.test" >/dev/null 2>&1 || \
   echo "::warning::extension warm-up did not fully succeed; individual require gates remain authoritative"
 rm -f "$STAGE/test/_warm.test"
+fi
 
 # Run the suite in one invocation, streaming the native sqllogictest report.
 # bearer_auth/* runs separately on the http lane against a bearer-protected

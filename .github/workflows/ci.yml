@@ -11,7 +11,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  actions: read
+
 env:
+  VGI_REF: 3a2249f815ff6e2a8b5289a3e6284326084e3630
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -211,6 +216,21 @@ jobs:
 
       - name: Install uv (for haybarn-cli)
         uses: astral-sh/setup-uv@v5
+
+      - name: Checkout matching native sources
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: ${{ env.VGI_REF }}
+          path: vgi-upstream
+
+      - name: Fetch matching native integration runner
+        run: >-
+          python3 "$VGI_SRC/scripts/ci_fetch_native_runner.py"
+          --source "$VGI_SRC" --output "$RUNNER_TEMP/vgi-native"
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-upstream
+          GH_TOKEN: ${{ github.token }}
 
       - name: Build and run the doc examples
         run: bash scripts/check_doc_examples.sh
