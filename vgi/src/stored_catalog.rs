@@ -147,11 +147,19 @@ impl StoredCatalog {
 
     /// Publish catalog metadata through the configured durable repository.
     #[cfg(feature = "catalog-publication")]
-    pub fn snapshot_policy(mut self, policy: Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>) -> Self {
-        self.snapshot_policy = Some(policy); self
+    pub fn snapshot_policy(
+        mut self,
+        policy: Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>,
+    ) -> Self {
+        self.snapshot_policy = Some(policy);
+        self
     }
     #[cfg(feature = "catalog-publication")]
-    pub(crate) fn snapshot_version(&self, store: &dyn FunctionStorage, session: &[u8]) -> Result<i64> {
+    pub(crate) fn snapshot_version(
+        &self,
+        store: &dyn FunctionStorage,
+        session: &[u8],
+    ) -> Result<i64> {
         Ok(self.reported_version(&self.load(store, session)?))
     }
 
@@ -1323,7 +1331,10 @@ mod tests {
         );
         let first = s.contents(None);
         let etag = first.etag.clone().unwrap();
-        assert_eq!(etag, crate::catalog_contents::catalog_response_digest(&first));
+        assert_eq!(
+            etag,
+            crate::catalog_contents::catalog_response_digest(&first)
+        );
         assert!(s.contents(Some(&etag)).not_modified);
         s.create_view("v", "error").unwrap();
         let changed = s.contents(Some(&etag));
@@ -1338,7 +1349,12 @@ mod tests {
         s.create_table(&["main"], "t").unwrap();
         s.create_schema(&["s2"]).unwrap();
         let c = s.contents(None);
-        let paths: Vec<_> = c.schema_contents().unwrap().iter().map(|s| s.path.clone()).collect();
+        let paths: Vec<_> = c
+            .schema_contents()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
         assert_eq!(paths, vec![path(&["main"]), path(&["s2"])]);
         let tables = |schema: &[&str]| {
             let batch = wire::to_batch(p::CatalogSchemaContentsTablesParams {
@@ -1357,8 +1373,10 @@ mod tests {
         };
         assert_eq!(c.schema_contents().unwrap()[0].tables, tables(&["main"]));
         assert_eq!(c.schema_contents().unwrap()[0].views.len(), 1);
-        let info: SchemaInfo =
-            wire::from_batch(&crate::ipc::read_batch(&c.schema_contents().unwrap()[1].schema.0).unwrap()).unwrap();
+        let info: SchemaInfo = wire::from_batch(
+            &crate::ipc::read_batch(&c.schema_contents().unwrap()[1].schema.0).unwrap(),
+        )
+        .unwrap();
         assert_eq!(info.comment.as_deref(), Some("made here"));
     }
 

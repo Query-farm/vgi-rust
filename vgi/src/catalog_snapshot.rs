@@ -239,12 +239,13 @@ impl CatalogSnapshotPolicy {
                 if (self.identity)(request)? != before {
                     return Err(error);
                 }
-                if value.etag.is_some() && value.etag.as_deref() == if_none_match {
+                if let Some(etag) = value
+                    .etag
+                    .as_ref()
+                    .filter(|etag| Some(etag.as_str()) == if_none_match)
+                {
                     return Ok(SnapshotDelivery::Inline(
-                        CatalogContentsResponse::unchanged(
-                            value.catalog_version,
-                            value.etag.unwrap(),
-                        ),
+                        CatalogContentsResponse::unchanged(value.catalog_version, etag.clone()),
                     ));
                 }
                 Ok(SnapshotDelivery::Inline(value))
@@ -795,22 +796,33 @@ mod tests {
         })
     }
     fn response() -> CatalogContentsResponse {
-        let functions = (0..4).map(|i| {
-            let mut function = crate::catalog::default_function_info(&format!("f{i}"), "scalar");
-            function.schema_path = vec!["main".into()];
-            function.arguments = vgi_rpc::Bytes(vec![0xff, 0, 0x80]);
-            function.output_schema = vgi_rpc::Bytes(vec![]);
-            function.parameter_default_values = if i % 2 == 0 { None } else { Some(vgi_rpc::Bytes(vec![])) };
-            function
-        }).collect();
+        let functions = (0..4)
+            .map(|i| {
+                let mut function =
+                    crate::catalog::default_function_info(&format!("f{i}"), "scalar");
+                function.schema_path = vec!["main".into()];
+                function.arguments = vgi_rpc::Bytes(vec![0xff, 0, 0x80]);
+                function.output_schema = vgi_rpc::Bytes(vec![]);
+                function.parameter_default_values = if i % 2 == 0 {
+                    None
+                } else {
+                    Some(vgi_rpc::Bytes(vec![]))
+                };
+                function
+            })
+            .collect();
         CatalogContentsResponse {
             catalog_version: 1,
             etag: Some("e1".into()),
             not_modified: false,
-            schemas: vgi_protocol::catalog::encode_collection(vec![crate::catalog::main_schema_info(&[])]).unwrap(),
+            schemas: vgi_protocol::catalog::encode_collection(vec![
+                crate::catalog::main_schema_info(&[]),
+            ])
+            .unwrap(),
             tables: None,
             views: None,
-            functions: vgi_protocol::catalog::encode_collection_with_batch_size(functions, 2).unwrap(),
+            functions: vgi_protocol::catalog::encode_collection_with_batch_size(functions, 2)
+                .unwrap(),
             macros: None,
             indexes: None,
         }

@@ -923,7 +923,12 @@ impl VgiClient {
                 );
                 continue;
             }
-            let decoded = resp.schema_contents().and_then(|entries| entries.iter().map(SchemaSnapshot::decode).collect::<Result<Vec<_>>>());
+            let decoded = resp.schema_contents().and_then(|entries| {
+                entries
+                    .iter()
+                    .map(SchemaSnapshot::decode)
+                    .collect::<Result<Vec<_>>>()
+            });
             match decoded {
                 Ok(schemas) => {
                     return Ok(CatalogSnapshot {
@@ -2104,7 +2109,14 @@ mod load_catalog_tests {
     }
 
     fn full(version: i64, etag: Option<&str>, schemas: Vec<SchemaContents>) -> Reply {
-        reply(vgi_protocol::catalog::from_schema_contents(version, etag.map(str::to_string), &schemas).unwrap())
+        reply(
+            vgi_protocol::catalog::from_schema_contents(
+                version,
+                etag.map(str::to_string),
+                &schemas,
+            )
+            .unwrap(),
+        )
     }
 
     impl VgiTransport for Scripted {
@@ -2190,13 +2202,14 @@ mod load_catalog_tests {
 
     #[test]
     fn a_schema_with_a_missing_parent_falls_back() {
-        let (mut client, log) = client(vec![full(2, None, vec![entry(&["main"], &["missing", "child"])])]);
+        let (mut client, log) = client(vec![full(
+            2,
+            None,
+            vec![entry(&["main"], &["missing", "child"])],
+        )]);
         let snap = client.load_catalog(&attached(true), None).unwrap();
         assert_eq!(snap.source, CatalogLoadSource::PerSchema);
-        assert!(snap
-            .fallback_reason
-            .unwrap()
-            .contains("parent"));
+        assert!(snap.fallback_reason.unwrap().contains("parent"));
         assert_eq!(calls(&log), ["catalog_contents", "catalog_schemas"]);
     }
 
@@ -2250,9 +2263,7 @@ mod load_catalog_tests {
             not_modified: false,
             fallback_reason: None,
         };
-        let nm = |etag: &str| {
-            reply(CatalogContentsResponse::unchanged(2, etag.to_string()))
-        };
+        let nm = |etag: &str| reply(CatalogContentsResponse::unchanged(2, etag.to_string()));
         let (mut c, _) = client(vec![nm("e2")]);
         let kept = c.load_catalog(&attached(true), Some(&previous)).unwrap();
         assert!(kept.not_modified);

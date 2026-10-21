@@ -145,7 +145,11 @@ fn validate_value(array: &dyn Array, field: &arrow_schema::Field, row: usize) ->
                     let value = array.as_any().downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>().ok_or_else(|| RpcError::type_error("expected int32 dictionary"))?;
                     (value.keys().value(row) as usize, value.values().as_ref())
                 }
-                _ => return Err(RpcError::type_error("unsupported catalog dictionary index type")),
+                _ => {
+                    return Err(RpcError::type_error(
+                        "unsupported catalog dictionary index type",
+                    ))
+                }
             };
             if key >= values.len() || (values.is_null(key) && !field.is_nullable()) {
                 return Err(RpcError::value_error("invalid catalog dictionary value"));
@@ -285,9 +289,8 @@ impl CatalogContentsResponse {
             let items = match kind {
                 "SCALAR" | "scalar" | "SCALAR_FUNCTION" => &mut schema.scalar_functions,
                 "AGGREGATE" | "aggregate" | "AGGREGATE_FUNCTION" => &mut schema.aggregate_functions,
-                "TABLE" | "TABLE_BUFFERING" | "table" | "table_buffering" | "table_in_out" | "TABLE_FUNCTION" => {
-                    &mut schema.table_functions
-                }
+                "TABLE" | "TABLE_BUFFERING" | "table" | "table_buffering" | "table_in_out"
+                | "TABLE_FUNCTION" => &mut schema.table_functions,
                 _ => {
                     return Err(RpcError::type_error(format!(
                         "unsupported catalog function type {kind}"

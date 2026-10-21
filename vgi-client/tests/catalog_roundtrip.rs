@@ -391,7 +391,7 @@ fn transactions_are_optional_and_round_trip_when_offered() {
     client.detach(&cat).expect("detach");
 }
 
-/// `catalog_contents` (protocol 2.1.0): the example worker advertises it, and
+/// `catalog_contents` (protocol 2.2.0): the example worker advertises it, and
 /// one call returns every schema the per-schema calls list — parents first —
 /// with each kind holding exactly what the matching per-schema call returns.
 #[test]
@@ -417,7 +417,7 @@ fn catalog_contents_matches_the_per_schema_calls() {
         resp.catalog_version,
         client.catalog_version(&cat).expect("catalog_version")
     );
-    let contents = resp.schemas;
+    let contents = resp.schema_contents().expect("decode catalog collections");
 
     let listed = client.schemas(&cat).expect("catalog_schemas");
     let bulk_schemas: Vec<SchemaInfo> = decode_item_blobs(
@@ -512,16 +512,19 @@ fn catalog_contents_revalidates_with_its_etag() {
             .contents_response(&cat, Some("whatever"))
             .expect("catalog_contents");
         assert!(!again.not_modified, "no etag: if_none_match is ignored");
-        assert_eq!(again.schemas.len(), full.schemas.len());
+        assert_eq!(
+            again.schema_contents().unwrap().len(),
+            full.schema_contents().unwrap().len()
+        );
         return;
     };
-    assert!(!full.schemas.is_empty());
+    assert!(!full.schema_contents().unwrap().is_empty());
 
     let same = client
         .contents_response(&cat, Some(&etag))
         .expect("conditional catalog_contents");
     assert!(same.not_modified);
-    assert!(same.schemas.is_empty());
+    assert!(same.streams().iter().all(|stream| stream.is_none()));
     assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
     assert_eq!(same.catalog_version, full.catalog_version);
 
@@ -530,7 +533,10 @@ fn catalog_contents_revalidates_with_its_etag() {
         .expect("catalog_contents");
     assert!(!other.not_modified);
     assert_eq!(other.etag.as_deref(), Some(etag.as_str()));
-    assert_eq!(other.schemas.len(), full.schemas.len());
+    assert_eq!(
+        other.schema_contents().unwrap().len(),
+        full.schema_contents().unwrap().len()
+    );
 
     client.detach(&cat).expect("detach");
 }

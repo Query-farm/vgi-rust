@@ -242,20 +242,37 @@ pub fn finish(
     if result.etag.as_deref().is_some() && result.etag.as_deref() == if_none_match {
         return Ok(not_modified(result.etag.unwrap()));
     }
-    let mut response = vgi_protocol::catalog::from_schema_contents(catalog_version, result.etag, &schemas)?;
+    let mut response =
+        vgi_protocol::catalog::from_schema_contents(catalog_version, result.etag, &schemas)?;
     if response.etag.is_none() && etag_mode == CatalogContentsEtag::ContentHash {
         response.etag = Some(catalog_response_digest(&response));
     }
-    if response.etag.as_deref().is_some() && response.etag.as_deref() == if_none_match { return Ok(not_modified(response.etag.unwrap())); }
+    if response.etag.as_deref().is_some() && response.etag.as_deref() == if_none_match {
+        return Ok(not_modified(response.etag.unwrap()));
+    }
     Ok(response)
 }
 
 /// Hash the exact six streams and catalog generation, independent of the ETag field.
 pub fn catalog_response_digest(response: &CatalogContentsResponse) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"vgi.catalog.contents.2.2\0"); digest.update(response.catalog_version.to_le_bytes());
-    for stream in response.streams() { match stream { None => digest.update([0]), Some(value) => {digest.update([1]);digest.update((value.0.len() as u64).to_le_bytes());digest.update(&value.0);} } }
-    digest.finalize().iter().map(|b|format!("{b:02x}")).collect()
+    digest.update(b"vgi.catalog.contents.2.2\0");
+    digest.update(response.catalog_version.to_le_bytes());
+    for stream in response.streams() {
+        match stream {
+            None => digest.update([0]),
+            Some(value) => {
+                digest.update([1]);
+                digest.update((value.0.len() as u64).to_le_bytes());
+                digest.update(&value.0);
+            }
+        }
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Paths are unique, each equals the `SchemaInfo.path` inside its `schema`
@@ -393,7 +410,12 @@ mod tests {
         assert!(!resp.not_modified);
         assert_eq!(resp.etag.as_deref(), Some("e1"));
         assert_eq!(resp.catalog_version, 7);
-        let paths: Vec<_> = resp.schema_contents().unwrap().iter().map(|s| s.path.join(".")).collect();
+        let paths: Vec<_> = resp
+            .schema_contents()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.join("."))
+            .collect();
         assert_eq!(paths, ["main", "a", "a.b"]);
     }
 

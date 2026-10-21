@@ -2932,7 +2932,9 @@ impl Dispatcher {
             let cached = self.cached_contents(req, key)?;
             if let (Some(etag), Some(inm)) = (&cached.etag, &if_none_match) {
                 if etag == inm {
-                    return Ok(Some(wire::to_result_batch(CatalogContentsResponse::unchanged(Self::CATALOG_VERSION, etag.clone()))?));
+                    return Ok(Some(wire::to_result_batch(
+                        CatalogContentsResponse::unchanged(Self::CATALOG_VERSION, etag.clone()),
+                    )?));
                 }
             }
             return Ok(Some(cached.response.clone()));
@@ -6676,7 +6678,8 @@ mod catalog_contents_tests {
         let resp = contents(&d);
         assert_eq!(resp.catalog_version, Dispatcher::CATALOG_VERSION);
         let paths: Vec<Vec<String>> = resp
-            .schema_contents().unwrap()
+            .schema_contents()
+            .unwrap()
             .iter()
             .map(|sc| decode::<SchemaInfo>(&sc.schema).path)
             .collect();
@@ -6685,7 +6688,12 @@ mod catalog_contents_tests {
             [path(&["data"]), path(&["main"]), path(&["data", "deep"])]
         );
         // The struct's `path` names the schema without decoding SchemaInfo.
-        let named: Vec<Vec<String>> = resp.schema_contents().unwrap().iter().map(|sc| sc.path.clone()).collect();
+        let named: Vec<Vec<String>> = resp
+            .schema_contents()
+            .unwrap()
+            .iter()
+            .map(|sc| sc.path.clone())
+            .collect();
         assert_eq!(named, paths);
         // No provider and no content hash: no etag, never not_modified.
         assert_eq!(resp.etag, None);
@@ -6702,7 +6710,8 @@ mod catalog_contents_tests {
         .unwrap();
         let mut listed = items(d.handle_catalog_schemas(&request("catalog_schemas", batch)));
         let mut bulk: Vec<Bytes> = contents(&d)
-            .schema_contents().unwrap()
+            .schema_contents()
+            .unwrap()
             .iter()
             .map(|sc| sc.schema.clone())
             .collect();
@@ -6888,7 +6897,10 @@ mod catalog_contents_tests {
         let d = hashed();
         let full = contents(&d);
         let etag = full.etag.clone().expect("content-hash sets an etag");
-        assert_eq!(etag, crate::catalog_contents::catalog_response_digest(&full));
+        assert_eq!(
+            etag,
+            crate::catalog_contents::catalog_response_digest(&full)
+        );
         for _ in 0..4 {
             assert_eq!(contents(&hashed()).etag.as_deref(), Some(etag.as_str()));
         }
