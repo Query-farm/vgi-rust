@@ -178,13 +178,16 @@ pub use vgi_protocol::{cache_control, ipc, wire, VGI_PROTOCOL_NAME, VGI_PROTOCOL
 pub use ::vgi_rpc;
 pub use ::vgi_rpc::{Result, RpcError};
 
-// Both suites drive a real loopback HTTP server (tokio + `vgi_rpc::http`), so
+// These suites drive a real loopback HTTP server (tokio + `vgi_rpc::http`), so
 // they exist only when the HTTP transport is compiled in.
 #[cfg(all(test, feature = "transport-http"))]
 mod http_continuation_tests;
 
 #[cfg(all(test, feature = "transport-http"))]
 mod function_shape_dispatch_tests;
+
+#[cfg(all(test, feature = "transport-http"))]
+mod continuation_tests;
 
 pub use dispatch::FunctionScope;
 pub use function::{

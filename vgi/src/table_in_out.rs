@@ -4,6 +4,27 @@
 //!
 //! Driven as an exchange stream: each input batch produces zero or more output
 //! batches. The dispatch adapter applies auto-filter pushdown to the output.
+//!
+//! # Continued output
+//!
+//! An exchange answers each input batch with one reply, but a function can
+//! answer one input with several: one upstream API page per reply, or more
+//! output than it wants to build at once. It emits each reply but the last with
+//! [`EmitOptions::more`] and records where to pick up with
+//! [`TableInOutOutput::set_resume_state`]. The client then asks for the next
+//! reply with a continuation tick (a zero-row input batch carrying
+//! `vgi.status: CONTINUE`), which the framework answers by calling
+//! [`TableInOutFunction::resume`] with that state. Every reply's `parent_rows`
+//! index the last real (non-tick) input batch.
+//!
+//! `resume` gets no input, so the state must hold everything it needs. Over
+//! HTTP it reaches the next turn only inside the stream's sealed state token, so
+//! keep it small: positions to resume from, never buffered output rows.
+//!
+//! The protocol is strict, with no capability negotiation: while output is
+//! pending a tick is the only valid input, and a tick is valid only then; cache
+//! control may only ride an input's first reply. Mirrors vgi-python's
+//! `out.emit(..., more=True)` / `resume()`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +43,14 @@ use crate::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, Proce
 /// 1→1 map (the extension assumes it, and requires output rows == input rows).
 pub const PARENT_ROW_METADATA_KEY: &str = "vgi_rpc.parent_row#b64";
 
+/// Per-batch wire-metadata key of the continued-output status: a reply carries
+/// [`STATUS_HAVE_MORE_OUTPUT`], a continuation tick [`STATUS_CONTINUE`].
+pub const STATUS_METADATA_KEY: &str = "vgi.status";
+/// Reply status: this input batch has more output; the client sends a tick.
+pub const STATUS_HAVE_MORE_OUTPUT: &str = "HAVE_MORE_OUTPUT";
+/// Input status: a continuation tick asking for the next reply.
+pub const STATUS_CONTINUE: &str = "CONTINUE";
+
 /// Options for one emitted table-in-out output batch (all optional).
 #[derive(Default)]
 pub struct EmitOptions {
@@ -33,6 +62,12 @@ pub struct EmitOptions {
     /// `parent_rows[i]` is the input-row index that produced output row `i`.
     /// MUST carry exactly one entry per emitted row (validated at emit).
     pub parent_rows: Option<Vec<i32>>,
+    /// This input batch has more output after this reply: the framework calls
+    /// [`TableInOutFunction::resume`] for the next one. Valid only on the one
+    /// batch a turn emits, from a function whose
+    /// [`resume_supported`](TableInOutFunction::resume_supported) is true, and
+    /// only after [`TableInOutOutput::set_resume_state`] in the same turn.
+    pub more: bool,
 }
 
 /// Collects one `process` call's output batches with optional per-batch
@@ -44,12 +79,28 @@ pub struct EmitOptions {
 #[derive(Default)]
 pub struct TableInOutOutput {
     pub(crate) items: Vec<(RecordBatch, Option<HashMap<String, String>>)>,
+    /// Which of `items` said [`EmitOptions::more`], by index.
+    pub(crate) more: Vec<usize>,
+    /// What [`set_resume_state`](Self::set_resume_state) recorded this turn.
+    pub(crate) resume_state: Option<Vec<u8>>,
 }
 
 impl TableInOutOutput {
     /// Emit a batch with no per-batch metadata.
     pub fn emit(&mut self, batch: RecordBatch) {
         self.items.push((batch, None));
+    }
+
+    /// Record where [`TableInOutFunction::resume`] picks up after a reply
+    /// emitted with [`EmitOptions::more`]. Every turn that says more must call
+    /// it, `resume` included (with its advanced position). The value is
+    /// bincode-encoded into the exchange state, which over HTTP rides the
+    /// stream's state token: keep it to positions, never output rows.
+    pub fn set_resume_state<T: serde::Serialize>(&mut self, state: &T) -> Result<()> {
+        let bytes = vgi_rpc::stream_codec::bincode_encode(state)
+            .map_err(|e| RpcError::runtime_error(format!("encode resume state: {e}")))?;
+        self.resume_state = Some(bytes);
+        Ok(())
     }
 
     /// Emit a batch with [`EmitOptions`] (metadata / cache control / LATERAL
@@ -81,10 +132,21 @@ impl TableInOutOutput {
         if let Some(cc) = opts.cache_control {
             md.extend(cc.to_metadata());
         }
+        if opts.more {
+            self.more.push(self.items.len());
+        }
         self.items
             .push((batch, if md.is_empty() { None } else { Some(md) }));
         Ok(())
     }
+}
+
+/// Decode the state [`TableInOutOutput::set_resume_state`] recorded, in
+/// [`TableInOutFunction::resume`]. An error rather than a default: a lost
+/// position would silently restart or end the input's output.
+pub fn decode_resume_state<T: serde::de::DeserializeOwned>(state: &[u8]) -> Result<T> {
+    vgi_rpc::stream_codec::bincode_decode(state)
+        .map_err(|e| RpcError::runtime_error(format!("decode resume state: {e}")))
 }
 
 /// A table-in-out VGI function.
@@ -148,6 +210,33 @@ pub trait TableInOutFunction: Send + Sync {
             out.emit(b);
         }
         Ok(())
+    }
+
+    /// Whether the function continues one input's output across several
+    /// replies (it overrides [`resume`](Self::resume)). Only such a function
+    /// may emit with [`EmitOptions::more`]. Registration refuses it with
+    /// `max_workers = 1`: the client runs that function on one connection
+    /// shared by every pipeline, which cannot leave output pending.
+    fn resume_supported(&self) -> bool {
+        false
+    }
+
+    /// Emit the next reply for the last input batch, after a reply that said
+    /// [`EmitOptions::more`]. `state` is what the previous turn recorded with
+    /// [`TableInOutOutput::set_resume_state`]; read it with
+    /// [`decode_resume_state`]. Like `process_out`, emit exactly one batch,
+    /// with `more` (and an advanced resume state) unless it is the last. Its
+    /// `parent_rows` index the input batch `process_out` received.
+    fn resume(
+        &self,
+        _params: &ProcessParams,
+        _state: &[u8],
+        _out: &mut TableInOutOutput,
+    ) -> Result<()> {
+        Err(RpcError::runtime_error(format!(
+            "{}: resume() is not implemented",
+            self.name()
+        )))
     }
 
     /// Whether the function flushes accumulated state at end-of-stream (drives

@@ -65,6 +65,9 @@ pub struct Exchange<'a> {
     parent_rows: Option<Vec<i32>>,
     last_cache_control: Option<CacheControl>,
     first_input_metadata: Option<vgi_rpc::wire::Metadata>,
+    /// The last input's schema while its output continues: the worker's last
+    /// answer said `HAVE_MORE_OUTPUT`, so the next turn must be a tick.
+    pending_more: Option<SchemaRef>,
     connection_reusable: Arc<AtomicBool>,
     closed: bool,
 }
@@ -100,23 +103,68 @@ impl Exchange<'_> {
         self.last_cache_control.as_ref()
     }
 
+    /// Whether the worker's last answer said it has more output for the same
+    /// input (`vgi.status: HAVE_MORE_OUTPUT`). While it does, fetch the next
+    /// answer with [`continue_output`](Self::continue_output); `send` is
+    /// refused until the output is drained, and closing drops what remains.
+    pub fn has_more_output(&self) -> bool {
+        self.pending_more.is_some()
+    }
+
     /// Send one input batch and read the worker's answer.
     ///
     /// `Ok(None)` means the worker ended the stream. A zero-row answer is
     /// returned as an empty batch rather than `None`, because "no rows for this
     /// input" is a real answer in exchange mode and callers of a 1→0 transform
-    /// need to see it.
+    /// need to see it. An answer may be only the first of several for this
+    /// input; see [`has_more_output`](Self::has_more_output).
     pub fn send(&mut self, input: &RecordBatch) -> Result<Option<RecordBatch>> {
+        if self.pending_more.is_some() {
+            return Err(RpcError::protocol_error(
+                "send while the last input's output is pending; call continue_output()",
+            ));
+        }
+        let metadata = self.first_input_metadata.take();
+        let (answer, more) = self.turn(input, metadata.as_ref())?;
+        self.pending_more = more.then(|| input.schema());
+        Ok(answer)
+    }
+
+    /// Fetch the next answer for the last input, after one that said more:
+    /// sends a continuation tick (a zero-row batch of the input schema carrying
+    /// `vgi.status: CONTINUE`). Its provenance indexes that same input.
+    pub fn continue_output(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(input_schema) = self.pending_more.clone() else {
+            return Err(RpcError::protocol_error(
+                "continue_output with no output pending",
+            ));
+        };
+        let tick = RecordBatch::new_empty(input_schema.clone());
+        let metadata =
+            vgi_rpc::wire::Metadata::from([(STATUS_KEY.to_string(), STATUS_CONTINUE.to_string())]);
+        let (answer, more) = self.turn(&tick, Some(&metadata))?;
+        self.pending_more = more.then_some(input_schema);
+        Ok(answer)
+    }
+
+    /// One exchange turn: send `input`, read and check the answer, and say
+    /// whether it has more output for the same input.
+    fn turn(
+        &mut self,
+        input: &RecordBatch,
+        metadata: Option<&vgi_rpc::wire::Metadata>,
+    ) -> Result<(Option<RecordBatch>, bool)> {
         if self.closed {
             return Err(RpcError::protocol_error("send after close"));
         }
-        let metadata = self.first_input_metadata.take();
-        let response = self.stream.exchange_with_metadata(input, metadata.as_ref());
+        // An error ends the exchange, so pending output never outlives it.
+        self.pending_more = None;
+        let response = self.stream.exchange_with_metadata(input, metadata);
         if response.is_err() {
             self.connection_reusable.store(false, Ordering::Release);
         }
         match response? {
-            None => Ok(None),
+            None => Ok((None, false)),
             Some((batch, md)) => {
                 let result = (|| {
                     check_batch_schema(&self.function, &self.emitted_schema, &batch)?;
@@ -142,7 +190,8 @@ impl Exchange<'_> {
                 if result.is_err() {
                     self.connection_reusable.store(false, Ordering::Release);
                 }
-                result.map(Some)
+                let more = md.get(STATUS_KEY).map(String::as_str) == Some(STATUS_HAVE_MORE_OUTPUT);
+                result.map(|batch| (Some(batch), more))
             }
         }
     }
@@ -192,6 +241,13 @@ impl Drop for Exchange<'_> {
 
 /// Metadata key carrying per-output-row provenance.
 const PARENT_ROW_KEY: &str = "vgi_rpc.parent_row#b64";
+
+/// Continued output: an answer carrying `HAVE_MORE_OUTPUT` under this key has
+/// more for the same input, which the client asks for with an input carrying
+/// `CONTINUE`.
+const STATUS_KEY: &str = "vgi.status";
+const STATUS_HAVE_MORE_OUTPUT: &str = "HAVE_MORE_OUTPUT";
+const STATUS_CONTINUE: &str = "CONTINUE";
 
 fn update_answer_metadata(
     parent_rows: &mut Option<Vec<i32>>,
@@ -379,6 +435,7 @@ impl VgiClient {
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: conditional_request_metadata(opts),
+            pending_more: None,
             connection_reusable,
             closed: false,
         })
@@ -680,6 +737,7 @@ mod tests {
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: None,
+            pending_more: None,
             connection_reusable: Arc::clone(&connection_reusable),
             closed: false,
         };

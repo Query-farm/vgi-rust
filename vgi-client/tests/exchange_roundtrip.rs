@@ -211,6 +211,105 @@ fn a_one_to_n_transform_reports_row_provenance() {
     ex.close().expect("close");
 }
 
+/// Drain one input's continued output: its first answer, then a tick per
+/// answer that said more. Returns each answer's values and provenance.
+fn drain_continued(
+    ex: &mut vgi_client::exchange::Exchange<'_>,
+    input: &RecordBatch,
+) -> Vec<(Vec<i64>, Option<Vec<i32>>)> {
+    let mut answers = Vec::new();
+    let mut out = ex.send(input).expect("exchange").expect("an answer");
+    loop {
+        answers.push((
+            column_values(&out, 0),
+            ex.parent_rows().map(<[i32]>::to_vec),
+        ));
+        if !ex.has_more_output() {
+            return answers;
+        }
+        out = ex
+            .continue_output()
+            .expect("continue")
+            .expect("a tick is answered");
+    }
+}
+
+#[test]
+fn a_classic_table_in_out_continues_its_output() {
+    skip_without_worker!();
+    let mut client = connect();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let schema_path = cat.default_schema().to_string();
+
+    // `paged_explode` emits 0..n-1 per input row, `page_size` rows per answer,
+    // the rest through continuation ticks.
+    let mut spec = BindSpec::table("paged_explode").in_schema(&schema_path);
+    spec.function_type = FunctionType::TableInOut;
+    spec.arguments = Arguments::new().named("page_size", ArgValue::Int(3));
+    let bound = client
+        .bind_with_input(&cat, &spec, &i64_schema("n"))
+        .expect("`paged_explode` must exist in the example catalog");
+    let mut ex = client
+        .open_exchange(&bound, &ScanOptions::default())
+        .expect("open exchange");
+
+    let answers = drain_continued(&mut ex, &i64_batch("n", &[4, 0, 3]));
+    let values: Vec<Vec<i64>> = answers.into_iter().map(|(v, _)| v).collect();
+    assert_eq!(values, vec![vec![0, 1, 2], vec![3, 0, 1], vec![2]]);
+
+    // Drained: the next input is a real one, and a tick is refused locally.
+    assert!(ex.continue_output().is_err());
+    let answers = drain_continued(&mut ex, &i64_batch("n", &[2]));
+    assert_eq!(answers, vec![(vec![0, 1], None)]);
+
+    ex.close().expect("close");
+}
+
+#[test]
+fn a_blended_function_continues_with_provenance() {
+    skip_without_worker!();
+    let mut client = connect();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let schema_path = cat.default_schema().to_string();
+
+    let mut spec = BindSpec::table("blended_paged").in_schema(&schema_path);
+    spec.function_type = FunctionType::TableInOut;
+    spec.arguments = Arguments::new()
+        .positional(ArgValue::Placeholder(DataType::Int64))
+        .named("page_size", ArgValue::Int(2));
+    let bound = client
+        .bind_with_input(&cat, &spec, &i64_schema("n"))
+        .expect("`blended_paged` must exist in the example catalog");
+    let mut ex = client
+        .open_exchange(&bound, &ScanOptions::default())
+        .expect("open exchange");
+
+    // Every answer's provenance indexes the one real input, ticks included.
+    let answers = drain_continued(&mut ex, &i64_batch("n", &[1, 3]));
+    assert_eq!(
+        answers,
+        vec![
+            (vec![0, 0], Some(vec![0, 1])),
+            (vec![1, 2], Some(vec![1, 1])),
+        ]
+    );
+    ex.close().expect("close");
+    drop(ex);
+
+    // While output is pending, a real input is refused before it is sent.
+    let mut ex2 = client
+        .open_exchange(&bound, &ScanOptions::default())
+        .expect("open exchange");
+    ex2.send(&i64_batch("n", &[5])).expect("first page");
+    assert!(ex2.has_more_output());
+    assert!(ex2.send(&i64_batch("n", &[1])).is_err());
+    ex2.close().expect("close drops the pending output");
+}
+
 #[test]
 fn a_buffered_function_sinks_then_sources() {
     skip_without_worker!();

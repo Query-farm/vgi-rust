@@ -1359,6 +1359,11 @@ pub struct FunctionInfo {
     /// enter the in-out registration branch with real-typed args and drive the
     /// literal single-row scan-mode.
     pub input_from_args: bool,
+    /// Blended functions only: the most input rows one worker call receives.
+    /// The client's batched-LATERAL operator splits each input chunk, after
+    /// dedup, into calls of at most this many rows. `None` sends a whole chunk
+    /// per call.
+    pub input_rows_per_call: Option<i64>,
     pub required_settings: Vec<String>,
     pub required_secrets: Vec<RequiredSecret>,
 }

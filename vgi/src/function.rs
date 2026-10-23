@@ -540,6 +540,15 @@ pub struct FunctionMetadata {
     /// positionally for varargs); named args stay bind-time scalars on
     /// `ProcessParams::arguments`. Surfaced as `FunctionInfo.input_from_args`.
     pub input_from_args: bool,
+    /// Blended (`input_from_args`) functions only: the most input rows one
+    /// worker call receives. The client's batched-LATERAL operator splits each
+    /// input chunk, after dedup, into calls of at most this many rows, so a
+    /// function that fans each row out to an upstream request can bound the
+    /// work one call does. `None` (the default) sends a whole chunk per call.
+    /// Must be positive; registration refuses anything else. Surfaced as
+    /// `FunctionInfo.input_rows_per_call`. Mirrors the Python SDK's
+    /// `Meta.input_rows_per_call`.
+    pub input_rows_per_call: Option<i64>,
 }
 
 impl FunctionMetadata {
@@ -616,6 +625,7 @@ impl Default for FunctionMetadata {
             required_secrets: Vec::new(),
             max_workers: 0,
             input_from_args: false,
+            input_rows_per_call: None,
         }
     }
 }

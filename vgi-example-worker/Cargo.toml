@@ -31,6 +31,7 @@ arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-arith = { workspace = true }

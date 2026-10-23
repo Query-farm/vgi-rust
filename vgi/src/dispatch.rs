@@ -761,6 +761,26 @@ impl Dispatcher {
         scope: FunctionScope,
     ) {
         let name = f.name().to_string();
+        let meta = f.metadata();
+        // Continued output and input_rows_per_call, refused at startup when
+        // the client could not drive them, rather than at the first query.
+        assert!(
+            !(f.resume_supported() && meta.max_workers == 1),
+            "{name}: resume() (continued output) is not supported with max_workers = 1; \
+             the client runs such a function on one connection shared by every \
+             pipeline, which cannot leave output pending."
+        );
+        if let Some(n) = meta.input_rows_per_call {
+            assert!(
+                meta.input_from_args,
+                "{name}: input_rows_per_call applies only to a blended (input_from_args) \
+                 function, whose per-row input the client can split into calls."
+            );
+            assert!(
+                n >= 1,
+                "{name}: input_rows_per_call must be a positive row count, got {n}"
+            );
+        }
         self.tableinouts.entry(name.clone()).or_default().push(f);
         self.note_scope(FnKind::TableInOut, &name, scope);
     }
@@ -1720,6 +1740,7 @@ impl Dispatcher {
                 filters,
                 blob,
                 filter_history: Default::default(),
+                continuation: TioContinuation::default(),
             };
             return Ok(
                 StreamResult::exchange(output_schema, in_schema, Box::new(state))
@@ -1942,6 +1963,7 @@ impl Dispatcher {
             schema_path: bind_call.schema_path.clone().unwrap_or_default(),
             filter_deltas: Vec::new(),
             filter_predicate_order: Vec::new(),
+            continuation: TioContinuation::default(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -2189,6 +2211,7 @@ impl Dispatcher {
                     func: f,
                     params,
                     filters,
+                    continuation: blob.continuation.clone(),
                     blob: bytes.to_vec(),
                     filter_history,
                 },
@@ -4843,6 +4866,26 @@ pub struct ExchangeBlob {
     /// `filter_deltas` (a compacted replay cannot always reproduce it).
     #[serde(default)]
     pub filter_predicate_order: Vec<String>,
+    /// Table-in-out continued output: the pending reply's position, so a tick
+    /// rebuilt on any worker can resume it. See [`TioContinuation`].
+    #[serde(default)]
+    pub continuation: TioContinuation,
+}
+
+/// A table-in-out exchange's continued-output position (see
+/// `crate::table_in_out`). Lives in the exchange state, so over HTTP it rides
+/// the stream's sealed state token to whichever worker gets the next tick.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct TioContinuation {
+    /// The last reply said `HAVE_MORE_OUTPUT`, so the next input must be a
+    /// continuation tick (and only then may one arrive).
+    pub more_pending: bool,
+    /// What the function recorded with `TableInOutOutput::set_resume_state`,
+    /// handed to its `resume`.
+    pub resume_state: Vec<u8>,
+    /// Rows of the last real input batch: a tick has none, but its reply's
+    /// `parent_rows` index that batch, and filtering checks them against it.
+    pub input_rows: u64,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -5036,7 +5079,9 @@ impl TableProducer for FinalizeFlushProducer {
     }
 }
 
-/// Per-input-batch table-in-out exchange. Applies auto-filter pushdown.
+/// Per-input-batch table-in-out exchange. Applies auto-filter pushdown, and
+/// drives continued output (see `crate::table_in_out`): a reply that says more
+/// is followed by continuation ticks, each answered through `resume`.
 struct TableInOutExchangeState {
     func: Arc<dyn TableInOutFunction>,
     params: ProcessParams,
@@ -5044,6 +5089,19 @@ struct TableInOutExchangeState {
     blob: Vec<u8>,
     /// The dynamic-filter deltas a continuation must replay (compacted).
     filter_history: crate::pushdown::DeltaHistory,
+    /// Whether output is pending, and where it resumes.
+    continuation: TioContinuation,
+}
+
+/// Whether this exchange turn's input is a continuation tick rather than real
+/// input. The status rides the input batch's metadata, surfaced as the tick
+/// metadata on every transport; the request metadata is a fallback, as for
+/// the revalidators (see [`cond_validator`]).
+fn is_continuation_tick(ctx: &CallContext) -> bool {
+    let key = crate::table_in_out::STATUS_METADATA_KEY;
+    ctx.tick_metadata(key)
+        .or_else(|| ctx.transport_metadata.get(key).cloned())
+        .is_some_and(|v| v == crate::table_in_out::STATUS_CONTINUE)
 }
 
 impl ExchangeState for TableInOutExchangeState {
@@ -5067,17 +5125,85 @@ impl ExchangeState for TableInOutExchangeState {
                 self.filters = Some(current.clone());
             }
         }
+        // A tick asks for the next reply of the last input's output, and is the
+        // only valid input while that output is pending. No negotiation: the
+        // client never sends one otherwise, so anything else is a protocol bug.
+        let tick = is_continuation_tick(ctx);
+        let name = self.func.name();
+        if tick && !self.continuation.more_pending {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: continuation tick received, but no output is pending"
+            )));
+        }
+        if tick && input.num_rows() != 0 {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: a continuation tick must have no rows, got {}",
+                input.num_rows()
+            )));
+        }
+        if !tick && self.continuation.more_pending {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: input received while output is pending; expected a continuation tick"
+            )));
+        }
         // Conditional-revalidation validators (exchange-mode result cache): the
         // client holds a stale cached result for THIS input unit and asks the
         // worker to confirm freshness cheaply. They ride the input batch's
         // custom metadata (surfaced as this tick's metadata), so re-read them
-        // on every tick — each input unit can carry its own validators.
-        self.params.if_none_match =
-            cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
-        self.params.if_modified_since =
-            cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
+        // on every real input — each input unit can carry its own validators.
+        // They apply to that input's first reply only, so a continuation tick
+        // (which never carries them) offers none to `resume`.
+        if tick {
+            self.params.if_none_match = None;
+            self.params.if_modified_since = None;
+        } else {
+            self.params.if_none_match =
+                cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
+            self.params.if_modified_since =
+                cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
+        }
         let mut collected = crate::table_in_out::TableInOutOutput::default();
-        self.func.process_out(&self.params, input, &mut collected)?;
+        if tick {
+            let state = std::mem::take(&mut self.continuation.resume_state);
+            self.func.resume(&self.params, &state, &mut collected)?;
+        } else {
+            self.continuation.input_rows = input.num_rows() as u64;
+            self.func.process_out(&self.params, input, &mut collected)?;
+        }
+        let more = match collected.more.as_slice() {
+            [] => false,
+            [0] if collected.items.len() == 1 => true,
+            _ => {
+                return Err(RpcError::runtime_error(format!(
+                    "{name}: a reply that says more must be the only batch its turn emits"
+                )))
+            }
+        };
+        if more && !self.func.resume_supported() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: emitted more output but does not implement resume() \
+                 (resume_supported() is false)"
+            )));
+        }
+        if more && collected.resume_state.is_none() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: emitted more output without set_resume_state(); resume() \
+                 would have nothing to continue from"
+            )));
+        }
+        // Cache control describes an input's whole output and rides its first
+        // reply only; a tick's reply is never that.
+        if tick
+            && collected.items.iter().any(|(_, md)| {
+                md.as_ref()
+                    .is_some_and(|m| m.keys().any(|k| k.starts_with("vgi.cache.")))
+            })
+        {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: cache control is only valid on an input's first reply, \
+                 not on one answering a continuation tick"
+            )));
+        }
         // 1:1 lockstep: the client reads exactly ONE output batch per input
         // batch, so an accumulate-only tick (process emitted nothing, e.g.
         // substream_partial_sum) still answers with a 0-row batch — parity
@@ -5085,34 +5211,49 @@ impl ExchangeState for TableInOutExchangeState {
         // blocks forever on ReadDataBatch.
         if collected.items.is_empty() {
             out.emit(RecordBatch::new_empty(out.schema()))?;
+            self.continuation = TioContinuation {
+                input_rows: self.continuation.input_rows,
+                ..Default::default()
+            };
             return Ok(());
         }
+        // A reply's parent_rows index the last real input, which a tick is not.
+        let input_rows = self.continuation.input_rows as usize;
         for (batch, mut metadata) in collected.items {
             let batch = match &self.filters {
                 Some(f) => {
                     let keep = f.evaluate(&batch)?;
-                    crate::table_in_out::filter_parent_rows(
-                        &mut metadata,
-                        &keep,
-                        input.num_rows(),
-                    )?;
+                    crate::table_in_out::filter_parent_rows(&mut metadata, &keep, input_rows)?;
                     arrow_select::filter::filter_record_batch(&batch, &keep)
                         .map_err(|e| RpcError::runtime_error(e.to_string()))?
                 }
                 None => batch,
             };
             let batch = crate::table_in_out::project_batch(&batch, &out.schema())?;
+            if more {
+                metadata.get_or_insert_with(HashMap::new).insert(
+                    crate::table_in_out::STATUS_METADATA_KEY.to_string(),
+                    crate::table_in_out::STATUS_HAVE_MORE_OUTPUT.to_string(),
+                );
+            }
             match metadata {
                 Some(md) => out.emit_with_metadata(batch, md)?,
                 None => out.emit(batch)?,
             }
         }
+        self.continuation.more_pending = more;
+        self.continuation.resume_state = if more {
+            collected.resume_state.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(&self.blob)?;
         blob.filter_deltas = self.filter_history.deltas().to_vec();
         blob.filter_predicate_order = self.filter_history.order().to_vec();
+        blob.continuation = self.continuation.clone();
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
 }

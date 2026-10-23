@@ -181,6 +181,17 @@ the output schema, and `process` (or the buffering / aggregate lifecycle methods
 See [filter ownership and typed pruning](docs/filtering-and-pruning.md) for safe
 external-data scans using `FilterHandling::Sdk` and partial-column candidate masks.
 
+A table-in-out function answers each input batch with one reply. To answer one
+input with several (one upstream API page per reply), emit each but the last with
+`EmitOptions { more: true, .. }`, record where to pick up with
+`out.set_resume_state(&position)`, and implement `resume` (plus
+`resume_supported() -> true`): the framework calls it for each next reply with
+that state (`vgi::table_in_out::decode_resume_state`). Over HTTP the state travels
+in the stream's state token, so keep positions there, not output rows. A blended
+function (`input_from_args`) may also cap the input rows per call with
+`FunctionMetadata::input_rows_per_call`. See
+`vgi-example-worker/src/table_in_out/paged.rs`.
+
 Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets,
 bearer auth, and a cross-process state store are handled for you.
 

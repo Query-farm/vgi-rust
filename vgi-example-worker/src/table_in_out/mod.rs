@@ -4,6 +4,7 @@
 
 mod blended;
 mod cached;
+mod paged;
 
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table_in_out(SlowCancellableInOutFunction);
     blended::register(w);
     cached::register(w);
+    paged::register(w);
 }
 
 /// `slow_cancellable_inout(probe_path, input, sleep_ms)` — passthrough with a

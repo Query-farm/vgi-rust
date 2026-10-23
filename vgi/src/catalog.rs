@@ -617,6 +617,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         sink_order_dependent: false,
         requires_input_batch_index: false,
         input_from_args: false, // set per-function from FunctionMetadata.input_from_args
+        input_rows_per_call: None,
         required_settings: Vec::new(),
         required_secrets: Vec::new(),
     }
@@ -809,6 +810,7 @@ pub fn table_in_out_function_info(
     // in-out registration branch with real-typed args and drive the literal
     // single-row scan-mode.
     fi.input_from_args = meta.input_from_args;
+    fi.input_rows_per_call = meta.input_rows_per_call;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
