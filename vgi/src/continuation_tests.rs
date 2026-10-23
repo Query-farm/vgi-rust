@@ -9,7 +9,10 @@
 //! (the DuckDB suite cannot send a malformed tick), and cover the refusals the
 //! protocol requires of every worker: a tick with nothing pending, a tick with
 //! rows, real input while output is pending, cache control on a tick's reply,
-//! and "more" from a function that cannot resume.
+//! "more" from a function that cannot resume, a turn of several batches, and a
+//! tick that `resume` answers with none. They also pin what a tick's reply is
+//! given: no revalidators, and auto-applied filters checked against the last
+//! real input's rows.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,8 +52,9 @@ fn n_batch(values: &[i64]) -> RecordBatch {
     .unwrap()
 }
 
-/// For each input row with count `n`, rows `0..n-1`, `PAGE` per reply. The
-/// flags break the contract in the one way each refusal test needs.
+/// For each input row `r` with count `n`, rows `0..n-1` (parent row `r`),
+/// `PAGE` per reply. The flags break the contract in the one way each refusal
+/// test needs, or probe what a turn is handed.
 struct Pager {
     name: &'static str,
     /// `resume_supported()`.
@@ -59,7 +63,19 @@ struct Pager {
     records_state: bool,
     /// Advertise cache control on every reply, a tick's included.
     cache_every_reply: bool,
+    /// Answer a real input with two plain batches (neither says more).
+    two_batches: bool,
+    /// `resume` emits nothing.
+    empty_resume: bool,
+    /// `process_out` requires the `if_none_match` validator `v1`; `resume`
+    /// fails if it is offered any validator.
+    validator_probe: bool,
+    /// The framework applies pushed-down filters to the output.
+    filtered: bool,
 }
+
+/// Output still to send: each row's value and its parent input row.
+type Rest = Vec<(i64, i32)>;
 
 impl Pager {
     const fn new(name: &'static str) -> Self {
@@ -68,20 +84,26 @@ impl Pager {
             resumable: true,
             records_state: true,
             cache_every_reply: false,
+            two_batches: false,
+            empty_resume: false,
+            validator_probe: false,
+            filtered: false,
         }
     }
 
-    /// Emit the next page of `rest` (the output still to send).
-    fn emit(&self, mut rest: Vec<i64>, out: &mut TableInOutOutput) -> Result<()> {
+    /// Emit the next page of `rest`.
+    fn emit(&self, mut rest: Rest, out: &mut TableInOutOutput) -> Result<()> {
         let tail = rest.split_off(rest.len().min(PAGE));
         let more = !tail.is_empty();
         if more && self.records_state {
             out.set_resume_state(&tail)?;
         }
+        let (values, parents): (Vec<i64>, Vec<i32>) = rest.into_iter().unzip();
         out.emit_with(
-            n_batch(&rest),
+            n_batch(&values),
             EmitOptions {
                 more,
+                parent_rows: Some(parents),
                 cache_control: self.cache_every_reply.then(|| CacheControl::ttl(60)),
                 ..Default::default()
             },
@@ -94,7 +116,11 @@ impl TableInOutFunction for Pager {
         self.name
     }
     fn metadata(&self) -> FunctionMetadata {
-        FunctionMetadata::default()
+        FunctionMetadata {
+            filter_pushdown: self.filtered,
+            auto_apply_filters: self.filtered,
+            ..Default::default()
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         // `Arguments::serialize_positional` over an empty slice writes no
@@ -112,26 +138,48 @@ impl TableInOutFunction for Pager {
     }
     fn process_out(
         &self,
-        _params: &ProcessParams,
+        params: &ProcessParams,
         batch: &RecordBatch,
         out: &mut TableInOutOutput,
     ) -> Result<()> {
+        if self.validator_probe && params.if_none_match.as_deref() != Some("v1") {
+            return Err(vgi_rpc::RpcError::runtime_error(format!(
+                "process_out expected if_none_match v1, got {:?}",
+                params.if_none_match
+            )));
+        }
+        if self.two_batches {
+            out.emit(n_batch(&[1]));
+            out.emit(n_batch(&[2]));
+            return Ok(());
+        }
         let counts = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         let rows = (0..counts.len())
-            .flat_map(|i| 0..counts.value(i).max(0))
+            .flat_map(|i| (0..counts.value(i).max(0)).map(move |v| (v, i as i32)))
             .collect();
         self.emit(rows, out)
     }
     fn resume(
         &self,
-        _params: &ProcessParams,
+        params: &ProcessParams,
         state: &[u8],
         out: &mut TableInOutOutput,
     ) -> Result<()> {
+        if self.validator_probe
+            && (params.if_none_match.is_some() || params.if_modified_since.is_some())
+        {
+            return Err(vgi_rpc::RpcError::runtime_error(format!(
+                "resume was offered validators: {:?} / {:?}",
+                params.if_none_match, params.if_modified_since
+            )));
+        }
+        if self.empty_resume {
+            return Ok(());
+        }
         self.emit(decode_resume_state(state)?, out)
     }
 }
@@ -152,6 +200,22 @@ fn start_server() -> u16 {
     w.register_table_in_out(Pager {
         cache_every_reply: true,
         ..Pager::new("test_pager_cache_every_reply")
+    });
+    w.register_table_in_out(Pager {
+        two_batches: true,
+        ..Pager::new("test_pager_two_batches")
+    });
+    w.register_table_in_out(Pager {
+        empty_resume: true,
+        ..Pager::new("test_pager_empty_resume")
+    });
+    w.register_table_in_out(Pager {
+        validator_probe: true,
+        ..Pager::new("test_pager_validator_probe")
+    });
+    w.register_table_in_out(Pager {
+        filtered: true,
+        ..Pager::new("test_pager_filtered")
     });
     let server = Arc::new(w.build_server());
     let state = HttpState::builder().server(server).build();
@@ -200,8 +264,44 @@ fn frame(batch: &RecordBatch, method: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     buf
 }
 
+/// A `vgi.filters.v2` snapshot of one required predicate, `n > 0`.
+fn n_positive_filter() -> Vec<u8> {
+    let json = r#"{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{"id":"p","revision":0,"mode":"required","source":"query","expression":{"node":"comparison","op":"gt","left":{"node":"column_ref","column_index":0,"column_name":"n"},"right":{"node":"literal","value_ref":0}}}]}"#;
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("filter_spec", DataType::Utf8, false),
+            Field::new("value_0", DataType::Int64, true),
+        ],
+        HashMap::from([
+            (
+                "vgi_filter_encoding".to_string(),
+                "vgi.filters.v2".to_string(),
+            ),
+            ("vgi_filter_version".to_string(), "2".to_string()),
+            (
+                "vgi_evaluation_context".to_string(),
+                "vgi.none.v1".to_string(),
+            ),
+        ]),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(arrow_array::StringArray::from(vec![json])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    ipc::write_batch(&batch).unwrap()
+}
+
 /// The `init` body opening an INPUT-phase exchange on `function`.
 fn init_body(function: &str) -> Vec<u8> {
+    init_body_with_filters(function, None)
+}
+
+/// [`init_body`], pushing down `filters` (a `vgi.filters.v2` snapshot).
+fn init_body_with_filters(function: &str, filters: Option<Vec<u8>>) -> Vec<u8> {
     let args = crate::arguments::Arguments::serialize_positional(&[
         Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
     ])
@@ -229,7 +329,7 @@ fn init_body(function: &str) -> Vec<u8> {
         output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,
-        pushdown_filters: None,
+        pushdown_filters: filters.map(vgi_rpc::LargeBytes),
         join_keys: None,
         phase: Some(DictString(crate::protocol::enums::phase::INPUT.to_string())),
         execution_id: None,
@@ -277,6 +377,8 @@ fn post(port: u16, path: &str, body: Vec<u8>) -> Vec<u8> {
 #[derive(Debug)]
 struct Reply {
     values: Vec<i64>,
+    /// The data batch's `parent_row` provenance, if it carried any.
+    parents: Option<Vec<i32>>,
     /// The data batch said `HAVE_MORE_OUTPUT`.
     more: bool,
     /// The data batch carried `vgi.cache.*` keys.
@@ -288,6 +390,7 @@ struct Reply {
 fn parse(body: &[u8]) -> Reply {
     let mut reply = Reply {
         values: Vec::new(),
+        parents: None,
         more: false,
         cache_control: false,
         token: None,
@@ -307,6 +410,17 @@ fn parse(body: &[u8]) -> Reply {
             }
             reply.more |= md_get(&md, STATUS_METADATA_KEY) == Some(STATUS_HAVE_MORE_OUTPUT);
             reply.cache_control |= md.keys().any(|k| k.starts_with("vgi.cache."));
+            if let Some(encoded) = md_get(&md, crate::table_in_out::PARENT_ROW_METADATA_KEY) {
+                use base64::Engine;
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                reply.parents = Some(
+                    raw.chunks(4)
+                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                        .collect(),
+                );
+            }
             if let Some(col) = rb
                 .schema()
                 .index_of("n")
@@ -328,7 +442,11 @@ struct Stream {
 
 impl Stream {
     fn open(port: u16, function: &str) -> Self {
-        let init = parse(&post(port, "init/init", init_body(function)));
+        Self::open_with(port, init_body(function))
+    }
+
+    fn open_with(port: u16, body: Vec<u8>) -> Self {
+        let init = parse(&post(port, "init/init", body));
         assert_eq!(init.error, None, "init failed");
         Stream {
             port,
@@ -339,7 +457,14 @@ impl Stream {
     /// Send `batch`, with `vgi.status: CONTINUE` when `tick`, and advance the
     /// state token on success.
     fn turn(&mut self, batch: &RecordBatch, tick: bool) -> Reply {
-        let mut extra = vec![(STATE_KEY, self.token.as_str())];
+        self.turn_with(batch, tick, &[])
+    }
+
+    /// [`turn`](Self::turn) with `metadata` on the input batch as well.
+    fn turn_with(&mut self, batch: &RecordBatch, tick: bool, metadata: &[(&str, &str)]) -> Reply {
+        let token = self.token.clone();
+        let mut extra = vec![(STATE_KEY, token.as_str())];
+        extra.extend_from_slice(metadata);
         if tick {
             extra.push((STATUS_METADATA_KEY, STATUS_CONTINUE));
         }
@@ -447,6 +572,82 @@ fn cache_control_on_a_tick_reply_is_refused() {
     assert!(
         message.contains("only valid on an input's first reply"),
         "{message}"
+    );
+}
+
+/// The client reads one batch per turn, so a turn of two (neither saying
+/// more) would answer the next turn with the second and desync the lockstep.
+#[test]
+fn a_turn_of_several_batches_is_refused() {
+    let port = start_server();
+    let mut s = Stream::open(port, "test_pager_two_batches");
+    let message = s.send(&[1]).error.expect("two batches must fail");
+    assert!(message.contains("at most one batch, got 2"), "{message}");
+}
+
+/// A tick must be answered with a batch: padding an empty `resume` with an
+/// empty reply that does not say more would end the output silently.
+#[test]
+fn a_tick_answered_with_nothing_is_refused() {
+    let port = start_server();
+    let mut s = Stream::open(port, "test_pager_empty_resume");
+    let first = s.send(&[5]);
+    assert!(first.more && first.error.is_none(), "{first:?}");
+    let message = s.tick().error.expect("an empty resume must fail");
+    assert!(
+        message.contains("emitted no batch for a continuation tick"),
+        "{message}"
+    );
+}
+
+/// Revalidators belong to the real input they ride: `process_out` sees them,
+/// and `resume` is never offered them, even when a (misbehaving) client puts
+/// them on the tick.
+#[test]
+fn validators_are_cleared_before_resume() {
+    let port = start_server();
+    let mut s = Stream::open(port, "test_pager_validator_probe");
+    let inm = vgi_protocol::cache_control::CACHE_IF_NONE_MATCH_KEY;
+    let ims = vgi_protocol::cache_control::CACHE_IF_MODIFIED_SINCE_KEY;
+    let mut replies = vec![s.turn_with(&n_batch(&[5]), false, &[(inm, "v1")])];
+    while replies.last().unwrap().more {
+        let tick = s.turn_with(
+            &n_batch(&[]),
+            true,
+            &[(inm, "v1"), (ims, "Wed, 26 Aug 2026 12:00:00 GMT")],
+        );
+        replies.push(tick);
+    }
+    assert!(replies.iter().all(|r| r.error.is_none()), "{replies:?}");
+    let values: Vec<i64> = replies.iter().flat_map(|r| r.values.clone()).collect();
+    assert_eq!(values, vec![0, 1, 2, 3, 4]);
+}
+
+/// Auto-applied filters run on a tick's reply too, and its provenance is
+/// checked against (and still indexes) the last real input's rows: the tick
+/// itself has none, so checking against it would refuse every parent row.
+#[test]
+fn filters_apply_to_a_tick_reply_against_the_last_inputs_rows() {
+    let port = start_server();
+    let mut s = Stream::open_with(
+        port,
+        init_body_with_filters("test_pager_filtered", Some(n_positive_filter())),
+    );
+    // Unfiltered: [0 1] [2 0] [1], parents [0 0] [0 2] [2].
+    let mut replies = vec![s.send(&[3, 0, 2])];
+    while replies.last().unwrap().more {
+        replies.push(s.tick());
+    }
+    assert!(replies.iter().all(|r| r.error.is_none()), "{replies:?}");
+    let pages: Vec<(Vec<i64>, Option<Vec<i32>>)> =
+        replies.into_iter().map(|r| (r.values, r.parents)).collect();
+    assert_eq!(
+        pages,
+        vec![
+            (vec![1], Some(vec![0])),
+            (vec![2], Some(vec![0])),
+            (vec![1], Some(vec![2])),
+        ]
     );
 }
 

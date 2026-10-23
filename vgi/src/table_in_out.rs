@@ -2,8 +2,10 @@
 
 //! Table-in-out function model: transform input batches to output batches.
 //!
-//! Driven as an exchange stream: each input batch produces zero or more output
-//! batches. The dispatch adapter applies auto-filter pushdown to the output.
+//! Driven as an exchange stream: each input batch is answered by exactly one
+//! output batch (an input that emits none is answered with an empty one; a
+//! turn that emits several is refused). The dispatch adapter applies
+//! auto-filter pushdown to the output.
 //!
 //! # Continued output
 //!
@@ -55,6 +57,7 @@ pub const STATUS_CONTINUE: &str = "CONTINUE";
 #[derive(Default)]
 pub struct EmitOptions {
     /// Arbitrary per-batch wire metadata (merged under the derived keys).
+    /// It may not carry `vgi.status`: use [`more`](Self::more).
     pub metadata: Option<HashMap<String, String>>,
     /// Result-cache advertisement — rendered to `vgi.cache.*` keys.
     pub cache_control: Option<CacheControl>,
@@ -108,6 +111,14 @@ impl TableInOutOutput {
     /// cache_control=..., parent_rows=...)` kwargs.
     pub fn emit_with(&mut self, batch: RecordBatch, opts: EmitOptions) -> Result<()> {
         let mut md: HashMap<String, String> = opts.metadata.unwrap_or_default();
+        // The framework must see "more" to expect the tick that follows, so the
+        // status only rides `EmitOptions::more`, never raw metadata.
+        if md.contains_key(STATUS_METADATA_KEY) {
+            return Err(RpcError::runtime_error(format!(
+                "emit_with(metadata=...) may not carry `{STATUS_METADATA_KEY}`; say there is \
+                 more output with EmitOptions::more"
+            )));
+        }
         if let Some(parent_rows) = opts.parent_rows {
             if parent_rows.len() != batch.num_rows() {
                 return Err(RpcError::runtime_error(format!(
@@ -173,7 +184,9 @@ pub trait TableInOutFunction: Send + Sync {
             opaque_data: Vec::new(),
         })
     }
-    /// Transform one input batch into output batches. Default: pass through
+    /// Transform one input batch into at most one output batch (return none
+    /// to answer with an empty batch; several are refused, as the client
+    /// reads one reply per input — concatenate them). Default: pass through
     /// the input; the dispatcher filters and then projects it by column name. A
     /// distributed/accumulating function persists partial state to
     /// `params.storage` here and returns an empty batch.
@@ -224,7 +237,8 @@ pub trait TableInOutFunction: Send + Sync {
     /// Emit the next reply for the last input batch, after a reply that said
     /// [`EmitOptions::more`]. `state` is what the previous turn recorded with
     /// [`TableInOutOutput::set_resume_state`]; read it with
-    /// [`decode_resume_state`]. Like `process_out`, emit exactly one batch,
+    /// [`decode_resume_state`]. Emit exactly one batch (emitting none is
+    /// refused: it would end the output silently),
     /// with `more` (and an advanced resume state) unless it is the last. Its
     /// `parent_rows` index the input batch `process_out` received.
     fn resume(
@@ -356,6 +370,36 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn raw_status_metadata_is_refused() {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let mut out = TableInOutOutput::default();
+        let error = out
+            .emit_with(
+                batch.clone(),
+                EmitOptions {
+                    metadata: Some(HashMap::from([(
+                        STATUS_METADATA_KEY.to_string(),
+                        STATUS_HAVE_MORE_OUTPUT.to_string(),
+                    )])),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("EmitOptions::more"), "{error}");
+        assert!(out.items.is_empty() && out.more.is_empty());
+
+        out.emit_with(
+            batch,
+            EmitOptions {
+                more: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.more, vec![0]);
+    }
 
     #[test]
     fn zero_column_projection_preserves_rows() {

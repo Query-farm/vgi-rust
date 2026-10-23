@@ -5170,15 +5170,25 @@ impl ExchangeState for TableInOutExchangeState {
             self.continuation.input_rows = input.num_rows() as u64;
             self.func.process_out(&self.params, input, &mut collected)?;
         }
-        let more = match collected.more.as_slice() {
-            [] => false,
-            [0] if collected.items.len() == 1 => true,
-            _ => {
-                return Err(RpcError::runtime_error(format!(
-                    "{name}: a reply that says more must be the only batch its turn emits"
-                )))
-            }
-        };
+        // One reply per turn: the client reads exactly one batch per input or
+        // tick, so a second would answer the next turn and desync the lockstep.
+        // A reply that says more is that one batch.
+        if collected.items.len() > 1 {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: a table-in-out turn must emit at most one batch, got {}; \
+                 combine them, or emit one with EmitOptions::more and the rest from resume()",
+                collected.items.len()
+            )));
+        }
+        // An empty tick answer would end the continuation silently (a padded
+        // reply that does not say more), truncating the input's output.
+        if tick && collected.items.is_empty() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: resume() emitted no batch for a continuation tick; every tick \
+                 must be answered with exactly one batch"
+            )));
+        }
+        let more = !collected.more.is_empty();
         if more && !self.func.resume_supported() {
             return Err(RpcError::runtime_error(format!(
                 "{name}: emitted more output but does not implement resume() \
@@ -5205,10 +5215,12 @@ impl ExchangeState for TableInOutExchangeState {
             )));
         }
         // 1:1 lockstep: the client reads exactly ONE output batch per input
-        // batch, so an accumulate-only tick (process emitted nothing, e.g.
+        // batch, so an accumulate-only input (process emitted nothing, e.g.
         // substream_partial_sum) still answers with a 0-row batch — parity
-        // with the Python SDK's `empty_batch` padding. Without it the client
-        // blocks forever on ReadDataBatch.
+        // with the Python SDK's `TableInOutFunction.process`, which pads an
+        // empty `transform()` result with `empty_batch`. Without it the client
+        // blocks forever on ReadDataBatch. (A tick never gets here: an empty
+        // resume() was refused above.)
         if collected.items.is_empty() {
             out.emit(RecordBatch::new_empty(out.schema()))?;
             self.continuation = TioContinuation {

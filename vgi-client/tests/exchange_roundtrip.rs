@@ -310,6 +310,190 @@ fn a_blended_function_continues_with_provenance() {
     ex2.close().expect("close drops the pending output");
 }
 
+/// The continued-output fixtures' failure and revalidation modes, on both
+/// call paths: `blended_paged` (batched LATERAL) and `paged_explode` (stock
+/// in-out). Contracts: the extension's
+/// `table_in_out/continuation_resume_error_revalidate.test` header, with
+/// `lateral_continuation.test` and `continuation_classic.test`.
+const PAGED_FIXTURES: [&str; 2] = ["blended_paged", "paged_explode"];
+
+/// Bind a paged fixture with `named` arguments, its input column `n`.
+fn bind_paged(
+    client: &mut VgiClient,
+    cat: &vgi_client::AttachedCatalog,
+    function: &str,
+    named: &[(&str, ArgValue)],
+) -> vgi_client::BoundFunction {
+    let mut spec = BindSpec::table(function).in_schema(cat.default_schema());
+    spec.function_type = FunctionType::TableInOut;
+    let mut args = Arguments::new();
+    if function == "blended_paged" {
+        args = args.positional(ArgValue::Placeholder(DataType::Int64));
+    }
+    for (name, value) in named {
+        args = args.named(*name, value.clone());
+    }
+    spec.arguments = args;
+    client
+        .bind_with_input(cat, &spec, &i64_schema("n"))
+        .unwrap_or_else(|e| panic!("bind `{function}`: {e}"))
+}
+
+#[test]
+fn fail_on_page_fails_that_reply_counting_per_input_batch() {
+    skip_without_worker!();
+    for function in PAGED_FIXTURES {
+        let mut client = connect();
+        let cat = client
+            .attach("example", AttachOptions::default())
+            .expect("attach");
+        let bound = bind_paged(
+            &mut client,
+            &cat,
+            function,
+            &[
+                ("page_size", ArgValue::Int(2)),
+                ("fail_on_page", ArgValue::Int(3)),
+            ],
+        );
+        let mut ex = client
+            .open_exchange(&bound, &ScanOptions::default())
+            .expect("open exchange");
+        // Two replies: page 3 is never reached.
+        let answers = drain_continued(&mut ex, &i64_batch("n", &[3]));
+        assert_eq!(answers.len(), 2, "{function}: {answers:?}");
+        // The count restarts with the next input batch: pages 1 and 2 go out,
+        // the third (a tick's reply) fails.
+        ex.send(&i64_batch("n", &[6])).expect("page 1");
+        assert!(ex.has_more_output());
+        ex.continue_output().expect("page 2");
+        assert!(ex.has_more_output());
+        let error = ex.continue_output().expect_err("page 3 fails");
+        assert!(
+            error.to_string().contains("failing on page 3 as asked"),
+            "{function}: {error}"
+        );
+        drop(ex);
+
+        // fail_on_page = 1 fails the input's first reply.
+        let bound = bind_paged(
+            &mut client,
+            &cat,
+            function,
+            &[("fail_on_page", ArgValue::Int(1))],
+        );
+        let mut ex = client
+            .open_exchange(&bound, &ScanOptions::default())
+            .expect("open exchange");
+        let error = ex.send(&i64_batch("n", &[1])).expect_err("page 1 fails");
+        assert!(
+            error.to_string().contains("failing on page 1 as asked"),
+            "{function}: {error}"
+        );
+    }
+}
+
+#[test]
+fn revalidate_answers_by_whether_the_request_is_conditional() {
+    skip_without_worker!();
+    for function in PAGED_FIXTURES {
+        let mut client = connect();
+        let cat = client
+            .attach("example", AttachOptions::default())
+            .expect("attach");
+        // cache_ttl is ignored under revalidate.
+        let named = [
+            ("page_size", ArgValue::Int(1)),
+            ("cache_ttl", ArgValue::Int(300)),
+            ("revalidate", ArgValue::Bool(true)),
+        ];
+        let bound = bind_paged(&mut client, &cat, function, &named);
+
+        // A plain request: the whole output in one reply, ttl 0, etag v1,
+        // revalidatable.
+        let mut ex = client
+            .open_exchange(&bound, &ScanOptions::default())
+            .expect("open exchange");
+        let answers = drain_continued(&mut ex, &i64_batch("n", &[3]));
+        let values: Vec<Vec<i64>> = answers.into_iter().map(|(v, _)| v).collect();
+        assert_eq!(values, vec![vec![0, 1, 2]], "{function}");
+        let cc = ex.cache_control().expect("cache control").clone();
+        assert_eq!(cc.ttl_seconds, Some(0), "{function}");
+        assert_eq!(cc.etag.as_deref(), Some("v1"), "{function}");
+        assert!(cc.revalidatable && !cc.not_modified, "{function}");
+        ex.close().expect("close");
+        drop(ex);
+
+        // A conditional request: the data changed (+1000), paged as usual,
+        // the first reply ttl 0, etag v2, revalidatable, not not_modified.
+        let opts = ScanOptions {
+            if_none_match: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let mut ex = client.open_exchange(&bound, &opts).expect("open exchange");
+        let first = ex
+            .send(&i64_batch("n", &[3]))
+            .expect("send")
+            .expect("reply");
+        assert_eq!(column_values(&first, 0), vec![1000], "{function}");
+        let cc = ex.cache_control().expect("cache control").clone();
+        assert_eq!(cc.ttl_seconds, Some(0), "{function}");
+        assert_eq!(cc.etag.as_deref(), Some("v2"), "{function}");
+        assert!(cc.revalidatable && !cc.not_modified, "{function}");
+        let mut values = vec![1000];
+        while ex.has_more_output() {
+            let page = ex.continue_output().expect("tick").expect("reply");
+            values.extend(column_values(&page, 0));
+        }
+        assert_eq!(values, vec![1000, 1001, 1002], "{function}");
+        ex.close().expect("close");
+    }
+}
+
+#[test]
+fn not_modified_more_is_refused_by_the_client() {
+    skip_without_worker!();
+    for function in PAGED_FIXTURES {
+        let mut client = connect();
+        let cat = client
+            .attach("example", AttachOptions::default())
+            .expect("attach");
+        let named = [
+            ("page_size", ArgValue::Int(2)),
+            ("revalidate", ArgValue::Bool(true)),
+            ("not_modified_more", ArgValue::Bool(true)),
+        ];
+        let bound = bind_paged(&mut client, &cat, function, &named);
+
+        // Only a conditional request is answered with it: a plain one is the
+        // whole output in one reply, as under revalidate alone.
+        let mut ex = client
+            .open_exchange(&bound, &ScanOptions::default())
+            .expect("open exchange");
+        let answers = drain_continued(&mut ex, &i64_batch("n", &[3]));
+        assert_eq!(answers.len(), 1, "{function}: {answers:?}");
+        ex.close().expect("close");
+        drop(ex);
+
+        // On a conditional request the first reply is empty, not_modified and
+        // says more: a 304 that is not its input's only reply.
+        let opts = ScanOptions {
+            if_none_match: Some("v1".to_string()),
+            ..Default::default()
+        };
+        let mut ex = client.open_exchange(&bound, &opts).expect("open exchange");
+        let error = ex
+            .send(&i64_batch("n", &[3]))
+            .expect_err("not_modified with more must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("not_modified on a continued reply"),
+            "{function}: {error}"
+        );
+    }
+}
+
 #[test]
 fn a_buffered_function_sinks_then_sources() {
     skip_without_worker!();
