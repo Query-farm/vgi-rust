@@ -83,7 +83,7 @@ fn attaches_and_reports_a_default_schema() {
         "attach must return a session handle"
     );
     assert!(
-        !cat.default_schema().is_empty(),
+        !cat.default_schema().expect("fixture declares a default schema").is_empty(),
         "attach must name a default schema"
     );
 
@@ -194,7 +194,10 @@ fn function_listing_survives_the_raw_identifier_column() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema = cat.default_schema().to_string();
+    let schema = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let tables = client
         .functions(&cat, &schema, FunctionKind::Table)
@@ -225,7 +228,10 @@ fn reads_one_table_back_by_name() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema = cat.default_schema().to_string();
+    let schema = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let listed = client.tables(&cat, &schema).expect("tables");
     let Some(first) = listed.first() else {

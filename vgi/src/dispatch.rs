@@ -2351,7 +2351,7 @@ impl Dispatcher {
                 catalog_version_frozen: sec.catalog_version_frozen,
                 catalog_version: 1,
                 attach_opaque_data_required: true,
-                default_schema: catalog::MAIN_SCHEMA.to_string(),
+                default_schema: Some(catalog::MAIN_SCHEMA.to_string()),
                 settings: Vec::new(),
                 secret_types: Vec::new(),
                 attach_catalogs: Vec::new(),
@@ -2452,7 +2452,7 @@ impl Dispatcher {
             catalog_version_frozen: self.catalog.catalog_version_frozen,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: catalog::MAIN_SCHEMA.to_string(),
+            default_schema: Some(catalog::MAIN_SCHEMA.to_string()),
             settings: self
                 .settings
                 .iter()

@@ -14,6 +14,15 @@ use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
 
 #[test]
+fn attach_default_schema_preserves_null_and_raw_names() {
+    use vgi_protocol::protocol::dtos::CatalogAttachResult;
+    for (name, expected) in [("none", None), ("main", Some("main")), ("dotted", Some("sales.archive"))] {
+        let result: CatalogAttachResult = round_trip(&format!("attach_default_schema_{name}"));
+        assert_eq!(result.default_schema.as_deref(), expected);
+    }
+}
+
+#[test]
 fn typed_indexes_preserve_raw_paths_context_and_options() {
     use vgi_protocol::generated::protocol_types::{IndexDefinition, IndexKey};
     let column: IndexKey = round_trip("index_key_column");

@@ -630,9 +630,9 @@ impl AttachedCatalog {
         &self.info
     }
 
-    /// The schema a bare table name resolves in.
-    pub fn default_schema(&self) -> &str {
-        &self.info.default_schema
+    /// The raw root schema a bare table name resolves in, or no implicit default.
+    pub fn default_schema(&self) -> Option<&str> {
+        self.info.default_schema.as_deref()
     }
 
     /// Whether the worker offered transactions.
@@ -1785,6 +1785,16 @@ mod attach_option_tests {
         }
     }
 
+    #[test]
+    fn default_schema_preserves_absence_and_raw_identifier() {
+        let mut catalog = attached_catalog_for_test();
+        assert_eq!(catalog.default_schema(), Some("data"));
+        catalog.info.default_schema = None;
+        assert_eq!(catalog.default_schema(), None);
+        catalog.info.default_schema = Some("sales.archive".to_string());
+        assert_eq!(catalog.default_schema(), Some("sales.archive"));
+    }
+
     fn attached_catalog_for_test() -> AttachedCatalog {
         let info = CatalogAttachResult {
             catalog_capabilities: None,
@@ -1796,7 +1806,7 @@ mod attach_option_tests {
             catalog_version_frozen: false,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: "data".to_string(),
+            default_schema: Some("data".to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -2267,7 +2277,7 @@ mod load_catalog_tests {
             catalog_version_frozen: false,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: "main".to_string(),
+            default_schema: Some("main".to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),

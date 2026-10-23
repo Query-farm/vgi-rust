@@ -65,7 +65,10 @@ fn worker_log_batches_reach_the_log_facade() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("logging_generator")
         .in_schema(&schema_path)

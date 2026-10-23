@@ -49,7 +49,10 @@ fn scans_a_table_function_end_to_end() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("rowid_sequence")
         .in_schema(&schema_path)
@@ -79,7 +82,10 @@ fn a_large_scan_drains_every_row_in_order() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     const N: i64 = 5000;
     let spec = BindSpec::table("rowid_sequence")
@@ -116,7 +122,10 @@ fn planned_split_metadata_and_redemption_context_round_trip() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
     let spec = BindSpec::table("split_partitioned")
         .in_schema(&schema_path)
         .with_arguments(Arguments::new().named("rows_per_country", 3i64));
@@ -161,7 +170,10 @@ fn a_zero_row_scan_ends_cleanly() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("rowid_sequence")
         .in_schema(&schema_path)
@@ -181,7 +193,10 @@ fn projection_narrows_both_the_schema_and_the_batches() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("rowid_sequence")
         .in_schema(&schema_path)
@@ -222,7 +237,10 @@ fn an_out_of_range_projection_is_rejected_before_any_rpc() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("rowid_sequence")
         .in_schema(&schema_path)
@@ -246,7 +264,10 @@ fn named_arguments_reach_the_worker() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     // `cacheable_numbers(n, ttl)` takes both arguments by name.
     let spec = BindSpec::table("cacheable_numbers")
@@ -275,7 +296,10 @@ fn a_cacheable_result_advertises_its_directives() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("cacheable_numbers")
         .in_schema(&schema_path)
@@ -309,7 +333,10 @@ fn a_no_store_result_says_so() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("cache_no_store").in_schema(&schema_path);
     let Ok(bound) = client.bind(&cat, &spec) else {
@@ -345,7 +372,10 @@ fn parallel_connections_share_one_scan_and_partition_the_rows() {
     let cat = primary
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = BindSpec::table("partitioned_batch_index")
         .in_schema(&schema_path)

@@ -244,7 +244,7 @@ impl StoredCatalog {
             catalog_version_frozen: false,
             catalog_version: self.reported_version(&state),
             attach_opaque_data_required: true,
-            default_schema: DEFAULT_SCHEMA.to_string(),
+            default_schema: Some(DEFAULT_SCHEMA.to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),

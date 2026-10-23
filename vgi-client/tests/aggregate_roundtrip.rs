@@ -68,7 +68,10 @@ fn sums_one_group() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = sum_spec(&schema_path);
     let agg = client
@@ -100,7 +103,10 @@ fn keeps_groups_apart() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = sum_spec(&schema_path);
     let agg = client
@@ -144,7 +150,10 @@ fn finalize_answers_in_the_order_asked() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = sum_spec(&schema_path);
     let agg = client
@@ -181,7 +190,10 @@ fn a_batch_without_group_ids_is_refused_before_the_rpc() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = sum_spec(&schema_path);
     let agg = client
@@ -208,7 +220,10 @@ fn two_executions_aggregate_independently() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
     let spec = sum_spec(&schema_path);
 
     // Each bind mints its own execution; folding into one must not disturb the
@@ -260,7 +275,10 @@ fn evaluates_a_window_frame_over_a_shipped_partition() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = window_sum_spec(&schema_path);
     let agg = client
@@ -297,7 +315,10 @@ fn evaluates_several_window_rows_in_one_call() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = window_sum_spec(&schema_path);
     let agg = client
@@ -330,7 +351,10 @@ fn a_frame_count_that_disagrees_with_the_frame_list_is_refused() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let spec = window_sum_spec(&schema_path);
     let agg = client
