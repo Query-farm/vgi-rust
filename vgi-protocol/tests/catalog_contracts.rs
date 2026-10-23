@@ -543,9 +543,9 @@ fn logical_type_and_opaque_macro_batches_preserve_metadata_and_variant_bytes() {
         "logical_variant_absent",
         "logical_variant_null_member",
         "macro_create",
-        "macro_create_legacy",
+        "macro_create_single",
         "macro_info",
-        "macro_info_legacy",
+        "macro_info_single",
     ] {
         let original = StreamReader::try_new(Cursor::new(fixture(name)), None)
             .unwrap()
@@ -634,6 +634,19 @@ fn logical_type_and_opaque_macro_batches_preserve_metadata_and_variant_bytes() {
                     value
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn macro_info_typed_codec_keeps_the_entire_family() {
+    use vgi_protocol::protocol::dtos::MacroInfo;
+    for (name, count) in [("macro_info", 2), ("macro_info_single", 1)] {
+        let info: MacroInfo = round_trip(name);
+        assert_eq!(info.overloads.len(), count);
+        for overload in &info.overloads {
+            assert_eq!(overload.schema_path, info.schema_path);
+            assert!(overload.parameters.iter().all(|p| p.default_expression.is_none()));
         }
     }
 }

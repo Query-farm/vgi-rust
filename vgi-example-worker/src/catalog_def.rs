@@ -272,6 +272,7 @@ fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
     CatMacro {
+        overloads: None,
         name: name.to_string(),
         parameters: params.iter().map(|s| s.to_string()).collect(),
         definition: def.to_string(),
@@ -283,6 +284,7 @@ fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
 }
 fn tmacro(name: &str, params: &[&str], def: &str) -> CatMacro {
     CatMacro {
+        overloads: None,
         table_macro: true,
         ..smacro(name, params, def)
     }
@@ -1591,6 +1593,7 @@ pub fn build() -> CatalogModel {
                 ],
                 macros: vec![
                     CatMacro {
+                        overloads: None,
                         comment: Some("Multiply two values".to_string()),
                         parameter_docs: vec![
                             ("x".to_string(), "First factor".to_string()),
@@ -1602,6 +1605,7 @@ pub fn build() -> CatalogModel {
                         ..smacro("vgi_multiply", &["x", "y"], "main.double(x * y) / 2")
                     },
                     CatMacro {
+                        overloads: None,
                         comment: Some(
                             "Clamp a value between lo and hi (defaults: 0..100)".to_string(),
                         ),
@@ -1623,6 +1627,7 @@ pub fn build() -> CatalogModel {
                         )
                     },
                     CatMacro {
+                        overloads: None,
                         comment: Some("Table macro returning range of values".to_string()),
                         parameter_docs: vec![(
                             "n".to_string(),

@@ -286,50 +286,27 @@ pub fn decode_setting_specs(info: &CatalogAttachResult) -> Result<Vec<SettingSpe
         .collect()
 }
 
-/// Decode the typed, one-row default-value batch attached to a macro.
-///
-/// Only parameters that actually have defaults appear as columns. Keeping the
-/// values as Arrow arrays lets engine adapters preserve temporal, decimal,
-/// binary, and null types instead of round-tripping them through strings.
-pub fn decode_macro_defaults(info: &MacroInfo) -> Result<Vec<(String, ArrayRef)>> {
-    let Some(bytes) = info
-        .parameter_default_values
-        .as_ref()
-        .filter(|bytes| !bytes.0.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
-    if batch.num_rows() != 1 {
-        return Err(RpcError::type_error(format!(
-            "MacroInfo.parameter_default_values must contain one row, found {}",
-            batch.num_rows()
-        )));
-    }
+/// Decode literal defaults from one explicitly selected overload. Expression defaults
+/// require the owning SQL binder and are not evaluated or silently discarded here.
+pub fn decode_macro_defaults(overload: &vgi_protocol::generated::protocol_types::MacroOverload) -> Result<Vec<(String, ArrayRef)>> {
     let mut seen = std::collections::HashSet::new();
-    let mut defaults = Vec::with_capacity(batch.num_columns());
-    for (field, value) in batch.schema().fields().iter().zip(batch.columns()) {
-        let parameter = info
-            .parameters
-            .iter()
-            .find(|parameter| parameter.eq_ignore_ascii_case(field.name()))
-            .ok_or_else(|| {
-                RpcError::type_error(format!(
-                    "macro {} default names unknown parameter {:?}",
-                    info.name,
-                    field.name()
-                ))
-            })?;
-        let key = parameter.to_ascii_lowercase();
-        if !seen.insert(key) {
-            return Err(RpcError::type_error(format!(
-                "macro {} declares duplicate default for parameter {:?}",
-                info.name, parameter
-            )));
+    let mut result = Vec::new();
+    for parameter in &overload.parameters {
+        if !seen.insert(parameter.name.to_ascii_lowercase()) {
+            return Err(RpcError::type_error("duplicate macro parameter"));
         }
-        defaults.push((parameter.clone(), value.clone()));
+        if parameter.default_expression.is_some() {
+            return Err(RpcError::type_error("expression default requires the owning SQL binder"));
+        }
+        if let Some(bytes) = &parameter.default_value {
+            let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
+            if batch.num_rows() != 1 || batch.num_columns() != 1 || batch.schema().field(0).name() != &parameter.name {
+                return Err(RpcError::type_error("macro default requires one row and one column named for its parameter"));
+            }
+            result.push((parameter.name.clone(), batch.column(0).clone()));
+        }
     }
-    Ok(defaults)
+    Ok(result)
 }
 
 /// Encode a one-row typed option batch for [`AttachOptions::options`].
@@ -2009,137 +1986,40 @@ mod setting_spec_tests {
 
 #[cfg(test)]
 mod macro_default_tests {
-    use std::sync::Arc;
-
-    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
-
     use super::*;
+    use arrow_array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::generated::protocol_types::{MacroOverload, MacroParameter, QueryEvaluationContext};
 
-    fn info(parameters: &[&str], defaults: Option<RecordBatch>) -> MacroInfo {
-        MacroInfo {
-            comment: None,
-            tags: Vec::new(),
-            name: "clamp".to_string(),
-            schema_path: vec!["main".to_string()],
-            macro_type: DictString("scalar".to_string()),
-            parameters: parameters.iter().map(|value| value.to_string()).collect(),
-            parameter_default_values: defaults.map(|batch| {
-                Bytes::from(vgi_protocol::ipc::write_batch(&batch).expect("encode defaults"))
-            }),
-            definition: "val".to_string(),
-            arguments_schema: None,
-            overloads: None,
-        }
-    }
-
-    fn defaults(fields: &[&str], columns: Vec<ArrayRef>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(
-            fields
-                .iter()
-                .map(|name| Field::new(*name, DataType::Int64, false))
-                .collect::<Vec<_>>(),
-        ));
-        RecordBatch::try_new(schema, columns).expect("defaults batch")
-    }
-
-    #[test]
-    fn decodes_named_typed_macro_defaults() {
-        let macro_info = info(
-            &["val", "lo", "hi"],
-            Some(defaults(
-                &["lo", "hi"],
-                vec![
-                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![100])) as ArrayRef,
-                ],
-            )),
-        );
-        let decoded = decode_macro_defaults(&macro_info).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].0, "lo");
-        assert_eq!(
-            decoded[1]
-                .1
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0),
-            100
-        );
-    }
-
-    #[test]
-    fn empty_macro_defaults_are_absent() {
-        assert!(
-            decode_macro_defaults(&info(&["x"], None))
-                .unwrap()
-                .is_empty()
-        );
-        let mut empty = info(&["x"], None);
-        empty.parameter_default_values = Some(Bytes::from(Vec::new()));
-        assert!(decode_macro_defaults(&empty).unwrap().is_empty());
+    fn overload(value: Option<i64>) -> MacroOverload {
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef]).unwrap();
+        MacroOverload { parameters: vec![MacroParameter { name: "x".into(), declared_type: None,
+            default_value: Some(Bytes::from(vgi_protocol::ipc::write_batch(&batch).unwrap())),
+            default_expression: None, documentation: Some("typed default".into()) }],
+            definition: "x".into(), profile: "duckdb.macro.v1".into(), schema_path: vec!["main".into()], macro_type: "scalar".into(),
+            evaluation_context: QueryEvaluationContext { timezone: "UTC".into(), collation: "binary".into(),
+                default_order: "asc".into(), default_null_order: "nulls_last".into(), preserve_insertion_order: true } }
     }
 
     #[test]
     fn preserves_the_declared_type_of_a_null_default() {
-        let schema = Arc::new(Schema::new(vec![Field::new("lo", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![None])) as ArrayRef],
-        )
-        .unwrap();
-        let decoded = decode_macro_defaults(&info(&["lo"], Some(batch))).unwrap();
+        let decoded = decode_macro_defaults(&overload(None)).unwrap();
         assert_eq!(decoded[0].1.data_type(), &DataType::Int64);
         assert!(decoded[0].1.is_null(0));
+        assert_eq!(decoded[0].0, "x");
     }
 
     #[test]
-    fn rejects_wrong_cardinality_unknown_and_duplicate_defaults() {
-        let two_rows = info(
-            &["lo"],
-            Some(defaults(
-                &["lo"],
-                vec![Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef],
-            )),
-        );
-        assert!(
-            decode_macro_defaults(&two_rows)
-                .unwrap_err()
-                .message
-                .contains("one row")
-        );
-
-        let unknown = info(
-            &["lo"],
-            Some(defaults(
-                &["other"],
-                vec![Arc::new(Int64Array::from(vec![0])) as ArrayRef],
-            )),
-        );
-        assert!(
-            decode_macro_defaults(&unknown)
-                .unwrap_err()
-                .message
-                .contains("unknown parameter")
-        );
-
-        let duplicate = info(
-            &["lo"],
-            Some(defaults(
-                &["lo", "LO"],
-                vec![
-                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                ],
-            )),
-        );
-        assert!(
-            decode_macro_defaults(&duplicate)
-                .unwrap_err()
-                .message
-                .contains("duplicate default")
-        );
+    fn separates_absence_and_rejects_expression_or_wrong_parameter() {
+        let mut value = overload(Some(7));
+        assert_eq!(decode_macro_defaults(&value).unwrap().len(), 1);
+        value.parameters[0].name = "other".into();
+        assert!(decode_macro_defaults(&value).is_err());
+        value.parameters[0].default_value = None;
+        assert!(decode_macro_defaults(&value).unwrap().is_empty());
+        value.parameters[0].default_expression = Some(Bytes::from(vec![1]));
+        assert!(decode_macro_defaults(&value).unwrap_err().message.contains("owning SQL binder"));
     }
 }
 

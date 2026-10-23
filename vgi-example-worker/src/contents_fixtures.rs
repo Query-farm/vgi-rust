@@ -91,6 +91,7 @@ fn static_catalog(name: &str) -> CatalogModel {
                 }],
                 macros: vec![
                     CatMacro {
+                        overloads: None,
                         name: "contents_triple".to_string(),
                         parameters: vec!["x".to_string()],
                         definition: "x * 3".to_string(),
@@ -99,6 +100,7 @@ fn static_catalog(name: &str) -> CatalogModel {
                         ..Default::default()
                     },
                     CatMacro {
+                        overloads: None,
                         name: "contents_range".to_string(),
                         parameters: vec!["n".to_string()],
                         definition: "SELECT * FROM range(n)".to_string(),

@@ -1126,6 +1126,8 @@ impl Default for CatView {
 
 #[derive(Default, Clone)]
 pub struct CatMacro {
+    /// Complete family; simple descriptor fields must be empty when supplied.
+    pub overloads: Option<Vec<vgi_protocol::generated::protocol_types::MacroOverload>>,
     pub name: String,
     pub parameters: Vec<String>,
     pub definition: String,
@@ -1600,36 +1602,123 @@ pub fn table_info(
 }
 
 /// Build a `MacroInfo` DTO.
-pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos::MacroInfo {
-    crate::protocol::dtos::MacroInfo {
+pub fn macro_info(
+    schema_path: &[String],
+    m: &CatMacro,
+) -> Result<crate::protocol::dtos::MacroInfo> {
+    use vgi_protocol::generated::protocol_types::{
+        MacroOverload, MacroParameter, QueryEvaluationContext,
+    };
+    let kind = if m.table_macro { "table" } else { "scalar" };
+    let invalid = |message: &str| vgi_rpc::RpcError::value_error(message);
+    let overloads = if let Some(family) = &m.overloads {
+        if family.is_empty()
+            || !m.parameters.is_empty()
+            || !m.definition.is_empty()
+            || !m.defaults.is_empty()
+            || !m.parameter_docs.is_empty()
+        {
+            return Err(invalid(
+                "a nonempty macro family cannot coexist with simple-definition fields",
+            ));
+        }
+        for overload in family {
+            if overload.schema_path != schema_path || overload.macro_type != kind {
+                return Err(invalid(
+                    "macro overload owner and kind must equal parent macro",
+                ));
+            }
+            if overload
+                .parameters
+                .iter()
+                .any(|p| p.default_expression.is_some())
+            {
+                return Err(invalid("discovery macro defaults must be resolved values"));
+            }
+        }
+        family.clone()
+    } else {
+        if m.definition.trim().is_empty() || m.definition.contains('\0') {
+            return Err(invalid("macro definition must be nonempty SQL without NUL"));
+        }
+        for (name, _) in m
+            .defaults
+            .iter()
+            .map(|(name, _)| (name, ()))
+            .chain(m.parameter_docs.iter().map(|(name, _)| (name, ())))
+        {
+            if !m.parameters.contains(name) {
+                return Err(invalid("unknown macro parameter"));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_default = false;
+        let mut parameters = Vec::new();
+        for name in &m.parameters {
+            if name.is_empty() || name.contains('\0') || !seen.insert(name.to_ascii_lowercase()) {
+                return Err(invalid("invalid or duplicate macro parameter"));
+            }
+            let defaults: Vec<_> = m
+                .defaults
+                .iter()
+                .filter(|(n, _)| n == name)
+                .cloned()
+                .collect();
+            if defaults.len() > 1 {
+                return Err(invalid("duplicate macro default"));
+            }
+            if seen_default && defaults.is_empty() {
+                return Err(invalid("required parameter cannot follow a default"));
+            }
+            seen_default |= !defaults.is_empty();
+            parameters.push(MacroParameter {
+                name: name.clone(),
+                declared_type: None,
+                default_value: if defaults.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::from(build_macro_defaults(&defaults)?))
+                },
+                default_expression: None,
+                documentation: m
+                    .parameter_docs
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone()),
+            });
+        }
+        vec![MacroOverload {
+            parameters,
+            definition: m.definition.clone(),
+            profile: "duckdb.macro.v1".into(),
+            schema_path: schema_path.to_vec(),
+            macro_type: kind.into(),
+            evaluation_context: QueryEvaluationContext {
+                timezone: "UTC".into(),
+                collation: "binary".into(),
+                default_order: "asc".into(),
+                default_null_order: "nulls_last".into(),
+                preserve_insertion_order: true,
+            },
+        }]
+    };
+    Ok(crate::protocol::dtos::MacroInfo {
         comment: m.comment.clone(),
         tags: Vec::new(),
         name: m.name.clone(),
         schema_path: schema_path.to_vec(),
-        macro_type: DictString(if m.table_macro {
-            "table".into()
-        } else {
-            "scalar".into()
-        }),
-        parameters: m.parameters.clone(),
-        parameter_default_values: Some(Bytes::from(
-            build_macro_defaults(&m.defaults).unwrap_or_default(),
-        )),
-        definition: m.definition.clone(),
-        arguments_schema: Some(Bytes::from(
-            build_macro_arguments_schema(m).unwrap_or_default(),
-        )),
-        overloads: None,
-    }
+        macro_type: DictString(kind.into()),
+        overloads,
+    })
 }
 
-/// Build a macro `arguments_schema`: one nullable Arrow field per parameter, in
+/// Build a local documentation schema: one nullable Arrow field per parameter, in
 /// `parameters` order. A parameter's field type is the type of its default value
 /// when one is known (else `Null`). The per-parameter description rides as
 /// `vgi_doc` field metadata (UTF-8, presence-only — the key is omitted entirely
 /// when there is no doc), the exact same mechanism functions use for per-argument
-/// docs. Returns empty IPC bytes when the macro has no parameters and no docs,
-/// so older readers are unaffected.
+/// docs. This helper is for local presentation only: catalog discovery and CREATE
+/// use canonical overload parameters. Returns empty IPC bytes for no parameters.
 pub fn build_macro_arguments_schema(m: &CatMacro) -> Result<Vec<u8>> {
     // Nothing to carry: no parameters and no docs -> emit nothing.
     if m.parameters.is_empty() && m.parameter_docs.is_empty() {
@@ -2045,6 +2134,7 @@ mod tests {
 
     fn macro_with_docs() -> CatMacro {
         CatMacro {
+            overloads: None,
             name: "vgi_clamp".to_string(),
             parameters: vec!["val".to_string(), "lo".to_string(), "hi".to_string()],
             definition: "GREATEST(lo, LEAST(hi, val))".to_string(),
@@ -2124,30 +2214,20 @@ mod tests {
     }
 
     #[test]
-    fn test_macro_info_appends_arguments_schema_with_docs() {
-        let info = macro_info(&path("main"), &macro_with_docs());
-        // arguments_schema is populated for a documented macro.
-        let arguments_schema = info
-            .arguments_schema
-            .as_ref()
-            .expect("arguments_schema column present");
-        assert!(!arguments_schema.0.is_empty());
-        let decoded =
-            ipc::read_schema(&arguments_schema.0).expect("read MacroInfo.arguments_schema");
-        assert_eq!(decoded.fields().len(), 3);
-        assert_eq!(
-            decoded
-                .field(0)
-                .metadata()
-                .get("vgi_doc")
-                .map(String::as_str),
-            Some("Value to clamp"),
-        );
+    fn test_macro_info_preserves_canonical_parameter_docs() {
+        let info = macro_info(&path("main"), &macro_with_docs()).unwrap();
+        assert_eq!(info.overloads.len(), 1);
+        let overload = &info.overloads[0];
+        assert_eq!(overload.parameters[0].documentation.as_deref(), Some("Value to clamp"));
+        assert!(overload.parameters[1].declared_type.is_none());
+        assert!(overload.parameters[1].default_value.is_some());
+        assert_eq!(overload.schema_path, path("main"));
     }
 
     #[test]
     fn test_macro_arguments_schema_empty_when_no_params_and_no_docs() {
         let m = CatMacro {
+            overloads: None,
             name: "no_args".to_string(),
             parameters: vec![],
             definition: "42".to_string(),
@@ -2161,15 +2241,8 @@ mod tests {
             bytes.is_empty(),
             "macro with no parameters and no docs emits empty arguments_schema",
         );
-        // And the DTO carries empty bytes (older readers unaffected).
-        let info = macro_info(&path("main"), &m);
-        assert!(
-            info.arguments_schema
-                .as_ref()
-                .expect("arguments_schema column present")
-                .0
-                .is_empty()
-        );
+        let info = macro_info(&path("main"), &m).unwrap();
+        assert!(info.overloads[0].parameters.is_empty());
     }
 
     fn ab_table(required: Vec<Vec<Vec<String>>>) -> CatTable {

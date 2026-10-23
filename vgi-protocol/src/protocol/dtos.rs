@@ -1175,19 +1175,8 @@ pub struct MacroInfo {
     pub name: String,
     pub schema_path: SchemaPath,
     pub macro_type: DictString,
-    pub parameters: Vec<String>,
-    pub parameter_default_values: Option<Bytes>,
-    pub definition: String,
-    /// Optional Arrow schema (IPC bytes) with one nullable field per parameter,
-    /// in `parameters` order. Each field's type is the parameter's default value
-    /// type when known (else null), and the `vgi_doc` field metadata key carries
-    /// the parameter's description (UTF-8, presence-only — omitted when
-    /// undocumented). Mirrors the per-argument doc channel functions expose via
-    /// `FunctionInfo.arguments`. Empty means the worker supplied no per-parameter
-    /// docs (older workers); readers fall back to `parameters` for names.
-    pub arguments_schema: Option<Bytes>,
-    /// Complete overload family. The legacy catalog adapter supplies None.
-    pub overloads: Option<Vec<crate::generated::protocol_types::MacroOverload>>,
+    /// The complete canonical overload family, in declaration order.
+    pub overloads: Vec<crate::generated::protocol_types::MacroOverload>,
 }
 
 /// `IndexInfo` item (`catalog_schema_contents_indexes`, and

@@ -3602,9 +3602,9 @@ impl Dispatcher {
                         _ => true,
                     })
                     .map(|m| catalog::macro_info(path, m))
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| Ok(Vec::new()))?;
         catalog::serialize_items(infos)
     }
 
