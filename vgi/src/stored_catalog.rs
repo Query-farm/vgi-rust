@@ -404,6 +404,7 @@ impl StoredCatalog {
                         "catalog_table_create requires negotiated table profiles",
                     ));
                 }
+                crate::column_metadata::validate_column_metadata_ipc(&q.columns.0)?;
                 // Reject malformed or unauthorized NOT NULL claims before effects.
                 require_unconstrained_columns(crate::ipc::read_schema(&q.columns.0)?.as_ref())?;
                 self.mutate(
@@ -647,6 +648,7 @@ struct StoredTable {
 
 impl StoredTable {
     fn info(&self, path: &[String]) -> Result<TableInfo> {
+        crate::column_metadata::validate_column_metadata_ipc(&self.columns)?;
         let mut t = catalog::CatTable::new(
             &self.name,
             crate::ipc::read_schema(&self.columns)?,
@@ -1299,6 +1301,60 @@ mod tests {
             .downcast_ref::<arrow_array::BinaryArray>()
             .unwrap();
         crate::ipc::read_batch(envelope.value(0)).unwrap()
+    }
+
+    #[test]
+    fn column_metadata_create_and_discovery_corpus() {
+        use base64::Engine;
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
+        let vectors = &corpus["column_metadata_schemas"];
+        let session = Session::new(StoredCatalog::new("mem"));
+        for (group, values) in vectors.as_object().unwrap() {
+            for (name, encoded) in values.as_object().unwrap() {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_str().unwrap())
+                    .unwrap();
+                let request = wire::to_batch(TableCreateRequest {
+                    attach_opaque_data: Bytes(b"attach".to_vec()),
+                    schema_path: path(&["main"]),
+                    name: name.clone(),
+                    columns: Bytes(raw.clone()),
+                    on_conflict: DictString("ERROR".into()),
+                    constraint_definitions: vec![],
+                    transaction_opaque_data: None,
+                    options: None,
+                    layout: None,
+                    comment: None,
+                    tags: None,
+                })
+                .unwrap();
+                let params = wire::to_batch(p::CatalogTableCreateParams {
+                    request: Bytes(crate::ipc::write_batch(&request).unwrap()),
+                })
+                .unwrap();
+                let before = session.version();
+                let result = session.call("catalog_table_create", params);
+                if group == "invalid" {
+                    assert!(result.is_err(), "accepted {name}");
+                    assert_eq!(before, session.version());
+                } else {
+                    result.unwrap();
+                    let tables: Vec<TableInfo> =
+                        session.list("catalog_schema_contents_tables", &["main"]);
+                    let info = tables.iter().find(|t| &t.name == name).unwrap();
+                    let expected = crate::ipc::read_schema(&raw).unwrap();
+                    assert_eq!(
+                        crate::ipc::read_schema(&info.columns.0).unwrap(),
+                        expected,
+                        "{name}"
+                    );
+                    crate::column_metadata::validate_column_metadata_ipc(&info.columns.0).unwrap();
+                }
+            }
+        }
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 4);
     }
 
     #[test]

@@ -1547,6 +1547,7 @@ pub fn table_info(
     scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
+    crate::column_metadata::validate_column_metadata(&t.columns)?;
     if !t.not_null.is_empty()
         || !t.unique.is_empty()
         || !t.primary_key.is_empty()
