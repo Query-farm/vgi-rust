@@ -191,6 +191,38 @@ fn column_request_params_preserve_raw_targets_and_nullable_fields() {
     check!(CatalogTableNotNullDropParams, "not_null_drop");
 }
 
+#[test]
+fn column_expressions_preserve_canonical_payload_and_absent_using() {
+    use vgi_protocol::generated::request_params::{
+        CatalogTableColumnDefaultSetParams, CatalogTableColumnTypeChangeParams,
+    };
+    for variant in ["literal", "nested"] {
+        let default_params: CatalogTableColumnDefaultSetParams =
+            round_trip(&format!("column_default_set_{variant}"));
+        let batch = StreamReader::try_new(Cursor::new(default_params.expression.0), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let expression: SqlExpression = from_batch(&batch).unwrap();
+        assert_eq!(expression.schema_path, default_params.schema_path);
+        assert!(!expression.profile.is_empty());
+        let using: CatalogTableColumnTypeChangeParams =
+            round_trip(&format!("column_type_change_{variant}"));
+        if variant == "literal" {
+            assert!(using.expression.is_none());
+        } else {
+            let batch = StreamReader::try_new(Cursor::new(using.expression.unwrap().0), None)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            let expression: SqlExpression = from_batch(&batch).unwrap();
+            assert_eq!(expression.schema_path, using.schema_path);
+        }
+    }
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let corpus: serde_json::Value =
         serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
