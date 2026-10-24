@@ -11,7 +11,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  actions: read
+
 env:
+  VGI_REF: fc3e08f7e7fd800165a0edc00313de46fed15329
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -55,6 +60,15 @@ jobs:
       - name: cargo test (vgi.v2 surface + wire name)
         run: cargo test -p vgi --all-features --test vgi_v2_surface --test protocol_name
 
+      - name: cargo test (SDK filtering, pruning, diagnostics)
+        run: cargo test -p vgi --all-features --lib
+
+      - name: cargo test (worker testing kit and diagnostic delivery)
+        run: cargo test -p vgi-client --no-default-features --features testing --lib --test testing_kit --test execution_diagnostics
+
+      - name: cargo test (external-data worker over stdio)
+        run: cargo test -p vgi-external-data-worker
+
       - name: cargo test --doc (vgi)
         run: cargo test --doc -p vgi --all-features
 
@@ -68,7 +82,7 @@ jobs:
   # `conformance.Secondary.v1` -- deliberately non-alphabetical, so a server
   # that sorts its listing fails -- the secondary passes the routing,
   # error-model and traceback groups, and over HTTP the fixture's opted-in
-  # `vgi_rpc.Identity.v1` passes the identity groups. Run on every transport
+  # `vgi_rpc.Identity.v2` passes the identity groups. Run on every transport
   # the worker serves.
   #
   # The suite comes from vgi-rpc-python `main`, unpinned by design (the same
@@ -202,6 +216,21 @@ jobs:
 
       - name: Install uv (for haybarn-cli)
         uses: astral-sh/setup-uv@v5
+
+      - name: Checkout matching native sources
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: ${{ env.VGI_REF }}
+          path: vgi-upstream
+
+      - name: Fetch matching native integration runner
+        run: >-
+          python3 "$VGI_SRC/scripts/ci_fetch_native_runner.py"
+          --source "$VGI_SRC" --output "$RUNNER_TEMP/vgi-native"
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-upstream
+          GH_TOKEN: ${{ github.token }}
 
       - name: Build and run the doc examples
         run: bash scripts/check_doc_examples.sh

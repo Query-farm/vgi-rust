@@ -41,7 +41,7 @@
 /// losing identifier boundaries. Protocol 2.1 adds the optional
 /// `catalog_contents` bulk-load RPC, advertised via
 /// `CatalogAttachResult.supports_catalog_contents`.
-pub const VGI_PROTOCOL_VERSION: &str = "2.1.0";
+pub const VGI_PROTOCOL_VERSION: &str = "2.2.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///
@@ -58,7 +58,10 @@ pub const VGI_PROTOCOL_VERSION: &str = "2.1.0";
 pub const VGI_PROTOCOL_NAME: &str = "vgi.v2";
 
 pub mod cache_control;
+pub mod catalog;
 pub mod generated;
 pub mod ipc;
 pub mod protocol;
 pub mod wire;
+
+mod function_metadata;

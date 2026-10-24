@@ -12,7 +12,7 @@
 #   3. attach each built worker in Haybarn (Query Farm's DuckDB distribution,
 #      which provides the `vgi` extension) and check `upper_case` works.
 #
-# Requires: cargo, and `uvx` (from https://docs.astral.sh/uv/) for `haybarn-cli`.
+# Requires cargo and either a VGI-linked HAYBARN_CLI or uvx for the published haybarn-cli.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -80,19 +80,20 @@ EXPECTED="VGI_CI_PROBE"
 for rs in "${names[@]}"; do
   name="$(basename "$rs" .rs)"
   bin="$WORK/target/debug/$name"
-  sql="INSTALL vgi FROM community; LOAD vgi;
+  setup="INSTALL vgi FROM community; LOAD vgi;"
+  if [ -n "${HAYBARN_CLI:-}" ]; then
+    setup="LOAD vgi;"
+  fi
+  sql="$setup
        ATTACH 'demo' (TYPE vgi, LOCATION '$bin');
        SELECT demo.main.upper_case('$PROBE') AS r;"
-  # Track the LATEST haybarn-cli (no version pin) so doc-examples always
-  # validates against the CURRENT community-published `vgi` extension —
-  # mirroring the integration suite, which resolves the latest haybarn release
-  # at runtime (HAYBARN_RELEASE in .github/workflows/integration.yml). A hard
-  # pin goes stale: when the worker's wire schema advances (e.g. a new
-  # catalog_attach field) the extension does strict schema-equality, so a pin
-  # pointing at an older extension fails ("field count differs"). If
-  # `INSTALL vgi FROM community` ever 404s transiently (a DuckDB version bump
-  # landing before the extension republishes), it self-heals on the next run.
-  out="$(uvx haybarn-cli :memory: -noheader -list -cmd ".bail on" -c "$sql" 2>&1 || true)"
+  # CI supplies the CLI linked with the matching native VGI revision. Local
+  # checks retain the published haybarn-cli/community-extension path by default.
+  if [ -n "${HAYBARN_CLI:-}" ]; then
+    out="$("$HAYBARN_CLI" :memory: -noheader -list -cmd ".bail on" -c "$sql" 2>&1 || true)"
+  else
+    out="$(uvx haybarn-cli :memory: -noheader -list -cmd ".bail on" -c "$sql" 2>&1 || true)"
+  fi
   if ! grep -q "$EXPECTED" <<<"$out"; then
     echo "✗ $name: expected upper_case('$PROBE') = '$EXPECTED', got:"
     echo "$out"

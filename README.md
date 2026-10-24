@@ -31,6 +31,21 @@ drops in behind the same `ATTACH ... (TYPE vgi)`. Built on
 HTTP producer batching and worker-visible response budgets are covered in
 [`docs/response-budgets.md`](docs/response-budgets.md).
 
+Window evaluation retains decoded Arrow partitions in each dispatcher's LRU cache, avoiding
+repeated storage reads and IPC decoding for successive frames. The cache defaults to 256 entries
+and 256 MiB of accounted Arrow buffers, schemas, and filter masks. Set
+`VGI_WINDOW_CACHE_MAX_BYTES` before starting the worker to change the byte budget; `0` disables
+retention. Oversized or evicted partitions remain available through shared `FunctionStorage`.
+Window destruction removes the local partition, and aggregate destruction clears the local
+execution. Other worker processes have independent caches. On admission and partition
+destruction, a worker checks the small shared schema records to evict copies whose destructor
+ran elsewhere; cache hits do not read storage. Idle workers can retain copies until their next
+admission or eviction, subject to the per-worker budget.
+This bounds retained cache data, not total worker RSS or buffers still held by active requests.
+Retained capacity can exceed logical payload size: the benchmarked decoder gives a 128 MiB
+string partition a 256 MiB backing allocation before metadata. That partition exceeds the
+default budget; `VGI_WINDOW_CACHE_MAX_BYTES=402653184` (384 MiB) allows it to be retained.
+
 ## Why a worker instead of a C++ extension?
 
 | Traditional DuckDB extension | VGI worker |
@@ -51,10 +66,10 @@ domain-specific functions to your team as a single binary.
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.35"
-vgi-rpc = "0.25"
-arrow-array = "59"
-arrow-schema = "59"
+vgi = "0.45"
+vgi-rpc = "0.32"
+arrow-array = "60"
+arrow-schema = "60"
 ```
 
 **2. Write a function and serve it:**
@@ -143,6 +158,13 @@ so `DETACH demo; ATTACH 'demo' (...)` (or a fresh session) picks up a new build.
   (`demo.main.upper_case`) or run `USE demo;`.
 - **Runtime / type errors** — errors returned from `process` (and bind-time
   `argument_specs` type checks) surface directly in DuckDB's error message.
+- **Telling bad input from a bug** — every error carries a gRPC-style code
+  (`vgi_rpc.error_code`). The SDK codes its own: bad arguments and type-bound
+  failures are `INVALID_ARGUMENT`, unknown functions / tables / schemas are
+  `NOT_FOUND`, writes to a read-only catalog are `FAILED_PRECONDITION`,
+  unsupported operations are `UNIMPLEMENTED`; anything else is `UNKNOWN`. Use
+  `vgi::errors::{invalid_argument, not_found, failed_precondition,
+  unimplemented}` to code your own worker's errors the same way.
 
 ## Function types
 
@@ -156,6 +178,20 @@ so `DETACH demo; ATTACH 'demo' (...)` (or a fresh session) picks up a new build.
 
 Each trait is small: `name`, `metadata`, `argument_specs`, an `on_bind` to resolve
 the output schema, and `process` (or the buffering / aggregate lifecycle methods).
+See [filter ownership and typed pruning](docs/filtering-and-pruning.md) for safe
+external-data scans using `FilterHandling::Sdk` and partial-column candidate masks.
+
+A table-in-out function answers each input batch with one reply. To answer one
+input with several (one upstream API page per reply), emit each but the last with
+`EmitOptions { more: true, .. }`, record where to pick up with
+`out.set_resume_state(&position)`, and implement `resume` (plus
+`resume_supported() -> true`): the framework calls it for each next reply with
+that state (`vgi::table_in_out::decode_resume_state`). Over HTTP the state travels
+in the stream's state token, so keep positions there, not output rows. A blended
+function (`input_from_args`) may also cap the input rows per call with
+`FunctionMetadata::input_rows_per_call`. See
+`vgi-example-worker/src/table_in_out/paged.rs`.
+
 Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets,
 bearer auth, and a cross-process state store are handled for you.
 
@@ -181,7 +217,7 @@ HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
 Every transport hosts `vgi.v2`, `vgi_rpc.Reflection.v1`, and any protocols the
 worker adds with `Worker::hosted_protocols`; HTTP additionally hosts
-`vgi_rpc.Identity.v1` when the worker sets `Worker::resolve_token` and/or
+`vgi_rpc.Identity.v2` when the worker sets `Worker::resolve_token` and/or
 `Worker::mint_grant`; with a grant key (`--grant-key` / `VGI_RPC_GRANT_KEYS`)
 it mints sealed grants and accepts them back as bearer credentials. With a
 grant source and a signing key (`VGI_SIGNING_KEY`), HTTP also hosts
@@ -227,9 +263,16 @@ table, table-in-out, buffering, aggregate, and catalog-backed tables/views.
 
 ## Testing your own worker
 
-The fastest check is to call your function from a DuckDB session (see "Your first
-worker"). For automated tests, drive the worker from Rust with `vgi-rpc`'s client,
-or shell out to a DuckDB session from your test harness.
+Enable `vgi-client`'s optional `testing` feature to test your worker through
+attach, bind, and scan. `TestWorker` launches your binary; `ScanResult` compares
+typed schemas and row multisets, preserving duplicates and NULLs. Typed filter
+fixtures and `check_pushdown` compare a pushed scan with an independent reference,
+including projection and filter-only columns.
+
+See [Testing your worker](docs/testing-workers.md) for setup, expected-row and
+pushdown tests, boundary fixtures, and CI commands. The
+[external-data example](examples/external-data/) includes runnable subprocess
+tests. DuckDB remains useful as an independent SQL reference for conformance.
 
 ## Running the SDK's integration suite (contributors)
 

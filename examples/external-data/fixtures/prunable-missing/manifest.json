@@ -1,0 +1,4 @@
+[
+  {"latitude": 40.8, "file": "south.jsonl"},
+  {"latitude": 42.0, "file": "missing.jsonl"}
+]

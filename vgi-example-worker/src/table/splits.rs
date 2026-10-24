@@ -1657,8 +1657,10 @@ impl TableFunction for SplitPartitioned {
             }]),
             sort_order: Some(vec![SortField {
                 column: "sales".to_string(),
-                direction: DictString("asc".to_string()),
-                nulls: DictString("nulls_last".to_string()),
+                direction: DictString(vgi::protocol::enums::order_by_direction::ASC.to_string()),
+                nulls: DictString(
+                    vgi::protocol::enums::order_by_null_order::NULLS_LAST.to_string(),
+                ),
             }]),
             cache_max_age_seconds: Some(60),
             splits: (0..COUNTRIES.len() as i64)

@@ -7,7 +7,7 @@
 //!    `ticket_probe` with `region` and the secret `api_key` and reads the probe
 //!    row;
 //! 2. she calls `vgi.attach_tickets.v1` `seal_attach` and
-//!    `vgi_rpc.Identity.v1` `issue_grant`;
+//!    `vgi_rpc.Identity.v2` `issue_grant`;
 //! 3. a second client authenticated only by `Bearer <grant>` attaches with
 //!    nothing but `vgi_attach_ticket` and reads the same row;
 //! 4. bob's grant with alice's ticket is refused (`attach_ticket_invalid`), and
@@ -238,6 +238,14 @@ fn seal_attach(
     bearer: Option<&str>,
     request: SealAttachRequest,
 ) -> vgi_rpc::Result<String> {
+    Ok(seal_attach_ticket(url, bearer, request)?.ticket)
+}
+
+fn seal_attach_ticket(
+    url: &str,
+    bearer: Option<&str>,
+    request: SealAttachRequest,
+) -> vgi_rpc::Result<AttachTicket> {
     let inner = vgi::wire::to_batch(request)?;
     let params = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -257,8 +265,7 @@ fn seal_attach(
         "seal_attach",
         &params,
     )?;
-    let ticket: AttachTicket = vgi::wire::from_batch(&result)?;
-    Ok(ticket.ticket)
+    vgi::wire::from_batch(&result)
 }
 
 fn issue_grant(url: &str, bearer: &str) -> String {
@@ -339,7 +346,7 @@ fn a_runner_holding_a_grant_reattaches_from_a_ticket_without_the_secret() {
     assert_eq!(row, (REGION.to_string(), API_KEY_DIGEST.to_string()));
 
     // 2. seal_attach + issue_grant, as alice.
-    let ticket = seal_attach(
+    let sealed = seal_attach_ticket(
         &url,
         Some("vgi-test-alice"),
         SealAttachRequest {
@@ -351,6 +358,15 @@ fn a_runner_holding_a_grant_reattaches_from_a_ticket_without_the_secret() {
         },
     )
     .unwrap();
+    // `ttl_seconds = 0` asks for the grant keys' ceiling (7 days by default):
+    // `expires_at` is that instant as a timestamp[us, UTC], not unix seconds.
+    let expires_at = sealed.expires_at.as_ref().expect("a capped lifetime").0;
+    let ahead = expires_at - chrono::Utc::now();
+    assert!(
+        ahead > chrono::Duration::days(6) && ahead <= chrono::Duration::days(7),
+        "{expires_at}"
+    );
+    let ticket = sealed.ticket;
     assert!(ticket.starts_with("vgia1."), "{ticket}");
     let alice_grant = issue_grant(&url, "vgi-test-alice");
     assert!(alice_grant.starts_with("vgig1."));
@@ -435,7 +451,7 @@ fn without_a_signing_key_tickets_are_not_hosted() {
     let url = worker.url();
     let hosted = hosted_protocols(&url);
     assert!(
-        hosted.iter().any(|(n, _, _)| n == "vgi_rpc.Identity.v1"),
+        hosted.iter().any(|(n, _, _)| n == "vgi_rpc.Identity.v2"),
         "grants are on: {hosted:?}"
     );
     assert!(
@@ -469,8 +485,11 @@ fn tickets_are_hosted_with_the_reference_hash() {
         .iter()
         .find(|(n, _, _)| n == ATTACH_TICKETS_PROTOCOL_NAME)
         .unwrap_or_else(|| panic!("{hosted:?}"));
-    assert_eq!(version, "1.0.0");
+    // 2.0.0: `AttachTicket.expires_at` became a nullable timestamp[us, UTC].
+    assert_eq!(version, "2.0.0");
     // vgi-python f5e99c7: RpcServer(...).bindings["vgi.attach_tickets.v1"].protocol_hash
+    // (unchanged by 2.0.0 -- the method's params and result are binary
+    // envelopes, so the record inside them is not part of the hash).
     assert_eq!(
         hash,
         "241fffa801dd073c76fa933b9ad5ac790a95b81fee02e73a8332da4d3526b4e0"

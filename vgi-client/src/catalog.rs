@@ -16,6 +16,7 @@ use vgi_protocol::protocol::dtos::{
     FunctionInfo, IndexInfo, MacroInfo, ScanBranch, ScanBranchesResult, ScanFunctionResult,
     SchemaContents, SchemaInfo, TableInfo, ViewInfo,
 };
+use vgi_protocol::protocol::enums;
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString};
 
@@ -567,9 +568,9 @@ impl OnConflict {
     fn dict(self) -> DictString {
         DictString(
             match self {
-                Self::Error => "error",
-                Self::Ignore => "ignore",
-                Self::Replace => "replace",
+                Self::Error => enums::on_conflict::ERROR,
+                Self::Ignore => enums::on_conflict::IGNORE,
+                Self::Replace => enums::on_conflict::REPLACE,
             }
             .to_string(),
         )
@@ -785,7 +786,7 @@ impl VgiClient {
     /// children. Read with no transaction: the result is the committed catalog
     /// at `catalog_version`.
     pub fn contents(&mut self, cat: &AttachedCatalog) -> Result<Vec<SchemaContents>> {
-        Ok(self.contents_response(cat, None)?.schemas)
+        self.contents_response(cat, None)?.schema_contents()
     }
 
     /// The whole `catalog_contents` response: the snapshot plus the
@@ -834,27 +835,14 @@ impl VgiClient {
                     resp.etag, if_none_match
                 )));
             }
-            if !resp.schemas.is_empty() {
+            if resp.streams().iter().any(|s| s.is_some()) {
                 return Err(RpcError::type_error(
                     "catalog_contents: a not_modified response carries schemas",
                 ));
             }
             return Ok(resp);
         }
-        for (i, entry) in resp.schemas.iter().enumerate() {
-            let batch = vgi_protocol::ipc::read_batch(&entry.schema.0).map_err(|e| {
-                RpcError::type_error(format!(
-                    "catalog_contents: schemas[{i}].schema is not a readable IPC batch: {e}"
-                ))
-            })?;
-            let info: SchemaInfo = vgi_protocol::wire::from_batch(&batch)?;
-            if info.path != entry.path {
-                return Err(RpcError::type_error(format!(
-                    "catalog_contents: schemas[{i}].path {:?} differs from its SchemaInfo.path {:?}",
-                    entry.path, info.path
-                )));
-            }
-        }
+        resp.schema_contents()?;
         Ok(resp)
     }
 
@@ -923,11 +911,12 @@ impl VgiClient {
                 );
                 continue;
             }
-            let decoded = resp
-                .schemas
-                .iter()
-                .map(SchemaSnapshot::decode)
-                .collect::<Result<Vec<_>>>();
+            let decoded = resp.schema_contents().and_then(|entries| {
+                entries
+                    .iter()
+                    .map(SchemaSnapshot::decode)
+                    .collect::<Result<Vec<_>>>()
+            });
             match decoded {
                 Ok(schemas) => {
                     return Ok(CatalogSnapshot {
@@ -1585,6 +1574,19 @@ fn validate_scan_branches(branches: &[ScanBranch]) -> Result<()> {
 }
 
 #[cfg(test)]
+mod enum_wire_tests {
+    use super::*;
+
+    /// `on_conflict` is Python's `OnConflict`: member names on the wire.
+    #[test]
+    fn on_conflict_is_a_python_member_name() {
+        assert_eq!(OnConflict::Error.dict().0, "ERROR");
+        assert_eq!(OnConflict::Ignore.dict().0, "IGNORE");
+        assert_eq!(OnConflict::Replace.dict().0, "REPLACE");
+    }
+}
+
+#[cfg(test)]
 mod attach_option_tests {
     use std::sync::{Arc, Mutex};
 
@@ -2050,7 +2052,6 @@ mod load_catalog_tests {
             options: None,
             comment: None,
             tags: Vec::new(),
-            attach_opaque_data: Bytes(vec![1]),
             path: path.iter().map(|s| s.to_string()).collect(),
             estimated_object_count: Some(
                 [
@@ -2090,12 +2091,14 @@ mod load_catalog_tests {
     }
 
     fn full(version: i64, etag: Option<&str>, schemas: Vec<SchemaContents>) -> Reply {
-        reply(CatalogContentsResponse {
-            catalog_version: version,
-            etag: etag.map(str::to_string),
-            not_modified: false,
-            schemas,
-        })
+        reply(
+            vgi_protocol::catalog::from_schema_contents(
+                version,
+                etag.map(str::to_string),
+                &schemas,
+            )
+            .unwrap(),
+        )
     }
 
     impl VgiTransport for Scripted {
@@ -2183,15 +2186,15 @@ mod load_catalog_tests {
     }
 
     #[test]
-    fn a_path_that_disagrees_with_its_schema_info_falls_back() {
-        let (mut client, log) = client(vec![full(2, None, vec![entry(&["main"], &["other"])])]);
+    fn a_schema_with_a_missing_parent_falls_back() {
+        let (mut client, log) = client(vec![full(
+            2,
+            None,
+            vec![entry(&["main"], &["missing", "child"])],
+        )]);
         let snap = client.load_catalog(&attached(true), None).unwrap();
         assert_eq!(snap.source, CatalogLoadSource::PerSchema);
-        assert!(
-            snap.fallback_reason
-                .unwrap()
-                .contains("differs from its SchemaInfo.path")
-        );
+        assert!(snap.fallback_reason.unwrap().contains("parent"));
         assert_eq!(calls(&log), ["catalog_contents", "catalog_schemas"]);
     }
 
@@ -2246,14 +2249,7 @@ mod load_catalog_tests {
             not_modified: false,
             fallback_reason: None,
         };
-        let nm = |etag: &str| {
-            reply(CatalogContentsResponse {
-                catalog_version: 2,
-                etag: Some(etag.to_string()),
-                not_modified: true,
-                schemas: Vec::new(),
-            })
-        };
+        let nm = |etag: &str| reply(CatalogContentsResponse::unchanged(2, etag.to_string()));
         let (mut c, _) = client(vec![nm("e2")]);
         let kept = c.load_catalog(&attached(true), Some(&previous)).unwrap();
         assert!(kept.not_modified);

@@ -1,17 +1,21 @@
 # Integration suite in CI
 
+CI uses the VGI source revision pinned by `VGI_REF` for both the test suite and a native runner linked with that VGI extension. `scripts/ci_fetch_native_runner.py` verifies the runner provenance and sets `RUNNER_LINKS_EXTENSIONS=1`; this lets wire-contract changes run before a separate public extension release. The local driver still defaults to the signed community extension when that flag is omitted. Existing test exclusions and coverage floors apply in both modes.
+
+The documentation job also uses the matching `HAYBARN_CLI`; local documentation checks use `uvx haybarn-cli` and the community extension unless `HAYBARN_CLI` is supplied.
+
 `.github/workflows/integration.yml` runs the **canonical `Query-farm/vgi`
 integration sqllogictest suite** against the Rust example worker on every push /
 PR, across all three public transports on Linux.
 
 ## How it works
 
-The workflow always tests against `Query-farm/vgi` **main**, using the signed
-VGI extension that users install from the Haybarn community channel. Framework
-CI builds only the Rust worker; extension compilation and publication belong to
-the VGI extension repository. The standalone `haybarn-unittest` runner is
-downloaded from the latest Haybarn release so its ABI matches the current
-community artifact. `httpfs`/`json`/`parquet`/`spatial` come from core.
+The workflow checks out the pinned `Query-farm/vgi` revision and downloads the
+native integration artifact built from that same commit. Framework CI builds
+only the Rust worker. The artifact contains the runner and CLI with VGI and the
+required core extensions linked; `spatial` remains an explicit native-build
+coverage limitation. Local runs with an independent standalone runner keep the
+community-extension preprocessing path.
 
 - [`run-integration.sh`](run-integration.sh) — the driver: stages the suite,
   boots the worker(s), and runs `haybarn-unittest` for one transport lane.
@@ -104,7 +108,8 @@ input would otherwise abort the whole merge).
 
 ## Version pinning
 
-`VGI_REF` is deliberately **not** pinned — it is `main`. Do not replace it with
-a commit: CI should expose any lag between the shared corpus and the published
-community artifact. `HAYBARN_RELEASE` is resolved to the latest release at run
-time so the runner stays ABI-compatible with that artifact.
+`VGI_REF` pins both the shared test corpus and its native build. Update it when
+adopting a new wire contract or test requirement. The artifact fetcher checks the
+source commit, manifest and checksums, and waits for that commit's build instead
+of silently taking a runner from another revision. Signed community publication
+is a separate release step.

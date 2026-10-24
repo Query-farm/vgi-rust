@@ -191,7 +191,11 @@ impl TableInOutFunction for GeoEncode3Function {
 
 /// Read a blended input column by its declared arg name, falling back to the
 /// position (the varargs / positional shapes name columns `col0..colN-1`).
-fn named_col<'a>(batch: &'a RecordBatch, name: &str, pos: usize) -> Result<&'a ArrayRef> {
+pub(super) fn named_col<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+    pos: usize,
+) -> Result<&'a ArrayRef> {
     batch
         .column_by_name(name)
         .or_else(|| batch.columns().get(pos))
@@ -466,7 +470,7 @@ impl TableInOutFunction for BlendedAnyVarargsFunction {
 }
 
 /// Cast a column to Int64.
-fn i64_col(col: &ArrayRef) -> Result<Int64Array> {
+pub(super) fn i64_col(col: &ArrayRef) -> Result<Int64Array> {
     let cast = arrow_cast::cast(col, &DataType::Int64)
         .map_err(|e| RpcError::runtime_error(e.to_string()))?;
     Ok(cast.as_primitive::<Int64Type>().clone())

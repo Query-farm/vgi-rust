@@ -34,7 +34,7 @@ use vgi_rpc::{Bytes, DictString};
 
 use crate::catalog::AttachedCatalog;
 use crate::client::VgiClient;
-use crate::scan::{BindSpec, BoundFunction, Scan, ScanOptions};
+use crate::scan::{check_batch_schema, project_schema, BindSpec, BoundFunction, Scan, ScanOptions};
 use crate::transport::ExchangeStream;
 use crate::wire_call::{call, envelope};
 
@@ -59,10 +59,15 @@ fn conditional_request_metadata(opts: &ScanOptions) -> Option<vgi_rpc::wire::Met
 pub struct Exchange<'a> {
     stream: Box<dyn ExchangeStream + 'a>,
     header: GlobalInitResponse,
+    function: String,
     schema: SchemaRef,
+    emitted_schema: SchemaRef,
     parent_rows: Option<Vec<i32>>,
     last_cache_control: Option<CacheControl>,
     first_input_metadata: Option<vgi_rpc::wire::Metadata>,
+    /// The last input's schema while its output continues: the worker's last
+    /// answer said `HAVE_MORE_OUTPUT`, so the next turn must be a tick.
+    pending_more: Option<SchemaRef>,
     connection_reusable: Arc<AtomicBool>,
     closed: bool,
 }
@@ -73,7 +78,7 @@ impl Exchange<'_> {
         &self.header.execution_id
     }
 
-    /// The output schema, as resolved at bind.
+    /// The requested output schema after projection, excluding filter-only columns.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -98,26 +103,110 @@ impl Exchange<'_> {
         self.last_cache_control.as_ref()
     }
 
+    /// Whether the worker's last answer said it has more output for the same
+    /// input (`vgi.status: HAVE_MORE_OUTPUT`). While it does, fetch the next
+    /// answer with [`continue_output`](Self::continue_output); `send` is
+    /// refused until the output is drained, and closing drops what remains.
+    pub fn has_more_output(&self) -> bool {
+        self.pending_more.is_some()
+    }
+
     /// Send one input batch and read the worker's answer.
     ///
     /// `Ok(None)` means the worker ended the stream. A zero-row answer is
     /// returned as an empty batch rather than `None`, because "no rows for this
     /// input" is a real answer in exchange mode and callers of a 1→0 transform
-    /// need to see it.
+    /// need to see it. An answer may be only the first of several for this
+    /// input; see [`has_more_output`](Self::has_more_output).
     pub fn send(&mut self, input: &RecordBatch) -> Result<Option<RecordBatch>> {
+        if self.pending_more.is_some() {
+            return Err(RpcError::protocol_error(
+                "send while the last input's output is pending; call continue_output()",
+            ));
+        }
+        let metadata = self.first_input_metadata.take();
+        let (answer, more) = self.turn(input, metadata.as_ref(), false)?;
+        self.pending_more = more.then(|| input.schema());
+        Ok(answer)
+    }
+
+    /// Fetch the next answer for the last input, after one that said more:
+    /// sends a continuation tick (a zero-row batch of the input schema carrying
+    /// `vgi.status: CONTINUE`). Its provenance indexes that same input.
+    pub fn continue_output(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(input_schema) = self.pending_more.clone() else {
+            return Err(RpcError::protocol_error(
+                "continue_output with no output pending",
+            ));
+        };
+        let tick = RecordBatch::new_empty(input_schema.clone());
+        let metadata =
+            vgi_rpc::wire::Metadata::from([(STATUS_KEY.to_string(), STATUS_CONTINUE.to_string())]);
+        let (answer, more) = self.turn(&tick, Some(&metadata), true)?;
+        self.pending_more = more.then_some(input_schema);
+        Ok(answer)
+    }
+
+    /// One exchange turn: send `input` (a continuation tick when `tick`), read
+    /// and check the answer, and say whether it has more output for the same
+    /// input.
+    fn turn(
+        &mut self,
+        input: &RecordBatch,
+        metadata: Option<&vgi_rpc::wire::Metadata>,
+        tick: bool,
+    ) -> Result<(Option<RecordBatch>, bool)> {
         if self.closed {
             return Err(RpcError::protocol_error("send after close"));
         }
-        let metadata = self.first_input_metadata.take();
-        let response = self.stream.exchange_with_metadata(input, metadata.as_ref());
+        // An error ends the exchange, so pending output never outlives it.
+        self.pending_more = None;
+        let response = self.stream.exchange_with_metadata(input, metadata);
         if response.is_err() {
             self.connection_reusable.store(false, Ordering::Release);
         }
         match response? {
-            None => Ok(None),
+            // Every tick must be answered: ending the stream instead would
+            // silently truncate the input's output. The worker's side of the
+            // exchange is now in an unknown state, so the connection is not
+            // pooled again.
+            None if tick => {
+                self.connection_reusable.store(false, Ordering::Release);
+                Err(RpcError::protocol_error(format!(
+                    "function `{}`: the worker ended the stream in answer to a \
+                     continuation tick; its output for the last input was truncated",
+                    self.function,
+                )))
+            }
+            None => Ok((None, false)),
             Some((batch, md)) => {
-                update_answer_metadata(&mut self.parent_rows, &mut self.last_cache_control, &md)?;
-                Ok(Some(batch))
+                let more = md.get(STATUS_KEY).map(String::as_str) == Some(STATUS_HAVE_MORE_OUTPUT);
+                let result = (|| {
+                    check_continued_reply(&self.function, &md, more, tick)?;
+                    check_batch_schema(&self.function, &self.emitted_schema, &batch)?;
+                    update_answer_metadata(
+                        &mut self.parent_rows,
+                        &mut self.last_cache_control,
+                        &md,
+                    )?;
+                    let keep = self.schema.fields().len();
+                    if keep == batch.num_columns() {
+                        Ok(batch)
+                    } else {
+                        // ScanOptions puts requested columns before filter-only
+                        // columns, so trimming preserves the requested order.
+                        batch.project(&(0..keep).collect::<Vec<_>>()).map_err(|error| {
+                            RpcError::runtime_error(format!(
+                                "function `{}`: could not drop filter-only exchange columns: {error}",
+                                self.function,
+                            ))
+                        })
+                    }
+                })();
+                if result.is_err() {
+                    self.connection_reusable.store(false, Ordering::Release);
+                }
+                result.map(|batch| (Some(batch), more))
             }
         }
     }
@@ -128,6 +217,9 @@ impl Exchange<'_> {
             return Ok(());
         }
         self.closed = true;
+        // Closing the input drops any pending output; the worker ends its
+        // stream without sending it.
+        self.pending_more = None;
         let result = self.stream.close();
         if result.is_err() {
             self.connection_reusable.store(false, Ordering::Release);
@@ -141,6 +233,7 @@ impl Exchange<'_> {
             return Ok(());
         }
         self.closed = true;
+        self.pending_more = None;
         let result = self.stream.cancel();
         if result.is_err() {
             self.connection_reusable.store(false, Ordering::Release);
@@ -167,6 +260,42 @@ impl Drop for Exchange<'_> {
 
 /// Metadata key carrying per-output-row provenance.
 const PARENT_ROW_KEY: &str = "vgi_rpc.parent_row#b64";
+
+/// Continued output: an answer carrying `HAVE_MORE_OUTPUT` under this key has
+/// more for the same input, which the client asks for with an input carrying
+/// `CONTINUE`.
+const STATUS_KEY: &str = "vgi.status";
+const STATUS_HAVE_MORE_OUTPUT: &str = "HAVE_MORE_OUTPUT";
+const STATUS_CONTINUE: &str = "CONTINUE";
+
+/// Refuse what only the client can catch on a continued reply.
+///
+/// A `not_modified` answer stands for an input's whole stored output, so it
+/// must be that input's only reply: one that says more, or that answers a
+/// tick, is a protocol violation (the extension fails the query with
+/// "not_modified on a continued reply"). Cache control describes an input's
+/// whole output and rides its first reply only, so a tick's reply carries none.
+fn check_continued_reply(
+    function: &str,
+    metadata: &vgi_rpc::wire::Metadata,
+    more: bool,
+    tick: bool,
+) -> Result<()> {
+    if tick && metadata.keys().any(|k| k.starts_with("vgi.cache.")) {
+        return Err(RpcError::protocol_error(format!(
+            "function `{function}`: cache control on a reply to a continuation tick; \
+             it is only valid on an input's first reply"
+        )));
+    }
+    let not_modified = CacheControl::from_metadata(metadata).is_some_and(|c| c.not_modified);
+    if not_modified && more {
+        return Err(RpcError::protocol_error(format!(
+            "function `{function}`: not_modified on a continued reply (one that says \
+             HAVE_MORE_OUTPUT); a 304 must be its input's only reply"
+        )));
+    }
+    Ok(())
+}
 
 fn update_answer_metadata(
     parent_rows: &mut Option<Vec<i32>>,
@@ -284,6 +413,8 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
+            copy_from: None,
+            copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
         };
@@ -316,6 +447,9 @@ impl VgiClient {
         bound: &BoundFunction,
         opts: &ScanOptions,
     ) -> Result<Exchange<'a>> {
+        let schema = project_schema(bound.output_schema(), opts.projection.as_deref())?;
+        let emitted_schema =
+            project_schema(bound.output_schema(), opts.wire_projection().as_deref())?;
         let request = bound.init_request(opts, Some(phase::INPUT), None);
         let params = wire::to_batch(p::InitParams {
             request: envelope(request)?,
@@ -340,14 +474,16 @@ impl VgiClient {
                 return Err(error);
             }
         };
-        let schema = bound.output_schema().clone();
         Ok(Exchange {
             stream,
             header,
+            function: bound.function_name().to_owned(),
             schema,
+            emitted_schema,
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: conditional_request_metadata(opts),
+            pending_more: None,
             connection_reusable,
             closed: false,
         })
@@ -500,6 +636,9 @@ impl VgiClient {
         phase_name: &str,
         finalize_state_id: Option<Bytes>,
     ) -> Result<Scan<'a>> {
+        let schema = project_schema(bound.output_schema(), opts.projection.as_deref())?;
+        let emitted_schema =
+            project_schema(bound.output_schema(), opts.wire_projection().as_deref())?;
         let mut request = bound.init_request(opts, Some(phase_name), finalize_state_id);
         // A finalize is a producer stream. The worker selects tick mode by the
         // *absence* of an input schema, so it must not be echoed back here even
@@ -509,12 +648,13 @@ impl VgiClient {
             request: envelope(request)?,
         })?;
         let connection_reusable = self.exchange_reuse_guard();
-        Scan::open(
+        Scan::open_projected(
             self.transport_mut(),
             &params,
             conditional_request_metadata(opts),
             bound.function_name(),
-            bound.output_schema().clone(),
+            schema,
+            emitted_schema,
             connection_reusable,
         )
     }
@@ -579,6 +719,8 @@ mod tests {
     struct StubExchangeStream {
         calls: Arc<StreamCalls>,
         failure: StreamFailure,
+        /// Scripted answers, in order; end-of-stream once they run out.
+        replies: std::collections::VecDeque<Option<(RecordBatch, Metadata)>>,
     }
 
     impl ExchangeStream for StubExchangeStream {
@@ -590,7 +732,7 @@ mod tests {
             if self.failure == StreamFailure::Send {
                 return Err(RpcError::runtime_error("stub send failure"));
             }
-            Ok(None)
+            Ok(self.replies.pop_front().flatten())
         }
 
         fn exchange_with_metadata(
@@ -633,20 +775,165 @@ mod tests {
     ) -> (Exchange<'static>, Arc<AtomicBool>) {
         let connection_reusable = Arc::new(AtomicBool::new(true));
         let exchange = Exchange {
-            stream: Box::new(StubExchangeStream { calls, failure }),
+            stream: Box::new(StubExchangeStream {
+                calls,
+                failure,
+                replies: Default::default(),
+            }),
             header: GlobalInitResponse {
                 execution_id: Bytes(b"stub".to_vec()),
                 max_workers: 1,
                 opaque_data: None,
             },
+            function: "stub".to_owned(),
             schema: Arc::new(Schema::empty()),
+            emitted_schema: Arc::new(Schema::empty()),
             parent_rows: None,
             last_cache_control: None,
             first_input_metadata: None,
+            pending_more: None,
             connection_reusable: Arc::clone(&connection_reusable),
             closed: false,
         };
         (exchange, connection_reusable)
+    }
+
+    /// An exchange whose worker answers with `replies`, in order, then ends
+    /// the stream.
+    fn scripted_exchange(
+        calls: Arc<StreamCalls>,
+        replies: Vec<Metadata>,
+    ) -> (Exchange<'static>, Arc<AtomicBool>) {
+        let (mut exchange, connection_reusable) =
+            stub_exchange_with_failure(Arc::clone(&calls), StreamFailure::None);
+        exchange.stream = Box::new(StubExchangeStream {
+            calls,
+            failure: StreamFailure::None,
+            replies: replies
+                .into_iter()
+                .map(|md| Some((RecordBatch::new_empty(Arc::new(Schema::empty())), md)))
+                .collect(),
+        });
+        (exchange, connection_reusable)
+    }
+
+    fn says_more() -> Metadata {
+        Metadata::from([(STATUS_KEY.to_string(), STATUS_HAVE_MORE_OUTPUT.to_string())])
+    }
+
+    fn empty_input() -> RecordBatch {
+        RecordBatch::new_empty(Arc::new(Schema::empty()))
+    }
+
+    #[test]
+    fn a_continued_answer_is_followed_by_ticks() {
+        let calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) =
+            scripted_exchange(Arc::clone(&calls), vec![says_more(), Metadata::new()]);
+        assert!(exchange.send(&empty_input()).unwrap().is_some());
+        assert!(exchange.has_more_output());
+        assert!(exchange.continue_output().unwrap().is_some());
+        assert!(!exchange.has_more_output());
+        assert!(reusable.load(Ordering::Acquire));
+        let metadata = calls.input_metadata.lock().unwrap();
+        assert_eq!(
+            metadata[1]
+                .as_ref()
+                .and_then(|m| m.get(STATUS_KEY))
+                .map(String::as_str),
+            Some(STATUS_CONTINUE)
+        );
+    }
+
+    #[test]
+    fn send_while_output_is_pending_is_refused_before_it_is_sent() {
+        let calls = Arc::new(StreamCalls::default());
+        let (mut exchange, _) = scripted_exchange(Arc::clone(&calls), vec![says_more()]);
+        exchange.send(&empty_input()).unwrap();
+        let error = exchange.send(&empty_input()).unwrap_err();
+        assert!(error.to_string().contains("output is pending"), "{error}");
+        assert_eq!(calls.input_metadata.lock().unwrap().len(), 1);
+        assert!(exchange.has_more_output());
+    }
+
+    #[test]
+    fn end_of_stream_in_answer_to_a_tick_is_a_protocol_error() {
+        let calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) = scripted_exchange(Arc::clone(&calls), vec![says_more()]);
+        exchange.send(&empty_input()).unwrap();
+        let error = exchange.continue_output().unwrap_err();
+        assert!(error.to_string().contains("continuation tick"), "{error}");
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(!exchange.has_more_output());
+    }
+
+    #[test]
+    fn end_of_stream_after_a_real_input_is_a_normal_end() {
+        let calls = Arc::new(StreamCalls::default());
+        let (mut exchange, reusable) = scripted_exchange(Arc::clone(&calls), Vec::new());
+        assert!(exchange.send(&empty_input()).unwrap().is_none());
+        assert!(reusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn not_modified_on_a_reply_that_says_more_is_refused() {
+        let calls = Arc::new(StreamCalls::default());
+        let mut reply = says_more();
+        reply.insert(
+            vgi_protocol::cache_control::CACHE_NOT_MODIFIED_KEY.to_string(),
+            "1".to_string(),
+        );
+        let (mut exchange, reusable) = scripted_exchange(Arc::clone(&calls), vec![reply]);
+        let error = exchange.send(&empty_input()).unwrap_err();
+        assert!(error.to_string().contains("not_modified"), "{error}");
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(!exchange.has_more_output());
+    }
+
+    #[test]
+    fn not_modified_alone_on_a_single_reply_is_accepted() {
+        let calls = Arc::new(StreamCalls::default());
+        let reply = Metadata::from([(
+            vgi_protocol::cache_control::CACHE_NOT_MODIFIED_KEY.to_string(),
+            "1".to_string(),
+        )]);
+        let (mut exchange, reusable) = scripted_exchange(Arc::clone(&calls), vec![reply]);
+        assert!(exchange.send(&empty_input()).unwrap().is_some());
+        assert!(exchange.cache_control().unwrap().not_modified);
+        assert!(reusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cache_control_on_a_tick_reply_is_refused() {
+        for key in [
+            vgi_protocol::cache_control::CACHE_NOT_MODIFIED_KEY,
+            vgi_protocol::cache_control::CACHE_TTL_KEY,
+        ] {
+            let calls = Arc::new(StreamCalls::default());
+            let tick_reply = Metadata::from([(key.to_string(), "1".to_string())]);
+            let (mut exchange, reusable) =
+                scripted_exchange(Arc::clone(&calls), vec![says_more(), tick_reply]);
+            exchange.send(&empty_input()).unwrap();
+            let error = exchange.continue_output().unwrap_err();
+            assert!(error.to_string().contains("continuation tick"), "{error}");
+            assert!(!reusable.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn close_and_cancel_drop_pending_output() {
+        for cancel in [false, true] {
+            let calls = Arc::new(StreamCalls::default());
+            let (mut exchange, _) = scripted_exchange(Arc::clone(&calls), vec![says_more()]);
+            exchange.send(&empty_input()).unwrap();
+            assert!(exchange.has_more_output());
+            if cancel {
+                exchange.cancel().unwrap();
+            } else {
+                exchange.close().unwrap();
+            }
+            assert!(!exchange.has_more_output());
+        }
     }
 
     #[test]

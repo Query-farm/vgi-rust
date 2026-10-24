@@ -46,10 +46,10 @@ example below needs):
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.35"
-vgi-rpc = "0.25"
-arrow-array = "59"
-arrow-schema = "59"
+vgi = "0.45"
+vgi-rpc = "0.32"
+arrow-array = "60"
+arrow-schema = "60"
 ```
 
 **2. Write a function and serve it:**
@@ -179,6 +179,9 @@ Register any mix of these via the typed traits in [`vgi`](https://docs.rs/vgi):
 
 Each trait is small: `name`, `metadata`, `argument_specs`, an `on_bind` to resolve
 the output schema, and `process` (or the buffering / aggregate lifecycle methods).
+See [filter ownership and typed pruning](../docs/filtering-and-pruning.md) for safe
+external-data scans using `FilterHandling::Sdk` and partial-column candidate masks.
+
 Projection & filter pushdown, ORDER BY / TABLESAMPLE hints, settings, secrets
 (two-phase bind), bearer auth, and a cross-process state store are handled for you.
 
@@ -207,6 +210,19 @@ as native catalogs.
 - **Unix socket** (`--unix <path>`) — one long-lived worker (the launcher contract).
 - **HTTP** (`--http`) — Arrow-IPC over HTTP with AEAD-sealed stateless stream
   tokens and optional bearer auth.
+
+## Testing your worker
+
+Use `vgi-client` with `features = ["testing"]` in your dev dependencies.
+`TestWorker` exercises attach, bind, and scan against your own binary, while
+`ScanResult` compares typed schemas and unordered rows with duplicate counts and
+NULLs preserved. Build typed filters with `FilterExpr` and compare pushed scans
+with independently filtered full scans using `check_pushdown`.
+
+The [testing guide](https://github.com/Query-farm/vgi-rust/blob/main/docs/testing-workers.md)
+shows fixture construction, filter-only projections, exact integer checks, and
+CI commands. The [external-data example](https://github.com/Query-farm/vgi-rust/tree/main/examples/external-data)
+provides a complete worker with subprocess tests.
 
 ## Where to go next
 

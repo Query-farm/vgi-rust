@@ -397,7 +397,7 @@ fn transactions_are_optional_and_round_trip_when_offered() {
     client.detach(&cat).expect("detach");
 }
 
-/// `catalog_contents` (protocol 2.1.0): the example worker advertises it, and
+/// `catalog_contents` (protocol 2.2.0): the example worker advertises it, and
 /// one call returns every schema the per-schema calls list — parents first —
 /// with each kind holding exactly what the matching per-schema call returns.
 #[test]
@@ -423,7 +423,7 @@ fn catalog_contents_matches_the_per_schema_calls() {
         resp.catalog_version,
         client.catalog_version(&cat).expect("catalog_version")
     );
-    let contents = resp.schemas;
+    let contents = resp.schema_contents().expect("decode catalog collections");
 
     let listed = client.schemas(&cat).expect("catalog_schemas");
     let bulk_schemas: Vec<SchemaInfo> = decode_item_blobs(
@@ -518,16 +518,19 @@ fn catalog_contents_revalidates_with_its_etag() {
             .contents_response(&cat, Some("whatever"))
             .expect("catalog_contents");
         assert!(!again.not_modified, "no etag: if_none_match is ignored");
-        assert_eq!(again.schemas.len(), full.schemas.len());
+        assert_eq!(
+            again.schema_contents().unwrap().len(),
+            full.schema_contents().unwrap().len()
+        );
         return;
     };
-    assert!(!full.schemas.is_empty());
+    assert!(!full.schema_contents().unwrap().is_empty());
 
     let same = client
         .contents_response(&cat, Some(&etag))
         .expect("conditional catalog_contents");
     assert!(same.not_modified);
-    assert!(same.schemas.is_empty());
+    assert!(same.streams().iter().all(|stream| stream.is_none()));
     assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
     assert_eq!(same.catalog_version, full.catalog_version);
 
@@ -536,7 +539,135 @@ fn catalog_contents_revalidates_with_its_etag() {
         .expect("catalog_contents");
     assert!(!other.not_modified);
     assert_eq!(other.etag.as_deref(), Some(etag.as_str()));
-    assert_eq!(other.schemas.len(), full.schemas.len());
+    assert_eq!(
+        other.schema_contents().unwrap().len(),
+        full.schema_contents().unwrap().len()
+    );
+
+    client.detach(&cat).expect("detach");
+}
+
+/// Every dictionary-encoded enum the worker writes into a catalog record must
+/// be the Python enum **member name** — `vgi_rpc` puts an `Enum` field on the
+/// wire as `.name`, and the DuckDB extension decodes these columns with strict
+/// generated codecs. vgi-rust used to send `FunctionType` / `MacroType` values
+/// (`"scalar"`, `"table"`, …); the hand-written C++ decoder accepted them case
+/// insensitively, the generated one rejects them. Pin the exact strings.
+#[test]
+fn catalog_enum_columns_carry_python_member_names() {
+    use std::collections::BTreeSet;
+
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+
+    const FUNCTION_TYPES: [&str; 4] = ["SCALAR", "TABLE", "TABLE_BUFFERING", "AGGREGATE"];
+    const MACRO_TYPES: [&str; 2] = ["SCALAR", "TABLE"];
+    const STABILITY: [&str; 3] = ["CONSISTENT", "VOLATILE", "CONSISTENT_WITHIN_QUERY"];
+    const NULL_HANDLING: [&str; 2] = ["DEFAULT", "SPECIAL"];
+    const ORDER_PRESERVATION: [&str; 3] = ["PRESERVES_ORDER", "NO_ORDER_GUARANTEE", "FIXED_ORDER"];
+    const PARTITION_KIND: [&str; 4] = [
+        "NOT_PARTITIONED",
+        "SINGLE_VALUE_PARTITIONS",
+        "OVERLAPPING_PARTITIONS",
+        "DISJOINT_PARTITIONS",
+    ];
+    const ORDER_DEPENDENT: [&str; 2] = ["ORDER_DEPENDENT", "NOT_ORDER_DEPENDENT"];
+    const DISTINCT_DEPENDENT: [&str; 2] = ["DISTINCT_DEPENDENT", "NOT_DISTINCT_DEPENDENT"];
+
+    let mut function_types = BTreeSet::new();
+    let mut macro_types = BTreeSet::new();
+    for schema in client.schemas(&cat).expect("catalog_schemas") {
+        let schema_name = schema.path.first().expect("non-empty schema path").clone();
+        for (kind, expected) in [
+            (FunctionKind::Scalar, &["SCALAR"][..]),
+            (FunctionKind::Aggregate, &["AGGREGATE"][..]),
+            (FunctionKind::Table, &["TABLE", "TABLE_BUFFERING"][..]),
+        ] {
+            for f in client
+                .functions(&cat, &schema_name, kind)
+                .unwrap_or_else(|e| panic!("functions({kind:?}): {e}"))
+            {
+                let ft = f.function_type.0.as_str();
+                assert!(
+                    expected.contains(&ft),
+                    "{}.{}: function_type {ft:?} under {kind:?}, expected one of {expected:?}",
+                    schema_name,
+                    f.name
+                );
+                function_types.insert(ft.to_string());
+                let check = |field: &str, value: Option<&str>, allowed: &[&str]| {
+                    if let Some(v) = value {
+                        assert!(
+                            allowed.contains(&v),
+                            "{}.{}: {field} {v:?} is not a member name of {allowed:?}",
+                            schema_name,
+                            f.name
+                        );
+                    }
+                };
+                check(
+                    "stability",
+                    f.stability.as_ref().map(|d| d.0.as_str()),
+                    &STABILITY,
+                );
+                check(
+                    "null_handling",
+                    f.null_handling.as_ref().map(|d| d.0.as_str()),
+                    &NULL_HANDLING,
+                );
+                check(
+                    "order_preservation",
+                    f.order_preservation.as_ref().map(|d| d.0.as_str()),
+                    &ORDER_PRESERVATION,
+                );
+                check("partition_kind", Some(&f.partition_kind.0), &PARTITION_KIND);
+                check(
+                    "order_dependent",
+                    Some(&f.order_dependent.0),
+                    &ORDER_DEPENDENT,
+                );
+                check(
+                    "distinct_dependent",
+                    Some(&f.distinct_dependent.0),
+                    &DISTINCT_DEPENDENT,
+                );
+            }
+        }
+        for (kind, expected) in [(MacroKind::Scalar, "SCALAR"), (MacroKind::Table, "TABLE")] {
+            for m in client
+                .macros(&cat, &schema_name, kind)
+                .unwrap_or_else(|e| panic!("macros({kind:?}): {e}"))
+            {
+                assert_eq!(
+                    m.macro_type.0, expected,
+                    "{}.{}: macro_type under {kind:?}",
+                    schema_name, m.name
+                );
+                assert!(MACRO_TYPES.contains(&m.macro_type.0.as_str()));
+                macro_types.insert(m.macro_type.0.clone());
+            }
+        }
+    }
+
+    // The example catalog exercises every FunctionType member and both macro
+    // kinds, so a regression on any one of them is visible here.
+    assert_eq!(
+        function_types,
+        FUNCTION_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        macro_types,
+        MACRO_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
+    );
 
     client.detach(&cat).expect("detach");
 }

@@ -80,6 +80,8 @@ pub struct StoredCatalog {
     supports_catalog_contents: bool,
     contents_provider: Option<Arc<dyn CatalogContentsProvider>>,
     catalog_contents_etag: CatalogContentsEtag,
+    #[cfg(feature = "catalog-publication")]
+    pub(crate) snapshot_policy: Option<Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>>,
 }
 
 impl std::fmt::Debug for StoredCatalog {
@@ -105,6 +107,8 @@ impl StoredCatalog {
             supports_catalog_contents: true,
             contents_provider: None,
             catalog_contents_etag: CatalogContentsEtag::None,
+            #[cfg(feature = "catalog-publication")]
+            snapshot_policy: None,
         }
     }
 
@@ -140,6 +144,24 @@ impl StoredCatalog {
     pub fn catalog_contents_etag(mut self, etag: CatalogContentsEtag) -> Self {
         self.catalog_contents_etag = etag;
         self
+    }
+
+    /// Publish catalog metadata through the configured durable repository.
+    #[cfg(feature = "catalog-publication")]
+    pub fn snapshot_policy(
+        mut self,
+        policy: Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>,
+    ) -> Self {
+        self.snapshot_policy = Some(policy);
+        self
+    }
+    #[cfg(feature = "catalog-publication")]
+    pub(crate) fn snapshot_version(
+        &self,
+        store: &dyn FunctionStorage,
+        session: &[u8],
+    ) -> Result<i64> {
+        Ok(self.reported_version(&self.load(store, session)?))
     }
 
     /// The name the catalog is attached by.
@@ -187,7 +209,7 @@ impl StoredCatalog {
         match events.next().transpose()? {
             Some(Event::Attached) => {}
             _ => {
-                return Err(RpcError::value_error(format!(
+                return Err(crate::errors::not_found(format!(
                     "catalog '{}' is not attached (unknown or detached session)",
                     self.name
                 )));
@@ -350,7 +372,8 @@ impl StoredCatalog {
                 Err(RpcError::value_error(format!(
                     "catalog '{}' stores table metadata only; its tables have no rows to scan",
                     self.name
-                )))
+                ))
+                .with_code(crate::errors::Code::Unimplemented))
             }
             "catalog_contents" => {
                 let params: p::CatalogContentsParams = wire::from_batch(&req.batch)?;
@@ -521,7 +544,8 @@ impl StoredCatalog {
             other => Err(RpcError::value_error(format!(
                 "catalog '{}' does not support {other}",
                 self.name
-            ))),
+            ))
+            .with_code(crate::errors::Code::Unimplemented)),
         }
     }
 
@@ -572,7 +596,7 @@ impl OnConflict {
             "error" | "" => Ok(OnConflict::Error),
             "ignore" => Ok(OnConflict::Ignore),
             "replace" => Ok(OnConflict::Replace),
-            other => Err(RpcError::value_error(format!(
+            other => Err(crate::errors::invalid_argument(format!(
                 "unknown on_conflict '{other}' (expected error, ignore or replace)"
             ))),
         }
@@ -768,7 +792,9 @@ impl State {
         self.schemas
             .iter_mut()
             .find(|s| same_path(&s.path, path))
-            .ok_or_else(|| RpcError::value_error(format!("Schema '{}' not found", path.join("."))))
+            .ok_or_else(|| {
+                crate::errors::not_found(format!("Schema '{}' not found", path.join(".")))
+            })
     }
 
     fn table_items(&self, path: &[String]) -> Result<Vec<Bytes>> {
@@ -828,10 +854,12 @@ impl State {
                 on_conflict,
             } => {
                 if path.is_empty() {
-                    return Err(RpcError::value_error("schema path must not be empty"));
+                    return Err(crate::errors::invalid_argument(
+                        "schema path must not be empty",
+                    ));
                 }
                 if path.len() > 1 && self.schema(&path[..path.len() - 1]).is_none() {
-                    return Err(RpcError::value_error(format!(
+                    return Err(crate::errors::not_found(format!(
                         "Schema '{}' not found",
                         path[..path.len() - 1].join(".")
                     )));
@@ -864,7 +892,7 @@ impl State {
                     return if *ignore_not_found {
                         Ok(false)
                     } else {
-                        Err(RpcError::value_error(format!(
+                        Err(crate::errors::not_found(format!(
                             "Schema '{}' not found",
                             path.join(".")
                         )))
@@ -1044,7 +1072,7 @@ fn drop_named<T>(
         if ignore_not_found {
             Ok(false)
         } else {
-            Err(RpcError::value_error(format!(
+            Err(crate::errors::not_found(format!(
                 "{kind} '{}.{name}' not found",
                 path.join(".")
             )))
@@ -1104,7 +1132,7 @@ fn require_unconstrained_columns(schema: &Schema) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog_contents::{CatalogContentsResult, catalog_contents_digest};
+    use crate::catalog_contents::CatalogContentsResult;
     use crate::storage::MemoryStorage;
     use arrow_schema::{DataType, Field, Schema};
 
@@ -1232,7 +1260,7 @@ mod tests {
                 schema_path: path(schema),
                 name: name.to_string(),
                 columns: Bytes::from(crate::ipc::write_schema(&columns).unwrap()),
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 constraint_definitions: Vec::new(),
                 transaction_opaque_data: None,
 
@@ -1254,7 +1282,7 @@ mod tests {
                 options: None,
                 attach_opaque_data: Bytes::from(b"attach".to_vec()),
                 path: path(schema),
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 comment: Some("made here".to_string()),
                 tags: None,
                 transaction_opaque_data: None,
@@ -1729,8 +1757,8 @@ mod tests {
         let c = s.contents(None);
         assert_eq!(c.catalog_version, 0);
         assert_eq!(c.etag, None);
-        assert_eq!(c.schemas.len(), 1);
-        assert_eq!(c.schemas[0].views.len(), 1);
+        assert_eq!(c.schema_contents().unwrap().len(), 1);
+        assert_eq!(c.schema_contents().unwrap()[0].views.len(), 1);
     }
 
     struct Generation;
@@ -1754,7 +1782,7 @@ mod tests {
         assert_eq!(first.etag.as_deref(), Some("gen-1"));
         assert_eq!(first.catalog_version, 1);
         let again = s.contents(Some("gen-1"));
-        assert!(again.not_modified && again.schemas.is_empty());
+        assert!(again.not_modified && again.schema_contents().unwrap().is_empty());
         s.create_view("v", "error").unwrap();
         let changed = s.contents(Some("gen-1"));
         assert!(!changed.not_modified);
@@ -1769,7 +1797,10 @@ mod tests {
         );
         let first = s.contents(None);
         let etag = first.etag.clone().unwrap();
-        assert_eq!(etag, catalog_contents_digest(&first.schemas));
+        assert_eq!(
+            etag,
+            crate::catalog_contents::catalog_response_digest(&first)
+        );
         assert!(s.contents(Some(&etag)).not_modified);
         s.create_view("v", "error").unwrap();
         let changed = s.contents(Some(&etag));
@@ -1784,7 +1815,12 @@ mod tests {
         s.create_table(&["main"], "t").unwrap();
         s.create_schema(&["s2"]).unwrap();
         let c = s.contents(None);
-        let paths: Vec<_> = c.schemas.iter().map(|s| s.path.clone()).collect();
+        let paths: Vec<_> = c
+            .schema_contents()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
         assert_eq!(paths, vec![path(&["main"]), path(&["s2"])]);
         let tables = |schema: &[&str]| {
             let batch = wire::to_batch(p::CatalogSchemaContentsTablesParams {
@@ -1801,10 +1837,12 @@ mod tests {
             .unwrap();
             r.items
         };
-        assert_eq!(c.schemas[0].tables, tables(&["main"]));
-        assert_eq!(c.schemas[0].views.len(), 1);
-        let info: SchemaInfo =
-            wire::from_batch(&crate::ipc::read_batch(&c.schemas[1].schema.0).unwrap()).unwrap();
+        assert_eq!(c.schema_contents().unwrap()[0].tables, tables(&["main"]));
+        assert_eq!(c.schema_contents().unwrap()[0].views.len(), 1);
+        let info: SchemaInfo = wire::from_batch(
+            &crate::ipc::read_batch(&c.schema_contents().unwrap()[1].schema.0).unwrap(),
+        )
+        .unwrap();
         assert_eq!(info.comment.as_deref(), Some("made here"));
     }
 
@@ -1820,10 +1858,9 @@ mod tests {
             transaction_opaque_data: None,
         })
         .unwrap();
-        let err = s
-            .call("catalog_view_rename", batch)
-            .unwrap_err()
-            .to_string();
+        let err = s.call("catalog_view_rename", batch).unwrap_err();
+        assert_eq!(err.error_code(), "UNIMPLEMENTED", "{err}");
+        let err = err.to_string();
         assert!(
             err.contains("does not support catalog_view_rename"),
             "{err}"
@@ -1870,7 +1907,7 @@ mod tests {
                 comment: None,
                 tags: None,
                 column_comments: None,
-                on_conflict: DictString("error".to_string()),
+                on_conflict: DictString("ERROR".to_string()),
                 transaction_opaque_data: None,
             })
             .unwrap();
@@ -1909,6 +1946,7 @@ mod tests {
         // The declarative primary is still read-only.
         let err = view(&Bytes::from(b"example".to_vec()), "x").unwrap_err();
         assert!(err.to_string().contains("read-only"));
+        assert_eq!(err.error_code(), "FAILED_PRECONDITION", "{err}");
 
         let catalogs = d
             .handle_catalog_catalogs(&request(

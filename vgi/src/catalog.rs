@@ -617,6 +617,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         sink_order_dependent: false,
         requires_input_batch_index: false,
         input_from_args: false, // set per-function from FunctionMetadata.input_from_args
+        input_rows_per_call: None,
         required_settings: Vec::new(),
         required_secrets: Vec::new(),
     }
@@ -624,6 +625,7 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
 
 /// Apply common metadata fields onto a `FunctionInfo`.
 fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> {
+    let filtering = meta.filter_handling()?;
     if !meta.additional_filter_functions.is_empty()
         || !meta.runtime_filter_algorithms.is_empty()
         || !meta.filter_evaluation_contexts.is_empty()
@@ -656,7 +658,7 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> 
     }
     fi.supports_batch_index = meta.supports_batch_index;
     fi.supports_splits = meta.supports_splits;
-    fi.filters_exactly_applied = meta.filters_exactly_applied;
+    fi.filters_exactly_applied = filtering != crate::FilterHandling::Disabled;
     fi.supports_positions = meta.supports_positions;
     fi.split_token_ttl_seconds = meta.split_token_ttl_seconds;
     if let Some(pk) = &meta.partition_kind {
@@ -808,6 +810,7 @@ pub fn table_in_out_function_info(
     // in-out registration branch with real-typed args and drive the literal
     // single-row scan-mode.
     fi.input_from_args = meta.input_from_args;
+    fi.input_rows_per_call = meta.input_rows_per_call;
     let arg_schema = build_arg_schema(&f.argument_specs());
     fi.arguments = Bytes::from(ipc::write_schema(&arg_schema)?);
     apply_argument_monotonicity(&mut fi, &meta, &arg_schema, false)?;
@@ -884,13 +887,12 @@ pub fn main_schema_info(attach_opaque_data: &[u8]) -> SchemaInfo {
 pub fn schema_info(
     path: &[String],
     comment: Option<&str>,
-    attach_opaque_data: &[u8],
+    _attach_opaque_data: &[u8],
 ) -> SchemaInfo {
     SchemaInfo {
         options: None,
         comment: comment.map(|s| s.to_string()),
         tags: Vec::new(),
-        attach_opaque_data: Bytes::from(attach_opaque_data.to_vec()),
         path: path.to_vec(),
         estimated_object_count: None,
     }
@@ -976,6 +978,9 @@ pub struct CatalogModel {
     /// when the catalog returns no etag of its own, the SHA-256 of the snapshot.
     /// Off by default.
     pub catalog_contents_etag: crate::catalog_contents::CatalogContentsEtag,
+    /// Optional immutable catalog publication policy. Authorization precedes every cache lookup.
+    #[cfg(feature = "catalog-publication")]
+    pub snapshot_policy: Option<std::sync::Arc<crate::catalog_snapshot::CatalogSnapshotPolicy>>,
     /// Whether this catalog's `catalog_contents` depends on nothing but the
     /// worker's registrations: not on the attach (its options, data version or
     /// session) nor on the caller. Lets the dispatcher build the response once
@@ -1038,7 +1043,7 @@ pub fn resolve_version_npm(
         .collect();
     sorted.sort();
     let unsupported = || {
-        vgi_rpc::RpcError::value_error(format!(
+        crate::errors::invalid_argument(format!(
             "Unsupported {label} {spec:?}; this worker serves {supported:?}"
         ))
     };
@@ -1263,7 +1268,7 @@ impl CatTable {
             // the AT clause themselves (carried on the bind request), so the
             // catalog leaves the schema/scan unchanged (pass-through).
             if has_at && self.branches.is_none() && !self.supports_time_travel {
-                return Err(vgi_rpc::RpcError::value_error(
+                return Err(crate::errors::unimplemented(
                     "this table does not support time travel",
                 ));
             }
@@ -1275,20 +1280,18 @@ impl CatTable {
             Some("VERSION") => {
                 let want: i64 = at_value
                     .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT VERSION value"))?;
+                    .ok_or_else(|| crate::errors::invalid_argument("invalid AT VERSION value"))?;
                 self.time_travel
                     .iter()
                     .find(|t| t.version == want)
                     .map(Some)
-                    .ok_or_else(|| {
-                        vgi_rpc::RpcError::value_error(format!("Unknown version: {want}"))
-                    })
+                    .ok_or_else(|| crate::errors::not_found(format!("Unknown version: {want}")))
             }
             Some("TIMESTAMP") => {
                 let year: i32 = at_value
                     .and_then(|v| v.get(..4))
                     .and_then(|y| y.parse().ok())
-                    .ok_or_else(|| vgi_rpc::RpcError::value_error("invalid AT TIMESTAMP value"))?;
+                    .ok_or_else(|| crate::errors::invalid_argument("invalid AT TIMESTAMP value"))?;
                 self.time_travel
                     .iter()
                     .filter(|t| t.timestamp_year.is_some_and(|ty| ty <= year))
@@ -1301,12 +1304,12 @@ impl CatTable {
                             .filter_map(|t| t.timestamp_year)
                             .min()
                             .unwrap_or(0);
-                        vgi_rpc::RpcError::value_error(format!(
+                        crate::errors::not_found(format!(
                             "No version exists at timestamp {at_value:?}: table did not exist before {min_year}"
                         ))
                     })
             }
-            Some(other) => Err(vgi_rpc::RpcError::value_error(format!(
+            Some(other) => Err(crate::errors::invalid_argument(format!(
                 "Unsupported at_unit: {other:?}"
             ))),
         }
@@ -1709,7 +1712,11 @@ pub fn macro_info(
         tags: Vec::new(),
         name: m.name.clone(),
         schema_path: schema_path.to_vec(),
-        macro_type: DictString(kind.into()),
+        macro_type: enums::dict(if m.table_macro {
+            enums::macro_type::TABLE
+        } else {
+            enums::macro_type::SCALAR
+        }),
         overloads,
     })
 }
@@ -1835,12 +1842,60 @@ mod tests {
     }
 
     #[test]
+    fn filter_ownership_is_validated_and_sdk_guarantee_is_published() {
+        use crate::FilterHandling;
+        for owner in [
+            FilterHandling::Disabled,
+            FilterHandling::Sdk,
+            FilterHandling::Worker,
+        ] {
+            let meta = FunctionMetadata::default().with_filter_handling(owner);
+            assert_eq!(meta.filter_handling().unwrap(), owner);
+            let mut info = default_function_info("f", "table");
+            apply_metadata(&mut info, &meta).unwrap();
+            assert_eq!(
+                info.filter_pushdown,
+                (owner != FilterHandling::Disabled).then_some(true)
+            );
+            assert_eq!(
+                info.filters_exactly_applied,
+                owner != FilterHandling::Disabled
+            );
+        }
+        let legacy_sdk = FunctionMetadata {
+            filter_pushdown: true,
+            auto_apply_filters: true,
+            ..Default::default()
+        };
+        let mut info = default_function_info("f", "table");
+        apply_metadata(&mut info, &legacy_sdk).unwrap();
+        assert!(info.filters_exactly_applied);
+        assert_eq!(legacy_sdk.filter_handling().unwrap(), FilterHandling::Sdk);
+
+        for (pushdown, auto, exact) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let invalid = FunctionMetadata {
+                filter_pushdown: pushdown,
+                auto_apply_filters: auto,
+                filters_exactly_applied: exact,
+                ..Default::default()
+            };
+            let err = apply_metadata(&mut info, &invalid).unwrap_err();
+            assert!(err.to_string().contains("filter"));
+        }
+    }
+
+    #[test]
     fn filtering_defaults_to_the_standard_v1_semantic_profile_only() {
         let mut filtering = default_function_info("f", "table");
         apply_metadata(
             &mut filtering,
             &FunctionMetadata {
                 filter_pushdown: true,
+                auto_apply_filters: true,
                 ..Default::default()
             },
         )
@@ -1962,6 +2017,53 @@ mod tests {
         let mut table = default_function_info("bad", enums::function_type::TABLE);
         let err = apply_argument_monotonicity(&mut table, &declared, &args, false).unwrap_err();
         assert!(err.to_string().contains("only valid for scalar"));
+    }
+
+    /// The raw dictionary value of one enum column in a serialized item.
+    fn wire_enum(item: &Bytes, column: &str) -> String {
+        use arrow_array::{cast::AsArray, types::Int16Type};
+        let batch = ipc::read_batch(&item.0).unwrap();
+        let col = batch.column_by_name(column).unwrap();
+        let dict = col.as_dictionary::<Int16Type>();
+        let values = dict.values().as_string::<i32>();
+        values.value(dict.keys().value(0) as usize).to_string()
+    }
+
+    /// `FunctionInfo.function_type` and `MacroInfo.macro_type` cross the wire
+    /// as the Python enum member NAME. vgi-rust used to write the lower-case
+    /// `.value` (`"scalar"`, `"table"`, …), which the DuckDB extension's strict
+    /// generated decoders reject.
+    #[test]
+    fn function_and_macro_types_are_python_member_names() {
+        for (ft, wire) in [
+            (enums::function_type::SCALAR, "SCALAR"),
+            (enums::function_type::TABLE, "TABLE"),
+            (enums::function_type::TABLE_BUFFERING, "TABLE_BUFFERING"),
+            (enums::function_type::AGGREGATE, "AGGREGATE"),
+        ] {
+            let items = serialize_items(vec![default_function_info("f", ft)]).unwrap();
+            assert_eq!(wire_enum(&items[0], "function_type"), wire);
+            assert_eq!(wire_enum(&items[0], "partition_kind"), "NOT_PARTITIONED");
+            assert_eq!(
+                wire_enum(&items[0], "order_dependent"),
+                "NOT_ORDER_DEPENDENT"
+            );
+            assert_eq!(
+                wire_enum(&items[0], "distinct_dependent"),
+                "NOT_DISTINCT_DEPENDENT"
+            );
+        }
+        for (table_macro, wire) in [(false, "SCALAR"), (true, "TABLE")] {
+            let m = CatMacro {
+                name: "m".to_string(),
+                parameters: vec!["a".to_string()],
+                definition: "a".to_string(),
+                table_macro,
+                ..Default::default()
+            };
+            let items = serialize_items(vec![macro_info(&path("main"), &m).unwrap()]).unwrap();
+            assert_eq!(wire_enum(&items[0], "macro_type"), wire);
+        }
     }
 
     #[test]
@@ -2383,7 +2485,7 @@ impl std::error::Error for MissingAttachOptions {}
 
 impl From<MissingAttachOptions> for vgi_rpc::RpcError {
     fn from(e: MissingAttachOptions) -> Self {
-        vgi_rpc::RpcError::value_error(e.to_string())
+        crate::errors::invalid_argument(e.to_string())
     }
 }
 
@@ -2705,5 +2807,77 @@ mod attach_option_secret_tests {
         let specs = vec![ipc::write_batch(&batch).unwrap()];
         assert!(secret_attach_option_names(&specs).is_empty());
         assert_eq!(required_attach_option_names(&specs), vec!["legacy"]);
+    }
+}
+
+#[cfg(test)]
+mod binary_dictionary_tests {
+    use super::*;
+    use arrow_array::{types::Int32Type, Array, DictionaryArray};
+    #[test]
+    fn function_binary_dictionaries_preserve_content_nulls_and_replacements() {
+        let rows = (0..7)
+            .map(|i| {
+                let mut function = default_function_info(&format!("f{i}"), "scalar");
+                function.schema_path = vec![if i % 2 == 0 { "main" } else { "other" }.into()];
+                function.arguments = Bytes(vec![0xff, 0, if i < 3 { 0x80 } else { 0x81 }]);
+                function.output_schema = Bytes(vec![]);
+                function.parameter_default_values = match i % 3 {
+                    0 => None,
+                    1 => Some(Bytes(vec![])),
+                    _ => Some(Bytes(vec![0xff, 0])),
+                };
+                function
+            })
+            .collect::<Vec<_>>();
+        let singleton = crate::wire::to_batch(rows[0].clone()).unwrap();
+        let dictionary = singleton
+            .column_by_name("arguments")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(dictionary.values().len(), 1);
+        let single: FunctionInfo = crate::wire::from_batch(&singleton).unwrap();
+        assert_eq!(single.arguments, rows[0].arguments);
+        // An index referencing a null dictionary value is distinct from empty bytes.
+        for field_name in ["parameter_default_values", "arguments"] {
+            let mut columns = singleton.columns().to_vec();
+            let index = singleton.schema().index_of(field_name).unwrap();
+            let values = std::sync::Arc::new(arrow_array::BinaryArray::from(vec![None::<&[u8]>]));
+            let null_value = DictionaryArray::<Int32Type>::try_new(
+                arrow_array::Int32Array::from(vec![0]),
+                values,
+            )
+            .unwrap();
+            columns[index] = std::sync::Arc::new(null_value);
+            let batch = arrow_array::RecordBatch::try_new(singleton.schema(), columns).unwrap();
+            let bytes = Bytes(crate::ipc::write_batch(&batch).unwrap());
+            let decoded = vgi_protocol::catalog::decode_collection::<FunctionInfo>(Some(&bytes));
+            if field_name == "arguments" {
+                assert!(decoded.is_err());
+            } else {
+                assert!(decoded.unwrap()[0].parameter_default_values.is_none());
+            }
+        }
+        let stream = vgi_protocol::catalog::encode_collection_with_batch_size(rows.clone(), 3)
+            .unwrap()
+            .unwrap();
+        let mut reader = vgi_rpc::wire::StreamReader::new(std::io::Cursor::new(&stream.0)).unwrap();
+        let (first, _) = reader.read_next().unwrap().unwrap();
+        let dictionary = first
+            .column_by_name("arguments")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(
+            dictionary.values().len(),
+            1,
+            "equal independent byte buffers deduplicate"
+        );
+        let decoded =
+            vgi_protocol::catalog::decode_collection::<FunctionInfo>(Some(&stream)).unwrap();
+        assert_eq!(format!("{rows:?}"), format!("{decoded:?}"));
     }
 }

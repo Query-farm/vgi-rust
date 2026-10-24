@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, SchemaRef};
-use vgi_rpc::Result;
+use vgi_rpc::{Result, RpcError};
 
 pub use crate::protocol::dtos::{
     EvaluationContextCapability, FilterFunctionCapability, FunctionExample,
@@ -253,7 +253,8 @@ impl ArgSpec {
 }
 
 /// Validate each spec's type bound against the input schema. Errors (value
-/// error) naming the failed bound, matching Python's `SchemaValidationError`.
+/// error, code `INVALID_ARGUMENT`) naming the failed bound, matching Python's
+/// `SchemaValidationError`.
 pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>) -> Result<()> {
     let Some(schema) = input_schema else {
         return Ok(());
@@ -267,7 +268,7 @@ pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>)
         }
         if let Some(field) = schema.fields().get(spec.position as usize) {
             if !(bound.pred)(field.data_type()) {
-                return Err(vgi_rpc::RpcError::value_error(format!(
+                return Err(crate::errors::invalid_argument(format!(
                     "{}: argument {} of type {} does not satisfy {}",
                     bound.name,
                     spec.name,
@@ -286,9 +287,9 @@ pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>)
 /// range (`ge`/`le`/`gt`/`lt`), and `pattern` constraints are validated once
 /// here — mirroring the Python SDK, so a discovered constraint (surfaced via
 /// `vgi_function_arguments()`) is actually binding. A violating value returns an
-/// `RpcError::value_error`; a null const value skips its value constraints, and
-/// column (non-const) arguments are not enforced here (type bounds are
-/// [`validate_type_bounds`]'s job).
+/// `RpcError::value_error` coded `INVALID_ARGUMENT`; a null const value skips
+/// its value constraints, and column (non-const) arguments are not enforced
+/// here (type bounds are [`validate_type_bounds`]'s job).
 pub fn validate_arg_constraints(
     specs: &[ArgSpec],
     args: &crate::arguments::Arguments,
@@ -368,7 +369,7 @@ pub fn validate_arg_constraints(
 }
 
 fn constraint_err(spec: &ArgSpec, detail: &str) -> vgi_rpc::RpcError {
-    vgi_rpc::RpcError::value_error(format!("argument {}: {}", spec.name, detail))
+    crate::errors::invalid_argument(format!("argument {}: {}", spec.name, detail))
 }
 
 /// Format a numeric bound, trimming a trailing `.0` (matches the `vgi_range` text).
@@ -409,6 +410,38 @@ fn const_in_choices(
     })
 }
 
+/// Who enforces every required pushed predicate before returning rows.
+///
+/// Pruning only rules out impossible candidates. It never fulfills this
+/// responsibility by itself, even if a pruning result looks exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterHandling {
+    /// The function does not accept pushed filters; the engine filters rows.
+    Disabled,
+    /// The SDK applies exact filters to producer output before projection.
+    /// Emit every column needed by the filter, including filter-only columns.
+    Sdk,
+    /// The worker guarantees exact evaluation of every accepted required
+    /// predicate. Unsupported predicates must fail, never be silently ignored.
+    Worker,
+}
+
+impl FilterHandling {
+    pub(crate) fn validate_filters(
+        self,
+        filters: Option<&crate::pushdown::PushdownFilters>,
+    ) -> Result<()> {
+        if self == Self::Disabled
+            && filters.is_some_and(|filters| filters.has_required_predicates())
+        {
+            return Err(RpcError::value_error(
+                "function with FilterHandling::Disabled cannot accept required pushed filters",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Optimizer- and discovery-facing function metadata (`FunctionInfo`).
 #[derive(Debug, Clone)]
 pub struct FunctionMetadata {
@@ -431,9 +464,12 @@ pub struct FunctionMetadata {
     /// parameters in signature order; a present null is an explicit NULL.
     pub parameter_default_values: Option<arrow_array::RecordBatch>,
     pub projection_pushdown: bool,
+    /// Accept pushed predicates. Prefer [`Self::with_filter_handling`] to set
+    /// this together with the exact-filtering responsibility. Setting this
+    /// alone is rejected: it must have an SDK or worker filtering owner.
     pub filter_pushdown: bool,
     pub sampling_pushdown: bool,
-    /// Worker-side: auto-apply pushed-down filters to emitted batches.
+    /// Legacy switch for SDK filtering. Prefer [`Self::with_filter_handling`].
     pub auto_apply_filters: bool,
     /// Filter Encoding v2 semantic profiles implemented by this function.
     pub filter_semantic_profiles: Vec<String>,
@@ -453,9 +489,10 @@ pub struct FunctionMetadata {
     /// Without it, the division lives behind an opaque worker-side queue and a
     /// retry reads neither what it read before nor what it missed.
     pub supports_splits: bool,
-    /// Declares that the worker applies every pushed filter EXACTLY, so the
-    /// engine may drop its own copy rather than re-filtering. Wrong answers if
-    /// declared falsely — leave it false unless certain.
+    /// Legacy declaration that the worker enforces every pushed filter exactly.
+    /// SDK filtering also publishes this guarantee automatically. A false value
+    /// does NOT guarantee the engine retains a residual filter after pushdown.
+    /// Prefer [`Self::with_filter_handling`] to declare an explicit owner.
     pub filters_exactly_applied: bool,
     /// Declares addressable positions in the data, for incremental and
     /// streaming reads. The engine owns the checkpoint; this declares only that
@@ -503,6 +540,52 @@ pub struct FunctionMetadata {
     /// positionally for varargs); named args stay bind-time scalars on
     /// `ProcessParams::arguments`. Surfaced as `FunctionInfo.input_from_args`.
     pub input_from_args: bool,
+    /// Blended (`input_from_args`) functions only: the most input rows one
+    /// worker call receives. The client's batched-LATERAL operator splits each
+    /// input chunk, after dedup, into calls of at most this many rows, so a
+    /// function that fans each row out to an upstream request can bound the
+    /// work one call does. `None` (the default) sends a whole chunk per call.
+    /// Must be positive; registration refuses anything else. Surfaced as
+    /// `FunctionInfo.input_rows_per_call`. Mirrors the Python SDK's
+    /// `Meta.input_rows_per_call`.
+    pub input_rows_per_call: Option<i64>,
+}
+
+impl FunctionMetadata {
+    /// Configure filter acceptance and exact evaluation together.
+    ///
+    /// Existing `filter_pushdown: true, auto_apply_filters: true` declarations
+    /// remain valid and mean [`FilterHandling::Sdk`]. Workers using manual
+    /// filtering must explicitly select [`FilterHandling::Worker`] (or set the
+    /// legacy `filters_exactly_applied` flag). An ownerless declaration fails at
+    /// discovery/init instead of silently returning unfiltered rows.
+    #[must_use]
+    pub fn with_filter_handling(mut self, handling: FilterHandling) -> Self {
+        self.filter_pushdown = handling != FilterHandling::Disabled;
+        self.auto_apply_filters = handling == FilterHandling::Sdk;
+        self.filters_exactly_applied = handling != FilterHandling::Disabled;
+        self
+    }
+
+    /// Resolve and validate the filtering contract, including legacy flags.
+    pub fn filter_handling(&self) -> Result<FilterHandling> {
+        if !self.filter_pushdown {
+            if self.auto_apply_filters || self.filters_exactly_applied {
+                return Err(RpcError::value_error(
+                    "filter ownership requires filter_pushdown; use with_filter_handling",
+                ));
+            }
+            Ok(FilterHandling::Disabled)
+        } else if self.auto_apply_filters {
+            Ok(FilterHandling::Sdk)
+        } else if self.filters_exactly_applied {
+            Ok(FilterHandling::Worker)
+        } else {
+            Err(RpcError::value_error(
+                "filter_pushdown requires an exact-filtering owner; use with_filter_handling(FilterHandling::Sdk) or FilterHandling::Worker",
+            ))
+        }
+    }
 }
 
 impl Default for FunctionMetadata {
@@ -542,6 +625,7 @@ impl Default for FunctionMetadata {
             required_secrets: Vec::new(),
             max_workers: 0,
             input_from_args: false,
+            input_rows_per_call: None,
         }
     }
 }
@@ -843,6 +927,28 @@ mod constraint_tests {
         assert!(validate_arg_constraints(&specs, &args_i64(5)).is_ok());
         assert!(validate_arg_constraints(&specs, &args_i64(99)).is_err());
         assert!(validate_arg_constraints(&specs, &args_i64(-1)).is_err());
+        let err = validate_arg_constraints(&specs, &args_i64(99)).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+    }
+
+    #[test]
+    fn type_bound_violation_is_invalid_argument() {
+        fn is_int64(t: &arrow_schema::DataType) -> bool {
+            *t == arrow_schema::DataType::Int64
+        }
+        let specs = vec![ArgSpec::any_column("value", 0, "").with_bound(TypeBound {
+            name: "is_int64",
+            pred: is_int64,
+        })];
+        let schema: SchemaRef =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        let err = validate_type_bounds(&specs, Some(&schema)).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+        assert_eq!(err.error_type, "ValueError");
     }
 
     #[test]

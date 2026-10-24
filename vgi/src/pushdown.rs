@@ -15,6 +15,12 @@ use vgi_rpc::{Result, RpcError};
 
 use crate::ipc;
 
+mod comparison;
+#[cfg(test)]
+mod comparison_tests;
+mod pruning;
+pub use pruning::{ColumnDomain, NonNullDomain};
+
 const ENCODING: &str = "vgi.filters.v2";
 const VERSION: &str = "2";
 const SEMANTICS: &str = "vgi.duckdb.standard.v1";
@@ -110,6 +116,8 @@ pub struct PushdownFilters {
     output_schema: SchemaRef,
 }
 
+/// Legacy integer-only convenience bounds. Prefer [`PushdownFilters::column_domain`]
+/// for pruning: it preserves Arrow types, exclusive endpoints, and NULLs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnBounds {
     pub min: Option<i64>,
@@ -296,6 +304,10 @@ struct Identity {
 }
 
 impl PushdownFilters {
+    pub(crate) fn has_required_predicates(&self) -> bool {
+        !self.required_ids.is_empty()
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         Self::parse_with_join_keys(bytes, &[])
     }
@@ -1394,11 +1406,22 @@ fn eval(expression: &Expr, batch: &RecordBatch) -> Result<ArrayRef> {
                 repeat_scalar(value, batch.num_rows())
             }
         }
-        Expr::Comparison { op, left, right } => Ok(Arc::new(compare_arrays(
-            &eval(left, batch)?,
-            &eval(right, batch)?,
-            op,
-        )?)),
+        Expr::Comparison { op, left, right } => {
+            // Preserve literal scalars at the comparison boundary. Other
+            // expression evaluators retain their existing batch-length contract.
+            let operand = |expression: &Expr| match expression {
+                Expr::Literal(value) => Ok(value.clone()),
+                _ => eval(expression, batch),
+            };
+            let result: ArrayRef = Arc::new(compare_arrays(&operand(left)?, &operand(right)?, op)?);
+            // Two scalar operands still describe a predicate for every row,
+            // including the zero-row batch case.
+            if result.len() == batch.num_rows() {
+                Ok(result)
+            } else {
+                repeat_scalar(&result, batch.num_rows())
+            }
+        }
         Expr::And(children) => Ok(Arc::new(fold_bool(children, batch, true)?)),
         Expr::Or(children) => Ok(Arc::new(fold_bool(children, batch, false)?)),
         Expr::Not(value) => Ok(Arc::new(
@@ -1468,42 +1491,7 @@ fn fold_bool(children: &[Expr], batch: &RecordBatch, and: bool) -> Result<Boolea
 }
 
 fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result<BooleanArray> {
-    let left = dictionary_values(left)?;
-    let right = dictionary_values(right)?;
-    let (left, right) = broadcast(&left, &right)?;
-    let result = match op {
-        "eq" => arrow_ord::cmp::eq(&left, &right),
-        "ne" => arrow_ord::cmp::neq(&left, &right),
-        "lt" => arrow_ord::cmp::lt(&left, &right),
-        "le" => arrow_ord::cmp::lt_eq(&left, &right),
-        "gt" => arrow_ord::cmp::gt(&left, &right),
-        "ge" => arrow_ord::cmp::gt_eq(&left, &right),
-        "distinct_from" | "not_distinct_from" => {
-            return distinct(&left, &right, op == "distinct_from")
-        }
-        _ => return Err(value_error("unknown comparison operator")),
-    };
-    result.map_err(cvt)
-}
-
-fn distinct(left: &ArrayRef, right: &ArrayRef, distinct: bool) -> Result<BooleanArray> {
-    let equals = arrow_ord::cmp::eq(left, right).map_err(cvt)?;
-    Ok(BooleanArray::from(
-        (0..left.len())
-            .map(|i| {
-                let value = if left.is_null(i) || right.is_null(i) {
-                    left.is_null(i) != right.is_null(i)
-                } else {
-                    !equals.value(i)
-                };
-                if distinct {
-                    value
-                } else {
-                    !value
-                }
-            })
-            .collect::<Vec<_>>(),
-    ))
+    comparison::sql_compare(&dictionary_values(left)?, &dictionary_values(right)?, op).map_err(cvt)
 }
 
 fn broadcast(left: &ArrayRef, right: &ArrayRef) -> Result<(ArrayRef, ArrayRef)> {
@@ -1597,11 +1585,11 @@ fn in_list(column: &ArrayRef, values: &ArrayRef) -> Result<BooleanArray> {
     for index in 0..values.len() {
         result = or_kleene(
             &result,
-            &arrow_ord::cmp::eq(
+            &compare_arrays(
                 &column,
                 &repeat_scalar(&values.slice(index, 1), column.len())?,
-            )
-            .map_err(cvt)?,
+                "eq",
+            )?,
         )?;
     }
     Ok(result)
@@ -1616,7 +1604,9 @@ fn logical_value_type(data_type: &DataType) -> &DataType {
 
 fn dictionary_values(array: &ArrayRef) -> Result<ArrayRef> {
     match array.data_type() {
-        DataType::Dictionary(_, value_type) => arrow_cast::cast(array, value_type).map_err(cvt),
+        DataType::Dictionary(..) => {
+            arrow_cast::cast(array, logical_value_type(array.data_type())).map_err(cvt)
+        }
         _ => Ok(array.clone()),
     }
 }

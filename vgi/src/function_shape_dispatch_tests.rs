@@ -210,7 +210,7 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         input_schema: input_schema
             .map(|s| Bytes::from(ipc::write_schema(s).unwrap()))
             .or(None),
@@ -221,6 +221,8 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("value".to_string())]),
     };

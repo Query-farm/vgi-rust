@@ -24,6 +24,7 @@ use crate::protocol::dtos::*;
 use crate::storage::{FunctionStorage, default_storage};
 use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
+use crate::window_cache::{CachedWindowPartition, WindowPartitionCache};
 use crate::wire;
 
 /// The `projection_repro` reproducer app — a distinct catalog served by the
@@ -285,6 +286,7 @@ pub struct Dispatcher {
     pub aggregates: HashMap<String, Vec<Arc<dyn AggregateFunction>>>,
     /// Shared cross-process state store (buffering + aggregate).
     pub store: Arc<dyn FunctionStorage>,
+    window_partitions: WindowPartitionCache,
     /// Declarative catalog (views / macros / function-backed tables).
     pub catalog: catalog::CatalogModel,
     /// Additional catalogs this worker serves (MetaWorker model). Each is
@@ -393,6 +395,7 @@ impl Dispatcher {
             buffering: HashMap::new(),
             aggregates: HashMap::new(),
             store: default_storage(),
+            window_partitions: WindowPartitionCache::from_env(),
             catalog: catalog::CatalogModel::default(),
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
@@ -521,7 +524,7 @@ impl Dispatcher {
 
     /// The stored catalog and session a request's `attach_opaque_data` names,
     /// with the raw handle.
-    fn stored_session(
+    pub(crate) fn stored_session(
         &self,
         req: &Request,
     ) -> Option<(&crate::stored_catalog::StoredCatalog, Vec<u8>, Vec<u8>)> {
@@ -662,11 +665,11 @@ impl Dispatcher {
         let cands = self
             .aggregates
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Aggregate, name, cands.len(), call)?;
         idxs.first()
             .map(|&i| cands[i].clone())
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))
     }
 
     pub fn register_scalar(&mut self, f: Arc<dyn ScalarFunction>) {
@@ -758,6 +761,26 @@ impl Dispatcher {
         scope: FunctionScope,
     ) {
         let name = f.name().to_string();
+        let meta = f.metadata();
+        // Continued output and input_rows_per_call, refused at startup when
+        // the client could not drive them, rather than at the first query.
+        assert!(
+            !(f.resume_supported() && meta.max_workers == 1),
+            "{name}: resume() (continued output) is not supported with max_workers = 1; \
+             the client runs such a function on one connection shared by every \
+             pipeline, which cannot leave output pending."
+        );
+        if let Some(n) = meta.input_rows_per_call {
+            assert!(
+                meta.input_from_args,
+                "{name}: input_rows_per_call applies only to a blended (input_from_args) \
+                 function, whose per-row input the client can split into calls."
+            );
+            assert!(
+                n >= 1,
+                "{name}: input_rows_per_call must be a positive row count, got {n}"
+            );
+        }
         self.tableinouts.entry(name.clone()).or_default().push(f);
         self.note_scope(FnKind::TableInOut, &name, scope);
     }
@@ -772,7 +795,7 @@ impl Dispatcher {
         let cands = self
             .tableinouts
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::TableInOut, name, cands.len(), call)?;
         // Blended (input_from_args) overloads resolve by input-column count /
         // type against their declared positional args (which are the input
@@ -784,7 +807,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -813,11 +838,11 @@ impl Dispatcher {
         let cands = self
             .buffering
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Buffering, name, cands.len(), call)?;
         idxs.first()
             .map(|&i| cands[i].clone())
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))
     }
 
     fn resolve_table(
@@ -830,7 +855,7 @@ impl Dispatcher {
         let cands = self
             .tables
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Table, name, cands.len(), call)?;
         let pick = crate::overload::resolve_overload(
             idxs.len(),
@@ -838,7 +863,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -916,7 +943,7 @@ impl Dispatcher {
                 .collect();
             elsewhere.sort();
             elsewhere.dedup();
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::not_found(format!(
                 "Function '{name}' is not declared in schema '{}' of catalog '{}'. \
                  It is declared in: {}",
                 schema.join("."),
@@ -929,7 +956,7 @@ impl Dispatcher {
             .filter(|&i| home(i).is_some_and(|h| h.in_catalog(call.catalog)))
             .collect();
         if in_catalog.is_empty() {
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::not_found(format!(
                 "Function '{name}' is not declared in catalog '{}'",
                 call.catalog
             )));
@@ -941,7 +968,7 @@ impl Dispatcher {
         schemas.sort_unstable();
         schemas.dedup();
         if schemas.len() > 1 {
-            return Err(RpcError::value_error(format!(
+            return Err(crate::errors::invalid_argument(format!(
                 "Ambiguous function call '{name}': declared in more than one schema of \
                  catalog '{}' ({}) — qualify the call with a schema to disambiguate",
                 call.catalog,
@@ -992,7 +1019,7 @@ impl Dispatcher {
         let cands = self
             .scalars
             .get(name)
-            .ok_or_else(|| RpcError::value_error(format!("Unknown function: '{name}'")))?;
+            .ok_or_else(|| crate::errors::not_found(format!("Unknown function: '{name}'")))?;
         let idxs = self.scoped_indices(FnKind::Scalar, name, cands.len(), call)?;
         let pick = crate::overload::resolve_overload(
             idxs.len(),
@@ -1000,7 +1027,9 @@ impl Dispatcher {
             args,
             input_schema,
         )
-        .ok_or_else(|| RpcError::value_error(format!("No matching overload for '{name}'")))?;
+        .ok_or_else(|| {
+            crate::errors::invalid_argument(format!("No matching overload for '{name}'"))
+        })?;
         Ok(cands[idxs[pick]].clone())
     }
 
@@ -1426,7 +1455,8 @@ impl Dispatcher {
                     input_schema: input_schema.clone(),
                     logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
-                let auto_apply = f.metadata().auto_apply_filters;
+                let filter_handling = f.metadata().filter_handling()?;
+                let auto_apply = filter_handling == crate::FilterHandling::Sdk;
                 let join_keys: Vec<Vec<u8>> = dto
                     .join_keys
                     .as_ref()
@@ -1443,6 +1473,7 @@ impl Dispatcher {
                         )
                     })
                     .transpose()?;
+                filter_handling.validate_filters(current_filters.as_ref())?;
                 let filters = auto_apply.then(|| current_filters.clone()).flatten();
                 let producer = f.finalize_producer(&bparams, fsid)?;
                 // A buffering source drains a possibly multi-batch result, and
@@ -1467,7 +1498,7 @@ impl Dispatcher {
                     inner: producer,
                     current_filters,
                     filters,
-                    project_to: None,
+                    project_to: Some(output_schema.clone()),
                     resume_blob,
                     conditional_checked: false,
                     filter_history: Default::default(),
@@ -1586,7 +1617,8 @@ impl Dispatcher {
                 call,
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
-            let auto_apply = f.metadata().auto_apply_filters;
+            let filter_handling = f.metadata().filter_handling()?;
+            let auto_apply = filter_handling == crate::FilterHandling::Sdk;
             let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
             let parsed_filters = params
                 .pushdown_filters
@@ -1599,6 +1631,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
+            filter_handling.validate_filters(parsed_filters.as_ref())?;
             params.current_pushdown_filters = parsed_filters.clone();
             // FINALIZE phase: flush accumulated state as a producer stream.
             if phase == crate::protocol::enums::phase::FINALIZE {
@@ -1607,7 +1640,21 @@ impl Dispatcher {
                     max_workers: 1,
                     opaque_data: None,
                 })?;
-                let batches = f.finish(&params)?;
+                // Enforce the same filtering contract on flush output as on
+                // ordinary exchange output. Persist the final wire batches so
+                // HTTP continuations do not need columns already projected out.
+                let filters = auto_apply.then_some(parsed_filters.as_ref()).flatten();
+                let batches = f
+                    .finish(&params)?
+                    .into_iter()
+                    .map(|batch| {
+                        let batch = match filters {
+                            Some(filters) => filters.apply(&batch)?,
+                            None => batch,
+                        };
+                        crate::table_in_out::project_batch(&batch, &output_schema)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 // Over HTTP a producer gets ONE batch per response, so a flush
                 // of more than one batch needs a continuation — and until this
                 // was wired it got a hard error instead ("emits more than one
@@ -1711,6 +1758,7 @@ impl Dispatcher {
                 filters,
                 blob,
                 filter_history: Default::default(),
+                continuation: TioContinuation::default(),
             };
             return Ok(
                 StreamResult::exchange(output_schema, in_schema, Box::new(state))
@@ -1750,7 +1798,8 @@ impl Dispatcher {
             )?;
             bp.arguments.remap_positional(&f.argument_specs());
             let max_workers = f.max_workers(&bp);
-            let auto_apply = f.metadata().auto_apply_filters;
+            let filter_handling = f.metadata().filter_handling()?;
+            let auto_apply = filter_handling == crate::FilterHandling::Sdk;
             let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
             let parsed_filters = params
                 .pushdown_filters
@@ -1763,6 +1812,7 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
+            filter_handling.validate_filters(parsed_filters.as_ref())?;
             params.current_pushdown_filters = parsed_filters.clone();
             // Primary init (no execution_id on the request) runs the global
             // OnInit hook once — e.g. to push a parallel-scan work queue.
@@ -1931,6 +1981,7 @@ impl Dispatcher {
             schema_path: bind_call.schema_path.clone().unwrap_or_default(),
             filter_deltas: Vec::new(),
             filter_predicate_order: Vec::new(),
+            continuation: TioContinuation::default(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -2071,7 +2122,7 @@ impl Dispatcher {
                     inner: producer,
                     current_filters,
                     filters,
-                    project_to: None,
+                    project_to: Some(output_schema.clone()),
                     resume_blob: Some(bytes.to_vec()),
                     conditional_checked: false,
                     filter_history,
@@ -2178,6 +2229,7 @@ impl Dispatcher {
                     func: f,
                     params,
                     filters,
+                    continuation: blob.continuation.clone(),
                     blob: bytes.to_vec(),
                     filter_history,
                 },
@@ -2205,7 +2257,7 @@ impl Dispatcher {
     /// The catalog active for a request, decoded from its `attach_opaque_data`
     /// (a secondary catalog when the secondary marker is present, else the
     /// primary). See [`decode_secondary_opaque`].
-    fn active_catalog<'a>(&'a self, req: &Request) -> &'a catalog::CatalogModel {
+    pub(crate) fn active_catalog<'a>(&'a self, req: &Request) -> &'a catalog::CatalogModel {
         if let Some((name, _)) = read_binary_col(req, "attach_opaque_data")
             .as_deref()
             .and_then(decode_secondary_opaque)
@@ -2656,7 +2708,7 @@ impl Dispatcher {
         } else {
             match (&dto.implementation_version, &cat.implementation_version) {
                 (Some(req), Some(have)) if req != have => {
-                    return Err(RpcError::value_error(format!(
+                    return Err(crate::errors::invalid_argument(format!(
                         "Unsupported implementation_version {req:?}; this worker serves {have:?}"
                     )));
                 }
@@ -2675,7 +2727,7 @@ impl Dispatcher {
             )?)
         } else if let Some(req) = &dto.data_version_spec {
             if !cat.supported_data_versions.contains(req) {
-                return Err(RpcError::value_error(format!(
+                return Err(crate::errors::invalid_argument(format!(
                     "Unsupported data_version_spec {req:?}; this worker serves one of {:?}",
                     cat.supported_data_versions
                 )));
@@ -2736,7 +2788,7 @@ impl Dispatcher {
     /// `SPLIT_SNAPSHOT_EXPIRED` is "re-run the query", which re-plans, mints the
     /// same mismatch and fails again. A livelock returning no rows, blaming the
     /// data for moving when it has not.
-    const CATALOG_VERSION: i64 = 1;
+    pub(crate) const CATALOG_VERSION: i64 = 1;
 
     /// The live anchor a split token must still name.
     fn split_live_anchor(&self) -> Vec<u8> {
@@ -2928,12 +2980,9 @@ impl Dispatcher {
             let cached = self.cached_contents(req, key)?;
             if let (Some(etag), Some(inm)) = (&cached.etag, &if_none_match) {
                 if etag == inm {
-                    return Ok(Some(wire::to_result_batch(CatalogContentsResponse {
-                        catalog_version: Self::CATALOG_VERSION,
-                        etag: Some(etag.clone()),
-                        not_modified: true,
-                        schemas: Vec::new(),
-                    })?));
+                    return Ok(Some(wire::to_result_batch(
+                        CatalogContentsResponse::unchanged(Self::CATALOG_VERSION, etag.clone()),
+                    )?));
                 }
             }
             return Ok(Some(cached.response.clone()));
@@ -3140,7 +3189,7 @@ impl Dispatcher {
             .schema_for_req(req, &schema_path)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
-                RpcError::value_error(format!(
+                crate::errors::not_found(format!(
                     "Unknown table: '{}.{table_name}'",
                     schema_path.join(".")
                 ))
@@ -3549,7 +3598,7 @@ impl Dispatcher {
             .schema_for_req(req, &schema_path)
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .ok_or_else(|| {
-                RpcError::value_error(format!(
+                crate::errors::not_found(format!(
                     "Unknown table: '{}.{table_name}'",
                     schema_path.join(".")
                 ))
@@ -4430,6 +4479,7 @@ impl Dispatcher {
     pub fn handle_aggregate_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateDestructorRequest = boxed(req)?;
         self.store.clear(&dto.execution_id.0);
+        self.window_partitions.clear_execution(&dto.execution_id.0);
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -4439,8 +4489,32 @@ impl Dispatcher {
         format!("win_{partition_id}_{suffix}").into_bytes()
     }
 
+    fn prune_completed_window_partitions(&self) {
+        // The output schema is small and is deleted with the partition. Check
+        // on admission/destruction, never on a hot cache hit. This reclaims
+        // copies whose destructor ran in another pooled worker, without
+        // fetching the partition payload or adding new storage/wire fields.
+        self.window_partitions.prune(|exec, partition| {
+            self.store
+                .kv_get(exec, &Self::win_key(partition, "o"))
+                .is_some()
+        });
+    }
+
     pub fn handle_aggregate_window_init(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateWindowInitRequest = boxed(req)?;
+        self.prune_completed_window_partitions();
+        let generation = self
+            .window_partitions
+            .remove(&dto.execution_id.0, dto.partition_id);
+        // Decode once, before publishing state, then retain the immutable Arrow
+        // buffers just as the Python dispatcher does. Storage is still needed
+        // for another pooled worker, a restart, or an oversized/cache-evicted entry.
+        let cached = Arc::new(Self::decode_window_partition(
+            &dto.partition_batch.0,
+            &dto.output_schema.0,
+            Some(dto.filter_mask.0.as_slice()),
+        )?);
         // Cache the partition (input columns + output schema + filter mask) so
         // the window / window_batch calls — possibly in another pooled worker —
         // can evaluate frames against it.
@@ -4454,14 +4528,47 @@ impl Dispatcher {
             &Self::win_key(dto.partition_id, "o"),
             &dto.output_schema.0,
         );
-        if let Some(m) = &dto.filter_mask {
+        if !dto.filter_mask.0.is_empty() {
             self.store.kv_put(
                 &dto.execution_id.0,
                 &Self::win_key(dto.partition_id, "m"),
-                &m.0,
+                &dto.filter_mask.0,
             );
+        } else {
+            self.store
+                .kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, "m"));
         }
+        self.window_partitions.insert_if_current(
+            &dto.execution_id.0,
+            dto.partition_id,
+            cached,
+            generation,
+        );
         Ok(Some(wire::empty_result_batch()?))
+    }
+
+    fn decode_window_partition(
+        pb: &[u8],
+        os: &[u8],
+        mask: Option<&[u8]>,
+    ) -> Result<CachedWindowPartition> {
+        let partition = ipc::read_batch(pb)?;
+        let output_schema = ipc::read_schema(os)?;
+        let mask = mask.filter(|bytes| !bytes.is_empty()).map(|bytes| {
+            (0..partition.num_rows())
+                .map(|i| {
+                    bytes
+                        .get(i / 8)
+                        .map(|byte| byte & (1 << (i % 8)) != 0)
+                        .unwrap_or(true)
+                })
+                .collect()
+        });
+        Ok(CachedWindowPartition {
+            partition,
+            output_schema,
+            mask,
+        })
     }
 
     /// Load the cached partition + output schema for a window call.
@@ -4469,7 +4576,13 @@ impl Dispatcher {
         &self,
         exec: &[u8],
         partition_id: i64,
-    ) -> Result<(RecordBatch, SchemaRef, Option<Vec<bool>>)> {
+    ) -> Result<Arc<CachedWindowPartition>> {
+        let (cached, _) = self.window_partitions.lookup(exec, partition_id);
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        self.prune_completed_window_partitions();
+        let (_, generation) = self.window_partitions.lookup(exec, partition_id);
         let pb = self
             .store
             .kv_get(exec, &Self::win_key(partition_id, "p"))
@@ -4482,26 +4595,15 @@ impl Dispatcher {
             .store
             .kv_get(exec, &Self::win_key(partition_id, "o"))
             .ok_or_else(|| RpcError::runtime_error("aggregate_window: missing output schema"))?;
-        let partition = ipc::read_batch(&pb)?;
-        let output_schema = ipc::read_schema(&os)?;
-        // `filter_mask` is an Arrow packed-bit boolean buffer (LSB-first),
-        // length == partition row count. Empty/absent means "all rows valid".
-        let n = partition.num_rows();
-        let mask = self
-            .store
-            .kv_get(exec, &Self::win_key(partition_id, "m"))
-            .filter(|b| !b.is_empty())
-            .map(|bytes| {
-                (0..n)
-                    .map(|i| {
-                        bytes
-                            .get(i / 8)
-                            .map(|byte| byte & (1 << (i % 8)) != 0)
-                            .unwrap_or(true)
-                    })
-                    .collect::<Vec<bool>>()
-            });
-        Ok((partition, output_schema, mask))
+        let mask = self.store.kv_get(exec, &Self::win_key(partition_id, "m"));
+        let cached = Arc::new(Self::decode_window_partition(&pb, &os, mask.as_deref())?);
+        self.window_partitions.insert_if_current(
+            exec,
+            partition_id,
+            Arc::clone(&cached),
+            generation,
+        );
+        Ok(cached)
     }
 
     pub fn handle_aggregate_window(&self, req: &Request) -> Result<Option<RecordBatch>> {
@@ -4510,16 +4612,20 @@ impl Dispatcher {
             &dto.function_name,
             self.unary_scope(None, dto.schema_path.as_deref()),
         )?;
-        let (partition, output_schema, mask) =
-            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        let cached = self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         let frames: Vec<(i64, i64)> = dto
             .frame_starts
             .iter()
             .zip(dto.frame_ends.iter())
             .map(|(&s, &e)| (s, e))
             .collect();
-        let col = f.window(&partition, &output_schema, &[frames], mask.as_deref())?;
-        let batch = RecordBatch::try_new(output_schema, vec![col])
+        let col = f.window(
+            &cached.partition,
+            &cached.output_schema,
+            &[frames],
+            cached.mask.as_deref(),
+        )?;
+        let batch = RecordBatch::try_new(Arc::clone(&cached.output_schema), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(wire::to_result_batch(AggregateWindowResponse {
             result_batch: Bytes::from(ipc::write_batch(&batch)?),
@@ -4532,8 +4638,7 @@ impl Dispatcher {
             &dto.function_name,
             self.unary_scope(None, dto.schema_path.as_deref()),
         )?;
-        let (partition, output_schema, mask) =
-            self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
+        let cached = self.load_window_partition(&dto.execution_id.0, dto.partition_id)?;
         // Split the flattened (start,end) arrays into per-row sub-frame lists.
         let mut frames: Vec<Vec<(i64, i64)>> = Vec::with_capacity(dto.count as usize);
         let mut off = 0usize;
@@ -4548,8 +4653,13 @@ impl Dispatcher {
             }
             frames.push(subs);
         }
-        let col = f.window(&partition, &output_schema, &frames, mask.as_deref())?;
-        let batch = RecordBatch::try_new(output_schema, vec![col])
+        let col = f.window(
+            &cached.partition,
+            &cached.output_schema,
+            &frames,
+            cached.mask.as_deref(),
+        )?;
+        let batch = RecordBatch::try_new(Arc::clone(&cached.output_schema), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(wire::to_result_batch(AggregateWindowResponse {
             result_batch: Bytes::from(ipc::write_batch(&batch)?),
@@ -4562,6 +4672,9 @@ impl Dispatcher {
             self.store
                 .kv_del(&dto.execution_id.0, &Self::win_key(dto.partition_id, sfx));
         }
+        self.window_partitions
+            .remove(&dto.execution_id.0, dto.partition_id);
+        self.prune_completed_window_partitions();
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -4725,7 +4838,7 @@ impl Dispatcher {
     /// read-only, so the request is accepted (proving the wire contract is
     /// intact) and rejected with a clear `catalog is read-only` error.
     pub fn handle_read_only(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        Err(RpcError::runtime_error("catalog is read-only"))
+        Err(crate::errors::failed_precondition("catalog is read-only"))
     }
 }
 
@@ -4811,6 +4924,26 @@ pub struct ExchangeBlob {
     /// `filter_deltas` (a compacted replay cannot always reproduce it).
     #[serde(default)]
     pub filter_predicate_order: Vec<String>,
+    /// Table-in-out continued output: the pending reply's position, so a tick
+    /// rebuilt on any worker can resume it. See [`TioContinuation`].
+    #[serde(default)]
+    pub continuation: TioContinuation,
+}
+
+/// A table-in-out exchange's continued-output position (see
+/// `crate::table_in_out`). Lives in the exchange state, so over HTTP it rides
+/// the stream's sealed state token to whichever worker gets the next tick.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct TioContinuation {
+    /// The last reply said `HAVE_MORE_OUTPUT`, so the next input must be a
+    /// continuation tick (and only then may one arrive).
+    pub more_pending: bool,
+    /// What the function recorded with `TableInOutOutput::set_resume_state`,
+    /// handed to its `resume`.
+    pub resume_state: Vec<u8>,
+    /// Rows of the last real input batch: a tick has none, but its reply's
+    /// `parent_rows` index that batch, and filtering checks them against it.
+    pub input_rows: u64,
 }
 
 /// Per-batch scalar exchange: calls `process` and emits the result.
@@ -5004,7 +5137,9 @@ impl TableProducer for FinalizeFlushProducer {
     }
 }
 
-/// Per-input-batch table-in-out exchange. Applies auto-filter pushdown.
+/// Per-input-batch table-in-out exchange. Applies auto-filter pushdown, and
+/// drives continued output (see `crate::table_in_out`): a reply that says more
+/// is followed by continuation ticks, each answered through `resume`.
 struct TableInOutExchangeState {
     func: Arc<dyn TableInOutFunction>,
     params: ProcessParams,
@@ -5012,6 +5147,19 @@ struct TableInOutExchangeState {
     blob: Vec<u8>,
     /// The dynamic-filter deltas a continuation must replay (compacted).
     filter_history: crate::pushdown::DeltaHistory,
+    /// Whether output is pending, and where it resumes.
+    continuation: TioContinuation,
+}
+
+/// Whether this exchange turn's input is a continuation tick rather than real
+/// input. The status rides the input batch's metadata, surfaced as the tick
+/// metadata on every transport; the request metadata is a fallback, as for
+/// the revalidators (see [`cond_validator`]).
+fn is_continuation_tick(ctx: &CallContext) -> bool {
+    let key = crate::table_in_out::STATUS_METADATA_KEY;
+    ctx.tick_metadata(key)
+        .or_else(|| ctx.transport_metadata.get(key).cloned())
+        .is_some_and(|v| v == crate::table_in_out::STATUS_CONTINUE)
 }
 
 impl ExchangeState for TableInOutExchangeState {
@@ -5035,41 +5183,147 @@ impl ExchangeState for TableInOutExchangeState {
                 self.filters = Some(current.clone());
             }
         }
+        // A tick asks for the next reply of the last input's output, and is the
+        // only valid input while that output is pending. No negotiation: the
+        // client never sends one otherwise, so anything else is a protocol bug.
+        let tick = is_continuation_tick(ctx);
+        let name = self.func.name();
+        if tick && !self.continuation.more_pending {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: continuation tick received, but no output is pending"
+            )));
+        }
+        if tick && input.num_rows() != 0 {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: a continuation tick must have no rows, got {}",
+                input.num_rows()
+            )));
+        }
+        if !tick && self.continuation.more_pending {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: input received while output is pending; expected a continuation tick"
+            )));
+        }
         // Conditional-revalidation validators (exchange-mode result cache): the
         // client holds a stale cached result for THIS input unit and asks the
         // worker to confirm freshness cheaply. They ride the input batch's
         // custom metadata (surfaced as this tick's metadata), so re-read them
-        // on every tick — each input unit can carry its own validators.
-        self.params.if_none_match =
-            cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
-        self.params.if_modified_since =
-            cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
-        let mut collected = crate::table_in_out::TableInOutOutput::default();
-        self.func.process_out(&self.params, input, &mut collected)?;
-        // 1:1 lockstep: the client reads exactly ONE output batch per input
-        // batch, so an accumulate-only tick (process emitted nothing, e.g.
-        // substream_partial_sum) still answers with a 0-row batch — parity
-        // with the Python SDK's `empty_batch` padding. Without it the client
-        // blocks forever on ReadDataBatch.
-        if collected.items.is_empty() {
-            collected.emit(RecordBatch::new_empty(out.schema()));
+        // on every real input — each input unit can carry its own validators.
+        // They apply to that input's first reply only, so a continuation tick
+        // (which never carries them) offers none to `resume`.
+        if tick {
+            self.params.if_none_match = None;
+            self.params.if_modified_since = None;
+        } else {
+            self.params.if_none_match =
+                cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
+            self.params.if_modified_since =
+                cond_validator(ctx, crate::cache_control::CACHE_IF_MODIFIED_SINCE_KEY);
         }
-        for (batch, metadata) in collected.items {
+        let mut collected = crate::table_in_out::TableInOutOutput::default();
+        if tick {
+            let state = std::mem::take(&mut self.continuation.resume_state);
+            self.func.resume(&self.params, &state, &mut collected)?;
+        } else {
+            self.continuation.input_rows = input.num_rows() as u64;
+            self.func.process_out(&self.params, input, &mut collected)?;
+        }
+        // One reply per turn: the client reads exactly one batch per input or
+        // tick, so a second would answer the next turn and desync the lockstep.
+        // A reply that says more is that one batch.
+        if collected.items.len() > 1 {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: a table-in-out turn must emit at most one batch, got {}; \
+                 combine them, or emit one with EmitOptions::more and the rest from resume()",
+                collected.items.len()
+            )));
+        }
+        // An empty tick answer would end the continuation silently (a padded
+        // reply that does not say more), truncating the input's output.
+        if tick && collected.items.is_empty() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: resume() emitted no batch for a continuation tick; every tick \
+                 must be answered with exactly one batch"
+            )));
+        }
+        let more = !collected.more.is_empty();
+        if more && !self.func.resume_supported() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: emitted more output but does not implement resume() \
+                 (resume_supported() is false)"
+            )));
+        }
+        if more && collected.resume_state.is_none() {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: emitted more output without set_resume_state(); resume() \
+                 would have nothing to continue from"
+            )));
+        }
+        // Cache control describes an input's whole output and rides its first
+        // reply only; a tick's reply is never that.
+        if tick
+            && collected.items.iter().any(|(_, md)| {
+                md.as_ref()
+                    .is_some_and(|m| m.keys().any(|k| k.starts_with("vgi.cache.")))
+            })
+        {
+            return Err(RpcError::runtime_error(format!(
+                "{name}: cache control is only valid on an input's first reply, \
+                 not on one answering a continuation tick"
+            )));
+        }
+        // 1:1 lockstep: the client reads exactly ONE output batch per input
+        // batch, so an accumulate-only input (process emitted nothing, e.g.
+        // substream_partial_sum) still answers with a 0-row batch — parity
+        // with the Python SDK's `TableInOutFunction.process`, which pads an
+        // empty `transform()` result with `empty_batch`. Without it the client
+        // blocks forever on ReadDataBatch. (A tick never gets here: an empty
+        // resume() was refused above.)
+        if collected.items.is_empty() {
+            out.emit(RecordBatch::new_empty(out.schema()))?;
+            self.continuation = TioContinuation {
+                input_rows: self.continuation.input_rows,
+                ..Default::default()
+            };
+            return Ok(());
+        }
+        // A reply's parent_rows index the last real input, which a tick is not.
+        let input_rows = self.continuation.input_rows as usize;
+        for (batch, mut metadata) in collected.items {
             let batch = match &self.filters {
-                Some(f) => f.apply(&batch)?,
+                Some(f) => {
+                    let keep = f.evaluate(&batch)?;
+                    crate::table_in_out::filter_parent_rows(&mut metadata, &keep, input_rows)?;
+                    arrow_select::filter::filter_record_batch(&batch, &keep)
+                        .map_err(|e| RpcError::runtime_error(e.to_string()))?
+                }
                 None => batch,
             };
+            let batch = crate::table_in_out::project_batch(&batch, &out.schema())?;
+            if more {
+                metadata.get_or_insert_with(HashMap::new).insert(
+                    crate::table_in_out::STATUS_METADATA_KEY.to_string(),
+                    crate::table_in_out::STATUS_HAVE_MORE_OUTPUT.to_string(),
+                );
+            }
             match metadata {
                 Some(md) => out.emit_with_metadata(batch, md)?,
                 None => out.emit(batch)?,
             }
         }
+        self.continuation.more_pending = more;
+        self.continuation.resume_state = if more {
+            collected.resume_state.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
         let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(&self.blob)?;
         blob.filter_deltas = self.filter_history.deltas().to_vec();
         blob.filter_predicate_order = self.filter_history.order().to_vec();
+        blob.continuation = self.continuation.clone();
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
 }
@@ -5335,6 +5589,20 @@ fn boxed<T: VgiArrow>(req: &Request) -> Result<T> {
             true,
         )));
         crate::protocol::dtos::ensure_nullable_columns(batch, &[("argument_names", names_type)])?
+    } else if req.method == "table_buffering_destructor" {
+        // Optional columns of the canonical request that older peers omit.
+        crate::protocol::dtos::ensure_nullable_columns(
+            batch,
+            &[
+                ("attach_opaque_data", arrow_schema::DataType::Binary),
+                ("transaction_id", arrow_schema::DataType::Binary),
+            ],
+        )?
+    } else if req.method.starts_with("aggregate_window") {
+        crate::protocol::dtos::ensure_nullable_columns(
+            batch,
+            &[("attach_opaque_data", arrow_schema::DataType::Binary)],
+        )?
     } else {
         batch
     };
@@ -5427,7 +5695,7 @@ fn read_string_list_col(req: &Request, name: &str) -> Result<Vec<String>> {
 }
 
 /// Read a nullable string column's row-0 value, if present and non-null.
-fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
+pub(crate) fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
     let col = req.column(name)?;
     if col.is_null(0) {
         return None;
@@ -5436,7 +5704,7 @@ fn read_opt_string_col(req: &Request, name: &str) -> Option<String> {
 }
 
 /// Read a (binary) column's row-0 bytes from a request, if present and non-null.
-fn read_binary_col(req: &Request, name: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_binary_col(req: &Request, name: &str) -> Option<Vec<u8>> {
     let col = req.column(name)?;
     col.as_any()
         .downcast_ref::<arrow_array::BinaryArray>()
@@ -5475,8 +5743,13 @@ fn opt_schema(field: &Option<Bytes>) -> Result<Option<SchemaRef>> {
     }
 }
 
-/// Normalize a DuckDB function-type filter (`"SCALAR_FUNCTION"`, `"scalar"`,
-/// …) to the short lowercase form; `None` means "no filter".
+/// Normalize a function-type value to the short lowercase form used for
+/// internal matching; `None` means "no filter".
+///
+/// Accepts the canonical wire spellings — a `FunctionType` member name
+/// (`"SCALAR"`, `"TABLE_BUFFERING"`, as `BindRequest.function_type` carries) or
+/// a `SchemaObjectType` member name (`"SCALAR_FUNCTION"`, as the listing
+/// `type` filter carries) — and, leniently, the legacy lower-case forms.
 fn normalize_function_type(t: &str) -> Option<String> {
     if t.is_empty() {
         return None;
@@ -5550,6 +5823,10 @@ mod canonical_constraint_version_tests {
         assert!(Dispatcher::at_version(&table, Some("VERSION"), Some("1")).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "window_cache_tests.rs"]
+mod window_partition_tests;
 
 #[cfg(test)]
 mod buffering_schema_tests {
@@ -5945,15 +6222,15 @@ mod scope_tests {
         assert_eq!(
             identity,
             vec![
-                ("before", "data".to_string(), "scalar", "before"),
-                ("overloaded", "main".to_string(), "scalar", "int overload"),
+                ("before", "data".to_string(), "SCALAR", "before"),
+                ("overloaded", "main".to_string(), "SCALAR", "int overload"),
                 (
                     "overloaded",
                     "data".to_string(),
-                    "scalar",
+                    "SCALAR",
                     "string overload"
                 ),
-                ("after", "main".to_string(), "scalar", "after"),
+                ("after", "main".to_string(), "SCALAR", "after"),
             ]
         );
     }
@@ -6681,7 +6958,8 @@ mod catalog_contents_tests {
         let resp = contents(&d);
         assert_eq!(resp.catalog_version, Dispatcher::CATALOG_VERSION);
         let paths: Vec<Vec<String>> = resp
-            .schemas
+            .schema_contents()
+            .unwrap()
             .iter()
             .map(|sc| decode::<SchemaInfo>(&sc.schema).path)
             .collect();
@@ -6690,7 +6968,12 @@ mod catalog_contents_tests {
             [path(&["data"]), path(&["main"]), path(&["data", "deep"])]
         );
         // The struct's `path` names the schema without decoding SchemaInfo.
-        let named: Vec<Vec<String>> = resp.schemas.iter().map(|sc| sc.path.clone()).collect();
+        let named: Vec<Vec<String>> = resp
+            .schema_contents()
+            .unwrap()
+            .iter()
+            .map(|sc| sc.path.clone())
+            .collect();
         assert_eq!(named, paths);
         // No provider and no content hash: no etag, never not_modified.
         assert_eq!(resp.etag, None);
@@ -6707,7 +6990,8 @@ mod catalog_contents_tests {
         .unwrap();
         let mut listed = items(d.handle_catalog_schemas(&request("catalog_schemas", batch)));
         let mut bulk: Vec<Bytes> = contents(&d)
-            .schemas
+            .schema_contents()
+            .unwrap()
             .iter()
             .map(|sc| sc.schema.clone())
             .collect();
@@ -6725,7 +7009,7 @@ mod catalog_contents_tests {
     fn every_kind_equals_its_per_schema_rpc_byte_for_byte() {
         let d = dispatcher();
         let mut non_empty = 0;
-        for sc in &contents(&d).schemas {
+        for sc in &contents(&d).schema_contents().unwrap() {
             let path = decode::<SchemaInfo>(&sc.schema).path;
             let bulk = [
                 &sc.tables,
@@ -6771,10 +7055,10 @@ mod catalog_contents_tests {
     /// ordered `Vec` of pairs.
     #[test]
     fn items_encode_deterministically() {
-        let first = catalog_contents_digest(&contents(&dispatcher()).schemas);
+        let first = catalog_contents_digest(&contents(&dispatcher()).schema_contents().unwrap());
         for _ in 0..8 {
             assert_eq!(
-                catalog_contents_digest(&contents(&dispatcher()).schemas),
+                catalog_contents_digest(&contents(&dispatcher()).schema_contents().unwrap()),
                 first
             );
         }
@@ -6788,7 +7072,7 @@ mod catalog_contents_tests {
         let resp = contents_if(&d, Some("anything")).unwrap();
         assert!(!resp.not_modified);
         assert_eq!(resp.etag, None);
-        assert_eq!(resp.schemas.len(), 3);
+        assert_eq!(resp.schema_contents().unwrap().len(), 3);
     }
 
     /// A generation-counter provider that counts how often it builds.
@@ -6824,12 +7108,12 @@ mod catalog_contents_tests {
         let full = contents(&d);
         let etag = full.etag.clone().expect("the provider returns an etag");
         assert!(!full.not_modified);
-        assert_eq!(full.schemas.len(), 3);
+        assert_eq!(full.schema_contents().unwrap().len(), 3);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         let same = contents_if(&d, Some(&etag)).unwrap();
         assert!(same.not_modified);
-        assert!(same.schemas.is_empty());
+        assert!(same.schema_contents().unwrap().is_empty());
         assert_eq!(same.etag.as_deref(), Some(etag.as_str()));
         assert_eq!(same.catalog_version, Dispatcher::CATALOG_VERSION);
         assert_eq!(
@@ -6841,7 +7125,7 @@ mod catalog_contents_tests {
         let stale = contents_if(&d, Some("gen-stale")).unwrap();
         assert!(!stale.not_modified);
         assert_eq!(stale.etag.as_deref(), Some(etag.as_str()));
-        assert_eq!(stale.schemas.len(), 3);
+        assert_eq!(stale.schema_contents().unwrap().len(), 3);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
@@ -6893,15 +7177,18 @@ mod catalog_contents_tests {
         let d = hashed();
         let full = contents(&d);
         let etag = full.etag.clone().expect("content-hash sets an etag");
-        assert_eq!(etag, catalog_contents_digest(&full.schemas));
+        assert_eq!(
+            etag,
+            crate::catalog_contents::catalog_response_digest(&full)
+        );
         for _ in 0..4 {
             assert_eq!(contents(&hashed()).etag.as_deref(), Some(etag.as_str()));
         }
         let same = contents_if(&d, Some(&etag)).unwrap();
-        assert!(same.not_modified && same.schemas.is_empty());
+        assert!(same.not_modified && same.schema_contents().unwrap().is_empty());
         let other = contents_if(&d, Some("0000")).unwrap();
         assert!(!other.not_modified);
-        assert_eq!(other.schemas.len(), 3);
+        assert_eq!(other.schema_contents().unwrap().len(), 3);
     }
 
     /// An attach-independent catalog is built once and its encoded response
@@ -6933,7 +7220,7 @@ mod catalog_contents_tests {
 
         let etag = contents(&d).etag.unwrap();
         let same = contents_if(&d, Some(&etag)).unwrap();
-        assert!(same.not_modified && same.schemas.is_empty());
+        assert!(same.not_modified && same.schema_contents().unwrap().is_empty());
         assert_eq!(builds.load(Ordering::SeqCst), 1);
 
         d.register_scalar(Arc::new(Probe("s_later")));
@@ -7054,7 +7341,7 @@ mod catalog_contents_tests {
         d.catalog_contents = false;
         assert!(!attach(&d).supports_catalog_contents);
         // Still served: the flag only tells the client it may call it.
-        assert_eq!(contents(&d).schemas.len(), 3);
+        assert_eq!(contents(&d).schema_contents().unwrap().len(), 3);
     }
 
     fn attach_named(d: &Dispatcher, name: &str) -> CatalogAttachResult {

@@ -1388,6 +1388,7 @@ fn data_tables() -> Vec<CatTable> {
 /// Python `versioned` fixture (impl 1.0.0, data range >=1.0.0,<2.0.0).
 pub fn versioned() -> CatalogModel {
     CatalogModel {
+        snapshot_policy: None,
         name: "versioned".to_string(),
         implementation_version: Some("1.0.0".to_string()),
         data_version_spec: Some(">=1.0.0,<2.0.0".to_string()),
@@ -1483,6 +1484,7 @@ pub fn versioned_tables() -> CatalogModel {
     );
     version_schemas.insert("3.0.0".to_string(), vec![main(vec![plants.clone()])]);
     CatalogModel {
+        snapshot_policy: None,
         name: "versioned_tables".to_string(),
         source_url: None,
         implementation_version: Some("11.0.0".to_string()),
@@ -1534,6 +1536,7 @@ pub fn build_by_name(name: &str) -> CatalogModel {
 
 pub fn build() -> CatalogModel {
     CatalogModel {
+        snapshot_policy: None,
         name: "example".to_string(),
         source_url: None,
         implementation_version: None,

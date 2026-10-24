@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
-use vgi_rpc::{Result, RpcError};
+use vgi_rpc::Result;
 
 use crate::arguments::Arguments;
 use crate::function::{ArgSpec, BindResponse, FunctionMetadata};
@@ -79,7 +79,7 @@ pub trait AggregateFunction: Send + Sync {
         _frames: &[Vec<(i64, i64)>],
         _filter_mask: Option<&[bool]>,
     ) -> Result<arrow_array::ArrayRef> {
-        Err(RpcError::runtime_error(
+        Err(crate::errors::unimplemented(
             "window() not supported by this aggregate",
         ))
     }
@@ -97,7 +97,7 @@ pub trait AggregateFunction: Send + Sync {
         _order_key_count: usize,
         _states: &mut HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<ArrayRef> {
-        Err(RpcError::runtime_error(
+        Err(crate::errors::unimplemented(
             "streaming_chunk() not supported by this aggregate",
         ))
     }

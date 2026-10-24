@@ -142,6 +142,10 @@ fn planned_split_metadata_and_redemption_context_round_trip() {
     );
     assert_eq!(plan.partitioning.as_ref().unwrap()[0].column, "country");
     assert_eq!(plan.sort_order.as_ref().unwrap()[0].column, "sales");
+    // `SortField.direction` / `.nulls` are `OrderByDirection` /
+    // `OrderByNullOrder`: on the wire as the member NAME, never the value.
+    assert_eq!(plan.sort_order.as_ref().unwrap()[0].direction.0, "ASC");
+    assert_eq!(plan.sort_order.as_ref().unwrap()[0].nulls.0, "NULLS_LAST");
     assert!(plan
         .splits
         .iter()

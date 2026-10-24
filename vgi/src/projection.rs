@@ -247,6 +247,8 @@ mod tests {
                 at_value: None,
                 schema_path: Some(vec!["main".into()]),
                 argument_names: None,
+                copy_to: None,
+                copy_from: None,
             },
             bind_result: BindResponse {
                 output_schema: Bytes::from(Vec::new()),

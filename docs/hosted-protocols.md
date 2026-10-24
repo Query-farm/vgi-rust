@@ -1,4 +1,4 @@
-# Hosting additional protocols, and `vgi_rpc.Identity.v1`
+# Hosting additional protocols, and `vgi_rpc.Identity.v2`
 
 A worker always hosts its own protocol, `vgi.v2` (what the DuckDB extension
 speaks), and `vgi_rpc.Reflection.v1`. It can host more, on every transport.
@@ -48,7 +48,7 @@ return Err(vgi_rpc::RpcError::new("ReportRebuilding", "report is being rebuilt")
     .with_details([vgi_rpc::ErrorDetail::retry_info(30.0)]));
 ```
 
-## `vgi_rpc.Identity.v1`: `Worker::resolve_token` / `Worker::mint_grant`
+## `vgi_rpc.Identity.v2`: `Worker::resolve_token` / `Worker::mint_grant`
 
 Identity resolves an opaque bearer credential to a principal
 (`introspect_token`) and mints standing grants for the calling user
@@ -105,7 +105,7 @@ my-worker --http                                    # or: --grant-key <base64> (
 
 or in code, `worker.grant_keys(vgi_rpc::grants::GrantKeys::new(...)?)`.
 
-- **Over HTTP only**, `vgi_rpc.Identity.v1` hosts `issue_grant`, minting sealed
+- **Over HTTP only**, `vgi_rpc.Identity.v2` hosts `issue_grant`, minting sealed
   `vgig1.` tokens -- unless the worker sets its own `Worker::mint_grant`, which
   keeps priority. The caller must have authenticated recently (`auth_time`
   within `max_auth_age`); a grant-authenticated caller carries no `auth_time`,
@@ -153,7 +153,7 @@ my-worker --http
   client learns from `vgi_rpc.Reflection.v1` `list_protocols`. This SDK never
   generates a signing key, so every key is a configured one and tickets
   survive restarts; rotating it invalidates every ticket.
-- **`seal_attach(SealAttachRequest) -> AttachTicket`** (version `1.0.0`): seals
+- **`seal_attach(SealAttachRequest) -> AttachTicket`** (version `2.0.0`): seals
   the *caller's* attach of `catalog_name` with `options` (the Arrow IPC options
   record, as `catalog_attach` carries it) into `vgia1.…` text. Anonymous callers
   get `action_denied`; no fresh login is needed. Options are checked against
@@ -161,8 +161,12 @@ my-worker --http
   reserved name, over 16 KiB, `ttl_seconds < 0` → `invalid_request` with one
   `BadRequest` violation each). The lifetime is capped at the grant maximum
   (`VGI_RPC_GRANT_MAX_TTL_SECONDS` / the grant keys'); `ttl_seconds = 0` asks
-  for that maximum, and with none the ticket does not expire
-  (`expires_at = +inf`).
+  for that maximum, and with none the ticket does not expire.
+  `AttachTicket.expires_at` is a nullable `timestamp[us, tz="UTC"]`
+  (`Option<vgi_rpc::UtcTimestamp>`): the instant the ticket stops opening, or
+  null for no expiry. Version `1.0.0` carried a float64 of unix seconds with
+  `+inf` for "no expiry"; the exact major.minor version check rejects a peer on
+  the other side of that change.
 - **Redemption.** A `catalog_attach` whose options contain `vgi_attach_ticket`
   (any letter case) is replaced, before routing and before any catalog code,
   by the attach the ticket seals: the sealed catalog name (the request's name

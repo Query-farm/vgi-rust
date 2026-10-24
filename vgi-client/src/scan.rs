@@ -26,6 +26,7 @@ use vgi_protocol::protocol::dtos::{
     GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse, ScanSplit, SortField,
     TableFunctionPlanRequest,
 };
+use vgi_protocol::protocol::enums;
 use vgi_protocol::{ipc, wire};
 use vgi_rpc::errors::{Result, RpcError};
 use vgi_rpc::{Bytes, DictString, LargeBytes, VgiArrow};
@@ -63,14 +64,16 @@ pub enum FunctionType {
 }
 
 impl FunctionType {
-    /// The wire spelling.
+    /// The wire spelling: the Python `FunctionType` **member name**.
+    ///
+    /// `FunctionType` has no table-in-out member — a streaming table-in-out
+    /// function binds as `TABLE`, exactly as the DuckDB extension sends it.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Table => "table",
-            Self::TableBuffering => "table_buffering",
-            Self::TableInOut => "table_in_out",
-            Self::Scalar => "scalar",
-            Self::Aggregate => "aggregate",
+            Self::Table | Self::TableInOut => enums::function_type::TABLE,
+            Self::TableBuffering => enums::function_type::TABLE_BUFFERING,
+            Self::Scalar => enums::function_type::SCALAR,
+            Self::Aggregate => enums::function_type::AGGREGATE,
         }
     }
 }
@@ -298,8 +301,8 @@ pub enum SortDirection {
 impl SortDirection {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Ascending => "asc",
-            Self::Descending => "desc",
+            Self::Ascending => enums::order_by_direction::ASC,
+            Self::Descending => enums::order_by_direction::DESC,
         }
     }
 }
@@ -316,8 +319,8 @@ pub enum NullOrder {
 impl NullOrder {
     fn as_str(self) -> &'static str {
         match self {
-            Self::First => "nulls_first",
-            Self::Last => "nulls_last",
+            Self::First => enums::order_by_null_order::NULLS_FIRST,
+            Self::Last => enums::order_by_null_order::NULLS_LAST,
         }
     }
 }
@@ -352,13 +355,11 @@ pub struct ScanOptions {
     /// Indices into the bind output schema that [`Self::pushdown_filters`]
     /// references but [`Self::projection`] does not ask for.
     ///
-    /// A pushed filter is keyed by its column's position in the PROJECTED set,
-    /// while an engine is free to push a predicate on a column the query never
-    /// selects — `SELECT a FROM t WHERE b > 1` is the whole case. Left alone,
-    /// the filter's key names some other column and a worker that honours it
-    /// filters on the wrong data. So the init asks for the UNION, projection
-    /// first, and the extra columns are dropped from each batch before it
-    /// reaches the caller: [`Scan::schema`] still reports the projection alone.
+    /// Filter Encoding v2 references columns by their ORIGINAL bind-schema
+    /// index and name, independent of projection. For `SELECT a FROM t WHERE
+    /// b > 1`, the worker still needs `b` to enforce the predicate. Init asks
+    /// for the union, projection first, and extra columns are dropped from
+    /// each returned batch: [`Scan::schema`] reports the projection alone.
     ///
     /// Ignored when `projection` is `None`, because every column is being
     /// emitted already.
@@ -405,12 +406,12 @@ pub struct ScanOptions {
 /// The projection to put on the wire: the requested columns, then any
 /// filter-only column, in first-reference order.
 ///
-/// Order is load-bearing twice over. The requested columns come FIRST so
+/// The requested columns come FIRST so
 /// trimming a batch back to what the caller asked for is a prefix slice — get
 /// that wrong and one column's values are read out of another's slot, which
 /// nothing downstream can catch because both are the right length and often the
-/// right type. And a filter's key is its column's position in THIS list, which
-/// is what [`ScanOptions::wire_index_of`] computes.
+/// right type. Filter Encoding v2 column references keep their original bind
+/// indices; they are never remapped to this list.
 ///
 /// `None` projection means "emit everything", so there is nothing to add: the
 /// filter's columns are already there, and turning `None` into a list would
@@ -438,7 +439,8 @@ impl ScanOptions {
     }
 
     /// Where `column` (an index into the bind output schema) lands in the
-    /// projected set — the index a pushed filter must be keyed by.
+    /// projected batch. This is NOT a Filter Encoding v2 column index: filter
+    /// expressions must retain the original bind-schema index and name.
     ///
     /// `None` when the scan projects everything, in which case a filter keeps
     /// the bind-schema index it already has.
@@ -708,7 +710,7 @@ impl Drop for Scan<'_> {
 }
 
 /// Narrow `schema` to `ids`, or hand it back whole when there is no projection.
-fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> {
+pub(crate) fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> {
     let Some(ids) = ids else {
         return Ok(Arc::clone(schema));
     };
@@ -740,7 +742,7 @@ fn project_schema(schema: &SchemaRef, ids: Option<&[i64]>) -> Result<SchemaRef> 
 /// them, so a nullability difference here would be this client's own doing
 /// rather than the worker's — and rejecting on it would fail scans that are
 /// perfectly correct.
-fn check_batch_schema(
+pub(crate) fn check_batch_schema(
     function: &str,
     expected: &arrow_schema::Schema,
     batch: &RecordBatch,
@@ -848,6 +850,8 @@ impl VgiClient {
             resolved_secrets_provided,
             at_unit: spec.at.as_ref().map(|a| a.unit.clone()),
             at_value: spec.at.as_ref().map(|a| a.value.clone()),
+            copy_from: None,
+            copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
         };
@@ -1199,8 +1203,14 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
 
     for sort in plan.sort_order.iter().flatten() {
         if bound.output_schema().field_with_name(&sort.column).is_err()
-            || !matches!(sort.direction.0.as_str(), "asc" | "desc")
-            || !matches!(sort.nulls.0.as_str(), "nulls_first" | "nulls_last")
+            || !matches!(
+                sort.direction.0.as_str(),
+                enums::order_by_direction::ASC | enums::order_by_direction::DESC
+            )
+            || !matches!(
+                sort.nulls.0.as_str(),
+                enums::order_by_null_order::NULLS_FIRST | enums::order_by_null_order::NULLS_LAST
+            )
         {
             return Err(RpcError::runtime_error(format!(
                 "function `{}`: invalid sort field for column `{}` ({}, {})",
@@ -1295,7 +1305,7 @@ impl VgiClient {
                 max_splits_per_response: opts.max_splits_per_response,
                 cursor: cursor.clone(),
                 refined_filters: opts.refined_filters.clone().map(LargeBytes),
-                filters_complete: Some(opts.filters_complete.unwrap_or(true)),
+                filters_complete: opts.filters_complete.unwrap_or(true),
                 start_position: opts.start_position.clone().map(Bytes),
                 end_position: opts.end_position.clone().map(Bytes),
                 order_by_column_name: opts.order_by.as_ref().map(|o| o.column.clone()),
@@ -1406,6 +1416,22 @@ mod tests {
                 .map(|(n, t)| Field::new(*n, t.clone(), true))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// `BindRequest.function_type`, `InitRequest.order_by_direction` /
+    /// `order_by_null_order` are Python enums: the wire carries the member
+    /// NAME. There is no `TABLE_IN_OUT` member — table-in-out binds as `TABLE`.
+    #[test]
+    fn enum_wire_spellings_are_python_member_names() {
+        assert_eq!(FunctionType::Table.as_str(), "TABLE");
+        assert_eq!(FunctionType::TableInOut.as_str(), "TABLE");
+        assert_eq!(FunctionType::TableBuffering.as_str(), "TABLE_BUFFERING");
+        assert_eq!(FunctionType::Scalar.as_str(), "SCALAR");
+        assert_eq!(FunctionType::Aggregate.as_str(), "AGGREGATE");
+        assert_eq!(SortDirection::Ascending.as_str(), "ASC");
+        assert_eq!(SortDirection::Descending.as_str(), "DESC");
+        assert_eq!(NullOrder::First.as_str(), "NULLS_FIRST");
+        assert_eq!(NullOrder::Last.as_str(), "NULLS_LAST");
     }
 
     #[test]
@@ -2133,8 +2159,8 @@ mod tests {
             })?;
             let sort = wire::to_batch(SortField {
                 column: "c".to_string(),
-                direction: DictString("asc".to_string()),
-                nulls: DictString("nulls_last".to_string()),
+                direction: DictString(enums::order_by_direction::ASC.to_string()),
+                nulls: DictString(enums::order_by_null_order::NULLS_LAST.to_string()),
             })?;
             let response = PlanResponse {
                 splits: vec![Bytes(ipc::write_batch(&split)?)],
@@ -2278,7 +2304,7 @@ mod tests {
         assert_eq!(requests[1].cursor.as_ref().unwrap().0, b"next");
         assert_eq!(requests[0].join_keys.as_ref().unwrap()[0].0, b"keys");
         assert_eq!(requests[0].max_splits_per_response, Some(1));
-        assert_eq!(requests[0].filters_complete, Some(false));
+        assert!(!requests[0].filters_complete);
         assert_eq!(requests[0].order_by_column_name.as_deref(), Some("c"));
         assert_eq!(requests[0].tablesample_seed, Some(42));
 

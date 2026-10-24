@@ -216,7 +216,7 @@ fn init_body_for_schema(
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         input_schema: None,
         settings: None,
         secrets: None,
@@ -225,6 +225,8 @@ fn init_body_for_schema(
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         // The extension names the owning schema on every bind (protocol 1.1.0);
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
@@ -675,7 +677,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table_buffering".to_string()),
+        function_type: DictString("TABLE_BUFFERING".to_string()),
         input_schema: None,
         settings: None,
         secrets: None,
@@ -684,6 +686,8 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         resolved_secrets_provided,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         // The extension names the owning schema on every bind (protocol 1.1.0);
         // these functions are registered without an explicit home, so they live
         // in the worker's own catalog under `main`.
@@ -851,7 +855,7 @@ fn start_grant_server() -> (u16, Arc<std::sync::Mutex<Option<Option<String>>>>) 
 }
 
 /// The grant loop, end to end over HTTP: a freshly logged-in user mints a
-/// sealed grant through `vgi_rpc.Identity.v1`'s `issue_grant`, and a vgi.v2
+/// sealed grant through `vgi_rpc.Identity.v2`'s `issue_grant`, and a vgi.v2
 /// call presenting it as `Bearer <grant>` runs authenticated as that user.
 #[test]
 fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
@@ -1015,7 +1019,7 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
     let bind = BindRequest {
         function_name: function.to_string(),
         arguments: Bytes::from(args),
-        function_type: DictString("table".to_string()),
+        function_type: DictString("TABLE".to_string()),
         // A table-in-out bind carries the input schema; FINALIZE reuses the
         // same bind call the INPUT phase used.
         input_schema: Some(Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap())),
@@ -1026,6 +1030,8 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
         resolved_secrets_provided: false,
         at_unit: None,
         at_value: None,
+        copy_from: None,
+        copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("count".to_string())]),
     };
