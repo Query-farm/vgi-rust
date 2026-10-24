@@ -12,6 +12,25 @@ use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
+    for scan in fixture_scans() {
+        w.register_table(scan);
+    }
+    w.register_table(RowIdSequenceFunction);
+}
+
+pub(crate) fn fixture_rows() -> std::collections::HashMap<String, RecordBatch> {
+    fixture_scans()
+        .into_iter()
+        .map(|scan| {
+            (
+                scan.name.trim_end_matches("_scan").to_string(),
+                RecordBatch::try_new(scan.schema, scan.columns).expect("static fixture rows"),
+            )
+        })
+        .collect()
+}
+
+fn fixture_scans() -> Vec<StaticScan> {
     let i = |v: Vec<i64>| Arc::new(Int64Array::from(v)) as ArrayRef;
     let s = |v: Vec<&str>| Arc::new(StringArray::from(v)) as ArrayRef;
     let f = |v: Vec<f64>| Arc::new(Float64Array::from(v)) as ArrayRef;
@@ -21,82 +40,83 @@ pub fn register(w: &mut vgi::Worker) {
     // `versioned_constraints_scan(version)` functions (see versioned_scan.rs),
     // not per-version static scans.
 
-    w.register_table(StaticScan::new(
-        "departments_scan",
-        &[
-            ("id", DataType::Int64),
-            ("name", DataType::Utf8),
-            ("budget", DataType::Float64),
-        ],
-        vec![
-            i(vec![1, 2, 3]),
-            s(vec!["Engineering", "Sales", "HR"]),
-            f(vec![500000.0, 300000.0, 200000.0]),
-        ],
-    ));
-    w.register_table(StaticScan::new(
-        "employees_scan",
-        &[
-            ("id", DataType::Int64),
-            ("name", DataType::Utf8),
-            ("email", DataType::Utf8),
-            ("department_id", DataType::Int64),
-        ],
-        vec![
-            i(vec![1, 2, 3, 4, 5]),
-            s(vec!["Alice", "Bob", "Carol", "Dave", "Eve"]),
-            s(vec![
-                "alice@co.com",
-                "bob@co.com",
-                "carol@co.com",
-                "dave@co.com",
-                "eve@co.com",
-            ]),
-            i(vec![1, 1, 2, 2, 3]),
-        ],
-    ));
-    w.register_table(StaticScan::new(
-        "projects_scan",
-        &[
-            ("department_id", DataType::Int64),
-            ("project_code", DataType::Utf8),
-            ("title", DataType::Utf8),
-        ],
-        vec![
-            i(vec![1, 1, 2]),
-            s(vec!["P001", "P002", "P003"]),
-            s(vec!["Backend API", "Frontend UI", "Sales Portal"]),
-        ],
-    ));
-    w.register_table(StaticScan::new(
-        "products_scan",
-        &[
-            ("id", DataType::Int64),
-            ("name", DataType::Utf8),
-            ("quantity", DataType::Int64),
-            ("price", DataType::Float64),
-        ],
-        vec![
-            i(vec![1, 2, 3]),
-            s(vec!["Widget", "Gadget", "Doohickey"]),
-            i(vec![100, 50, 200]),
-            f(vec![9.99, 24.99, 4.99]),
-        ],
-    ));
-    w.register_table(StaticScan::new(
-        "colors_scan",
-        &[
-            ("id", DataType::Int64),
-            ("color", DataType::Utf8),
-            ("hex_code", DataType::Utf8),
-        ],
-        vec![
-            i(vec![1, 2, 3]),
-            s(vec!["blue", "green", "red"]),
-            s(vec!["#0000FF", "#00FF00", "#FF0000"]),
-        ],
-    ));
-    w.register_table(RowIdSequenceFunction);
+    vec![
+        StaticScan::new(
+            "departments_scan",
+            &[
+                ("id", DataType::Int64),
+                ("name", DataType::Utf8),
+                ("budget", DataType::Float64),
+            ],
+            vec![
+                i(vec![1, 2, 3]),
+                s(vec!["Engineering", "Sales", "HR"]),
+                f(vec![500000.0, 300000.0, 200000.0]),
+            ],
+        ),
+        StaticScan::new(
+            "employees_scan",
+            &[
+                ("id", DataType::Int64),
+                ("name", DataType::Utf8),
+                ("email", DataType::Utf8),
+                ("department_id", DataType::Int64),
+            ],
+            vec![
+                i(vec![1, 2, 3, 4, 5]),
+                s(vec!["Alice", "Bob", "Carol", "Dave", "Eve"]),
+                s(vec![
+                    "alice@co.com",
+                    "bob@co.com",
+                    "carol@co.com",
+                    "dave@co.com",
+                    "eve@co.com",
+                ]),
+                i(vec![1, 1, 2, 2, 3]),
+            ],
+        ),
+        StaticScan::new(
+            "projects_scan",
+            &[
+                ("department_id", DataType::Int64),
+                ("project_code", DataType::Utf8),
+                ("title", DataType::Utf8),
+            ],
+            vec![
+                i(vec![1, 1, 2]),
+                s(vec!["P001", "P002", "P003"]),
+                s(vec!["Backend API", "Frontend UI", "Sales Portal"]),
+            ],
+        ),
+        StaticScan::new(
+            "products_scan",
+            &[
+                ("id", DataType::Int64),
+                ("name", DataType::Utf8),
+                ("quantity", DataType::Int64),
+                ("price", DataType::Float64),
+            ],
+            vec![
+                i(vec![1, 2, 3]),
+                s(vec!["Widget", "Gadget", "Doohickey"]),
+                i(vec![100, 50, 200]),
+                f(vec![9.99, 24.99, 4.99]),
+            ],
+        ),
+        StaticScan::new(
+            "colors_scan",
+            &[
+                ("id", DataType::Int64),
+                ("color", DataType::Utf8),
+                ("hex_code", DataType::Utf8),
+            ],
+            vec![
+                i(vec![1, 2, 3]),
+                s(vec!["blue", "green", "red"]),
+                s(vec!["#0000FF", "#00FF00", "#FF0000"]),
+            ],
+        ),
+    ]
 }
 
 /// Per-table scan helpers for the `versioned_tables` catalog only.

@@ -2400,6 +2400,16 @@ impl Dispatcher {
         // per-session scope id carried back on every request as the storage
         // scope (so two ATTACH sessions of the same catalog stay isolated).
         if let Some(sec) = self.secondary.iter().find(|c| c.name == dto.name) {
+            let agreement = sec
+                .capability_agreement
+                .map(|hook| {
+                    hook(
+                        dto.client_capabilities
+                            .as_ref()
+                            .map(|value| value.0.as_slice()),
+                    )
+                })
+                .transpose()?;
             let mut scope = self.next_execution_id();
             debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
             if let Some(hook) = &sec.attach_payload {
@@ -2412,8 +2422,8 @@ impl Dispatcher {
                 scope.extend_from_slice(&hook(options.as_ref())?);
             }
             let result = CatalogAttachResult {
-                catalog_capabilities: None,
-                selected_capabilities: None,
+                catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
+                selected_capabilities: agreement.map(|value| value.1),
                 query_pushdown: None,
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
@@ -2512,9 +2522,20 @@ impl Dispatcher {
             } else {
                 self.attach_bytes()
             };
+        let agreement = self
+            .catalog
+            .capability_agreement
+            .map(|hook| {
+                hook(
+                    dto.client_capabilities
+                        .as_ref()
+                        .map(|value| value.0.as_slice()),
+                )
+            })
+            .transpose()?;
         let result = CatalogAttachResult {
-            catalog_capabilities: None,
-            selected_capabilities: None,
+            catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
+            selected_capabilities: agreement.map(|value| value.1),
             query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
@@ -3217,9 +3238,10 @@ impl Dispatcher {
                 tt.columns = v.columns.clone();
                 tt.scan_function = v.scan_function.clone();
                 tt.scan_arguments = v.scan_arguments.clone();
-                // Constraints are defined against the current schema; drop them
-                // for historical versions whose columns differ.
-                if !t.is_current_version(v.version) {
+                if let Some((constraints, revision)) = t.constraint_versions.get(&v.version) {
+                    tt.constraints = constraints.clone();
+                    tt.definition_revision = revision.clone();
+                } else if !t.is_current_version(v.version) {
                     if !t.constraints.is_empty() {
                         return Err(RpcError::method_not_implemented(
                             "canonical constraints require version-specific provider snapshots",
@@ -5811,13 +5833,26 @@ mod canonical_constraint_version_tests {
             assert_eq!(info.definition_revision.unwrap().0, b"current-revision");
         }
         let error = Dispatcher::at_version(&table, Some("VERSION"), Some("1"));
-        assert!(
-            error
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("version-specific provider snapshots")
+        assert!(error
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("version-specific provider snapshots"));
+        table.constraint_versions.insert(
+            1,
+            (
+                Vec::new(),
+                Some(Bytes::from(b"historical-revision".to_vec())),
+            ),
         );
+        let historical = Dispatcher::at_version(&table, Some("VERSION"), Some("1")).unwrap();
+        assert!(historical.constraints.is_empty());
+        assert_eq!(
+            historical.definition_revision.unwrap().0,
+            b"historical-revision"
+        );
+        assert!(!table.constraints.is_empty());
+        table.constraint_versions.clear();
         // Tables without canonical claims retain ordinary historical selection.
         table.constraints.clear();
         assert!(Dispatcher::at_version(&table, Some("VERSION"), Some("1")).is_ok());
@@ -7385,6 +7420,86 @@ mod catalog_contents_tests {
         let primary = attach_named(&d, "cat");
         assert!(primary.supports_catalog_contents);
         assert!(!primary.catalog_version_frozen);
+    }
+
+    #[test]
+    fn declarative_capability_agreement_receives_offer_and_forwards_both_results() {
+        fn agreement(client: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
+            let client: ClientCapabilities = wire::from_batch(&ipc::read_batch(
+                client.ok_or_else(|| RpcError::value_error("missing offer"))?,
+            )?)?;
+            assert_eq!(client.engine, "test-client");
+            let selected = client
+                .catalog
+                .ok_or_else(|| RpcError::value_error("missing catalog offer"))?;
+            Ok((selected.clone(), selected))
+        }
+        let mut d = dispatcher();
+        d.catalog.capability_agreement = Some(agreement);
+        d.register_secondary_catalog(
+            catalog::CatalogModel {
+                name: "secondary".into(),
+                capability_agreement: Some(agreement),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let capabilities = Bytes::from(
+            ipc::write_batch(
+                &wire::to_batch(
+                    vgi_protocol::generated::protocol_types::CatalogCapabilities {
+                        read: vec!["vgi.constraint.records.read.v1".into()],
+                        ddl: vec![],
+                        write: vec![],
+                        transaction: vec![],
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let client = Bytes::from(
+            ipc::write_batch(
+                &wire::to_batch(ClientCapabilities {
+                    engine: "test-client".into(),
+                    native_formats: vec![],
+                    catalogs: vec![],
+                    can_stream: true,
+                    filter_encodings: vec![],
+                    catalog: Some(capabilities.clone()),
+                    query_pushdown: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        for name in ["cat", "secondary"] {
+            let make_request = |offer| {
+                let inner = wire::to_batch(CatalogAttachRequest {
+                    name: name.into(),
+                    options: None,
+                    data_version_spec: None,
+                    implementation_version: None,
+                    client_capabilities: offer,
+                })
+                .unwrap();
+                request(
+                    "catalog_attach",
+                    wire::to_batch(p::CatalogAttachParams {
+                        request: Bytes::from(ipc::write_batch(&inner).unwrap()),
+                    })
+                    .unwrap(),
+                )
+            };
+            let result = d
+                .handle_catalog_attach(&make_request(Some(client.clone())))
+                .unwrap()
+                .unwrap();
+            let attached: CatalogAttachResult = wire::from_batch(&inner(result)).unwrap();
+            assert_eq!(attached.catalog_capabilities.unwrap().0, capabilities.0);
+            assert_eq!(attached.selected_capabilities.unwrap().0, capabilities.0);
+            assert!(d.handle_catalog_attach(&make_request(None)).is_err());
+        }
     }
 
     struct NoRows(&'static str);

@@ -909,6 +909,10 @@ pub type AttachPayloadHook =
 /// A declarative catalog: named schemas with views, macros, and tables.
 #[derive(Default, Clone)]
 pub struct CatalogModel {
+    /// Provider-owned capability selection from the client's serialized offer.
+    /// The returned records are available and selected CatalogCapabilities IPC;
+    /// selected profiles must be offered, supported and include prerequisites.
+    pub capability_agreement: Option<fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>>,
     /// Catalog name advertised by `catalog_catalogs` (discovery).
     pub name: String,
     pub schemas: Vec<CatSchema>,
@@ -1154,6 +1158,9 @@ pub struct CatTable {
     /// Explicit canonical ConstraintInfo IPC records, with provider-owned identities.
     pub constraints: Vec<Bytes>,
     pub definition_revision: Option<Bytes>,
+    /// Authoritative canonical records and revision for each historical version.
+    /// Missing entries never reuse current constraints for an older snapshot.
+    pub constraint_versions: HashMap<i64, (Vec<Bytes>, Option<Bytes>)>,
     pub name: String,
     pub columns: SchemaRef,
     pub scan_function: String,
@@ -1211,6 +1218,7 @@ impl Default for CatTable {
         Self {
             constraints: Vec::new(),
             definition_revision: None,
+            constraint_versions: HashMap::new(),
             name: String::new(),
             columns: std::sync::Arc::new(arrow_schema::Schema::empty()),
             scan_function: String::new(),
@@ -1391,6 +1399,7 @@ impl CatTable {
         CatTable {
             constraints: Vec::new(),
             definition_revision: None,
+            constraint_versions: HashMap::new(),
             name: name.to_string(),
             columns,
             scan_function: scan_function.to_string(),

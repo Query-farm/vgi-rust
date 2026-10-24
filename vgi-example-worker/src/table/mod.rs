@@ -14,10 +14,10 @@ mod proj_repro;
 mod rff;
 mod settings_fixtures;
 pub mod splits;
-mod static_scan;
+pub(crate) mod static_scan;
 pub mod tt_pushdown;
 mod typed_probe;
-mod versioned_scan;
+pub(crate) mod versioned_scan;
 
 use std::sync::Arc;
 

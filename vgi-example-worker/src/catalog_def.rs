@@ -1388,6 +1388,7 @@ fn data_tables() -> Vec<CatTable> {
 /// Python `versioned` fixture (impl 1.0.0, data range >=1.0.0,<2.0.0).
 pub fn versioned() -> CatalogModel {
     CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "versioned".to_string(),
         implementation_version: Some("1.0.0".to_string()),
@@ -1484,6 +1485,7 @@ pub fn versioned_tables() -> CatalogModel {
     );
     version_schemas.insert("3.0.0".to_string(), vec![main(vec![plants.clone()])]);
     CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "versioned_tables".to_string(),
         source_url: None,
@@ -1535,7 +1537,8 @@ pub fn build_by_name(name: &str) -> CatalogModel {
 }
 
 pub fn build() -> CatalogModel {
-    CatalogModel {
+    let mut model = CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "example".to_string(),
         source_url: None,
@@ -1681,5 +1684,8 @@ pub fn build() -> CatalogModel {
                 tables: data_tables(),
             },
         ],
-    }
+    };
+    crate::canonical_constraints::qualify_catalog(&mut model)
+        .expect("immutable constraint fixture qualification");
+    model
 }
