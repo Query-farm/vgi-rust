@@ -86,13 +86,13 @@ pub(crate) fn record(bytes: &[u8], expected: &Schema) -> Result<arrow_array::Rec
                 .validate_full()
                 .map_err(|e| invalid(&e.to_string()))?;
         }
-        if reader.next().is_some() {
-            return Err(invalid("projection requires exactly one IPC batch"));
-        }
         row
     };
-    if cursor.position() != bytes.len() as u64 {
-        return Err(invalid("trailing projection IPC"));
+    // Arrow's reader treats a partial next length prefix as EOF. Inspect the
+    // unconsumed bytes ourselves so only physical EOF or one complete EOS is valid.
+    match &bytes[cursor.position() as usize..] {
+        [] | [0, 0, 0, 0] | [255, 255, 255, 255, 0, 0, 0, 0] => {}
+        _ => return Err(invalid("projection requires exactly one complete IPC batch")),
     }
     Ok(row)
 }
@@ -326,6 +326,28 @@ mod tests {
             vec![PROFILE.into(), PROFILE.into()],
         ] {
             assert!(validate_offer(&offer).is_err());
+        }
+    }
+    #[test]
+    fn projection_record_requires_complete_framing() {
+        let batch = wire::to_batch(proposal().bind_result).unwrap();
+        let encoded = ipc::write_batch(&batch).unwrap();
+        let eos = [255, 255, 255, 255, 0, 0, 0, 0];
+        assert!(encoded.ends_with(&eos));
+        let body = &encoded[..encoded.len() - eos.len()];
+        let with_tail = |tail: &[u8]| [body, tail].concat();
+        for complete in [encoded.clone(), body.to_vec(), with_tail(&[0; 4])] {
+            assert!(record(&complete, batch.schema().as_ref()).is_ok());
+        }
+        for size in 1..eos.len() {
+            assert!(record(&with_tail(&eos[..size]), batch.schema().as_ref()).is_err());
+        }
+        for invalid in [
+            [encoded.as_slice(), &eos].concat(),
+            [encoded.as_slice(), b"garbage"].concat(),
+            body[..body.len() - 1].to_vec(),
+        ] {
+            assert!(record(&invalid, batch.schema().as_ref()).is_err());
         }
     }
 }
