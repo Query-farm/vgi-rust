@@ -183,6 +183,7 @@ mod http_continuation_tests;
 mod function_shape_dispatch_tests;
 
 pub use dispatch::FunctionScope;
+pub use table_function::BindRepeatability;
 pub use function::{
     ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FunctionExample, FunctionMetadata,
     ProcessParams, ScalarFunction,

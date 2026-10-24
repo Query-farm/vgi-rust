@@ -4,8 +4,8 @@ use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use vgi::{
     function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams},
-    projection::{PROFILE, ProjectionAcceptance, ProjectionProposal},
-    table_function::{TableFunction, TableProducer},
+    projection::{ProjectionAcceptance, ProjectionProposal, PROFILE},
+    table_function::{BindRepeatability, TableFunction, TableProducer},
 };
 use vgi_rpc::{OutputCollector, Result, RpcError};
 pub struct ProjectionSequence;
@@ -30,6 +30,9 @@ impl TableFunction for ProjectionSequence {
     }
     fn projection_expression_profiles(&self, _: &BindParams) -> Vec<String> {
         vec![PROFILE.into()]
+    }
+    fn repeatability(&self, _: &BindParams) -> BindRepeatability {
+        BindRepeatability::StableWithinQuery
     }
     fn projection(
         &self,

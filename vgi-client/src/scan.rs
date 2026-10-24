@@ -1800,6 +1800,7 @@ mod tests {
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
                 projection_expression_profiles: Vec::new(),
+                repeatability: vgi_protocol::protocol::dtos::BindRepeatability::Unknown,
             },
             out,
         )

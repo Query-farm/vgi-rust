@@ -212,6 +212,7 @@ impl ProjectionProposal {
             lookup_scopes: Vec::new(),
             lookup_names: Vec::new(),
             projection_expression_profiles: self.bind_result.projection_expression_profiles.clone(),
+            repeatability: self.bind_result.repeatability,
         };
         Ok(ProjectionResponse {
             accepted_indices: a.accepted_indices,
@@ -254,6 +255,7 @@ mod tests {
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
                 projection_expression_profiles: vec![PROFILE.into()],
+                repeatability: crate::table_function::BindRepeatability::StableWithinQuery,
             },
             source_schema,
             result_schema: Arc::new(Schema::new(vec![Field::new("wide", DataType::Int64, true)
@@ -297,11 +299,14 @@ mod tests {
             })
         };
         assert!(p.response(None).unwrap().bind_result.is_none());
-        assert!(p
+        let accepted_wire = p
             .response(accepted(vec![0], correct.clone()))
             .unwrap()
             .bind_result
-            .is_some());
+            .unwrap();
+        let accepted_bind: BindResponse =
+            wire::from_batch(&ipc::read_batch(&accepted_wire.0).unwrap()).unwrap();
+        assert_eq!(accepted_bind.repeatability, p.bind_result.repeatability);
         for indices in [vec![], vec![-1], vec![1], vec![0, 0]] {
             assert!(p.response(accepted(indices, correct.clone())).is_err());
         }

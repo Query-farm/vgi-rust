@@ -1104,6 +1104,7 @@ impl Dispatcher {
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
                         projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1119,6 +1120,7 @@ impl Dispatcher {
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 projection_expression_profiles: Vec::new(),
+                repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1154,6 +1156,7 @@ impl Dispatcher {
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
                         projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1169,6 +1172,7 @@ impl Dispatcher {
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 projection_expression_profiles: Vec::new(),
+                repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1204,6 +1208,7 @@ impl Dispatcher {
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
                         projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1221,6 +1226,7 @@ impl Dispatcher {
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 projection_expression_profiles: profiles,
+                repeatability: f.repeatability(&params),
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1247,6 +1253,7 @@ impl Dispatcher {
                         .map(|l| l.scope.clone().unwrap_or_default())
                         .collect(),
                     projection_expression_profiles: Vec::new(),
+                    repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: lookups
                         .iter()
                         .map(|l| l.name.clone().unwrap_or_default())
@@ -1266,6 +1273,7 @@ impl Dispatcher {
             lookup_secret_types: Vec::new(),
             lookup_scopes: Vec::new(),
             projection_expression_profiles: Vec::new(),
+            repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: Vec::new(),
         };
         Ok(Some(wire::to_result_batch(resp)?))

@@ -474,6 +474,58 @@ pub fn read_copy_to(batch: &arrow_array::RecordBatch) -> Result<Option<CopyToCon
     }
 }
 
+/// Equivalent scans of one exact bound state within a query. This does not
+/// promise identical independent binds or later queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BindRepeatability {
+    #[default]
+    Unknown,
+    StableWithinQuery,
+}
+
+impl VgiArrow for BindRepeatability {
+    fn arrow_data_type() -> arrow_schema::DataType {
+        DictString::arrow_data_type()
+    }
+    fn describe_name() -> String {
+        DictString::describe_name()
+    }
+    fn read(arr: &dyn arrow_array::Array, idx: usize) -> Result<Self> {
+        if arr.is_null(idx) || arr.data_type() != &Self::arrow_data_type() {
+            return Err(RpcError::type_error(
+                "repeatability requires a nonnull dictionary enum",
+            ));
+        }
+        let dictionary = arr
+            .as_any()
+            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int16Type>>()
+            .ok_or_else(|| RpcError::type_error("invalid repeatability dictionary"))?;
+        let key = dictionary.keys().value(idx);
+        if key < 0
+            || key as usize >= dictionary.values().len()
+            || dictionary.values().is_null(key as usize)
+        {
+            return Err(RpcError::type_error(
+                "NULL or invalid repeatability dictionary value",
+            ));
+        }
+        match DictString::read(arr, idx)?.0.as_str() {
+            "UNKNOWN" => Ok(Self::Unknown),
+            "STABLE_WITHIN_QUERY" => Ok(Self::StableWithinQuery),
+            _ => Err(RpcError::value_error("invalid bind repeatability")),
+        }
+    }
+    fn build_singleton(value: Self) -> Result<arrow_array::ArrayRef> {
+        DictString::build_singleton(DictString(
+            match value {
+                Self::Unknown => "UNKNOWN",
+                Self::StableWithinQuery => "STABLE_WITHIN_QUERY",
+            }
+            .into(),
+        ))
+    }
+}
+
 /// `BindResponse` — flat result of `bind`.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct BindResponse {
@@ -483,6 +535,7 @@ pub struct BindResponse {
     pub lookup_scopes: Vec<String>,
     pub lookup_names: Vec<String>,
     pub projection_expression_profiles: Vec<String>,
+    pub repeatability: BindRepeatability,
 }
 
 // ---------------------------------------------------------------------------
