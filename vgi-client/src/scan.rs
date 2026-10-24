@@ -1799,6 +1799,7 @@ mod tests {
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
                 lookup_names: Vec::new(),
+                projection_expression_profiles: Vec::new(),
             },
             out,
         )

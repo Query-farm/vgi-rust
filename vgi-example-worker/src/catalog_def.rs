@@ -1648,7 +1648,7 @@ pub fn build() -> CatalogModel {
                         )
                     },
                 ],
-                tables: vec![
+                tables: vec![scan(CatTable::new("projection_rows",Arc::new(Schema::new(vec![Field::new("n",DataType::Int32,true)])),"projection_sequence",Vec::new(),None,Some(10)),"projection_sequence"),
                     // Schema-disambiguation probe (table dispatch): same
                     // registered table name as the data-schema table, backed
                     // by this schema's own scan-function implementation

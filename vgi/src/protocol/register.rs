@@ -155,6 +155,7 @@ impl VgiService for Dispatcher {
         table_function_statistics => handle_table_function_statistics,
         table_function_cardinality => handle_table_function_cardinality,
         table_function_plan => handle_table_function_plan,
+        table_function_projection => handle_table_function_projection,
     }
     opened_rpcs! {
         table_function_dynamic_to_string => handle_table_function_dynamic_to_string,

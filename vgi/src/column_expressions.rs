@@ -25,7 +25,7 @@ fn expression(value: &SqlExpression, owner: &[String]) -> Result<()> {
     if value.sql.trim().is_empty() || value.profile != PROFILE {
         return Err(invalid("unsupported generated profile or empty SQL"));
     }
-    if value.schema_path.is_empty() || value.schema_path.len() > 32 {
+    if value.schema_path.len() > 32 {
         return Err(invalid("invalid expression owner"));
     }
     for part in &value.schema_path {
@@ -52,7 +52,7 @@ fn expression(value: &SqlExpression, owner: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn encoded(value: &str, owner: &[String]) -> Result<()> {
+pub(crate) fn encoded(value: &str, owner: &[String]) -> Result<()> {
     if value.is_empty() || value.len() > 4 * MAXIMUM.div_ceil(3) {
         return Err(invalid("invalid expression size"));
     }

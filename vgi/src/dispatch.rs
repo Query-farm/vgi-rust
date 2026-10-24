@@ -1103,7 +1103,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
-                        lookup_names: lookups
+                        projection_expression_profiles: Vec::new(),
+                lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1117,6 +1118,7 @@ impl Dispatcher {
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: Vec::new(),
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1151,7 +1153,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
-                        lookup_names: lookups
+                        projection_expression_profiles: Vec::new(),
+                lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1165,6 +1168,7 @@ impl Dispatcher {
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: Vec::new(),
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1199,7 +1203,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
-                        lookup_names: lookups
+                        projection_expression_profiles: Vec::new(),
+                lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1208,11 +1213,14 @@ impl Dispatcher {
                 }
             }
             let bind = f.on_bind(&params)?;
+            let profiles = f.projection_expression_profiles(&params);
+            crate::projection::validate_offer(&profiles)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: profiles,
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1238,7 +1246,8 @@ impl Dispatcher {
                         .iter()
                         .map(|l| l.scope.clone().unwrap_or_default())
                         .collect(),
-                    lookup_names: lookups
+                    projection_expression_profiles: Vec::new(),
+                lookup_names: lookups
                         .iter()
                         .map(|l| l.name.clone().unwrap_or_default())
                         .collect(),
@@ -1256,7 +1265,8 @@ impl Dispatcher {
             opaque_data: Some(Bytes::from(bind.opaque_data)),
             lookup_secret_types: Vec::new(),
             lookup_scopes: Vec::new(),
-            lookup_names: Vec::new(),
+            projection_expression_profiles: Vec::new(),
+                lookup_names: Vec::new(),
         };
         Ok(Some(wire::to_result_batch(resp)?))
     }
@@ -3235,6 +3245,38 @@ impl Dispatcher {
     /// whole scan is one unit of work. That keeps every existing worker serving
     /// unchanged under protocol 1.4.0, so splits stay opt-in rather than
     /// something every worker must now implement.
+    pub fn handle_table_function_projection(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
+        let bytes = req.column("request")
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+            .filter(|c| c.len() == 1 && !c.is_null(0))
+            .ok_or_else(|| RpcError::type_error("projection requires one binary request"))?;
+        let raw: crate::projection::ProjectionRequest = wire::from_batch(
+            &crate::projection::record(bytes.value(0), &vgi_protocol::generated::protocol_schemas::table_function_projection_request_schema())?
+        )?;
+        let proposal = crate::projection::ProjectionProposal::decode(raw)?;
+        let mut params = self.bind_params(&proposal.bind_call, ctx)?;
+        let call = self.bind_scope(&proposal.bind_call, false, false)?;
+        let function = self.resolve_table(
+            &proposal.bind_call.function_name,
+            &params.arguments,
+            params.input_schema.as_ref(),
+            call,
+        )?;
+        params
+            .arguments
+            .remap_positional(&function.argument_specs());
+        let result = function.projection(&params, &proposal)?;
+        let result = proposal.response(result)?;
+        if ipc::write_batch(&wire::to_batch(result.clone())?)?.len() > 8 * 1024 * 1024 {
+            return Err(RpcError::value_error("projection response exceeds 8MiB"));
+        }
+        Ok(Some(wire::to_result_batch(result)?))
+    }
+
     pub fn handle_table_function_plan(
         &self,
         req: &Request,

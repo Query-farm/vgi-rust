@@ -482,6 +482,7 @@ pub struct BindResponse {
     pub lookup_secret_types: Vec<String>,
     pub lookup_scopes: Vec<String>,
     pub lookup_names: Vec<String>,
+    pub projection_expression_profiles: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

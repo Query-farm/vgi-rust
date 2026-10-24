@@ -3,6 +3,7 @@
 //! Table (producer) example fixtures.
 
 mod batch_index;
+mod projection;
 mod cache;
 mod cancellable;
 mod filters;
@@ -30,6 +31,7 @@ use vgi_rpc::{Result, RpcError};
 /// Register all table fixtures. `catalog_name` gates catalog-specific scans.
 pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     w.register_table(SequenceFunction);
+    w.register_table(projection::ProjectionSequence);
     w.register_table(NestedSequenceFunction);
     w.register_table(TxCachedValueFunction);
     w.register_table(ProfilingDemoFunction);
