@@ -125,6 +125,7 @@ pub mod buffering;
 
 pub mod catalog;
 pub mod column_metadata;
+pub mod column_expressions;
 pub mod catalog_contents;
 pub mod copy_from;
 pub mod copy_to;

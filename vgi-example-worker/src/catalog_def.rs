@@ -62,12 +62,19 @@ fn col_schema(fields: &[(&str, DataType)]) -> Arc<Schema> {
 fn f(name: &str, ty: DataType) -> Field {
     Field::new(name, ty, true)
 }
-/// Field carrying one metadata key/value (default / comment / generated_expression).
+/// Field carrying one metadata key/value (default or comment).
 fn fm(name: &str, ty: DataType, key: &str, val: &str) -> Field {
     Field::new(name, ty, true).with_metadata(std::collections::HashMap::from([(
         key.to_string(),
         val.to_string(),
     )]))
+}
+/// Canonical VIRTUAL expression owned by the data schema.
+fn generated(name: &str, ty: DataType, sql: &str) -> Field {
+    Field::new(name, ty, true).with_metadata(std::collections::HashMap::from([
+        (vgi::column_expressions::GENERATED.into(), vgi::column_expressions::generated_metadata(sql, &["data".into()]).expect("valid example expression")),
+        (vgi::column_expressions::GENERATION.into(), "virtual".into()),
+    ]))
 }
 /// A row-id column (`is_row_id` marker).
 fn frow(name: &str, ty: DataType) -> Field {
@@ -556,13 +563,8 @@ fn data_tables() -> Vec<CatTable> {
                 "generated_sequence",
                 vec![
                     f("n", Int64),
-                    fm("doubled", Int64, "generated_expression", "n * 2"),
-                    fm(
-                        "label",
-                        Utf8,
-                        "generated_expression",
-                        "'item_' || CAST(n AS VARCHAR)",
-                    ),
+                    generated("doubled", Int64, "n * 2"),
+                    generated("label", Utf8, "'item_' || CAST(n AS VARCHAR)"),
                 ],
                 "Table with generated columns backed by sequence(10)",
             );

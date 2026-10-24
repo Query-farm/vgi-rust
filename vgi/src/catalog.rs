@@ -1548,6 +1548,7 @@ pub fn table_info(
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
     crate::column_metadata::validate_column_metadata(&t.columns)?;
+    crate::column_expressions::validate(&t.columns, schema_path, true)?;
     if !t.not_null.is_empty()
         || !t.unique.is_empty()
         || !t.primary_key.is_empty()
