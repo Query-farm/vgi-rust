@@ -1,4 +1,7 @@
-# Catalog metadata and publication (wire 2.2)
+# Catalog metadata and publication (wire 3.0)
+
+This preparation branch uses `vgi.v3` / `3.0.0`. Upgrade clients and workers
+together; published `vgi.v2` peers use a separate route and are incompatible.
 
 `catalog_contents` returns six nullable Arrow IPC streams: `schemas`, `tables`, `views`, `functions`, `macros`, and `indexes`. A stream can contain multiple rows and record batches spanning multiple schemas. Empty categories are null. Functions and macros retain their subtype fields. Per-schema listing RPCs keep their existing item shapes, except `SchemaInfo` no longer carries attachment bytes; real attach request/result and function state remain intact.
 

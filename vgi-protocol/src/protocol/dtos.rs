@@ -795,7 +795,7 @@ pub struct ScanSplit {
 ///
 /// Field order is the reference's (`execution_id`, `opaque_data`,
 /// `max_workers`): `init` declares this as its header schema, which the
-/// `vgi.v2` protocol hash covers, so the emitted header must match it.
+/// `vgi.v3` protocol hash covers, so the emitted header must match it.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct GlobalInitResponse {
     pub execution_id: Bytes,

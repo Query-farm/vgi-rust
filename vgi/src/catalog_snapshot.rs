@@ -17,7 +17,7 @@ use vgi_rpc::external_ref::ExternalRef;
 use vgi_rpc::{Result, RpcError};
 
 const CODEC: &str = "catalog-collections-1";
-const WIRE: &str = "2.2";
+const WIRE: &str = "3.0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotIdentity {

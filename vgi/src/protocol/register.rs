@@ -1,6 +1,6 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Host `vgi.v2` on an [`RpcServer`]: the [`Dispatcher`]'s implementation of the
+//! Host `vgi.v3` on an [`RpcServer`]: the [`Dispatcher`]'s implementation of the
 //! generated [`VgiService`] trait.
 //!
 //! The method table itself — every method's name, method type and params /
@@ -25,9 +25,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     super::vgi_service::register(srv, disp);
 }
 
-/// `vgi.v2` methods this SDK registers but does not implement.
+/// `vgi.v3` methods this SDK registers but does not implement.
 ///
-/// The protocol is the unit of optionality: every SDK hosts every `vgi.v2`
+/// The protocol is the unit of optionality: every SDK hosts every `vgi.v3`
 /// method with the reference's schemas, so reflection reports one protocol
 /// hash everywhere. These keep the generated [`VgiService`] default and
 /// answer every call with `UNIMPLEMENTED` / `method_not_implemented` -- never

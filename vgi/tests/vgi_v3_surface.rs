@@ -1,9 +1,9 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! This port hosts the full `vgi.v2` surface, byte-identical to the reference.
+//! This port hosts the full `vgi.v3` surface, byte-identical to the reference.
 //!
 //! "The protocol is the unit of optionality": every SDK registers every
-//! `vgi.v2` method with exactly the reference's method types and params,
+//! `vgi.v3` method with exactly the reference's method types and params,
 //! result and header schemas, so `vgi_rpc.Reflection.v1` reports one protocol
 //! hash everywhere. A method this port does not implement is still registered
 //! and answers `UNIMPLEMENTED` / `method_not_implemented`.
@@ -24,30 +24,30 @@ use vgi_rpc::metadata::{
 };
 use vgi_rpc::wire::{StreamReader, StreamWriter};
 
-/// The combined successor `vgi.v2` protocol hash, including scalar projection.
+/// The combined successor `vgi.v3` protocol hash, including scalar projection.
 ///
-/// Changes only with `vgi.v2`'s protocol version (currently 2.2.0, see
+/// Changes only with `vgi.v3`'s protocol version (currently 3.0.0, see
 /// `VGI_PROTOCOL_VERSION`). If this fails, this port's surface drifted from
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
-const REFERENCE_VGI_V2_HASH: &str =
-    "41f61f37c7ce42f63f3ca47f8861508f3f356d2422a5b8a0bab48ff92c0857a8";
+const REFERENCE_VGI_V3_HASH: &str =
+    "50e9404173bee3262e96b8939eb5c425463336abca2a17916812d68b6e0f6cad";
 
 /// The reference's method count, for a readable failure before the hash.
-const REFERENCE_VGI_V2_METHODS: usize = 85;
+const REFERENCE_VGI_V3_METHODS: usize = 85;
 
 #[test]
-fn vgi_v2_hash_equals_the_reference() {
-    assert_eq!(vgi::VGI_PROTOCOL_VERSION, "2.2.0");
+fn vgi_v3_hash_equals_the_reference() {
+    assert_eq!(vgi::VGI_PROTOCOL_VERSION, "3.0.0");
     let server = Worker::new().build_server();
     assert_eq!(server.protocol_name(), VGI_PROTOCOL_NAME);
     assert_eq!(
         server.methods().len(),
-        REFERENCE_VGI_V2_METHODS,
+        REFERENCE_VGI_V3_METHODS,
         "method set differs from the reference: {:?}",
         server.sorted_method_names()
     );
-    assert_eq!(server.protocol_hash(), REFERENCE_VGI_V2_HASH);
+    assert_eq!(server.protocol_hash(), REFERENCE_VGI_V3_HASH);
 }
 
 /// Every stubbed method answers every call with `UNIMPLEMENTED` /

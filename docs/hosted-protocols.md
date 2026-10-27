@@ -1,6 +1,6 @@
 # Hosting additional protocols, and `vgi_rpc.Identity.v2`
 
-A worker always hosts its own protocol, `vgi.v2` (what the DuckDB extension
+A worker always hosts its own protocol, `vgi.v3` (what the DuckDB extension
 speaks), and `vgi_rpc.Reflection.v1`. It can host more, on every transport.
 
 ## Additional application protocols: `Worker::hosted_protocols`
@@ -28,14 +28,14 @@ worker.hosted_protocols(|| {
   the process, so reflection output and protocol hashes stay stable.
 - The protocols are hosted on **every** transport the worker serves: stdio,
   `--unix`, `--tcp`, the Iroh raw upstream, `--http`, and the SAB/wasm path.
-  `list_protocols` lists `vgi.v2` first, then these, in the order returned.
+  `list_protocols` lists `vgi.v3` first, then these, in the order returned.
 - Requests route on the pair `(protocol, method)`, with no fallback to
-  `vgi.v2`, so an added protocol cannot change how DuckDB's calls dispatch --
-  even if its method names repeat `vgi.v2`'s.
+  `vgi.v3`, so an added protocol cannot change how DuckDB's calls dispatch --
+  even if its method names repeat `vgi.v3`'s.
 - Each protocol has its own optional version, gated only on its own calls.
 - There is no way to host a *subset* of a protocol: the protocol is the unit of
   optionality. A capability that may be absent is its own protocol.
-- A name that is malformed, repeated, equal to `vgi.v2`, or under the reserved
+- A name that is malformed, repeated, equal to `vgi.v3`, or under the reserved
   `vgi_rpc.` prefix stops the worker at startup with an error naming
   `Worker::hosted_protocols`.
 

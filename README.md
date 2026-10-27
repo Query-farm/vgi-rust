@@ -215,7 +215,7 @@ SELECT external_db.main.transform(col) FROM t;   -- a function
 (`--unix <path>`, the launcher contract), or **HTTP** (`--http`, Arrow-IPC over
 HTTP with AEAD-sealed stateless stream tokens and optional bearer auth).
 
-Every transport hosts `vgi.v2`, `vgi_rpc.Reflection.v1`, and any protocols the
+Every transport hosts `vgi.v3`, `vgi_rpc.Reflection.v1`, and any protocols the
 worker adds with `Worker::hosted_protocols`; HTTP additionally hosts
 `vgi_rpc.Identity.v2` when the worker sets `Worker::resolve_token` and/or
 `Worker::mint_grant`; with a grant key (`--grant-key` / `VGI_RPC_GRANT_KEYS`)

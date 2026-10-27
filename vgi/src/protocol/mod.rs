@@ -8,7 +8,7 @@
 //! re-exported here at their original paths.
 //!
 //! [`register`] stays worker-side: it wires those types onto an `RpcServer` and
-//! is meaningless to a client. [`vgi_service`] is the generated `vgi.v2`
+//! is meaningless to a client. [`vgi_service`] is the generated `vgi.v3`
 //! registry it builds on: the `VgiService` trait, its `UNIMPLEMENTED`
 //! defaults and the method table.
 
