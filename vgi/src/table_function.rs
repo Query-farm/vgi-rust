@@ -7,6 +7,7 @@
 //! emits one batch per tick and calls `out.finish()` when exhausted.
 
 use arrow_schema::SchemaRef;
+pub use vgi_protocol::protocol::dtos::BindRepeatability;
 use vgi_rpc::Result;
 
 use crate::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
@@ -198,6 +199,23 @@ pub trait TableFunction: Send + Sync {
     fn argument_specs(&self) -> Vec<ArgSpec>;
     /// Resolve the output schema from bind-time arguments.
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse>;
+    /// Explicit per-bind scalar proposal offer. Empty disables negotiation.
+    fn projection_expression_profiles(&self, _params: &BindParams) -> Vec<String> {
+        Vec::new()
+    }
+    /// Equivalent scans of this bound state within one query; independent binds
+    /// may differ. The default makes no repeatability promise.
+    fn repeatability(&self, _params: &BindParams) -> BindRepeatability {
+        BindRepeatability::Unknown
+    }
+    /// Planning only: no rows consumed, resources allocated, or effects produced.
+    fn projection(
+        &self,
+        _params: &BindParams,
+        _proposal: &crate::projection::ProjectionProposal,
+    ) -> Result<Option<crate::projection::ProjectionAcceptance>> {
+        Ok(None)
+    }
     /// Worker parallelism hint (default single worker).
     fn max_workers(&self, _params: &BindParams) -> i64 {
         1

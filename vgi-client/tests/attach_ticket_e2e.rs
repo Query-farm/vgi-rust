@@ -154,7 +154,7 @@ fn attach_and_probe(
 /// `params` as an Arrow IPC stream, optionally as `bearer`. Returns the
 /// response's data batch, or the error batch it carried.
 ///
-/// Raw on purpose: the protocol under test is not `vgi.v2`, so it is reached
+/// Raw on purpose: the protocol under test is not `vgi.v3`, so it is reached
 /// the way any vgi-rpc client reaches a co-hosted protocol -- by its routing
 /// key -- with no client library between the test and the wire.
 fn raw_call(

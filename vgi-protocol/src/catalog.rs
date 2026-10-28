@@ -148,7 +148,7 @@ fn validate_value(array: &dyn Array, field: &arrow_schema::Field, row: usize) ->
                 _ => {
                     return Err(RpcError::type_error(
                         "unsupported catalog dictionary index type",
-                    ))
+                    ));
                 }
             };
             if key >= values.len() || (values.is_null(key) && !field.is_nullable()) {
@@ -294,7 +294,7 @@ impl CatalogContentsResponse {
                 _ => {
                     return Err(RpcError::type_error(format!(
                         "unsupported catalog function type {kind}"
-                    )))
+                    )));
                 }
             };
             items.push(item(row)?);
@@ -307,7 +307,7 @@ impl CatalogContentsResponse {
                 other => {
                     return Err(RpcError::type_error(format!(
                         "unsupported catalog macro type {other}"
-                    )))
+                    )));
                 }
             };
             items.push(item(row)?);
@@ -330,8 +330,77 @@ fn item<T: VgiArrow>(value: T) -> Result<Bytes> {
 #[cfg(test)]
 mod collection_tests {
     use super::*;
+
     #[test]
-    fn dictionaries_round_trip_all_rows_and_batches_across_schemas() {
+    fn canonical_macro_families_preserve_dictionary_kinds_and_typed_defaults() {
+        use crate::generated::protocol_types::{
+            MacroOverload, MacroParameter, QueryEvaluationContext,
+        };
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        use vgi_rpc::DictString;
+
+        let field = Field::new("x", DataType::Int64, true)
+            .with_metadata(HashMap::from([("field".into(), "kept".into())]));
+        let schema = Schema::new_with_metadata(
+            vec![field],
+            HashMap::from([("schema".into(), "kept".into())]),
+        );
+        let default = Bytes::from(
+            crate::ipc::write_batch(
+                &RecordBatch::try_new(
+                    Arc::new(schema),
+                    vec![Arc::new(Int64Array::from(vec![None]))],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let rows = (0..7)
+            .map(|i| {
+                let table = i % 2 != 0;
+                MacroInfo {
+                    comment: Some(String::new()),
+                    tags: vec![("tag".into(), "value".into())],
+                    name: format!("m{i}"),
+                    schema_path: vec!["main".into()],
+                    macro_type: DictString(if table { "TABLE" } else { "SCALAR" }.into()),
+                    overloads: vec![MacroOverload {
+                        parameters: vec![MacroParameter {
+                            name: "x".into(),
+                            declared_type: None,
+                            default_value: Some(default.clone()),
+                            default_expression: None,
+                            documentation: Some(String::new()),
+                        }],
+                        definition: if table { "SELECT x" } else { "x" }.into(),
+                        profile: "duckdb.macro.v1".into(),
+                        schema_path: vec!["main".into()],
+                        macro_type: if table { "table" } else { "scalar" }.into(),
+                        evaluation_context: QueryEvaluationContext {
+                            timezone: "UTC".into(),
+                            collation: "binary".into(),
+                            default_order: "asc".into(),
+                            default_null_order: "nulls_last".into(),
+                            preserve_insertion_order: true,
+                        },
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+        let stream = encode_collection_with_batch_size(rows.clone(), 2).unwrap();
+        let decoded = decode_collection::<MacroInfo>(stream.as_ref()).unwrap();
+        assert_eq!(format!("{rows:?}"), format!("{decoded:?}"));
+        for row in decoded {
+            let parameter = &row.overloads[0].parameters[0];
+            assert_eq!(parameter.default_value.as_ref().unwrap().0, default.0);
+            assert_eq!(parameter.documentation.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn canonical_indexes_round_trip_all_rows_and_batches_across_schemas() {
         let rows = (0..7)
             .map(|i| IndexInfo {
                 comment: if i % 2 == 0 {
@@ -342,13 +411,8 @@ mod collection_tests {
                 tags: vec![("tag".into(), "value".into())],
                 name: format!("i{i}"),
                 schema_path: vec![if i % 2 == 0 { "main" } else { "other" }.into()],
-                table_name: "t".into(),
-                index_type: "ART".into(),
-                constraint_type: vgi_rpc::DictString(
-                    if i % 2 == 0 { "PRIMARY" } else { "UNIQUE" }.into(),
-                ),
-                expressions: vec!["column".into()],
-                options: vec![],
+                definition: Bytes::from(vec![i as u8, 1]),
+                options: Bytes::from(vec![i as u8, 2]),
             })
             .collect::<Vec<_>>();
         let stream = encode_collection_with_batch_size(rows.clone(), 2).unwrap();
@@ -367,6 +431,7 @@ mod collection_tests {
             tags: vec![],
             path: vec!["main".into()],
             estimated_object_count: None,
+            options: None,
         })
         .unwrap();
         let mut fields = schema

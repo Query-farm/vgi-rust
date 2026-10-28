@@ -16,7 +16,8 @@ permissions:
   actions: read
 
 env:
-  VGI_REF: fc3e08f7e7fd800165a0edc00313de46fed15329
+  VGI_REF: a83ff7e8cd46aa840a10e78fe9b31603931824c2
+  VGI_NATIVE_RUNNER_BRANCH: release/vgi-v3-ci-20261028
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -55,10 +56,10 @@ jobs:
       - name: cargo build (example worker)
         run: cargo build -p vgi-example-worker
 
-      # The `vgi.v2` surface must hash to the reference's: drift in any method
+      # The `vgi.v3` surface must hash to the reference's: drift in any method
       # registration, schema, field order or nullability fails here.
-      - name: cargo test (vgi.v2 surface + wire name)
-        run: cargo test -p vgi --all-features --test vgi_v2_surface --test protocol_name
+      - name: cargo test (vgi.v3 surface + wire name)
+        run: cargo test -p vgi --all-features --test vgi_v3_surface --test protocol_name
 
       - name: cargo test (SDK filtering, pruning, diagnostics)
         run: cargo test -p vgi --all-features --lib
@@ -78,7 +79,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   # vgi-rpc's hosted-protocols group against the example fixture worker
-  # (MULTI_PROTOCOL_HOSTING.md §5/§7): reflection lists `vgi.v2` then
+  # (MULTI_PROTOCOL_HOSTING.md §5/§7): reflection lists `vgi.v3` then
   # `conformance.Secondary.v1` -- deliberately non-alphabetical, so a server
   # that sorts its listing fails -- the secondary passes the routing,
   # error-model and traceback groups, and over HTTP the fixture's opted-in
@@ -118,7 +119,7 @@ jobs:
       - name: Hosted protocols over stdio
         run: >-
           vgi-rpc-test-hosted --cmd "$GITHUB_WORKSPACE/target/debug/vgi-example-worker"
-          --expect vgi.v2,conformance.Secondary.v1
+          --expect vgi.v3,conformance.Secondary.v1
 
       - name: Hosted protocols over a unix socket
         shell: bash
@@ -131,7 +132,7 @@ jobs:
           trap 'kill $pid 2>/dev/null || true' EXIT
           for _ in $(seq 100); do [ -S "$sock" ] && break; sleep 0.1; done
           [ -S "$sock" ] || { cat unix.log; exit 1; }
-          vgi-rpc-test-hosted --unix "$sock" --expect vgi.v2,conformance.Secondary.v1
+          vgi-rpc-test-hosted --unix "$sock" --expect vgi.v3,conformance.Secondary.v1
 
       - name: Hosted protocols over HTTP, with Identity opted in
         shell: bash
@@ -148,7 +149,7 @@ jobs:
           done
           [ -n "$port" ] || { cat http.log; exit 1; }
           vgi-rpc-test-hosted --url "http://127.0.0.1:$port" \
-            --expect vgi.v2,conformance.Secondary.v1 --identity
+            --expect vgi.v3,conformance.Secondary.v1 --identity
 
   # Feature hygiene for the crates with optional features. Each crate is linted
   # on its own (no workspace feature unification) with no default features,

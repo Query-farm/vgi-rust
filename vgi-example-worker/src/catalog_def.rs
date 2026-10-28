@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::canonical_constraints::{check, constraint, foreign_key, set_constraints};
 use arrow_array::{ArrayRef, Int64Array};
 use arrow_schema::{DataType, Field, Schema};
 use vgi::arguments::Arguments;
@@ -61,12 +62,23 @@ fn col_schema(fields: &[(&str, DataType)]) -> Arc<Schema> {
 fn f(name: &str, ty: DataType) -> Field {
     Field::new(name, ty, true)
 }
-/// Field carrying one metadata key/value (default / comment / generated_expression).
+/// Field carrying one metadata key/value (default or comment).
 fn fm(name: &str, ty: DataType, key: &str, val: &str) -> Field {
     Field::new(name, ty, true).with_metadata(std::collections::HashMap::from([(
         key.to_string(),
         val.to_string(),
     )]))
+}
+/// Canonical VIRTUAL expression owned by the data schema.
+fn generated(name: &str, ty: DataType, sql: &str) -> Field {
+    Field::new(name, ty, true).with_metadata(std::collections::HashMap::from([
+        (
+            vgi::column_expressions::GENERATED.into(),
+            vgi::column_expressions::generated_metadata(sql, &["data".into()])
+                .expect("valid example expression"),
+        ),
+        (vgi::column_expressions::GENERATION.into(), "virtual".into()),
+    ]))
 }
 /// A row-id column (`is_row_id` marker).
 fn frow(name: &str, ty: DataType) -> Field {
@@ -148,10 +160,14 @@ fn i64_arg(v: i64) -> ArrayRef {
     Arc::new(Int64Array::from(vec![v]))
 }
 
-/// Build CNF `required_filters` (an AND of OR-groups) from `&[&[&str]]`.
-fn groups(gs: &[&[&str]]) -> Vec<Vec<String>> {
+/// Build CNF `required_filters` (an AND of OR-groups) from `&[&[&[&str]]]`.
+fn groups(gs: &[&[&[&str]]]) -> Vec<Vec<Vec<String>>> {
     gs.iter()
-        .map(|g| g.iter().map(|s| s.to_string()).collect())
+        .map(|g| {
+            g.iter()
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .collect()
+        })
         .collect()
 }
 
@@ -160,7 +176,7 @@ fn rff_table(
     name: &str,
     fields: Vec<Field>,
     scan_fn: &str,
-    required: &[&[&str]],
+    required: &[&[&[&str]]],
     comment: &str,
 ) -> CatTable {
     let mut t = dtable(name, fields, comment);
@@ -203,7 +219,7 @@ fn rff_native(
     scan_fn: &str,
     positional: Vec<ArrayRef>,
     named: &[(&str, ArrayRef)],
-    required: &[&[&str]],
+    required: &[&[&[&str]]],
     comment: &str,
 ) -> CatTable {
     let mut t = dtable(name, fields, comment);
@@ -255,6 +271,8 @@ fn view(name: &str, def: &str) -> CatView {
         comment: None,
         tags: Vec::new(),
         column_comments: Vec::new(),
+        aliases: Vec::new(),
+        security: "regular".into(),
     }
 }
 fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -265,6 +283,7 @@ fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
     CatMacro {
+        overloads: None,
         name: name.to_string(),
         parameters: params.iter().map(|s| s.to_string()).collect(),
         definition: def.to_string(),
@@ -276,6 +295,7 @@ fn smacro(name: &str, params: &[&str], def: &str) -> CatMacro {
 }
 fn tmacro(name: &str, params: &[&str], def: &str) -> CatMacro {
     CatMacro {
+        overloads: None,
         table_macro: true,
         ..smacro(name, params, def)
     }
@@ -316,8 +336,7 @@ fn data_tables() -> Vec<CatTable> {
     };
     let row_struct =
         DataType::Struct(vec![Field::new("a", Int64, true), Field::new("b", Utf8, true)].into());
-    let mut tables =
-        vec![
+    let mut tables = vec![
         inline(fn_table(
             "large_sequence",
             &[("n", Int64)],
@@ -335,7 +354,7 @@ fn data_tables() -> Vec<CatTable> {
             "rff_simple",
             vec![f("a", Int64), f("b", Int64)],
             "rff_simple_scan",
-            &[&["a"]],
+            &[&[&["a"]]],
             "rff_simple — requires a filter referencing column 'a'.",
         ),
         // rff_or — a single OR-group: a filter on 'a' OR 'b' satisfies it.
@@ -344,14 +363,14 @@ fn data_tables() -> Vec<CatTable> {
             "rff_or",
             vec![f("a", Int64), f("b", Int64)],
             "rff_simple_scan",
-            &[&["a", "b"]],
+            &[&[&["a"], &["b"]]],
             "rff_or — requires a filter on one of (a, b).",
         ),
         rff_table(
             "rff_struct",
             vec![fstruct_ab("s"), f("other", Int64)],
             "rff_struct_scan",
-            &[&["s.a"], &["s.b"]],
+            &[&[&["s", "a"]], &[&["s", "b"]]],
             "rff_struct — requires filters on both struct subfields s.a and s.b.",
         ),
         rff_table(
@@ -363,14 +382,14 @@ fn data_tables() -> Vec<CatTable> {
                 ),
             )],
             "rff_nested_scan",
-            &[&["wrapper.mid.leaf"]],
+            &[&[&["wrapper", "mid", "leaf"]]],
             "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf.",
         ),
         rff_table(
             "rff_multi",
             vec![fstruct_ab("s"), f("top", Int64)],
             "rff_multi_scan",
-            &[&["top"], &["s.a"]],
+            &[&[&["top"]], &[&["s", "a"]]],
             "rff_multi — mixed top-level + struct subfield requirements.",
         ),
         rff_table(
@@ -386,7 +405,12 @@ fn data_tables() -> Vec<CatTable> {
             "read_parquet",
             vec![branch_arg("rff_seg.parquet")],
             &[],
-            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
+            &[
+                &[&["bbox", "xmin"]],
+                &[&["bbox", "xmax"]],
+                &[&["bbox", "ymin"]],
+                &[&["bbox", "ymax"]],
+            ],
             "rff_parquet — native read_parquet delegation with bbox.* required filters.",
         ),
         rff_native(
@@ -405,7 +429,12 @@ fn data_tables() -> Vec<CatTable> {
                 "hive_partitioning",
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
             )],
-            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
+            &[
+                &[&["bbox", "xmin"]],
+                &[&["bbox", "xmax"]],
+                &[&["bbox", "ymin"]],
+                &[&["bbox", "ymax"]],
+            ],
             "rff_hive — native read_parquet over Hive glob with bbox.* required filters.",
         ),
         rff_native(
@@ -425,11 +454,11 @@ fn data_tables() -> Vec<CatTable> {
                 Arc::new(arrow_array::BooleanArray::from(vec![true])) as ArrayRef,
             )],
             &[
-                &["id"],
-                &["bbox.xmin"],
-                &["bbox.xmax"],
-                &["bbox.ymin"],
-                &["bbox.ymax"],
+                &[&["id"]],
+                &[&["bbox", "xmin"]],
+                &[&["bbox", "xmax"]],
+                &[&["bbox", "ymin"]],
+                &[&["bbox", "ymax"]],
             ],
             "rff_hive_mixed — native read_parquet, top-level 'id' + bbox.* required filters.",
         ),
@@ -437,7 +466,12 @@ fn data_tables() -> Vec<CatTable> {
             "rff_rowid",
             vec![frow("row_id", Int64), fbbox(), f("other", Int64)],
             "rff_rowid_scan",
-            &[&["bbox.xmin"], &["bbox.xmax"], &["bbox.ymin"], &["bbox.ymax"]],
+            &[
+                &[&["bbox", "xmin"]],
+                &[&["bbox", "xmax"]],
+                &[&["bbox", "ymin"]],
+                &[&["bbox", "ymax"]],
+            ],
             "rff_rowid — row_id virtual column + required bbox.* filters.",
         ),
         scan(
@@ -533,13 +567,8 @@ fn data_tables() -> Vec<CatTable> {
                 "generated_sequence",
                 vec![
                     f("n", Int64),
-                    fm("doubled", Int64, "generated_expression", "n * 2"),
-                    fm(
-                        "label",
-                        Utf8,
-                        "generated_expression",
-                        "'item_' || CAST(n AS VARCHAR)",
-                    ),
+                    generated("doubled", Int64, "n * 2"),
+                    generated("label", Utf8, "'item_' || CAST(n AS VARCHAR)"),
                 ],
                 "Table with generated columns backed by sequence(10)",
             );
@@ -655,17 +684,45 @@ fn data_tables() -> Vec<CatTable> {
                     ),
                 ],
             );
-            // V3 constraints (current): NOT NULL id/name, PK id, UNIQUE email,
-            // FK department_id → data.departments(id).
-            t.not_null = vec![0, 1];
-            t.primary_key = vec![vec![0]];
-            t.unique = vec![vec![2]];
-            t.foreign_keys = vec![vgi::catalog::ForeignKey {
-                referenced_schema_path: None,
-                columns: vec!["department_id".to_string()],
-                referenced_table: "departments".to_string(),
-                referenced_columns: vec!["id".to_string()],
-            }];
+            // Current fixture declarations are metadata-only; historical AT
+            // snapshots reject until the fixture supplies version-owned records.
+            set_constraints(
+                &mut t,
+                vec![
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.primary",
+                        "PRIMARY_KEY",
+                        &["id"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.id.required",
+                        "NOT_NULL",
+                        &["id"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.name.required",
+                        "NOT_NULL",
+                        &["name"],
+                    ),
+                    constraint(
+                        "versioned_constraints",
+                        "fixture.versioned.email.unique",
+                        "UNIQUE",
+                        &["email"],
+                    ),
+                    foreign_key(
+                        "versioned_constraints",
+                        "fixture.versioned.department.foreign",
+                        &["department_id"],
+                        "departments",
+                        "fixture.departments.primary",
+                        &["id"],
+                    ),
+                ],
+            );
             t
         },
         // Function-backed time-travel + filter pushdown. Reads AT at init via the
@@ -1104,10 +1161,40 @@ fn data_tables() -> Vec<CatTable> {
         ),
     ];
     departments = scan(departments, "departments_scan");
-    departments.primary_key = vec![vec![0]];
-    departments.not_null = vec![0, 1];
-    departments.unique = vec![vec![1]];
-    departments.check = vec!["budget >= 0".to_string()];
+    set_constraints(
+        &mut departments,
+        vec![
+            constraint(
+                "departments",
+                "fixture.departments.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.name.required",
+                "NOT_NULL",
+                &["name"],
+            ),
+            constraint(
+                "departments",
+                "fixture.departments.name.unique",
+                "UNIQUE",
+                &["name"],
+            ),
+            check(
+                "departments",
+                "fixture.departments.budget.check",
+                "budget >= 0",
+            ),
+        ],
+    );
     tables.push(departments);
 
     // products: defaults + column comments.
@@ -1133,8 +1220,23 @@ fn data_tables() -> Vec<CatTable> {
         "Product table with column defaults",
     );
     products = scan(products, "products_scan");
-    products.primary_key = vec![vec![0]];
-    products.not_null = vec![0];
+    set_constraints(
+        &mut products,
+        vec![
+            constraint(
+                "products",
+                "fixture.products.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "products",
+                "fixture.products.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+        ],
+    );
     products.statistics = vec![
         stat("id", StatValue::Int64(1), StatValue::Int64(100), 100),
         CatColStat {
@@ -1172,15 +1274,49 @@ fn data_tables() -> Vec<CatTable> {
         "Employee table with FK to departments",
     );
     employees = scan(employees, "employees_scan");
-    employees.primary_key = vec![vec![0]];
-    employees.not_null = vec![0, 1, 2];
-    employees.unique = vec![vec![2]];
-    employees.foreign_keys = vec![vgi::catalog::ForeignKey {
-        referenced_schema_path: None,
-        columns: vec!["department_id".to_string()],
-        referenced_table: "departments".to_string(),
-        referenced_columns: vec!["id".to_string()],
-    }];
+    set_constraints(
+        &mut employees,
+        vec![
+            constraint(
+                "employees",
+                "fixture.employees.primary",
+                "PRIMARY_KEY",
+                &["id"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.id.required",
+                "NOT_NULL",
+                &["id"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.name.required",
+                "NOT_NULL",
+                &["name"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.email.required",
+                "NOT_NULL",
+                &["email"],
+            ),
+            constraint(
+                "employees",
+                "fixture.employees.email.unique",
+                "UNIQUE",
+                &["email"],
+            ),
+            foreign_key(
+                "employees",
+                "fixture.employees.department.foreign",
+                &["department_id"],
+                "departments",
+                "fixture.departments.primary",
+                &["id"],
+            ),
+        ],
+    );
     tables.push(employees);
 
     // projects: composite PK, NOT NULL, FK→departments.
@@ -1194,14 +1330,43 @@ fn data_tables() -> Vec<CatTable> {
         "Projects with composite PK and FK to departments",
     );
     projects = scan(projects, "projects_scan");
-    projects.primary_key = vec![vec![0, 1]];
-    projects.not_null = vec![0, 1, 2];
-    projects.foreign_keys = vec![vgi::catalog::ForeignKey {
-        referenced_schema_path: None,
-        columns: vec!["department_id".to_string()],
-        referenced_table: "departments".to_string(),
-        referenced_columns: vec!["id".to_string()],
-    }];
+    set_constraints(
+        &mut projects,
+        vec![
+            constraint(
+                "projects",
+                "fixture.projects.primary",
+                "PRIMARY_KEY",
+                &["department_id", "project_code"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.department.required",
+                "NOT_NULL",
+                &["department_id"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.code.required",
+                "NOT_NULL",
+                &["project_code"],
+            ),
+            constraint(
+                "projects",
+                "fixture.projects.title.required",
+                "NOT_NULL",
+                &["title"],
+            ),
+            foreign_key(
+                "projects",
+                "fixture.projects.department.foreign",
+                &["department_id"],
+                "departments",
+                "fixture.departments.primary",
+                &["id"],
+            ),
+        ],
+    );
     tables.push(projects);
 
     // Schema-disambiguation probe (table dispatch): same registered table
@@ -1227,6 +1392,7 @@ fn data_tables() -> Vec<CatTable> {
 /// Python `versioned` fixture (impl 1.0.0, data range >=1.0.0,<2.0.0).
 pub fn versioned() -> CatalogModel {
     CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "versioned".to_string(),
         implementation_version: Some("1.0.0".to_string()),
@@ -1323,6 +1489,7 @@ pub fn versioned_tables() -> CatalogModel {
     );
     version_schemas.insert("3.0.0".to_string(), vec![main(vec![plants.clone()])]);
     CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "versioned_tables".to_string(),
         source_url: None,
@@ -1374,7 +1541,8 @@ pub fn build_by_name(name: &str) -> CatalogModel {
 }
 
 pub fn build() -> CatalogModel {
-    CatalogModel {
+    let mut model = CatalogModel {
+        capability_agreement: None,
         snapshot_policy: None,
         name: "example".to_string(),
         source_url: None,
@@ -1437,6 +1605,7 @@ pub fn build() -> CatalogModel {
                 ],
                 macros: vec![
                     CatMacro {
+                        overloads: None,
                         comment: Some("Multiply two values".to_string()),
                         parameter_docs: vec![
                             ("x".to_string(), "First factor".to_string()),
@@ -1448,6 +1617,7 @@ pub fn build() -> CatalogModel {
                         ..smacro("vgi_multiply", &["x", "y"], "main.double(x * y) / 2")
                     },
                     CatMacro {
+                        overloads: None,
                         comment: Some(
                             "Clamp a value between lo and hi (defaults: 0..100)".to_string(),
                         ),
@@ -1469,6 +1639,7 @@ pub fn build() -> CatalogModel {
                         )
                     },
                     CatMacro {
+                        overloads: None,
                         comment: Some("Table macro returning range of values".to_string()),
                         parameter_docs: vec![(
                             "n".to_string(),
@@ -1488,6 +1659,17 @@ pub fn build() -> CatalogModel {
                     },
                 ],
                 tables: vec![
+                    scan(
+                        CatTable::new(
+                            "projection_rows",
+                            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)])),
+                            "projection_sequence",
+                            Vec::new(),
+                            None,
+                            Some(10),
+                        ),
+                        "projection_sequence",
+                    ),
                     // Schema-disambiguation probe (table dispatch): same
                     // registered table name as the data-schema table, backed
                     // by this schema's own scan-function implementation
@@ -1517,5 +1699,8 @@ pub fn build() -> CatalogModel {
                 tables: data_tables(),
             },
         ],
-    }
+    };
+    crate::canonical_constraints::qualify_catalog(&mut model)
+        .expect("immutable constraint fixture qualification");
+    model
 }

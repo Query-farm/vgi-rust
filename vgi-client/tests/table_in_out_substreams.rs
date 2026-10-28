@@ -122,7 +122,10 @@ fn fan_out_then_finalize(ids: [Option<Bytes>; 2], finalize_id: Option<Bytes>) ->
         let cat = client
             .attach("example", AttachOptions::default())
             .expect("attach");
-        let mut spec = BindSpec::table("substream_partial_sum").in_schema(cat.default_schema());
+        let mut spec = BindSpec::table("substream_partial_sum").in_schema(
+            cat.default_schema()
+                .expect("fixture declares a default schema"),
+        );
         spec.function_type = FunctionType::TableInOut;
         client
             .bind_with_input(&cat, &spec, &input_schema)

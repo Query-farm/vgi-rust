@@ -99,7 +99,7 @@ impl Drop for HttpWorker {
     }
 }
 
-/// One raw `vgi.v2` unary call as `bearer`; the decoded result record.
+/// One raw `vgi.v3` unary call as `bearer`; the decoded result record.
 fn call(
     url: &str,
     bearer: &str,

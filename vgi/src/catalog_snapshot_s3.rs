@@ -365,8 +365,8 @@ mod tests {
         let manifest = CatalogPublicationManifest {
             cache_key: "key".into(),
             manifest_id: "generation".into(),
-            protocol_name: "vgi.v2".into(),
-            wire_revision: "2.2".into(),
+            protocol_name: "vgi.v3".into(),
+            wire_revision: "3.0".into(),
             contract_hash: "hash".into(),
             codec_revision: "catalog-collections-1".into(),
             catalog_version: 1,

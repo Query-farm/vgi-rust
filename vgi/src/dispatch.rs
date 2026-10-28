@@ -1132,6 +1132,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
+                        projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                         lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1146,6 +1148,8 @@ impl Dispatcher {
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: Vec::new(),
+                repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1180,6 +1184,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
+                        projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                         lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1194,6 +1200,8 @@ impl Dispatcher {
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: Vec::new(),
+                repeatability: crate::table_function::BindRepeatability::Unknown,
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1228,6 +1236,8 @@ impl Dispatcher {
                             .iter()
                             .map(|l| l.scope.clone().unwrap_or_default())
                             .collect(),
+                        projection_expression_profiles: Vec::new(),
+                        repeatability: crate::table_function::BindRepeatability::Unknown,
                         lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
@@ -1237,11 +1247,15 @@ impl Dispatcher {
                 }
             }
             let bind = f.on_bind(&params)?;
+            let profiles = f.projection_expression_profiles(&params);
+            crate::projection::validate_offer(&profiles)?;
             let resp = BindResponse {
                 output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
                 opaque_data: Some(Bytes::from(bind.opaque_data)),
                 lookup_secret_types: Vec::new(),
                 lookup_scopes: Vec::new(),
+                projection_expression_profiles: profiles,
+                repeatability: f.repeatability(&params),
                 lookup_names: Vec::new(),
             };
             return Ok(Some(wire::to_result_batch(resp)?));
@@ -1267,6 +1281,8 @@ impl Dispatcher {
                         .iter()
                         .map(|l| l.scope.clone().unwrap_or_default())
                         .collect(),
+                    projection_expression_profiles: Vec::new(),
+                    repeatability: crate::table_function::BindRepeatability::Unknown,
                     lookup_names: lookups
                         .iter()
                         .map(|l| l.name.clone().unwrap_or_default())
@@ -1285,6 +1301,8 @@ impl Dispatcher {
             opaque_data: Some(Bytes::from(bind.opaque_data)),
             lookup_secret_types: Vec::new(),
             lookup_scopes: Vec::new(),
+            projection_expression_profiles: Vec::new(),
+            repeatability: crate::table_function::BindRepeatability::Unknown,
             lookup_names: Vec::new(),
         };
         Ok(Some(wire::to_result_batch(resp)?))
@@ -2382,6 +2400,16 @@ impl Dispatcher {
         // per-session scope id carried back on every request as the storage
         // scope (so two ATTACH sessions of the same catalog stay isolated).
         if let Some(sec) = self.secondary.iter().find(|c| c.name == dto.name) {
+            let agreement = sec
+                .capability_agreement
+                .map(|hook| {
+                    hook(
+                        dto.client_capabilities
+                            .as_ref()
+                            .map(|value| value.0.as_slice()),
+                    )
+                })
+                .transpose()?;
             let mut scope = self.next_execution_id();
             debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
             if let Some(hook) = &sec.attach_payload {
@@ -2394,13 +2422,16 @@ impl Dispatcher {
                 scope.extend_from_slice(&hook(options.as_ref())?);
             }
             let result = CatalogAttachResult {
+                catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
+                selected_capabilities: agreement.map(|value| value.1),
+                query_pushdown: None,
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
                 supports_transactions: true,
                 supports_time_travel: sec.supports_time_travel,
                 catalog_version_frozen: sec.catalog_version_frozen,
                 catalog_version: 1,
                 attach_opaque_data_required: true,
-                default_schema: catalog::MAIN_SCHEMA.to_string(),
+                default_schema: Some(catalog::MAIN_SCHEMA.to_string()),
                 settings: Vec::new(),
                 secret_types: Vec::new(),
                 attach_catalogs: Vec::new(),
@@ -2491,14 +2522,28 @@ impl Dispatcher {
             } else {
                 self.attach_bytes()
             };
+        let agreement = self
+            .catalog
+            .capability_agreement
+            .map(|hook| {
+                hook(
+                    dto.client_capabilities
+                        .as_ref()
+                        .map(|value| value.0.as_slice()),
+                )
+            })
+            .transpose()?;
         let result = CatalogAttachResult {
+            catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
+            selected_capabilities: agreement.map(|value| value.1),
+            query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: true,
             supports_time_travel: self.catalog.supports_time_travel,
             catalog_version_frozen: self.catalog.catalog_version_frozen,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: catalog::MAIN_SCHEMA.to_string(),
+            default_schema: Some(catalog::MAIN_SCHEMA.to_string()),
             settings: self
                 .settings
                 .iter()
@@ -3196,9 +3241,15 @@ impl Dispatcher {
                 tt.columns = v.columns.clone();
                 tt.scan_function = v.scan_function.clone();
                 tt.scan_arguments = v.scan_arguments.clone();
-                // Constraints are defined against the current schema; drop them
-                // for historical versions whose columns differ.
-                if !t.is_current_version(v.version) {
+                if let Some((constraints, revision)) = t.constraint_versions.get(&v.version) {
+                    tt.constraints = constraints.clone();
+                    tt.definition_revision = revision.clone();
+                } else if !t.is_current_version(v.version) {
+                    if !t.constraints.is_empty() {
+                        return Err(RpcError::method_not_implemented(
+                            "canonical constraints require version-specific provider snapshots",
+                        ));
+                    }
                     tt.not_null.clear();
                     tt.primary_key.clear();
                     tt.unique.clear();
@@ -3276,6 +3327,39 @@ impl Dispatcher {
     /// whole scan is one unit of work. That keeps every existing worker serving
     /// unchanged under protocol 1.4.0, so splits stay opt-in rather than
     /// something every worker must now implement.
+    pub fn handle_table_function_projection(
+        &self,
+        req: &Request,
+        ctx: &CallContext,
+    ) -> Result<Option<RecordBatch>> {
+        let bytes = req
+            .column("request")
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+            .filter(|c| c.len() == 1 && !c.is_null(0))
+            .ok_or_else(|| RpcError::type_error("projection requires one binary request"))?;
+        let raw: crate::projection::ProjectionRequest = wire::from_batch(
+            &crate::projection::record(bytes.value(0), &vgi_protocol::generated::protocol_schemas::table_function_projection_request_schema())?
+        )?;
+        let proposal = crate::projection::ProjectionProposal::decode(raw)?;
+        let mut params = self.bind_params(&proposal.bind_call, ctx)?;
+        let call = self.bind_scope(&proposal.bind_call, false, false)?;
+        let function = self.resolve_table(
+            &proposal.bind_call.function_name,
+            &params.arguments,
+            params.input_schema.as_ref(),
+            call,
+        )?;
+        params
+            .arguments
+            .remap_positional(&function.argument_specs());
+        let result = function.projection(&params, &proposal)?;
+        let result = proposal.response(result)?;
+        if ipc::write_batch(&wire::to_batch(result.clone())?)?.len() > 8 * 1024 * 1024 {
+            return Err(RpcError::value_error("projection response exceeds 8MiB"));
+        }
+        Ok(Some(wire::to_result_batch(result)?))
+    }
+
     pub fn handle_table_function_plan(
         &self,
         req: &Request,
@@ -3643,9 +3727,9 @@ impl Dispatcher {
                         _ => true,
                     })
                     .map(|m| catalog::macro_info(path, m))
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| Ok(Vec::new()))?;
         catalog::serialize_items(infos)
     }
 
@@ -5702,6 +5786,84 @@ fn normalize_function_type(t: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod canonical_constraint_version_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::generated::protocol_types::{
+        CatalogObjectRef, ConstraintDefinition, ConstraintInfo,
+    };
+
+    fn record<T: vgi_rpc::VgiArrow>(value: T) -> Bytes {
+        Bytes::from(ipc::write_batch(&wire::to_batch(value).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn current_constraint_records_are_not_reused_for_historical_snapshots() {
+        let columns = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let mut table = catalog::CatTable::new("t", columns.clone(), "scan", vec![], None, None);
+        table.time_travel = [1, 2]
+            .into_iter()
+            .map(|version| catalog::TimeTravelVersion {
+                version,
+                columns: columns.clone(),
+                scan_function: "scan".into(),
+                scan_arguments: vec![],
+                timestamp_year: Some(2020 + version as i32),
+            })
+            .collect();
+        table.constraints = vec![record(ConstraintInfo {
+            r#ref: record(CatalogObjectRef {
+                kind: "constraint".into(),
+                schema_path: vec!["main".into()],
+                name: "stable-current-key".into(),
+                owner_table: Some("t".into()),
+            }),
+            definition: record(ConstraintDefinition {
+                kind: vgi_rpc::DictString("NOT_NULL".into()),
+                column_paths: vec![vec!["a".into()]],
+                declared_name: None,
+                check_expression: None,
+                foreign_key: None,
+            }),
+            enforcement: vgi_rpc::DictString("METADATA_ONLY".into()),
+            validation: vgi_rpc::DictString("UNVALIDATED".into()),
+            referenced_constraint: None,
+        })];
+        table.definition_revision = Some(Bytes::from(b"current-revision".to_vec()));
+        for (unit, value) in [(None, None), (Some("VERSION"), Some("2"))] {
+            let current = Dispatcher::at_version(&table, unit, value).unwrap();
+            let info = catalog::table_info(&["main".into()], &current, None).unwrap();
+            assert_eq!(info.constraints[0].0, table.constraints[0].0);
+            assert_eq!(info.definition_revision.unwrap().0, b"current-revision");
+        }
+        let error = Dispatcher::at_version(&table, Some("VERSION"), Some("1"));
+        assert!(error
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("version-specific provider snapshots"));
+        table.constraint_versions.insert(
+            1,
+            (
+                Vec::new(),
+                Some(Bytes::from(b"historical-revision".to_vec())),
+            ),
+        );
+        let historical = Dispatcher::at_version(&table, Some("VERSION"), Some("1")).unwrap();
+        assert!(historical.constraints.is_empty());
+        assert_eq!(
+            historical.definition_revision.unwrap().0,
+            b"historical-revision"
+        );
+        assert!(!table.constraints.is_empty());
+        table.constraint_versions.clear();
+        // Tables without canonical claims retain ordinary historical selection.
+        table.constraints.clear();
+        assert!(Dispatcher::at_version(&table, Some("VERSION"), Some("1")).is_ok());
+    }
+}
+
+#[cfg(test)]
 #[path = "window_cache_tests.rs"]
 mod window_partition_tests;
 
@@ -7258,6 +7420,86 @@ mod catalog_contents_tests {
         let primary = attach_named(&d, "cat");
         assert!(primary.supports_catalog_contents);
         assert!(!primary.catalog_version_frozen);
+    }
+
+    #[test]
+    fn declarative_capability_agreement_receives_offer_and_forwards_both_results() {
+        fn agreement(client: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
+            let client: ClientCapabilities = wire::from_batch(&ipc::read_batch(
+                client.ok_or_else(|| RpcError::value_error("missing offer"))?,
+            )?)?;
+            assert_eq!(client.engine, "test-client");
+            let selected = client
+                .catalog
+                .ok_or_else(|| RpcError::value_error("missing catalog offer"))?;
+            Ok((selected.clone(), selected))
+        }
+        let mut d = dispatcher();
+        d.catalog.capability_agreement = Some(agreement);
+        d.register_secondary_catalog(
+            catalog::CatalogModel {
+                name: "secondary".into(),
+                capability_agreement: Some(agreement),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let capabilities = Bytes::from(
+            ipc::write_batch(
+                &wire::to_batch(
+                    vgi_protocol::generated::protocol_types::CatalogCapabilities {
+                        read: vec!["vgi.constraint.records.read.v1".into()],
+                        ddl: vec![],
+                        write: vec![],
+                        transaction: vec![],
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let client = Bytes::from(
+            ipc::write_batch(
+                &wire::to_batch(ClientCapabilities {
+                    engine: "test-client".into(),
+                    native_formats: vec![],
+                    catalogs: vec![],
+                    can_stream: true,
+                    filter_encodings: vec![],
+                    catalog: Some(capabilities.clone()),
+                    query_pushdown: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        for name in ["cat", "secondary"] {
+            let make_request = |offer| {
+                let inner = wire::to_batch(CatalogAttachRequest {
+                    name: name.into(),
+                    options: None,
+                    data_version_spec: None,
+                    implementation_version: None,
+                    client_capabilities: offer,
+                })
+                .unwrap();
+                request(
+                    "catalog_attach",
+                    wire::to_batch(p::CatalogAttachParams {
+                        request: Bytes::from(ipc::write_batch(&inner).unwrap()),
+                    })
+                    .unwrap(),
+                )
+            };
+            let result = d
+                .handle_catalog_attach(&make_request(Some(client.clone())))
+                .unwrap()
+                .unwrap();
+            let attached: CatalogAttachResult = wire::from_batch(&inner(result)).unwrap();
+            assert_eq!(attached.catalog_capabilities.unwrap().0, capabilities.0);
+            assert_eq!(attached.selected_capabilities.unwrap().0, capabilities.0);
+            assert!(d.handle_catalog_attach(&make_request(None)).is_err());
+        }
     }
 
     struct NoRows(&'static str);

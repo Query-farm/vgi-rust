@@ -10,13 +10,14 @@ mod more;
 mod order_modes;
 pub mod partition;
 mod proj_repro;
+mod projection;
 mod rff;
 mod settings_fixtures;
 pub mod splits;
-mod static_scan;
+pub(crate) mod static_scan;
 pub mod tt_pushdown;
 mod typed_probe;
-mod versioned_scan;
+pub(crate) mod versioned_scan;
 
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use vgi_rpc::{Result, RpcError};
 /// Register all table fixtures. `catalog_name` gates catalog-specific scans.
 pub fn register(w: &mut vgi::Worker, catalog_name: &str) {
     w.register_table(SequenceFunction);
+    w.register_table(projection::ProjectionSequence);
     w.register_table(NestedSequenceFunction);
     w.register_table(TxCachedValueFunction);
     w.register_table(ProfilingDemoFunction);

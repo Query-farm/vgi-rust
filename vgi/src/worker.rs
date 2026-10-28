@@ -372,7 +372,7 @@ impl Worker {
         self.disp.register_attach_catalog(info);
     }
 
-    /// Host additional application protocols beside `vgi.v2`.
+    /// Host additional application protocols beside `vgi.v3`.
     ///
     /// `hook` returns the protocols -- each a
     /// [`HostedProtocol`]: a name, an optional
@@ -382,13 +382,13 @@ impl Worker {
     /// environment; what it returns is then fixed for the life of the process
     /// and hosted on **every** transport the worker serves (stdio, unix, TCP,
     /// the Iroh upstream, HTTP and the SAB/wasm path), listed by reflection
-    /// after `vgi.v2` in the order returned.
+    /// after `vgi.v3` in the order returned.
     ///
     /// Requests route on their `vgi_rpc.protocol` key with no fallback, so an
-    /// added protocol cannot change how `vgi.v2` (the DuckDB extension's
-    /// protocol) dispatches -- even when its method names repeat `vgi.v2`'s.
+    /// added protocol cannot change how `vgi.v3` (the DuckDB extension's
+    /// protocol) dispatches -- even when its method names repeat `vgi.v3`'s.
     ///
-    /// A returned name that is malformed, repeats another, is `vgi.v2`, or
+    /// A returned name that is malformed, repeats another, is `vgi.v3`, or
     /// claims the reserved `vgi_rpc.` prefix stops the worker at startup with
     /// an error naming this hook. Framework protocols are never supplied here:
     /// reflection is always hosted, and `vgi_rpc.Identity.v2` is enabled with
@@ -410,7 +410,7 @@ impl Worker {
     ///     ))]
     /// });
     /// let server = worker.build_server();
-    /// assert_eq!(server.hosted_protocol_names()[..2], ["vgi.v2", "example.Health.v1"]);
+    /// assert_eq!(server.hosted_protocol_names()[..2], ["vgi.v3", "example.Health.v1"]);
     /// ```
     pub fn hosted_protocols(
         &mut self,
@@ -537,7 +537,7 @@ impl Worker {
 
     /// Build the configured [`RpcServer`] for `transport`.
     ///
-    /// The one construction path every transport uses: `vgi.v2`, then the
+    /// The one construction path every transport uses: `vgi.v3`, then the
     /// [`hosted_protocols`](Self::hosted_protocols) (every transport), then
     /// `vgi_rpc.Reflection.v1` (every transport), then -- on HTTP, when opted
     /// in -- `vgi_rpc.Identity.v2`.
@@ -1160,7 +1160,7 @@ mod hosting_tests {
     }
 
     #[test]
-    fn the_hook_is_called_once_and_hosted_after_vgi_v2() {
+    fn the_hook_is_called_once_and_hosted_after_vgi_v3() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let mut worker = Worker::new();
@@ -1171,7 +1171,7 @@ mod hosting_tests {
         let server = worker.build_server_for(ServeTransport::Unix);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let names = server.hosted_protocol_names();
-        assert_eq!(names[..3], ["vgi.v2", "example.A.v1", "example.B.v1"]);
+        assert_eq!(names[..3], ["vgi.v3", "example.A.v1", "example.B.v1"]);
         assert!(names.contains(&vgi_rpc::reflection::REFLECTION_PROTOCOL_NAME));
     }
 
@@ -1265,7 +1265,7 @@ mod hosting_tests {
         assert_eq!(
             names[..3],
             [
-                "vgi.v2",
+                "vgi.v3",
                 "example.A.v1",
                 crate::attach_ticket::ATTACH_TICKETS_PROTOCOL_NAME
             ]

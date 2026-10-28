@@ -506,6 +506,58 @@ pub fn read_copy_to(batch: &arrow_array::RecordBatch) -> Result<Option<CopyToCon
     }
 }
 
+/// Equivalent scans of one exact bound state within a query. This does not
+/// promise identical independent binds or later queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BindRepeatability {
+    #[default]
+    Unknown,
+    StableWithinQuery,
+}
+
+impl VgiArrow for BindRepeatability {
+    fn arrow_data_type() -> arrow_schema::DataType {
+        DictString::arrow_data_type()
+    }
+    fn describe_name() -> String {
+        DictString::describe_name()
+    }
+    fn read(arr: &dyn arrow_array::Array, idx: usize) -> Result<Self> {
+        if arr.is_null(idx) || arr.data_type() != &Self::arrow_data_type() {
+            return Err(RpcError::type_error(
+                "repeatability requires a nonnull dictionary enum",
+            ));
+        }
+        let dictionary = arr
+            .as_any()
+            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int16Type>>()
+            .ok_or_else(|| RpcError::type_error("invalid repeatability dictionary"))?;
+        let key = dictionary.keys().value(idx);
+        if key < 0
+            || key as usize >= dictionary.values().len()
+            || dictionary.values().is_null(key as usize)
+        {
+            return Err(RpcError::type_error(
+                "NULL or invalid repeatability dictionary value",
+            ));
+        }
+        match DictString::read(arr, idx)?.0.as_str() {
+            "UNKNOWN" => Ok(Self::Unknown),
+            "STABLE_WITHIN_QUERY" => Ok(Self::StableWithinQuery),
+            _ => Err(RpcError::value_error("invalid bind repeatability")),
+        }
+    }
+    fn build_singleton(value: Self) -> Result<arrow_array::ArrayRef> {
+        DictString::build_singleton(DictString(
+            match value {
+                Self::Unknown => "UNKNOWN",
+                Self::StableWithinQuery => "STABLE_WITHIN_QUERY",
+            }
+            .into(),
+        ))
+    }
+}
+
 /// `BindResponse` — flat result of `bind`.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct BindResponse {
@@ -514,6 +566,8 @@ pub struct BindResponse {
     pub lookup_secret_types: Vec<String>,
     pub lookup_scopes: Vec<String>,
     pub lookup_names: Vec<String>,
+    pub projection_expression_profiles: Vec<String>,
+    pub repeatability: BindRepeatability,
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +793,7 @@ pub struct ScanSplit {
 ///
 /// Field order is the reference's (`execution_id`, `opaque_data`,
 /// `max_workers`): `init` declares this as its header schema, which the
-/// `vgi.v2` protocol hash covers, so the emitted header must match it.
+/// `vgi.v3` protocol hash covers, so the emitted header must match it.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct GlobalInitResponse {
     pub execution_id: Bytes,
@@ -770,6 +824,8 @@ pub struct ClientCapabilities {
     pub catalogs: Vec<String>,
     pub can_stream: bool,
     pub filter_encodings: Vec<String>,
+    pub catalog: Option<Bytes>,
+    pub query_pushdown: Option<crate::generated::protocol_types::ClientQueryCapabilities>,
 }
 
 /// Request for `table_function_cardinality` / `table_function_statistics`
@@ -1131,6 +1187,7 @@ pub struct SchemaInfo {
     pub tags: StrMap,
     pub path: SchemaPath,
     pub estimated_object_count: Option<IntMap>,
+    pub options: Option<Bytes>,
 }
 
 /// One `examples` entry of `FunctionInfo`.
@@ -1167,11 +1224,8 @@ pub struct TableInfo {
     pub schema_path: SchemaPath,
     /// IPC-serialized Arrow schema of the table columns.
     pub columns: Bytes,
-    pub not_null_constraints: Vec<i32>,
-    pub unique_constraints: Vec<Vec<i32>>,
-    pub check_constraints: Vec<String>,
-    pub primary_key_constraints: Vec<Vec<i32>>,
-    pub foreign_key_constraints: Vec<Bytes>,
+    pub constraints: Vec<Bytes>,
+    pub definition_revision: Option<Bytes>,
     /// Maximum result mode for each supported operation. Missing means unsupported;
     /// values are ordered `count < rows < changes`.
     pub write_result_modes: StrMap,
@@ -1189,12 +1243,12 @@ pub struct TableInfo {
     pub cardinality_max: InlineI64,
     pub column_statistics: Option<Bytes>,
     pub bind_result: Option<Bytes>,
-    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
-    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
-    /// A group is satisfied when any one of its member paths has a WHERE filter;
-    /// every group must be satisfied. Empty = no enforcement. Wire type
-    /// `list<list<utf8>>`. Trailing field of the C++ protocol's TableInfo.
-    pub required_filters: Vec<Vec<String>>,
+    /// AND-of-OR groups of raw component paths (`list<list<list<utf8>>>`).
+    /// Dots and quotes are literal; prefix satisfaction compares components.
+    /// A child does not satisfy its parent. Empty means no requirements.
+    pub required_filters: Vec<Vec<Vec<String>>>,
+    pub options: Option<Bytes>,
+    pub layout: Option<Bytes>,
 }
 
 /// `ViewInfo` item.
@@ -1206,6 +1260,8 @@ pub struct ViewInfo {
     pub schema_path: SchemaPath,
     pub definition: String,
     pub column_comments: StrMap,
+    pub aliases: Vec<String>,
+    pub security: String,
 }
 
 /// `MacroInfo` item.
@@ -1216,18 +1272,8 @@ pub struct MacroInfo {
     pub name: String,
     pub schema_path: SchemaPath,
     pub macro_type: DictString,
-    pub parameters: Vec<String>,
-    pub parameter_default_values: Option<Bytes>,
-    pub definition: String,
-    /// Optional Arrow schema (IPC bytes) with one nullable field per parameter,
-    /// in `parameters` order. Each field's type is the parameter's default value
-    /// type when known (else null), and the `vgi_doc` field metadata key carries
-    /// the parameter's description (UTF-8, presence-only — omitted when
-    /// undocumented). Mirrors the per-argument doc channel functions expose via
-    /// `FunctionInfo.arguments`. Empty means the worker supplied no per-parameter
-    /// docs (older workers); readers fall back to `parameters` for names. Appended
-    /// last for consistency with the reference wire contract.
-    pub arguments_schema: Option<Bytes>,
+    /// The complete canonical overload family, in declaration order.
+    pub overloads: Vec<crate::generated::protocol_types::MacroOverload>,
 }
 
 /// `IndexInfo` item (`catalog_schema_contents_indexes`, and
@@ -1238,12 +1284,10 @@ pub struct IndexInfo {
     pub tags: StrMap,
     pub name: String,
     pub schema_path: SchemaPath,
-    pub table_name: String,
-    pub index_type: String,
-    /// `UNIQUE` / `PRIMARY` / `FOREIGN` / `NONE` — dictionary-encoded on the wire.
-    pub constraint_type: DictString,
-    pub expressions: Vec<String>,
-    pub options: StrMap,
+    /// Complete canonical IndexDefinition IPC, without interpreting SQL or options.
+    pub definition: Bytes,
+    /// Effective typed options and explicit override names (OptionState IPC).
+    pub options: Bytes,
 }
 
 /// Boxed request of `catalog_table_create` (`CREATE TABLE` on a DDL-capable
@@ -1256,12 +1300,12 @@ pub struct TableCreateRequest {
     pub columns: Bytes,
     /// `error` / `ignore` / `replace` — dictionary-encoded on the wire.
     pub on_conflict: DictString,
-    pub not_null_constraints: Vec<i32>,
-    pub unique_constraints: Vec<Vec<i32>>,
-    pub check_constraints: Vec<String>,
-    pub primary_key_constraints: Vec<Vec<i32>>,
-    pub foreign_key_constraints: Vec<Bytes>,
+    pub constraint_definitions: Vec<Bytes>,
     pub transaction_opaque_data: Option<Bytes>,
+    pub comment: Option<String>,
+    pub tags: Option<StrMap>,
+    pub options: Option<Bytes>,
+    pub layout: Option<Bytes>,
 }
 
 /// `ScanFunctionResult` — names the table function that scans a catalog table.

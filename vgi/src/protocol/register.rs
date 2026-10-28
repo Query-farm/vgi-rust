@@ -1,6 +1,6 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Host `vgi.v2` on an [`RpcServer`]: the [`Dispatcher`]'s implementation of the
+//! Host `vgi.v3` on an [`RpcServer`]: the [`Dispatcher`]'s implementation of the
 //! generated [`VgiService`] trait.
 //!
 //! The method table itself — every method's name, method type and params /
@@ -25,9 +25,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
     super::vgi_service::register(srv, disp);
 }
 
-/// `vgi.v2` methods this SDK registers but does not implement.
+/// `vgi.v3` methods this SDK registers but does not implement.
 ///
-/// The protocol is the unit of optionality: every SDK hosts every `vgi.v2`
+/// The protocol is the unit of optionality: every SDK hosts every `vgi.v3`
 /// method with the reference's schemas, so reflection reports one protocol
 /// hash everywhere. These keep the generated [`VgiService`] default and
 /// answer every call with `UNIMPLEMENTED` / `method_not_implemented` -- never
@@ -36,6 +36,9 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
 /// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
 /// table; this port's catalogs are read-only for DML.
 pub const UNIMPLEMENTED_METHODS: &[&str] = &[
+    "catalog_dependencies",
+    "catalog_index_option_definitions",
+    "catalog_table_constraints_apply",
     "catalog_table_insert_function_get",
     "catalog_table_update_function_get",
     "catalog_table_delete_function_get",
@@ -152,6 +155,7 @@ impl VgiService for Dispatcher {
         table_function_statistics => handle_table_function_statistics,
         table_function_cardinality => handle_table_function_cardinality,
         table_function_plan => handle_table_function_plan,
+        table_function_projection => handle_table_function_projection,
     }
     opened_rpcs! {
         table_function_dynamic_to_string => handle_table_function_dynamic_to_string,
@@ -183,6 +187,7 @@ impl VgiService for Dispatcher {
         catalog_view_drop => handle_read_only,
         catalog_view_rename => handle_read_only,
         catalog_view_comment_set => handle_read_only,
+        catalog_view_column_comment_set => handle_read_only,
         catalog_macro_create => handle_read_only,
         catalog_macro_drop => handle_read_only,
         catalog_index_create => handle_read_only,

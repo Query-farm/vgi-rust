@@ -365,6 +365,32 @@ fn per_schema_snapshots_and_transactions_do_not_use_catalog_contents() {
     assert!(example.transaction().is_some());
     p.take();
     let txn = p.client.load_catalog(&example, None).expect("load in txn");
+    // The immutable fixture validates its actual scan rows before publication.
+    let data = txn.schema(&path(&["data"])).expect("data schema");
+    let departments = data
+        .tables
+        .iter()
+        .find(|table| table.name == "departments")
+        .expect("departments");
+    assert_eq!(
+        departments.definition_revision.as_ref().unwrap().0,
+        b"immutable-fixture:v1"
+    );
+    let info: vgi_protocol::generated::protocol_types::ConstraintInfo =
+        vgi_protocol::wire::from_batch(
+            &vgi_protocol::ipc::read_batch(&departments.constraints[0].0).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(info.enforcement.0, "ENFORCED");
+    assert_eq!(info.validation.0, "ALL_ROWS");
+    let reference: vgi_protocol::generated::protocol_types::CatalogObjectRef =
+        vgi_protocol::wire::from_batch(&vgi_protocol::ipc::read_batch(&info.r#ref.0).unwrap())
+            .unwrap();
+    assert_eq!(reference.name, "fixture.departments.primary");
+    let columns = vgi_protocol::ipc::read_schema(&departments.columns.0).unwrap();
+    assert!(!columns.field_with_name("id").unwrap().is_nullable());
+    assert!(!columns.field_with_name("name").unwrap().is_nullable());
+    assert!(columns.field_with_name("budget").unwrap().is_nullable());
     let calls = p.take();
     assert_eq!(count(&calls, "catalog_contents"), 0, "{calls:?}");
     assert!(per_schema(&calls) > 0);

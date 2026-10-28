@@ -893,6 +893,7 @@ pub fn schema_info(
     _attach_opaque_data: &[u8],
 ) -> SchemaInfo {
     SchemaInfo {
+        options: None,
         comment: comment.map(|s| s.to_string()),
         tags: Vec::new(),
         path: path.to_vec(),
@@ -908,9 +909,16 @@ pub fn schema_info(
 pub type AttachPayloadHook =
     std::sync::Arc<dyn Fn(Option<&arrow_array::RecordBatch>) -> Result<Vec<u8>> + Send + Sync>;
 
+/// Provider callback selecting available and agreed capability records from an offer.
+pub type CapabilityAgreementHook = fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>;
+
 /// A declarative catalog: named schemas with views, macros, and tables.
 #[derive(Default, Clone)]
 pub struct CatalogModel {
+    /// Provider-owned capability selection from the client's serialized offer.
+    /// The returned records are available and selected CatalogCapabilities IPC;
+    /// selected profiles must be offered, supported and include prerequisites.
+    pub capability_agreement: Option<CapabilityAgreementHook>,
     /// Catalog name advertised by `catalog_catalogs` (discovery).
     pub name: String,
     pub schemas: Vec<CatSchema>,
@@ -1106,17 +1114,35 @@ pub struct CatSchema {
     pub tables: Vec<CatTable>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct CatView {
     pub name: String,
     pub definition: String,
+    pub aliases: Vec<String>,
+    pub security: String,
     pub comment: Option<String>,
     pub tags: Vec<(String, String)>,
     pub column_comments: Vec<(String, String)>,
 }
 
+impl Default for CatView {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            definition: String::new(),
+            aliases: Vec::new(),
+            security: "regular".into(),
+            comment: None,
+            tags: Vec::new(),
+            column_comments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct CatMacro {
+    /// Complete family; simple descriptor fields must be empty when supplied.
+    pub overloads: Option<Vec<vgi_protocol::generated::protocol_types::MacroOverload>>,
     pub name: String,
     pub parameters: Vec<String>,
     pub definition: String,
@@ -1135,6 +1161,12 @@ pub struct CatMacro {
 /// A function-backed catalog table: scanned by `scan_function(scan_args)`.
 #[derive(Clone)]
 pub struct CatTable {
+    /// Explicit canonical ConstraintInfo IPC records, with provider-owned identities.
+    pub constraints: Vec<Bytes>,
+    pub definition_revision: Option<Bytes>,
+    /// Authoritative canonical records and revision for each historical version.
+    /// Missing entries never reuse current constraints for an older snapshot.
+    pub constraint_versions: HashMap<i64, (Vec<Bytes>, Option<Bytes>)>,
     pub name: String,
     pub columns: SchemaRef,
     pub scan_function: String,
@@ -1166,13 +1198,10 @@ pub struct CatTable {
     /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
     /// matching the request's `at_value` (or the highest version when absent).
     pub time_travel: Vec<TimeTravelVersion>,
-    /// Required WHERE-filter groups in conjunctive normal form (CNF): an AND
-    /// (outer list) of OR-groups (inner lists) of dotted-path column references.
-    /// A group is satisfied when any one of its member paths carries a WHERE
-    /// filter; every group must be satisfied. A single-path group is a plain
-    /// mandatory filter; a multi-path group `["ticker", "cik"]` means "one of".
-    /// Empty = no enforcement. Surfaced in `TableInfo.required_filters`.
-    pub required_filters: Vec<Vec<String>>,
+    /// AND-of-OR groups of raw component paths (`list<list<list<utf8>>>`).
+    /// Dots and quotes are literal; prefix satisfaction compares components.
+    /// A child does not satisfy its parent. Empty means no requirements.
+    pub required_filters: Vec<Vec<Vec<String>>>,
     /// Accept `AT` clauses even without declared `time_travel` versions: the
     /// backing function reads the AT clause itself (carried on the bind request)
     /// rather than the catalog resolving it to a version. Mirrors the Python
@@ -1193,6 +1222,9 @@ pub struct CatTable {
 impl Default for CatTable {
     fn default() -> Self {
         Self {
+            constraints: Vec::new(),
+            definition_revision: None,
+            constraint_versions: HashMap::new(),
             name: String::new(),
             columns: std::sync::Arc::new(arrow_schema::Schema::empty()),
             scan_function: String::new(),
@@ -1371,6 +1403,9 @@ impl CatTable {
         cardinality: Option<i64>,
     ) -> Self {
         CatTable {
+            constraints: Vec::new(),
+            definition_revision: None,
+            constraint_versions: HashMap::new(),
             name: name.to_string(),
             columns,
             scan_function: scan_function.to_string(),
@@ -1454,6 +1489,8 @@ pub fn view_info(schema_path: &[String], v: &CatView) -> crate::protocol::dtos::
         schema_path: schema_path.to_vec(),
         definition: v.definition.clone(),
         column_comments: v.column_comments.clone(),
+        aliases: v.aliases.clone(),
+        security: v.security.clone(),
     }
 }
 
@@ -1480,32 +1517,42 @@ pub fn scan_function_result(
     })
 }
 
-/// Validate a table's `required_filters` (CNF). Each OR-group must be
-/// non-empty, must contain no empty strings, and the leading dotted segment of
-/// every path must name a real column on the table. Struct subfield validity is
-/// left to DuckDB's binder (the descriptor doesn't unpack STRUCT subfields).
+/// Validate every raw path against the complete schema, without name rewriting.
 fn validate_required_filters(
     name: &str,
     columns: &SchemaRef,
-    required_filters: &[Vec<String>],
+    required_filters: &[Vec<Vec<String>>],
 ) -> Result<()> {
+    let invalid = |message: &str| {
+        vgi_rpc::RpcError::value_error(format!("Table '{name}': required_filters {message}"))
+    };
     for group in required_filters {
         if group.is_empty() {
-            return Err(vgi_rpc::RpcError::value_error(format!(
-                "Table '{name}': required_filters must not contain empty groups"
-            )));
+            return Err(invalid("must not contain empty groups"));
         }
+        let mut seen = std::collections::HashSet::new();
         for path in group {
             if path.is_empty() {
-                return Err(vgi_rpc::RpcError::value_error(format!(
-                    "Table '{name}': required_filters must not contain empty strings"
-                )));
+                return Err(invalid("must not contain empty paths"));
             }
-            let head = path.split('.').next().unwrap_or(path);
-            if columns.field_with_name(head).is_err() {
-                return Err(vgi_rpc::RpcError::value_error(format!(
-                    "Table '{name}': required_filters path '{path}' references unknown column '{head}'"
-                )));
+            if !seen.insert(path) {
+                return Err(invalid("contains duplicate paths"));
+            }
+            let mut fields = columns.fields();
+            for (i, part) in path.iter().enumerate() {
+                if part.is_empty() || part.contains('\0') {
+                    return Err(invalid("must not contain empty strings or NUL"));
+                }
+                let matches: Vec<_> = fields.iter().filter(|f| f.name() == part).collect();
+                if matches.len() != 1 {
+                    return Err(invalid("references unknown column or ambiguous component"));
+                }
+                if i + 1 < path.len() {
+                    match matches[0].data_type() {
+                        arrow_schema::DataType::Struct(children) => fields = children,
+                        _ => return Err(invalid("has a non-struct parent")),
+                    }
+                }
             }
         }
     }
@@ -1518,6 +1565,18 @@ pub fn table_info(
     scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
+    crate::column_metadata::validate_column_metadata(&t.columns)?;
+    crate::column_expressions::validate(&t.columns, schema_path, true)?;
+    if !t.not_null.is_empty()
+        || !t.unique.is_empty()
+        || !t.primary_key.is_empty()
+        || !t.check.is_empty()
+        || !t.foreign_keys.is_empty()
+    {
+        return Err(vgi_rpc::RpcError::method_not_implemented(
+            "legacy constraint metadata requires explicit canonical records",
+        ));
+    }
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
     //
@@ -1543,15 +1602,8 @@ pub fn table_info(
         name: t.name.clone(),
         schema_path: schema_path.to_vec(),
         columns: Bytes::from(ipc::write_schema_ref(&t.columns)?),
-        not_null_constraints: t.not_null.clone(),
-        unique_constraints: t.unique.clone(),
-        check_constraints: t.check.clone(),
-        primary_key_constraints: t.primary_key.clone(),
-        foreign_key_constraints: t
-            .foreign_keys
-            .iter()
-            .map(|fk| Ok(Bytes::from(serialize_foreign_key(schema_path, fk)?)))
-            .collect::<Result<Vec<_>>>()?,
+        constraints: t.constraints.clone(),
+        definition_revision: t.definition_revision.clone(),
         write_result_modes: Vec::new(),
         supports_column_statistics: !t.statistics.is_empty(),
         scan_function: Some(Bytes::from(scan)),
@@ -1563,12 +1615,114 @@ pub fn table_info(
         required_filters: t.required_filters.clone(),
         column_statistics: Some(Bytes::from(Vec::new())),
         bind_result: Some(Bytes::from(Vec::new())),
+
+        options: None,
+        layout: None,
     })
 }
 
 /// Build a `MacroInfo` DTO.
-pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos::MacroInfo {
-    crate::protocol::dtos::MacroInfo {
+pub fn macro_info(
+    schema_path: &[String],
+    m: &CatMacro,
+) -> Result<crate::protocol::dtos::MacroInfo> {
+    use vgi_protocol::generated::protocol_types::{
+        MacroOverload, MacroParameter, QueryEvaluationContext,
+    };
+    let kind = if m.table_macro { "table" } else { "scalar" };
+    let invalid = |message: &str| vgi_rpc::RpcError::value_error(message);
+    let overloads = if let Some(family) = &m.overloads {
+        if family.is_empty()
+            || !m.parameters.is_empty()
+            || !m.definition.is_empty()
+            || !m.defaults.is_empty()
+            || !m.parameter_docs.is_empty()
+        {
+            return Err(invalid(
+                "a nonempty macro family cannot coexist with simple-definition fields",
+            ));
+        }
+        for overload in family {
+            if overload.schema_path != schema_path || overload.macro_type != kind {
+                return Err(invalid(
+                    "macro overload owner and kind must equal parent macro",
+                ));
+            }
+            if overload
+                .parameters
+                .iter()
+                .any(|p| p.default_expression.is_some())
+            {
+                return Err(invalid("discovery macro defaults must be resolved values"));
+            }
+        }
+        family.clone()
+    } else {
+        if m.definition.trim().is_empty() || m.definition.contains('\0') {
+            return Err(invalid("macro definition must be nonempty SQL without NUL"));
+        }
+        for (name, _) in m
+            .defaults
+            .iter()
+            .map(|(name, _)| (name, ()))
+            .chain(m.parameter_docs.iter().map(|(name, _)| (name, ())))
+        {
+            if !m.parameters.contains(name) {
+                return Err(invalid("unknown macro parameter"));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_default = false;
+        let mut parameters = Vec::new();
+        for name in &m.parameters {
+            if name.is_empty() || name.contains('\0') || !seen.insert(name.to_ascii_lowercase()) {
+                return Err(invalid("invalid or duplicate macro parameter"));
+            }
+            let defaults: Vec<_> = m
+                .defaults
+                .iter()
+                .filter(|(n, _)| n == name)
+                .cloned()
+                .collect();
+            if defaults.len() > 1 {
+                return Err(invalid("duplicate macro default"));
+            }
+            if seen_default && defaults.is_empty() {
+                return Err(invalid("required parameter cannot follow a default"));
+            }
+            seen_default |= !defaults.is_empty();
+            parameters.push(MacroParameter {
+                name: name.clone(),
+                declared_type: None,
+                default_value: if defaults.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::from(build_macro_defaults(&defaults)?))
+                },
+                default_expression: None,
+                documentation: m
+                    .parameter_docs
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone()),
+            });
+        }
+        vec![MacroOverload {
+            parameters,
+            definition: m.definition.clone(),
+            profile: "duckdb.macro.v1".into(),
+            schema_path: schema_path.to_vec(),
+            macro_type: kind.into(),
+            evaluation_context: QueryEvaluationContext {
+                timezone: "UTC".into(),
+                collation: "binary".into(),
+                default_order: "asc".into(),
+                default_null_order: "nulls_last".into(),
+                preserve_insertion_order: true,
+            },
+        }]
+    };
+    Ok(crate::protocol::dtos::MacroInfo {
         comment: m.comment.clone(),
         tags: Vec::new(),
         name: m.name.clone(),
@@ -1578,24 +1732,17 @@ pub fn macro_info(schema_path: &[String], m: &CatMacro) -> crate::protocol::dtos
         } else {
             enums::macro_type::SCALAR
         }),
-        parameters: m.parameters.clone(),
-        parameter_default_values: Some(Bytes::from(
-            build_macro_defaults(&m.defaults).unwrap_or_default(),
-        )),
-        definition: m.definition.clone(),
-        arguments_schema: Some(Bytes::from(
-            build_macro_arguments_schema(m).unwrap_or_default(),
-        )),
-    }
+        overloads,
+    })
 }
 
-/// Build a macro `arguments_schema`: one nullable Arrow field per parameter, in
+/// Build a local documentation schema: one nullable Arrow field per parameter, in
 /// `parameters` order. A parameter's field type is the type of its default value
 /// when one is known (else `Null`). The per-parameter description rides as
 /// `vgi_doc` field metadata (UTF-8, presence-only — the key is omitted entirely
 /// when there is no doc), the exact same mechanism functions use for per-argument
-/// docs. Returns empty IPC bytes when the macro has no parameters and no docs,
-/// so older readers are unaffected.
+/// docs. This helper is for local presentation only: catalog discovery and CREATE
+/// use canonical overload parameters. Returns empty IPC bytes for no parameters.
 pub fn build_macro_arguments_schema(m: &CatMacro) -> Result<Vec<u8>> {
     // Nothing to carry: no parameters and no docs -> emit nothing.
     if m.parameters.is_empty() && m.parameter_docs.is_empty() {
@@ -1928,7 +2075,7 @@ mod tests {
                 table_macro,
                 ..Default::default()
             };
-            let items = serialize_items(vec![macro_info(&path("main"), &m)]).unwrap();
+            let items = serialize_items(vec![macro_info(&path("main"), &m).unwrap()]).unwrap();
             assert_eq!(wire_enum(&items[0], "macro_type"), wire);
         }
     }
@@ -2101,6 +2248,7 @@ mod tests {
 
     fn macro_with_docs() -> CatMacro {
         CatMacro {
+            overloads: None,
             name: "vgi_clamp".to_string(),
             parameters: vec!["val".to_string(), "lo".to_string(), "hi".to_string()],
             definition: "GREATEST(lo, LEAST(hi, val))".to_string(),
@@ -2178,30 +2326,23 @@ mod tests {
     }
 
     #[test]
-    fn test_macro_info_appends_arguments_schema_with_docs() {
-        let info = macro_info(&path("main"), &macro_with_docs());
-        // arguments_schema is populated for a documented macro.
-        let arguments_schema = info
-            .arguments_schema
-            .as_ref()
-            .expect("arguments_schema column present");
-        assert!(!arguments_schema.0.is_empty());
-        let decoded =
-            ipc::read_schema(&arguments_schema.0).expect("read MacroInfo.arguments_schema");
-        assert_eq!(decoded.fields().len(), 3);
+    fn test_macro_info_preserves_canonical_parameter_docs() {
+        let info = macro_info(&path("main"), &macro_with_docs()).unwrap();
+        assert_eq!(info.overloads.len(), 1);
+        let overload = &info.overloads[0];
         assert_eq!(
-            decoded
-                .field(0)
-                .metadata()
-                .get("vgi_doc")
-                .map(String::as_str),
-            Some("Value to clamp"),
+            overload.parameters[0].documentation.as_deref(),
+            Some("Value to clamp")
         );
+        assert!(overload.parameters[1].declared_type.is_none());
+        assert!(overload.parameters[1].default_value.is_some());
+        assert_eq!(overload.schema_path, path("main"));
     }
 
     #[test]
     fn test_macro_arguments_schema_empty_when_no_params_and_no_docs() {
         let m = CatMacro {
+            overloads: None,
             name: "no_args".to_string(),
             parameters: vec![],
             definition: "42".to_string(),
@@ -2215,17 +2356,11 @@ mod tests {
             bytes.is_empty(),
             "macro with no parameters and no docs emits empty arguments_schema",
         );
-        // And the DTO carries empty bytes (older readers unaffected).
-        let info = macro_info(&path("main"), &m);
-        assert!(info
-            .arguments_schema
-            .as_ref()
-            .expect("arguments_schema column present")
-            .0
-            .is_empty());
+        let info = macro_info(&path("main"), &m).unwrap();
+        assert!(info.overloads[0].parameters.is_empty());
     }
 
-    fn ab_table(required: Vec<Vec<String>>) -> CatTable {
+    fn ab_table(required: Vec<Vec<Vec<String>>>) -> CatTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, true),
             Field::new("b", DataType::Int64, true),
@@ -2236,25 +2371,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_constraints_are_not_silently_converted() {
+        let mut table = ab_table(vec![]);
+        table.not_null = vec![0];
+        assert!(table_info(&path("data"), &table, None).is_err());
+        table.not_null.clear();
+        table.constraints = vec![Bytes::from(vec![1, 2])];
+        table.definition_revision = Some(Bytes::from(vec![0, 255]));
+        let info = table_info(&path("data"), &table, None).unwrap();
+        assert_eq!(info.constraints[0].0, vec![1, 2]);
+        assert_eq!(info.definition_revision.unwrap().0, vec![0, 255]);
+    }
+
+    #[test]
     fn test_required_filters_cnf_wire_roundtrip() {
         use crate::protocol::dtos::TableInfo;
         // A CNF requirement: (a AND one-of(a,b)) — a singleton group plus a
         // genuine OR-group. Verifies the trailing `required_filters` field
-        // survives the list<list<utf8>> wire round-trip intact.
+        // survives the list<list<list<utf8>>> wire round-trip intact.
         let t = ab_table(vec![
-            vec!["a".to_string()],
-            vec!["a".to_string(), "b".to_string()],
+            vec![vec!["a".to_string()]],
+            vec![vec!["a".to_string()], vec!["b".to_string()]],
         ]);
         let info = table_info(&path("data"), &t, None).expect("table_info");
         assert_eq!(
             info.required_filters,
             vec![
-                vec!["a".to_string()],
-                vec!["a".to_string(), "b".to_string()]
+                vec![vec!["a".to_string()]],
+                vec![vec!["a".to_string()], vec!["b".to_string()]]
             ]
         );
 
-        // The wire schema for the field must be list<list<utf8>>.
+        // The wire schema for the field must be list<list<list<utf8>>>.
         let dt = TableInfo::arrow_data_type();
         let arrow_schema::DataType::Struct(fields) = dt else {
             panic!("TableInfo is not a struct");
@@ -2263,14 +2411,20 @@ mod tests {
             .iter()
             .find(|f| f.name() == "required_filters")
             .expect("required_filters field present");
-        assert_eq!(rf, fields.last().unwrap(), "must be the trailing field");
+        assert_eq!(
+            rf, &fields[17],
+            "required_filters retains its wire position"
+        );
         let arrow_schema::DataType::List(inner) = rf.data_type() else {
             panic!("required_filters is not a List, got {:?}", rf.data_type());
         };
         let arrow_schema::DataType::List(leaf) = inner.data_type() else {
             panic!("required_filters inner is not a List");
         };
-        assert_eq!(leaf.data_type(), &DataType::Utf8);
+        let arrow_schema::DataType::List(component) = leaf.data_type() else {
+            panic!("path is not a List");
+        };
+        assert_eq!(component.data_type(), &DataType::Utf8);
 
         // Full DTO round-trip through the flat batch.
         let batch = crate::wire::to_batch(info).expect("to_batch");
@@ -2278,8 +2432,8 @@ mod tests {
         assert_eq!(
             back.required_filters,
             vec![
-                vec!["a".to_string()],
-                vec!["a".to_string(), "b".to_string()]
+                vec![vec!["a".to_string()]],
+                vec![vec!["a".to_string()], vec!["b".to_string()]]
             ]
         );
     }
@@ -2293,24 +2447,23 @@ mod tests {
 
     #[test]
     fn test_required_filters_rejects_empty_string() {
-        let t = ab_table(vec![vec!["".to_string()]]);
+        let t = ab_table(vec![vec![vec!["".to_string()]]]);
         let err = table_info(&path("data"), &t, None).expect_err("empty string must be rejected");
         assert!(err.to_string().contains("empty strings"), "got: {err}");
     }
 
     #[test]
     fn test_required_filters_rejects_unknown_column() {
-        let t = ab_table(vec![vec!["nope".to_string()]]);
+        let t = ab_table(vec![vec![vec!["nope".to_string()]]]);
         let err = table_info(&path("data"), &t, None).expect_err("unknown column must be rejected");
         assert!(err.to_string().contains("unknown column"), "got: {err}");
     }
 
     #[test]
-    fn test_required_filters_accepts_struct_subfield_head() {
-        // A dotted path's leading segment ('a') is a real column; the subfield
-        // ('x') is left to DuckDB's binder — validation must accept it.
-        let t = ab_table(vec![vec!["a.x".to_string()]]);
-        assert!(table_info(&path("data"), &t, None).is_ok());
+    fn test_required_filters_rejects_non_struct_parent() {
+        // A valid top-level name does not make traversal through a scalar valid.
+        let t = ab_table(vec![vec![vec!["a".to_string(), "x".to_string()]]]);
+        assert!(table_info(&path("data"), &t, None).is_err());
     }
 }
 

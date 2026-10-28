@@ -64,7 +64,10 @@ fn a_scalar_function_maps_a_batch() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     // `double(value)` takes its argument as a column, so the argument slot
     // carries a typed placeholder and the values arrive in the input batch.
@@ -104,7 +107,10 @@ fn a_scalar_exchange_refuses_sends_after_close() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let mut spec = BindSpec::table("double").in_schema(&schema_path);
     spec.function_type = FunctionType::Scalar;
@@ -133,7 +139,10 @@ fn a_streaming_table_in_out_echoes_its_input() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let mut spec = BindSpec::table("echo").in_schema(&schema_path);
     spec.function_type = FunctionType::TableInOut;
@@ -166,7 +175,10 @@ fn a_one_to_n_transform_reports_row_provenance() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     // `repeat_inputs` emits each input row more than once, which is exactly
     // when a worker must say which input row each output row came from.
@@ -241,7 +253,10 @@ fn a_classic_table_in_out_continues_its_output() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture has a default schema")
+        .to_string();
 
     // `paged_explode` emits 0..n-1 per input row, `page_size` rows per answer,
     // the rest through continuation ticks.
@@ -274,7 +289,10 @@ fn a_blended_function_continues_with_provenance() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture has a default schema")
+        .to_string();
 
     let mut spec = BindSpec::table("blended_paged").in_schema(&schema_path);
     spec.function_type = FunctionType::TableInOut;
@@ -324,7 +342,8 @@ fn bind_paged(
     function: &str,
     named: &[(&str, ArgValue)],
 ) -> vgi_client::BoundFunction {
-    let mut spec = BindSpec::table(function).in_schema(cat.default_schema());
+    let mut spec = BindSpec::table(function)
+        .in_schema(cat.default_schema().expect("fixture has a default schema"));
     spec.function_type = FunctionType::TableInOut;
     let mut args = Arguments::new();
     if function == "blended_paged" {
@@ -501,7 +520,10 @@ fn a_buffered_function_sinks_then_sources() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema_path = cat.default_schema().to_string();
+    let schema_path = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let mut spec = BindSpec::table("buffer_input").in_schema(&schema_path);
     spec.function_type = FunctionType::TableBuffering;

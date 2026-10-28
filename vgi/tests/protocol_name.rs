@@ -1,15 +1,15 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! The VGI wire name is `vgi.v2`, and a built worker really hosts it.
+//! The VGI wire name is `vgi.v3`, and a built worker really hosts it.
 //!
 //! The name had never been decided, so each implementation inherited whatever
 //! its own protocol type happened to be called — Python `VgiProtocol`, Java and
 //! C# `VgiService`, Go `Service`, TypeScript `vgi`, and this port `VgiProtocol`.
 //! Since vgi-rpc 0.25.0 every request carries a `vgi_rpc.protocol` routing key,
-//! so those four answers meant no client could address all six servers. `vgi.v2`
+//! so those four answers meant no client could address all six servers. `vgi.v3`
 //! is the canonical name; the major is in it so an incompatible major is a
-//! different name (an honest 404) and `vgi.v2` can be served beside a future
-//! `vgi.v3`.
+//! different name (an honest 404) and `vgi.v2` can be served beside `vgi.v3`
+//! while clients migrate.
 //!
 //! Two assertions, because the constant being right and the *server* announcing
 //! it are different facts: the routing key is bound from the constant in three
@@ -23,7 +23,7 @@ use vgi::VGI_PROTOCOL_NAME;
 #[test]
 fn wire_name_is_the_canonical_one() {
     assert_eq!(
-        VGI_PROTOCOL_NAME, "vgi.v2",
+        VGI_PROTOCOL_NAME, "vgi.v3",
         "the VGI wire name is shared across every implementation; changing it \
          here strands this port's clients and servers from the rest",
     );
@@ -39,7 +39,7 @@ fn a_built_worker_hosts_the_canonical_name() {
     println!("This server hosts: {hosted:?}");
     assert_eq!(
         hosted.first().copied(),
-        Some("vgi.v2"),
+        Some("vgi.v3"),
         "the application protocol must be announced first and by its wire name",
     );
     assert!(

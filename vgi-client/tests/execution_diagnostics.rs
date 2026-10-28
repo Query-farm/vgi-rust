@@ -141,7 +141,11 @@ fn in_band_scan_events_reach_worker_log_sink_and_keep_executions_separate() {
             .bind(
                 &catalog,
                 &BindSpec::table("observations")
-                    .in_schema(catalog.default_schema())
+                    .in_schema(
+                        catalog
+                            .default_schema()
+                            .expect("fixture has a default schema"),
+                    )
                     .with_arguments(vgi_client::Arguments::new().positional(0i64)),
             )
             .unwrap();
@@ -196,7 +200,11 @@ fn denied_chunk_remains_a_typed_error_with_source_and_execution_context_on_wire(
             .bind(
                 &catalog,
                 &BindSpec::table("observations")
-                    .in_schema(catalog.default_schema())
+                    .in_schema(
+                        catalog
+                            .default_schema()
+                            .expect("fixture has a default schema"),
+                    )
                     .with_arguments(vgi_client::Arguments::new().positional(1i64)),
             )
             .unwrap();

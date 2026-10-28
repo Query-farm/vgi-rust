@@ -49,7 +49,8 @@ fn scalar_type_rejection_is_invalid_argument() {
         .attach("example", AttachOptions::default())
         .expect("attach");
 
-    let mut spec = BindSpec::table("double").in_schema(cat.default_schema());
+    let mut spec = BindSpec::table("double")
+        .in_schema(cat.default_schema().expect("fixture has a default schema"));
     spec.function_type = FunctionType::Scalar;
     spec.arguments = Arguments::new().positional(ArgValue::Placeholder(DataType::Utf8));
     let input = Schema::new(vec![Field::new("value", DataType::Utf8, true)]);
@@ -72,7 +73,7 @@ fn table_argument_constraint_is_invalid_argument() {
         .expect("attach");
 
     let spec = BindSpec::table("sequence")
-        .in_schema(cat.default_schema())
+        .in_schema(cat.default_schema().expect("fixture has a default schema"))
         .with_arguments(Arguments::new().positional(10i64).named("batch_size", 0i64));
 
     let err = client
@@ -83,7 +84,7 @@ fn table_argument_constraint_is_invalid_argument() {
 
     // The attachment stays usable after a coded error.
     let ok = BindSpec::table("sequence")
-        .in_schema(cat.default_schema())
+        .in_schema(cat.default_schema().expect("fixture has a default schema"))
         .with_arguments(Arguments::new().positional(10i64));
     client.bind(&cat, &ok).expect("a valid bind still succeeds");
 }
@@ -97,7 +98,8 @@ fn unknown_function_is_not_found() {
         .attach("example", AttachOptions::default())
         .expect("attach");
 
-    let spec = BindSpec::table("no_such_function_anywhere").in_schema(cat.default_schema());
+    let spec = BindSpec::table("no_such_function_anywhere")
+        .in_schema(cat.default_schema().expect("fixture has a default schema"));
     let err = client.bind(&cat, &spec).expect_err("unknown function");
     assert_eq!(err.error_code(), "NOT_FOUND", "{err}");
 }

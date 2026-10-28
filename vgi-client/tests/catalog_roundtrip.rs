@@ -83,7 +83,9 @@ fn attaches_and_reports_a_default_schema() {
         "attach must return a session handle"
     );
     assert!(
-        !cat.default_schema().is_empty(),
+        !cat.default_schema()
+            .expect("fixture declares a default schema")
+            .is_empty(),
         "attach must name a default schema"
     );
 
@@ -194,7 +196,10 @@ fn function_listing_survives_the_raw_identifier_column() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema = cat.default_schema().to_string();
+    let schema = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let tables = client
         .functions(&cat, &schema, FunctionKind::Table)
@@ -225,7 +230,10 @@ fn reads_one_table_back_by_name() {
     let cat = client
         .attach("example", AttachOptions::default())
         .expect("attach");
-    let schema = cat.default_schema().to_string();
+    let schema = cat
+        .default_schema()
+        .expect("fixture declares a default schema")
+        .to_string();
 
     let listed = client.tables(&cat, &schema).expect("tables");
     let Some(first) = listed.first() else {
@@ -391,7 +399,7 @@ fn transactions_are_optional_and_round_trip_when_offered() {
     client.detach(&cat).expect("detach");
 }
 
-/// `catalog_contents` (protocol 2.2.0): the example worker advertises it, and
+/// `catalog_contents` (protocol 3.0.0): the example worker advertises it, and
 /// one call returns every schema the per-schema calls list — parents first —
 /// with each kind holding exactly what the matching per-schema call returns.
 #[test]

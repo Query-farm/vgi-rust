@@ -23,6 +23,19 @@ use vgi_rpc::{Bytes, DictString};
 use crate::client::VgiClient;
 use crate::wire_call::{call, call_batch, call_items, call_unit, envelope};
 
+/// Metadata supplied when creating or replacing a regular view.
+#[derive(Clone, Debug, Default)]
+pub struct ViewCreateOptions {
+    /// Ordered output-column aliases, or an empty list to retain query names.
+    pub aliases: Vec<String>,
+    /// Optional view comment; an empty string is distinct from no comment.
+    pub comment: Option<String>,
+    /// Provider-defined metadata tags attached to the view.
+    pub tags: Vec<(String, String)>,
+    /// Comments keyed by the final output-column name.
+    pub column_comments: Vec<(String, String)>,
+}
+
 /// One attach-time option advertised by a catalog during discovery.
 ///
 /// The wire carries the type as an IPC schema and the default as an optional
@@ -278,50 +291,36 @@ pub fn decode_setting_specs(info: &CatalogAttachResult) -> Result<Vec<SettingSpe
         .collect()
 }
 
-/// Decode the typed, one-row default-value batch attached to a macro.
-///
-/// Only parameters that actually have defaults appear as columns. Keeping the
-/// values as Arrow arrays lets engine adapters preserve temporal, decimal,
-/// binary, and null types instead of round-tripping them through strings.
-pub fn decode_macro_defaults(info: &MacroInfo) -> Result<Vec<(String, ArrayRef)>> {
-    let Some(bytes) = info
-        .parameter_default_values
-        .as_ref()
-        .filter(|bytes| !bytes.0.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
-    if batch.num_rows() != 1 {
-        return Err(RpcError::type_error(format!(
-            "MacroInfo.parameter_default_values must contain one row, found {}",
-            batch.num_rows()
-        )));
-    }
+/// Decode literal defaults from one explicitly selected overload. Expression defaults
+/// require the owning SQL binder and are not evaluated or silently discarded here.
+pub fn decode_macro_defaults(
+    overload: &vgi_protocol::generated::protocol_types::MacroOverload,
+) -> Result<Vec<(String, ArrayRef)>> {
     let mut seen = std::collections::HashSet::new();
-    let mut defaults = Vec::with_capacity(batch.num_columns());
-    for (field, value) in batch.schema().fields().iter().zip(batch.columns()) {
-        let parameter = info
-            .parameters
-            .iter()
-            .find(|parameter| parameter.eq_ignore_ascii_case(field.name()))
-            .ok_or_else(|| {
-                RpcError::type_error(format!(
-                    "macro {} default names unknown parameter {:?}",
-                    info.name,
-                    field.name()
-                ))
-            })?;
-        let key = parameter.to_ascii_lowercase();
-        if !seen.insert(key) {
-            return Err(RpcError::type_error(format!(
-                "macro {} declares duplicate default for parameter {:?}",
-                info.name, parameter
-            )));
+    let mut result = Vec::new();
+    for parameter in &overload.parameters {
+        if !seen.insert(parameter.name.to_ascii_lowercase()) {
+            return Err(RpcError::type_error("duplicate macro parameter"));
         }
-        defaults.push((parameter.clone(), value.clone()));
+        if parameter.default_expression.is_some() {
+            return Err(RpcError::type_error(
+                "expression default requires the owning SQL binder",
+            ));
+        }
+        if let Some(bytes) = &parameter.default_value {
+            let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
+            if batch.num_rows() != 1
+                || batch.num_columns() != 1
+                || batch.schema().field(0).name() != &parameter.name
+            {
+                return Err(RpcError::type_error(
+                    "macro default requires one row and one column named for its parameter",
+                ));
+            }
+            result.push((parameter.name.clone(), batch.column(0).clone()));
+        }
     }
-    Ok(defaults)
+    Ok(result)
 }
 
 /// Encode a one-row typed option batch for [`AttachOptions::options`].
@@ -622,9 +621,9 @@ impl AttachedCatalog {
         &self.info
     }
 
-    /// The schema a bare table name resolves in.
-    pub fn default_schema(&self) -> &str {
-        &self.info.default_schema
+    /// The raw root schema a bare table name resolves in, or no implicit default.
+    pub fn default_schema(&self) -> Option<&str> {
+        self.info.default_schema.as_deref()
     }
 
     /// Whether the worker offered transactions.
@@ -723,6 +722,8 @@ impl VgiClient {
     /// Attach a catalog by name, returning the handle every later call needs.
     pub fn attach(&mut self, name: &str, options: AttachOptions) -> Result<AttachedCatalog> {
         let capabilities = ClientCapabilities {
+            query_pushdown: None,
+            catalog: None,
             engine: "vgi-rust".to_string(),
             native_formats: Vec::new(),
             catalogs: Vec::new(),
@@ -938,7 +939,7 @@ impl VgiClient {
                         source: CatalogLoadSource::CatalogContents,
                         not_modified: false,
                         fallback_reason: None,
-                    })
+                    });
                 }
                 Err(e) => {
                     reason = e.message;
@@ -1048,6 +1049,42 @@ impl VgiClient {
         definition: &str,
         on_conflict: OnConflict,
     ) -> Result<()> {
+        self.view_create_with_aliases(cat, schema_path, name, definition, on_conflict, &[])
+    }
+
+    /// Create a view with ordered raw output aliases.
+    pub fn view_create_with_aliases(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        definition: &str,
+        on_conflict: OnConflict,
+        aliases: &[String],
+    ) -> Result<()> {
+        self.view_create_with_options(
+            cat,
+            schema_path,
+            name,
+            definition,
+            on_conflict,
+            &ViewCreateOptions {
+                aliases: aliases.to_vec(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Create a regular view, retaining empty comments and raw output names.
+    pub fn view_create_with_options(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        definition: &str,
+        on_conflict: OnConflict,
+        options: &ViewCreateOptions,
+    ) -> Result<()> {
         call_unit(
             self.transport_mut(),
             "catalog_view_create",
@@ -1056,7 +1093,37 @@ impl VgiClient {
                 schema_path: schema_path.to_vec(),
                 name: name.to_string(),
                 definition: definition.to_string(),
+                aliases: Some(options.aliases.clone()),
+                security: "regular".into(),
+                comment: options.comment.clone(),
+                tags: Some(options.tags.clone()),
+                column_comments: Some(options.column_comments.clone()),
                 on_conflict: on_conflict.dict(),
+                transaction_opaque_data: cat.txn(),
+            },
+        )
+    }
+
+    /// Set or clear a comment on one raw view output identifier.
+    pub fn view_column_comment_set(
+        &mut self,
+        cat: &AttachedCatalog,
+        schema_path: &[String],
+        name: &str,
+        column_path: &[String],
+        comment: Option<&str>,
+        ignore_not_found: bool,
+    ) -> Result<()> {
+        call_unit(
+            self.transport_mut(),
+            "catalog_view_column_comment_set",
+            p::CatalogViewColumnCommentSetParams {
+                attach_opaque_data: cat.handle.clone(),
+                schema_path: schema_path.to_vec(),
+                name: name.into(),
+                column_path: column_path.to_vec(),
+                comment: comment.map(str::to_owned),
+                ignore_not_found,
                 transaction_opaque_data: cat.txn(),
             },
         )
@@ -1710,15 +1777,28 @@ mod attach_option_tests {
         }
     }
 
+    #[test]
+    fn default_schema_preserves_absence_and_raw_identifier() {
+        let mut catalog = attached_catalog_for_test();
+        assert_eq!(catalog.default_schema(), Some("data"));
+        catalog.info.default_schema = None;
+        assert_eq!(catalog.default_schema(), None);
+        catalog.info.default_schema = Some("sales.archive".to_string());
+        assert_eq!(catalog.default_schema(), Some("sales.archive"));
+    }
+
     fn attached_catalog_for_test() -> AttachedCatalog {
         let info = CatalogAttachResult {
+            catalog_capabilities: None,
+            selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes(vec![1]),
             supports_transactions: false,
             supports_time_travel: false,
             catalog_version_frozen: false,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: "data".to_string(),
+            default_schema: Some("data".to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -1746,11 +1826,8 @@ mod attach_option_tests {
             name: "numbers".to_string(),
             schema_path: vec!["data".to_string()],
             columns: Bytes(Vec::new()),
-            not_null_constraints: Vec::new(),
-            unique_constraints: Vec::new(),
-            check_constraints: Vec::new(),
-            primary_key_constraints: Vec::new(),
-            foreign_key_constraints: Vec::new(),
+            constraints: Vec::new(),
+            definition_revision: None,
             write_result_modes: Vec::new(),
             supports_column_statistics: false,
             scan_function: Some(Bytes(Vec::new())),
@@ -1762,6 +1839,9 @@ mod attach_option_tests {
             column_statistics: None,
             bind_result: None,
             required_filters: Vec::new(),
+
+            options: None,
+            layout: None,
         }
     }
 
@@ -1919,128 +1999,62 @@ mod setting_spec_tests {
 
 #[cfg(test)]
 mod macro_default_tests {
-    use std::sync::Arc;
-
-    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
-
     use super::*;
+    use arrow_array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use vgi_protocol::generated::protocol_types::{
+        MacroOverload, MacroParameter, QueryEvaluationContext,
+    };
 
-    fn info(parameters: &[&str], defaults: Option<RecordBatch>) -> MacroInfo {
-        MacroInfo {
-            comment: None,
-            tags: Vec::new(),
-            name: "clamp".to_string(),
-            schema_path: vec!["main".to_string()],
-            macro_type: DictString(enums::macro_type::SCALAR.to_string()),
-            parameters: parameters.iter().map(|value| value.to_string()).collect(),
-            parameter_default_values: defaults.map(|batch| {
-                Bytes::from(vgi_protocol::ipc::write_batch(&batch).expect("encode defaults"))
-            }),
-            definition: "val".to_string(),
-            arguments_schema: None,
+    fn overload(value: Option<i64>) -> MacroOverload {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+        )
+        .unwrap();
+        MacroOverload {
+            parameters: vec![MacroParameter {
+                name: "x".into(),
+                declared_type: None,
+                default_value: Some(Bytes::from(vgi_protocol::ipc::write_batch(&batch).unwrap())),
+                default_expression: None,
+                documentation: Some("typed default".into()),
+            }],
+            definition: "x".into(),
+            profile: "duckdb.macro.v1".into(),
+            schema_path: vec!["main".into()],
+            macro_type: "scalar".into(),
+            evaluation_context: QueryEvaluationContext {
+                timezone: "UTC".into(),
+                collation: "binary".into(),
+                default_order: "asc".into(),
+                default_null_order: "nulls_last".into(),
+                preserve_insertion_order: true,
+            },
         }
-    }
-
-    fn defaults(fields: &[&str], columns: Vec<ArrayRef>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(
-            fields
-                .iter()
-                .map(|name| Field::new(*name, DataType::Int64, false))
-                .collect::<Vec<_>>(),
-        ));
-        RecordBatch::try_new(schema, columns).expect("defaults batch")
-    }
-
-    #[test]
-    fn decodes_named_typed_macro_defaults() {
-        let macro_info = info(
-            &["val", "lo", "hi"],
-            Some(defaults(
-                &["lo", "hi"],
-                vec![
-                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![100])) as ArrayRef,
-                ],
-            )),
-        );
-        let decoded = decode_macro_defaults(&macro_info).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].0, "lo");
-        assert_eq!(
-            decoded[1]
-                .1
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0),
-            100
-        );
-    }
-
-    #[test]
-    fn empty_macro_defaults_are_absent() {
-        assert!(decode_macro_defaults(&info(&["x"], None))
-            .unwrap()
-            .is_empty());
-        let mut empty = info(&["x"], None);
-        empty.parameter_default_values = Some(Bytes::from(Vec::new()));
-        assert!(decode_macro_defaults(&empty).unwrap().is_empty());
     }
 
     #[test]
     fn preserves_the_declared_type_of_a_null_default() {
-        let schema = Arc::new(Schema::new(vec![Field::new("lo", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![None])) as ArrayRef],
-        )
-        .unwrap();
-        let decoded = decode_macro_defaults(&info(&["lo"], Some(batch))).unwrap();
+        let decoded = decode_macro_defaults(&overload(None)).unwrap();
         assert_eq!(decoded[0].1.data_type(), &DataType::Int64);
         assert!(decoded[0].1.is_null(0));
+        assert_eq!(decoded[0].0, "x");
     }
 
     #[test]
-    fn rejects_wrong_cardinality_unknown_and_duplicate_defaults() {
-        let two_rows = info(
-            &["lo"],
-            Some(defaults(
-                &["lo"],
-                vec![Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef],
-            )),
-        );
-        assert!(decode_macro_defaults(&two_rows)
+    fn separates_absence_and_rejects_expression_or_wrong_parameter() {
+        let mut value = overload(Some(7));
+        assert_eq!(decode_macro_defaults(&value).unwrap().len(), 1);
+        value.parameters[0].name = "other".into();
+        assert!(decode_macro_defaults(&value).is_err());
+        value.parameters[0].default_value = None;
+        assert!(decode_macro_defaults(&value).unwrap().is_empty());
+        value.parameters[0].default_expression = Some(Bytes::from(vec![1]));
+        assert!(decode_macro_defaults(&value)
             .unwrap_err()
             .message
-            .contains("one row"));
-
-        let unknown = info(
-            &["lo"],
-            Some(defaults(
-                &["other"],
-                vec![Arc::new(Int64Array::from(vec![0])) as ArrayRef],
-            )),
-        );
-        assert!(decode_macro_defaults(&unknown)
-            .unwrap_err()
-            .message
-            .contains("unknown parameter"));
-
-        let duplicate = info(
-            &["lo"],
-            Some(defaults(
-                &["lo", "LO"],
-                vec![
-                    Arc::new(Int64Array::from(vec![0])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                ],
-            )),
-        );
-        assert!(decode_macro_defaults(&duplicate)
-            .unwrap_err()
-            .message
-            .contains("duplicate default"));
+            .contains("owning SQL binder"));
     }
 }
 
@@ -2068,6 +2082,7 @@ mod load_catalog_tests {
 
     fn schema_item(path: &[&str]) -> Bytes {
         let info = SchemaInfo {
+            options: None,
             comment: None,
             tags: Vec::new(),
             path: path.iter().map(|s| s.to_string()).collect(),
@@ -2169,13 +2184,16 @@ mod load_catalog_tests {
 
     fn attached(supports: bool) -> AttachedCatalog {
         let info = CatalogAttachResult {
+            catalog_capabilities: None,
+            selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes(vec![1]),
             supports_transactions: false,
             supports_time_travel: false,
             catalog_version_frozen: false,
             catalog_version: 1,
             attach_opaque_data_required: true,
-            default_schema: "main".to_string(),
+            default_schema: Some("main".to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -2313,11 +2331,8 @@ mod load_catalog_tests {
                 )]))
                 .unwrap(),
             ),
-            not_null_constraints: Vec::new(),
-            unique_constraints: Vec::new(),
-            check_constraints: Vec::new(),
-            primary_key_constraints: Vec::new(),
-            foreign_key_constraints: Vec::new(),
+            constraints: Vec::new(),
+            definition_revision: None,
             write_result_modes: Vec::new(),
             supports_column_statistics: false,
             scan_function: None,
@@ -2329,17 +2344,17 @@ mod load_catalog_tests {
             column_statistics: None,
             bind_result: None,
             required_filters: Vec::new(),
+
+            options: None,
+            layout: None,
         };
         let index = IndexInfo {
             comment: None,
             tags: Vec::new(),
             name: "ix".to_string(),
             schema_path: vec!["main".to_string()],
-            table_name: "t".to_string(),
-            index_type: "ART".to_string(),
-            constraint_type: DictString(enums::index_constraint_type::NONE.to_string()),
-            expressions: vec!["x".to_string()],
-            options: Vec::new(),
+            definition: Bytes(vec![1, 2, 3]),
+            options: Bytes(vec![4, 5, 6]),
         };
         let enc = |b: RecordBatch| Bytes(ipc::write_batch(&b).unwrap());
         let mut e = entry(&["main"], &["main"]);

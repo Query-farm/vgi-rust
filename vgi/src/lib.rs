@@ -129,6 +129,8 @@ pub mod catalog_contents;
 pub mod catalog_snapshot;
 #[cfg(feature = "catalog-publication")]
 pub mod catalog_snapshot_s3;
+pub mod column_expressions;
+pub mod column_metadata;
 pub mod copy_from;
 pub mod copy_to;
 pub mod diagnostics;
@@ -139,6 +141,7 @@ pub mod numeric;
 pub mod opaque;
 pub mod overload;
 pub mod partition;
+pub mod projection;
 pub mod protocol;
 pub mod pushdown;
 pub mod secrets;
@@ -194,4 +197,5 @@ pub use function::{
     ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FilterHandling, FunctionExample,
     FunctionMetadata, ProcessParams, ScalarFunction,
 };
+pub use table_function::BindRepeatability;
 pub use worker::{HostedProtocolsHook, ServeTransport, Worker, INTROSPECT_PRINCIPALS_ENV};

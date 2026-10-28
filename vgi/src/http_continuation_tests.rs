@@ -757,7 +757,7 @@ fn buffering_bind_resolves_after_secrets_provided() {
     );
 }
 
-/// Records the `auth_principal` its bind saw -- the authentication a vgi.v2
+/// Records the `auth_principal` its bind saw -- the authentication a vgi.v3
 /// call ran under.
 struct PrincipalProbe(Arc<std::sync::Mutex<Option<Option<String>>>>);
 impl TableBufferingFunction for PrincipalProbe {
@@ -855,7 +855,7 @@ fn start_grant_server() -> (u16, Arc<std::sync::Mutex<Option<Option<String>>>>) 
 }
 
 /// The grant loop, end to end over HTTP: a freshly logged-in user mints a
-/// sealed grant through `vgi_rpc.Identity.v2`'s `issue_grant`, and a vgi.v2
+/// sealed grant through `vgi_rpc.Identity.v2`'s `issue_grant`, and a vgi.v3
 /// call presenting it as `Bearer <grant>` runs authenticated as that user.
 #[test]
 fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
@@ -918,7 +918,7 @@ fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
         .to_string();
     assert!(token.starts_with("vgig1."), "{token}");
 
-    // 2. A vgi.v2 call presenting the grant runs as alice.
+    // 2. A vgi.v3 call presenting the grant runs as alice.
     let (status, _) = post_as(
         port,
         &format!("{}/bind", vgi_protocol::VGI_PROTOCOL_NAME),
@@ -929,10 +929,10 @@ fn a_minted_grant_authenticates_a_vgi_call_as_its_owner() {
     assert_eq!(
         seen.lock().unwrap().clone(),
         Some(Some("alice@example".to_string())),
-        "the vgi.v2 call ran under the grant's owner"
+        "the vgi.v3 call ran under the grant's owner"
     );
 
-    // 3. A tampered grant is refused before any vgi.v2 code runs.
+    // 3. A tampered grant is refused before any vgi.v3 code runs.
     *seen.lock().unwrap() = None;
     // A fixed replacement is a no-op whenever the token already ends in it.
     let last = if token.ends_with('x') { 'y' } else { 'x' };
@@ -1842,8 +1842,12 @@ fn a_resent_revision_is_stale_and_adds_nothing_to_replay() {
     }
     let sizes = &stream.request_bytes[settled..];
     let largest = *sizes.iter().max().unwrap();
+    // StreamWriter pads IPC messages to 64 bytes. Metadata/compressed-token
+    // length variation can cross one boundary without retaining any stale delta.
+    // The bound stays constant across all 60 distinct resends.
+    let smallest = *sizes.iter().min().unwrap();
     assert!(
-        largest <= sizes[0] + 16,
+        largest <= smallest + 64,
         "stale deltas were kept for replay: the continuation grew from {} to {largest} \
          bytes (every size: {sizes:?})",
         sizes[0]

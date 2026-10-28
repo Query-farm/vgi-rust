@@ -14,6 +14,7 @@ mod accumulate;
 mod aggregate;
 mod attach_options;
 mod buffering;
+mod canonical_constraints;
 mod catalog_def;
 mod contents_fixtures;
 mod contents_reval;
@@ -142,9 +143,9 @@ fn catalog_contents_enabled() -> bool {
 
 /// The cross-SDK conformance surface (vgi-rpc's MULTI_PROTOCOL_HOSTING.md §7).
 ///
-/// `conformance.Secondary.v1` is hosted beside `vgi.v2` through the
+/// `conformance.Secondary.v1` is hosted beside `vgi.v3` through the
 /// [`Worker::hosted_protocols`] hook on every transport -- additive: no
-/// existing fixture function changes, and `vgi.v2` dispatch cannot be
+/// existing fixture function changes, and `vgi.v3` dispatch cannot be
 /// affected because requests route on their protocol key.
 ///
 /// With `--identity`, the worker also opts into `vgi_rpc.Identity.v2` (HTTP

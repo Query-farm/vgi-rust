@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use vgi_protocol::generated::request_params as p;
 use vgi_rpc::{Bytes, DictString, Request, Result, RpcError};
@@ -211,7 +212,7 @@ impl StoredCatalog {
                 return Err(crate::errors::not_found(format!(
                     "catalog '{}' is not attached (unknown or detached session)",
                     self.name
-                )))
+                )));
             }
         }
         let mut state = State::new();
@@ -260,13 +261,16 @@ impl StoredCatalog {
         self.append(store, session, &Event::Attached)?;
         let state = self.load(store, session)?;
         Ok(CatalogAttachResult {
+            catalog_capabilities: None,
+            selected_capabilities: None,
+            query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
             supports_transactions: false,
             supports_time_travel: false,
             catalog_version_frozen: false,
             catalog_version: self.reported_version(&state),
             attach_opaque_data_required: true,
-            default_schema: DEFAULT_SCHEMA.to_string(),
+            default_schema: Some(DEFAULT_SCHEMA.to_string()),
             settings: Vec::new(),
             secret_types: Vec::new(),
             attach_catalogs: Vec::new(),
@@ -383,6 +387,11 @@ impl StoredCatalog {
             }
             "catalog_schema_create" => {
                 let q: p::CatalogSchemaCreateParams = wire::from_batch(&req.batch)?;
+                if q.options.is_some() {
+                    return Err(RpcError::method_not_implemented(
+                        "catalog_schema_create requires negotiated vgi.schema.options.create.v1",
+                    ));
+                }
                 self.mutate(
                     store,
                     session,
@@ -412,8 +421,24 @@ impl StoredCatalog {
                 let boxed: p::CatalogTableCreateParams = wire::from_batch(&req.batch)?;
                 let q: TableCreateRequest =
                     wire::from_batch(&crate::ipc::read_batch(&boxed.request.0)?)?;
-                // Reject a malformed schema now rather than on every listing.
-                crate::ipc::read_schema(&q.columns.0)?;
+                if !q.constraint_definitions.is_empty()
+                    || q.comment.is_some()
+                    || q.tags.is_some()
+                    || q.options.is_some()
+                    || q.layout.is_some()
+                {
+                    return Err(RpcError::method_not_implemented(
+                        "catalog_table_create requires negotiated table profiles",
+                    ));
+                }
+                crate::column_metadata::validate_column_metadata_ipc(&q.columns.0)?;
+                crate::column_expressions::validate(
+                    crate::ipc::read_schema(&q.columns.0)?.as_ref(),
+                    &q.schema_path,
+                    false,
+                )?;
+                // Reject malformed or unauthorized NOT NULL claims before effects.
+                require_unconstrained_columns(crate::ipc::read_schema(&q.columns.0)?.as_ref())?;
                 self.mutate(
                     store,
                     session,
@@ -421,10 +446,10 @@ impl StoredCatalog {
                         path: q.schema_path,
                         name: q.name,
                         columns: q.columns.0.to_vec(),
-                        not_null: q.not_null_constraints,
-                        unique: q.unique_constraints,
-                        check: q.check_constraints,
-                        primary_key: q.primary_key_constraints,
+                        not_null: Vec::new(),
+                        unique: Vec::new(),
+                        check: Vec::new(),
+                        primary_key: Vec::new(),
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
                     },
                 )?;
@@ -445,6 +470,18 @@ impl StoredCatalog {
             }
             "catalog_view_create" => {
                 let q: p::CatalogViewCreateParams = wire::from_batch(&req.batch)?;
+                if q.column_comments.as_ref().is_some_and(|comments| {
+                    comments
+                        .iter()
+                        .any(|(name, _)| name.is_empty() || name.contains('\0'))
+                }) {
+                    return Err(RpcError::value_error(
+                        "view column comments require raw output identifiers",
+                    ));
+                }
+                if q.security != "regular" {
+                    return Err(RpcError::value_error("view security mode is unsupported"));
+                }
                 self.mutate(
                     store,
                     session,
@@ -452,7 +489,49 @@ impl StoredCatalog {
                         path: q.schema_path,
                         name: q.name,
                         definition: q.definition,
+                        aliases: q.aliases.unwrap_or_default(),
+                        comment: q.comment,
+                        tags: q.tags.unwrap_or_default(),
+                        column_comments: q.column_comments.unwrap_or_default(),
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
+                    },
+                )?;
+                Ok(None)
+            }
+            "catalog_view_column_comment_set" => {
+                let q: p::CatalogViewColumnCommentSetParams = wire::from_batch(&req.batch)?;
+                if q.column_path.len() != 1
+                    || q.column_path[0].is_empty()
+                    || q.column_path[0].contains('\0')
+                {
+                    return Err(RpcError::value_error(
+                        "view column comments require one raw output identifier",
+                    ));
+                }
+                self.mutate(
+                    store,
+                    session,
+                    Event::ViewCommentSet {
+                        path: q.schema_path,
+                        name: q.name,
+                        column: Some(q.column_path[0].clone()),
+                        comment: q.comment,
+                        ignore_not_found: q.ignore_not_found,
+                    },
+                )?;
+                Ok(None)
+            }
+            "catalog_view_comment_set" => {
+                let q: p::CatalogViewCommentSetParams = wire::from_batch(&req.batch)?;
+                self.mutate(
+                    store,
+                    session,
+                    Event::ViewCommentSet {
+                        path: q.schema_path,
+                        name: q.name,
+                        column: None,
+                        comment: q.comment,
+                        ignore_not_found: q.ignore_not_found,
                     },
                 )?;
                 Ok(None)
@@ -565,7 +644,23 @@ enum Event {
         path: Vec<String>,
         name: String,
         definition: String,
+        // Events written before alias support only had SELECT-derived output names.
+        #[serde(default)]
+        aliases: Vec<String>,
+        #[serde(default)]
+        comment: Option<String>,
+        #[serde(default)]
+        tags: Vec<(String, String)>,
+        #[serde(default)]
+        column_comments: Vec<(String, String)>,
         on_conflict: OnConflict,
+    },
+    ViewCommentSet {
+        path: Vec<String>,
+        name: String,
+        column: Option<String>,
+        comment: Option<String>,
+        ignore_not_found: bool,
     },
     ViewDrop {
         path: Vec<String>,
@@ -586,6 +681,7 @@ struct StoredTable {
 
 impl StoredTable {
     fn info(&self, path: &[String]) -> Result<TableInfo> {
+        crate::column_metadata::validate_column_metadata_ipc(&self.columns)?;
         let mut t = catalog::CatTable::new(
             &self.name,
             crate::ipc::read_schema(&self.columns)?,
@@ -606,17 +702,23 @@ impl StoredTable {
 struct StoredView {
     name: String,
     definition: String,
+    aliases: Vec<String>,
+    comment: Option<String>,
+    tags: Vec<(String, String)>,
+    column_comments: Vec<(String, String)>,
 }
 
 impl StoredView {
     fn info(&self, path: &[String]) -> ViewInfo {
         ViewInfo {
-            comment: None,
-            tags: Vec::new(),
+            comment: self.comment.clone(),
+            tags: self.tags.clone(),
             name: self.name.clone(),
             schema_path: path.to_vec(),
             definition: self.definition.clone(),
-            column_comments: Vec::new(),
+            column_comments: self.column_comments.clone(),
+            aliases: self.aliases.clone(),
+            security: "regular".into(),
         }
     }
 }
@@ -884,11 +986,19 @@ impl State {
                 path,
                 name,
                 definition,
+                aliases,
+                comment,
+                tags,
+                column_comments,
                 on_conflict,
             } => {
                 let view = StoredView {
                     name: name.clone(),
                     definition: definition.clone(),
+                    aliases: aliases.clone(),
+                    comment: comment.clone(),
+                    tags: tags.clone(),
+                    column_comments: column_comments.clone(),
                 };
                 let schema = self.schema_mut(path)?;
                 if schema.table(name).is_some() {
@@ -912,6 +1022,32 @@ impl State {
                         Ok(true)
                     }
                 }
+            }
+            Event::ViewCommentSet {
+                path,
+                name,
+                column,
+                comment,
+                ignore_not_found,
+            } => {
+                let schema = self.schema_mut(path)?;
+                let Some(view) = schema.views.iter_mut().find(|v| same(&v.name, name)) else {
+                    if *ignore_not_found {
+                        return Ok(false);
+                    }
+                    return Err(RpcError::value_error(format!(
+                        "View with name '{name}' does not exist"
+                    )));
+                };
+                if let Some(column) = column {
+                    view.column_comments.retain(|(key, _)| key != column);
+                    if let Some(value) = comment {
+                        view.column_comments.push((column.clone(), value.clone()));
+                    }
+                } else {
+                    view.comment = comment.clone();
+                }
+                Ok(true)
             }
             Event::ViewDrop {
                 path,
@@ -963,6 +1099,44 @@ fn drop_named<T>(
     }
 }
 
+// Empty canonical definitions authorize no SQL user-field nullability claims.
+fn require_unconstrained_columns(schema: &Schema) -> Result<()> {
+    fn visit(field: &Field, top: bool, depth: usize) -> Result<()> {
+        if depth > 64 {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: column nesting exceeds supported depth",
+            ));
+        }
+        if top && field.metadata().contains_key("is_row_id") {
+            return Ok(());
+        }
+        if field
+            .metadata()
+            .keys()
+            .any(|key| key == "ARROW:extension:name" || key.starts_with("vgi.logical_type."))
+        {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: logical column types require negotiation",
+            ));
+        }
+        if !field.is_nullable() {
+            return Err(RpcError::method_not_implemented(
+                "catalog_table_create: nonnullable user columns require canonical constraints",
+            ));
+        }
+        if let DataType::Struct(children) = field.data_type() {
+            for child in children {
+                visit(child, false, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+    for field in schema.fields() {
+        visit(field, true, 0)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +1156,34 @@ mod tests {
 
     fn path(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unsupported_view_security_does_not_mutate_or_append_an_event() {
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_view("v", "ERROR").unwrap();
+        let before = session.version();
+        for security in ["barrier", "unknown", ""] {
+            for on_conflict in ["ERROR", "IGNORE", "REPLACE"] {
+                let batch = wire::to_batch(p::CatalogViewCreateParams {
+                    attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                    schema_path: path(&["main"]),
+                    name: "v".into(),
+                    definition: "SELECT 2".into(),
+                    aliases: None,
+                    security: security.into(),
+                    comment: None,
+                    tags: None,
+                    column_comments: None,
+                    on_conflict: DictString(on_conflict.into()),
+                    transaction_opaque_data: None,
+                })
+                .unwrap();
+                let err = session.call("catalog_view_create", batch).unwrap_err();
+                assert!(err.to_string().contains("security"));
+            }
+        }
+        assert_eq!(session.version(), before);
     }
 
     struct Session {
@@ -1031,6 +1233,11 @@ mod tests {
                 schema_path: path(&["main"]),
                 name: name.to_string(),
                 definition: "SELECT 1 AS x".to_string(),
+                aliases: Some(vec!["a.b".to_string()]),
+                security: "regular".into(),
+                comment: None,
+                tags: None,
+                column_comments: None,
                 on_conflict: DictString(on_conflict.to_string()),
                 transaction_opaque_data: None,
             })
@@ -1062,12 +1269,13 @@ mod tests {
                 name: name.to_string(),
                 columns: Bytes::from(crate::ipc::write_schema(&columns).unwrap()),
                 on_conflict: DictString("ERROR".to_string()),
-                not_null_constraints: vec![0],
-                unique_constraints: Vec::new(),
-                check_constraints: Vec::new(),
-                primary_key_constraints: Vec::new(),
-                foreign_key_constraints: Vec::new(),
+                constraint_definitions: Vec::new(),
                 transaction_opaque_data: None,
+
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
             })
             .unwrap();
             let batch = wire::to_batch(p::CatalogTableCreateParams {
@@ -1079,6 +1287,7 @@ mod tests {
 
         fn create_schema(&self, schema: &[&str]) -> Result<Option<RecordBatch>> {
             let batch = wire::to_batch(p::CatalogSchemaCreateParams {
+                options: None,
                 attach_opaque_data: Bytes::from(b"attach".to_vec()),
                 path: path(schema),
                 on_conflict: DictString("ERROR".to_string()),
@@ -1132,6 +1341,246 @@ mod tests {
     }
 
     #[test]
+    fn column_metadata_create_and_discovery_corpus() {
+        use base64::Engine;
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
+        let vectors = &corpus["column_metadata_schemas"];
+        let session = Session::new(StoredCatalog::new("mem"));
+        for (group, values) in vectors.as_object().unwrap() {
+            for (name, encoded) in values.as_object().unwrap() {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_str().unwrap())
+                    .unwrap();
+                let request = wire::to_batch(TableCreateRequest {
+                    attach_opaque_data: Bytes(b"attach".to_vec()),
+                    schema_path: path(&["main"]),
+                    name: name.clone(),
+                    columns: Bytes(raw.clone()),
+                    on_conflict: DictString("ERROR".into()),
+                    constraint_definitions: vec![],
+                    transaction_opaque_data: None,
+                    options: None,
+                    layout: None,
+                    comment: None,
+                    tags: None,
+                })
+                .unwrap();
+                let params = wire::to_batch(p::CatalogTableCreateParams {
+                    request: Bytes(crate::ipc::write_batch(&request).unwrap()),
+                })
+                .unwrap();
+                let before = session.version();
+                let result = session.call("catalog_table_create", params);
+                if group == "invalid" {
+                    assert!(result.is_err(), "accepted {name}");
+                    assert_eq!(before, session.version());
+                } else {
+                    result.unwrap();
+                    let tables: Vec<TableInfo> =
+                        session.list("catalog_schema_contents_tables", &["main"]);
+                    let info = tables.iter().find(|t| &t.name == name).unwrap();
+                    let expected = crate::ipc::read_schema(&raw).unwrap();
+                    assert_eq!(
+                        crate::ipc::read_schema(&info.columns.0).unwrap(),
+                        expected,
+                        "{name}"
+                    );
+                    crate::column_metadata::validate_column_metadata_ipc(&info.columns.0).unwrap();
+                }
+            }
+        }
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 4);
+    }
+
+    #[test]
+    fn generated_column_discovery_and_unsupported_create_corpus() {
+        use base64::Engine;
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
+        let vectors = &corpus["generated_column_schemas"];
+        let session = Session::new(StoredCatalog::new("mem"));
+        for group in ["valid", "invalid"] {
+            let values = &vectors[group];
+            for (name, encoded) in values.as_object().unwrap() {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.as_str().unwrap())
+                    .unwrap();
+                let request = wire::to_batch(TableCreateRequest {
+                    attach_opaque_data: Bytes(b"attach".to_vec()),
+                    schema_path: path(&["main"]),
+                    name: name.clone(),
+                    columns: Bytes(raw.clone()),
+                    on_conflict: DictString("ERROR".into()),
+                    constraint_definitions: vec![],
+                    transaction_opaque_data: None,
+                    options: None,
+                    layout: None,
+                    comment: None,
+                    tags: None,
+                })
+                .unwrap();
+                let params = wire::to_batch(p::CatalogTableCreateParams {
+                    request: Bytes(crate::ipc::write_batch(&request).unwrap()),
+                })
+                .unwrap();
+                let columns = crate::ipc::read_schema(&raw).unwrap();
+                let table =
+                    catalog::CatTable::new(name, columns.clone(), "", Vec::new(), None, None);
+                let discovery = catalog::table_info(&path(&["main"]), &table, None);
+                if group == "invalid" {
+                    assert!(discovery.is_err(), "published {name}");
+                } else {
+                    let info = discovery.unwrap();
+                    assert_eq!(
+                        crate::ipc::read_schema(&info.columns.0).unwrap(),
+                        columns,
+                        "{name}"
+                    );
+                }
+                let before = session.version();
+                let result = session.call("catalog_table_create", params);
+                if group == "invalid" || name != "ordinary" {
+                    assert!(result.is_err(), "accepted {name}");
+                    assert_eq!(before, session.version());
+                } else {
+                    result.unwrap();
+                    let tables: Vec<TableInfo> =
+                        session.list("catalog_schema_contents_tables", &["main"]);
+                    let info = tables.iter().find(|t| &t.name == name).unwrap();
+                    let expected = crate::ipc::read_schema(&raw).unwrap();
+                    assert_eq!(
+                        crate::ipc::read_schema(&info.columns.0).unwrap(),
+                        expected,
+                        "{name}"
+                    );
+                    crate::column_metadata::validate_column_metadata_ipc(&info.columns.0).unwrap();
+                }
+            }
+        }
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn unsupported_typed_indexes_preserve_catalog_version_and_objects() {
+        use base64::Engine;
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../conformance/catalog-contracts.json")).unwrap();
+        let fixture = |name: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(corpus["records"][name].as_str().unwrap())
+                .unwrap()
+        };
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_table(&["main"], "t").unwrap();
+        let before = session.version();
+        let before_tables: Vec<TableInfo> =
+            session.list("catalog_schema_contents_tables", &["main"]);
+        let create = wire::to_batch(p::CatalogIndexCreateParams {
+            request: Bytes(fixture("index_create")),
+        })
+        .unwrap();
+        assert!(session.call("catalog_index_create", create).is_err());
+        let drop = wire::to_batch(p::CatalogIndexDropParams {
+            attach_opaque_data: Bytes(b"attach".to_vec()),
+            schema_path: path(&["main"]),
+            name: "t".into(),
+            ignore_not_found: true,
+            cascade: true,
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        assert!(session.call("catalog_index_drop", drop).is_err());
+        let options = wire::to_batch(p::CatalogIndexOptionDefinitionsParams {
+            attach_opaque_data: Bytes(b"attach".to_vec()),
+            table: Bytes(fixture("object_ref")),
+            algorithm: "ART".into(),
+            transaction_opaque_data: None,
+        })
+        .unwrap();
+        assert!(session
+            .call("catalog_index_option_definitions", options)
+            .is_err());
+        assert_eq!(session.version(), before);
+        let after_tables: Vec<TableInfo> =
+            session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(after_tables.len(), 1);
+        assert_eq!(after_tables[0].name, before_tables[0].name);
+        assert_eq!(after_tables[0].columns.0, before_tables[0].columns.0);
+    }
+
+    #[test]
+    fn unsupported_constraints_reject_before_replacement() {
+        let session = Session::new(StoredCatalog::new("mem"));
+        session.create_table(&["main"], "t").unwrap();
+        let before = session.version();
+        for on_conflict in ["ERROR", "IGNORE", "REPLACE"] {
+            let inner = wire::to_batch(TableCreateRequest {
+                attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                schema_path: path(&["main"]),
+                name: "t".into(),
+                columns: Bytes::from(Vec::new()),
+                on_conflict: DictString(on_conflict.into()),
+                constraint_definitions: vec![Bytes::from(vec![1])],
+                transaction_opaque_data: None,
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogTableCreateParams {
+                request: Bytes::from(crate::ipc::write_batch(&inner).unwrap()),
+            })
+            .unwrap();
+            let err = session.call("catalog_table_create", batch).unwrap_err();
+            assert!(err.to_string().contains("profiles"));
+        }
+        for field in [
+            Field::new("a", DataType::Utf8, false),
+            Field::new(
+                "record",
+                DataType::Struct(vec![Field::new("a", DataType::Utf8, false)].into()),
+                true,
+            ),
+        ] {
+            let inner = wire::to_batch(TableCreateRequest {
+                attach_opaque_data: Bytes::from(b"attach".to_vec()),
+                schema_path: path(&["main"]),
+                name: "t".into(),
+                columns: Bytes::from(crate::ipc::write_schema(&Schema::new(vec![field])).unwrap()),
+                on_conflict: DictString("REPLACE".into()),
+                constraint_definitions: vec![],
+                transaction_opaque_data: None,
+                options: None,
+                layout: None,
+                comment: None,
+                tags: None,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogTableCreateParams {
+                request: Bytes::from(crate::ipc::write_batch(&inner).unwrap()),
+            })
+            .unwrap();
+            assert!(session
+                .call("catalog_table_create", batch)
+                .unwrap_err()
+                .to_string()
+                .contains("nonnullable"));
+        }
+        assert_eq!(session.version(), before);
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "t");
+        assert!(tables[0].constraints.is_empty());
+        let columns = crate::ipc::read_schema(&tables[0].columns.0).unwrap();
+        assert_eq!(columns.field(0).data_type(), &DataType::Int32);
+        assert_eq!(columns.fields().len(), 2);
+    }
+
+    #[test]
     fn starts_empty_and_versions_every_change() {
         let s = Session::new(StoredCatalog::new("mem"));
         assert_eq!(s.version(), 1);
@@ -1146,9 +1595,10 @@ mod tests {
         let views: Vec<ViewInfo> = s.list("catalog_schema_contents_views", &["main"]);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].name, "v1");
+        assert_eq!(views[0].aliases, ["a.b"]);
         let tables: Vec<TableInfo> = s.list("catalog_schema_contents_tables", &["main"]);
         assert_eq!(tables[0].name, "t1");
-        assert_eq!(tables[0].not_null_constraints, vec![0]);
+        assert!(tables[0].constraints.is_empty());
         let cols = crate::ipc::read_schema(&tables[0].columns.0).unwrap();
         assert_eq!(cols.field(0).data_type(), &DataType::Int32);
 
@@ -1255,6 +1705,23 @@ mod tests {
         let state = other.load(&s.store, &s.session).unwrap();
         assert_eq!(state.version, 2);
         assert_eq!(state.schema(&path(&["main"])).unwrap().views.len(), 1);
+        assert_eq!(
+            state.schema(&path(&["main"])).unwrap().views[0].aliases,
+            ["a.b"]
+        );
+    }
+
+    #[test]
+    fn pre_alias_event_logs_retain_query_derived_names() {
+        let s = Session::new(StoredCatalog::new("mem"));
+        let event: Event = serde_json::from_str(
+            r#"{"ViewCreate":{"path":["main"],"name":"old","definition":"SELECT 1 AS x","on_conflict":"Error"}}"#,
+        ).unwrap();
+        s.cat.append(&s.store, &s.session, &event).unwrap();
+        let state = s.cat.load(&s.store, &s.session).unwrap();
+        let view = &state.schema(&path(&["main"])).unwrap().views[0];
+        assert_eq!(view.definition, "SELECT 1 AS x");
+        assert!(view.aliases.is_empty());
     }
 
     /// A conflicting DDL appended by a racing writer is skipped on replay,
@@ -1263,9 +1730,13 @@ mod tests {
     fn replay_skips_a_ddl_that_lost_a_race() {
         let s = Session::new(StoredCatalog::new("mem"));
         let ev = Event::ViewCreate {
+            comment: None,
+            tags: Vec::new(),
+            column_comments: Vec::new(),
             path: path(&["main"]),
             name: "v".to_string(),
             definition: "SELECT 1".to_string(),
+            aliases: vec!["a.b".to_string()],
             on_conflict: OnConflict::Error,
         };
         s.cat.append(&s.store, &s.session, &ev).unwrap();
@@ -1436,6 +1907,11 @@ mod tests {
                 schema_path: path(&["main"]),
                 name: name.to_string(),
                 definition: "SELECT 1".to_string(),
+                aliases: None,
+                security: "regular".into(),
+                comment: None,
+                tags: None,
+                column_comments: None,
                 on_conflict: DictString("ERROR".to_string()),
                 transaction_opaque_data: None,
             })

@@ -113,7 +113,7 @@ impl TableFunction for VersionedDataScan {
 
 pub struct VersionedConstraintsScan;
 impl VersionedConstraintsScan {
-    fn build(version: i64) -> (SchemaRef, Vec<ArrayRef>) {
+    pub(crate) fn build(version: i64) -> (SchemaRef, Vec<ArrayRef>) {
         use DataType::{Int64, Utf8};
         match version {
             1 => (

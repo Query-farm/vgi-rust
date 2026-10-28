@@ -141,7 +141,7 @@ impl Default for IrohHttpOptions {
 ///
 /// * **`protocol`** — the `vgi_rpc.protocol` routing key, required on every
 ///   request since vgi-rpc 0.25.0 even against a single-protocol server. A
-///   worker now co-hosts `vgi_rpc.Reflection.v1` alongside `vgi.v2`, so
+///   worker now co-hosts `vgi_rpc.Reflection.v1` alongside `vgi.v3`, so
 ///   "whichever protocol was registered first" is no longer a safe default and
 ///   an unbound client is refused outright.
 /// * **`protocol_version`** — a VGI worker rejects a request that does not
@@ -606,7 +606,7 @@ impl VgiClient {
     pub fn connect_httpi_with_options(target: &str, options: IrohHttpOptions) -> Result<Self> {
         use crate::transport::HttpTransport;
         let worker_logs = WorkerLogRouter::default();
-        // Bound like every other transport: each request names `vgi.v2` in
+        // Bound like every other transport: each request names `vgi.v3` in
         // its routing key and URL path (`HttpiClientBuilder::protocol`).
         let mut builder = vgi_rpc_client::HttpClient::connect_httpi(target)?
             .protocol(vgi_protocol::VGI_PROTOCOL_NAME)

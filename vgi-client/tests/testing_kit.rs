@@ -117,7 +117,12 @@ fn connect_fixture(handling: FilterHandling) -> Result<(TestWorker, std::thread:
 #[test]
 fn harness_compares_real_wire_scans_to_independent_fixtures() -> Result<()> {
     let (mut worker, server) = connect_fixture(FilterHandling::Sdk)?;
-    let spec = BindSpec::table("rows").in_schema(worker.catalog().default_schema());
+    let spec = BindSpec::table("rows").in_schema(
+        worker
+            .catalog()
+            .default_schema()
+            .expect("fixture has a default schema"),
+    );
 
     // id is intentionally absent from the requested projection; the kit must
     // add it for filtering, keep its full-schema index, then trim it away.
@@ -167,7 +172,12 @@ fn harness_compares_real_wire_scans_to_independent_fixtures() -> Result<()> {
 #[test]
 fn disabled_filtering_rejects_required_predicates_over_rpc() -> Result<()> {
     let (mut worker, server) = connect_fixture(FilterHandling::Disabled)?;
-    let spec = BindSpec::table("rows").in_schema(worker.catalog().default_schema());
+    let spec = BindSpec::table("rows").in_schema(
+        worker
+            .catalog()
+            .default_schema()
+            .expect("fixture has a default schema"),
+    );
     assert_eq!(
         worker
             .scan(&spec, &vgi_client::ScanOptions::default())?
@@ -276,7 +286,11 @@ fn table_in_out_filters_process_and_finish_before_projecting() -> Result<()> {
     let (mut worker, server) = connect_fixture(FilterHandling::Sdk)?;
     let catalog = worker.catalog().clone();
     let client = worker.client_mut();
-    let mut spec = BindSpec::table("input_rows").in_schema(catalog.default_schema());
+    let mut spec = BindSpec::table("input_rows").in_schema(
+        catalog
+            .default_schema()
+            .expect("fixture has a default schema"),
+    );
     spec.function_type = vgi_client::FunctionType::TableInOut;
     let bound = client.bind_with_input(&catalog, &spec, &schema())?;
     let options = label_projection()?;
@@ -309,7 +323,11 @@ fn buffering_finalize_filters_full_schema_then_projects() -> Result<()> {
     let (mut worker, server) = connect_fixture(FilterHandling::Sdk)?;
     let catalog = worker.catalog().clone();
     let client = worker.client_mut();
-    let mut spec = BindSpec::table("buffered_rows").in_schema(catalog.default_schema());
+    let mut spec = BindSpec::table("buffered_rows").in_schema(
+        catalog
+            .default_schema()
+            .expect("fixture has a default schema"),
+    );
     spec.function_type = vgi_client::FunctionType::TableBuffering;
     let bound = client.bind_with_input(&catalog, &spec, &schema())?;
     let execution_id = client.buffering_begin(&bound)?;
