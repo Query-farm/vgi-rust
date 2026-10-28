@@ -16,7 +16,11 @@ use vgi_rpc::VgiArrow;
 #[test]
 fn attach_default_schema_preserves_null_and_raw_names() {
     use vgi_protocol::protocol::dtos::CatalogAttachResult;
-    for (name, expected) in [("none", None), ("main", Some("main")), ("dotted", Some("sales.archive"))] {
+    for (name, expected) in [
+        ("none", None),
+        ("main", Some("main")),
+        ("dotted", Some("sales.archive")),
+    ] {
         let result: CatalogAttachResult = round_trip(&format!("attach_default_schema_{name}"));
         assert_eq!(result.default_schema.as_deref(), expected);
     }
@@ -646,7 +650,10 @@ fn macro_info_typed_codec_keeps_the_entire_family() {
         assert_eq!(info.overloads.len(), count);
         for overload in &info.overloads {
             assert_eq!(overload.schema_path, info.schema_path);
-            assert!(overload.parameters.iter().all(|p| p.default_expression.is_none()));
+            assert!(overload
+                .parameters
+                .iter()
+                .all(|p| p.default_expression.is_none()));
         }
     }
 }

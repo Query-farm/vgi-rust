@@ -3,7 +3,6 @@
 //! Table (producer) example fixtures.
 
 mod batch_index;
-mod projection;
 mod cache;
 mod cancellable;
 mod filters;
@@ -11,6 +10,7 @@ mod more;
 mod order_modes;
 pub mod partition;
 mod proj_repro;
+mod projection;
 mod rff;
 mod settings_fixtures;
 pub mod splits;

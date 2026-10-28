@@ -83,7 +83,9 @@ fn attaches_and_reports_a_default_schema() {
         "attach must return a session handle"
     );
     assert!(
-        !cat.default_schema().expect("fixture declares a default schema").is_empty(),
+        !cat.default_schema()
+            .expect("fixture declares a default schema")
+            .is_empty(),
         "attach must name a default schema"
     );
 

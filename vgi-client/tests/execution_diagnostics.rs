@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use vgi::diagnostics::{ExecutionDiagnostics, ScanStats, source_http_error};
+use vgi::diagnostics::{source_http_error, ExecutionDiagnostics, ScanStats};
 use vgi::table_function::{TableFunction, TableProducer};
 use vgi::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, Worker};
 use vgi_client::{AttachOptions, BindSpec, ScanOptions, VgiClient};

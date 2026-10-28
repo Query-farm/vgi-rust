@@ -46,7 +46,7 @@ example below needs):
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.45"
+vgi = "0.48"
 vgi-rpc = "0.32"
 arrow-array = "60"
 arrow-schema = "60"

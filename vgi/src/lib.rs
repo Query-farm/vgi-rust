@@ -124,14 +124,13 @@ pub mod attach_ticket;
 pub mod buffering;
 
 pub mod catalog;
-pub mod column_metadata;
-pub mod column_expressions;
-pub mod projection;
 pub mod catalog_contents;
 #[cfg(feature = "catalog-publication")]
 pub mod catalog_snapshot;
 #[cfg(feature = "catalog-publication")]
 pub mod catalog_snapshot_s3;
+pub mod column_expressions;
+pub mod column_metadata;
 pub mod copy_from;
 pub mod copy_to;
 pub mod diagnostics;
@@ -142,6 +141,7 @@ pub mod numeric;
 pub mod opaque;
 pub mod overload;
 pub mod partition;
+pub mod projection;
 pub mod protocol;
 pub mod pushdown;
 pub mod secrets;
@@ -193,9 +193,9 @@ mod function_shape_dispatch_tests;
 mod continuation_tests;
 
 pub use dispatch::FunctionScope;
-pub use table_function::BindRepeatability;
 pub use function::{
     ArgSpec, ArgumentMonotonicity, BindParams, BindResponse, FilterHandling, FunctionExample,
     FunctionMetadata, ProcessParams, ScalarFunction,
 };
+pub use table_function::BindRepeatability;
 pub use worker::{HostedProtocolsHook, ServeTransport, Worker, INTROSPECT_PRINCIPALS_ENV};

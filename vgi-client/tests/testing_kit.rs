@@ -15,7 +15,7 @@ use vgi::function::{
     ArgSpec, BindParams, BindResponse, FilterHandling, FunctionMetadata, ProcessParams,
 };
 use vgi::table_function::{TableFunction, TableProducer};
-use vgi_client::testing::{Comparison, FilterExpr, ScanResult, TestWorker, scan_options};
+use vgi_client::testing::{scan_options, Comparison, FilterExpr, ScanResult, TestWorker};
 use vgi_client::{AttachOptions, BindSpec, Result, StreamTransport, VgiClient};
 
 fn schema() -> SchemaRef {
@@ -159,13 +159,11 @@ fn harness_compares_real_wire_scans_to_independent_fixtures() -> Result<()> {
         row_limit: Some(1),
         ..options
     };
-    assert!(
-        worker
-            .check_pushdown(&spec, &unsupported, |_| unreachable!())
-            .unwrap_err()
-            .message
-            .contains("only filters and projection")
-    );
+    assert!(worker
+        .check_pushdown(&spec, &unsupported, |_| unreachable!())
+        .unwrap_err()
+        .message
+        .contains("only filters and projection"));
     drop(worker);
     server.join().unwrap();
     Ok(())

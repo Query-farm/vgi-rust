@@ -5,8 +5,8 @@
 //! methods).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -21,7 +21,7 @@ use crate::catalog;
 use crate::function::{BindParams, ProcessParams, ScalarFunction};
 use crate::ipc;
 use crate::protocol::dtos::*;
-use crate::storage::{FunctionStorage, default_storage};
+use crate::storage::{default_storage, FunctionStorage};
 use crate::table_function::{TableFunction, TableProducer};
 use crate::table_in_out::TableInOutFunction;
 use crate::window_cache::{CachedWindowPartition, WindowPartitionCache};
@@ -1134,7 +1134,7 @@ impl Dispatcher {
                             .collect(),
                         projection_expression_profiles: Vec::new(),
                         repeatability: crate::table_function::BindRepeatability::Unknown,
-                lookup_names: lookups
+                        lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1186,7 +1186,7 @@ impl Dispatcher {
                             .collect(),
                         projection_expression_profiles: Vec::new(),
                         repeatability: crate::table_function::BindRepeatability::Unknown,
-                lookup_names: lookups
+                        lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1238,7 +1238,7 @@ impl Dispatcher {
                             .collect(),
                         projection_expression_profiles: Vec::new(),
                         repeatability: crate::table_function::BindRepeatability::Unknown,
-                lookup_names: lookups
+                        lookup_names: lookups
                             .iter()
                             .map(|l| l.name.clone().unwrap_or_default())
                             .collect(),
@@ -1283,7 +1283,7 @@ impl Dispatcher {
                         .collect(),
                     projection_expression_profiles: Vec::new(),
                     repeatability: crate::table_function::BindRepeatability::Unknown,
-                lookup_names: lookups
+                    lookup_names: lookups
                         .iter()
                         .map(|l| l.name.clone().unwrap_or_default())
                         .collect(),
@@ -1303,7 +1303,7 @@ impl Dispatcher {
             lookup_scopes: Vec::new(),
             projection_expression_profiles: Vec::new(),
             repeatability: crate::table_function::BindRepeatability::Unknown,
-                lookup_names: Vec::new(),
+            lookup_names: Vec::new(),
         };
         Ok(Some(wire::to_result_batch(resp)?))
     }
@@ -2717,25 +2717,24 @@ impl Dispatcher {
         let cat = &self.catalog;
         // Implementation version: npm-resolved against the supported set when
         // opted in, else exact-match against the single declared version.
-        let resolved_impl = if cat.npm_version_resolution
-            && !cat.supported_implementation_versions.is_empty()
-        {
-            Some(catalog::resolve_version_npm(
-                dto.implementation_version.as_deref(),
-                &cat.supported_implementation_versions,
-                cat.implementation_version.as_deref().unwrap_or(""),
-                "implementation_version",
-            )?)
-        } else {
-            match (&dto.implementation_version, &cat.implementation_version) {
-                (Some(req), Some(have)) if req != have => {
-                    return Err(crate::errors::invalid_argument(format!(
+        let resolved_impl =
+            if cat.npm_version_resolution && !cat.supported_implementation_versions.is_empty() {
+                Some(catalog::resolve_version_npm(
+                    dto.implementation_version.as_deref(),
+                    &cat.supported_implementation_versions,
+                    cat.implementation_version.as_deref().unwrap_or(""),
+                    "implementation_version",
+                )?)
+            } else {
+                match (&dto.implementation_version, &cat.implementation_version) {
+                    (Some(req), Some(have)) if req != have => {
+                        return Err(crate::errors::invalid_argument(format!(
                         "Unsupported implementation_version {req:?}; this worker serves {have:?}"
                     )));
+                    }
+                    (_, have) => have.clone(),
                 }
-                (_, have) => have.clone(),
-            }
-        };
+            };
         // Data version: npm-style resolution when opted in, else exact-match.
         let resolved_data = if cat.supported_data_versions.is_empty() {
             None
@@ -3059,7 +3058,7 @@ impl Dispatcher {
         req: &Request,
         if_none_match: Option<&str>,
     ) -> Result<CatalogContentsResponse> {
-        use crate::catalog_contents::{CatalogContentsRequest, finish};
+        use crate::catalog_contents::{finish, CatalogContentsRequest};
         let cat = self.active_catalog(req);
         let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
         let build = || self.build_contents(req, cat);
@@ -3102,7 +3101,11 @@ impl Dispatcher {
             // `Some(0)` is a hard guarantee; an absent count means "unknown".
             let has = |kind: &str| !counts.iter().any(|(k, n)| k == kind && *n == 0);
             let kind = |present: bool, items: &dyn Fn() -> Result<Vec<Bytes>>| {
-                if present { items() } else { Ok(Vec::new()) }
+                if present {
+                    items()
+                } else {
+                    Ok(Vec::new())
+                }
             };
             let schema = catalog::serialize_items(vec![info])?
                 .pop()
@@ -3329,7 +3332,8 @@ impl Dispatcher {
         req: &Request,
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
-        let bytes = req.column("request")
+        let bytes = req
+            .column("request")
             .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
             .filter(|c| c.len() == 1 && !c.is_null(0))
             .ok_or_else(|| RpcError::type_error("projection requires one binary request"))?;
@@ -6011,10 +6015,9 @@ mod buffering_schema_tests {
         let d = Dispatcher::new("test");
         let exec = format!("test-error-{}", std::process::id()).into_bytes();
         d.store.clear(&exec);
-        assert!(
-            d.buffering_output_schema(&exec, &FixedOutput, None)
-                .is_err()
-        );
+        assert!(d
+            .buffering_output_schema(&exec, &FixedOutput, None)
+            .is_err());
     }
 }
 
@@ -6388,15 +6391,14 @@ mod scope_tests {
         assert_eq!(matched, vec![0]);
 
         let sibling = vec!["analytics".to_string(), "finance".to_string()];
-        assert!(
-            d.scoped_indices(
+        assert!(d
+            .scoped_indices(
                 FnKind::Scalar,
                 "f",
                 1,
                 CallScope::qualified("cat", &sibling),
             )
-            .is_err()
-        );
+            .is_err());
     }
 
     /// Naming a schema the function does not live in is an error that reports
@@ -6481,17 +6483,15 @@ mod scope_tests {
         // pre-1.1.0 peer: no bind it sends can name a schema
         assert!(CallScope::for_bind("cat", None, "f", false, false, true).is_ok());
         // a named schema always resolves exactly
-        assert!(
-            CallScope::for_bind(
-                "cat",
-                Some(path("main").as_slice()),
-                "f",
-                false,
-                false,
-                false
-            )
-            .is_ok()
-        );
+        assert!(CallScope::for_bind(
+            "cat",
+            Some(path("main").as_slice()),
+            "f",
+            false,
+            false,
+            false
+        )
+        .is_ok());
     }
 
     /// The hidden-function allowance is recognised from the worker's own
@@ -6769,8 +6769,8 @@ mod catalog_contents_tests {
 
     use super::*;
     use crate::catalog_contents::{
-        CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest,
-        CatalogContentsResult, catalog_contents_digest,
+        catalog_contents_digest, CatalogContentsEtag, CatalogContentsProvider,
+        CatalogContentsRequest, CatalogContentsResult,
     };
     use crate::function::{ArgSpec, FunctionMetadata};
     use arrow_schema::{DataType, Field, Schema};

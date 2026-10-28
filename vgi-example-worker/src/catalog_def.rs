@@ -72,7 +72,11 @@ fn fm(name: &str, ty: DataType, key: &str, val: &str) -> Field {
 /// Canonical VIRTUAL expression owned by the data schema.
 fn generated(name: &str, ty: DataType, sql: &str) -> Field {
     Field::new(name, ty, true).with_metadata(std::collections::HashMap::from([
-        (vgi::column_expressions::GENERATED.into(), vgi::column_expressions::generated_metadata(sql, &["data".into()]).expect("valid example expression")),
+        (
+            vgi::column_expressions::GENERATED.into(),
+            vgi::column_expressions::generated_metadata(sql, &["data".into()])
+                .expect("valid example expression"),
+        ),
         (vgi::column_expressions::GENERATION.into(), "virtual".into()),
     ]))
 }
@@ -1654,7 +1658,18 @@ pub fn build() -> CatalogModel {
                         )
                     },
                 ],
-                tables: vec![scan(CatTable::new("projection_rows",Arc::new(Schema::new(vec![Field::new("n",DataType::Int32,true)])),"projection_sequence",Vec::new(),None,Some(10)),"projection_sequence"),
+                tables: vec![
+                    scan(
+                        CatTable::new(
+                            "projection_rows",
+                            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)])),
+                            "projection_sequence",
+                            Vec::new(),
+                            None,
+                            Some(10),
+                        ),
+                        "projection_sequence",
+                    ),
                     // Schema-disambiguation probe (table dispatch): same
                     // registered table name as the data-schema table, backed
                     // by this schema's own scan-function implementation

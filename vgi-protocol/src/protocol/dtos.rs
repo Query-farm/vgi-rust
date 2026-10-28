@@ -474,13 +474,11 @@ mod backfill_tests {
             .downcast_ref::<arrow_array::BooleanArray>()
             .expect("boolean column");
         assert!(!supports_splits.value(0));
-        assert!(
-            !output
-                .schema()
-                .field_with_name("supports_splits")
-                .unwrap()
-                .is_nullable()
-        );
+        assert!(!output
+            .schema()
+            .field_with_name("supports_splits")
+            .unwrap()
+            .is_nullable());
     }
 }
 

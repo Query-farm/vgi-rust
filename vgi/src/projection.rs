@@ -92,7 +92,11 @@ pub(crate) fn record(bytes: &[u8], expected: &Schema) -> Result<arrow_array::Rec
     // unconsumed bytes ourselves so only physical EOF or one complete EOS is valid.
     match &bytes[cursor.position() as usize..] {
         [] | [0, 0, 0, 0] | [255, 255, 255, 255, 0, 0, 0, 0] => {}
-        _ => return Err(invalid("projection requires exactly one complete IPC batch")),
+        _ => {
+            return Err(invalid(
+                "projection requires exactly one complete IPC batch",
+            ))
+        }
     }
     Ok(row)
 }

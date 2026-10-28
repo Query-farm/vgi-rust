@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
+use arrow_array::{cast::AsArray, types::Int64Type, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use vgi_client::{
     ArgValue, Arguments, AttachOptions, BindSpec, FunctionType, ScanOptions, VgiClient,

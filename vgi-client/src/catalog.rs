@@ -3,8 +3,8 @@
 //! Attaching a catalog and discovering what it holds.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU8, Ordering},
+    Arc,
 };
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
@@ -289,7 +289,9 @@ pub fn decode_setting_specs(info: &CatalogAttachResult) -> Result<Vec<SettingSpe
 
 /// Decode literal defaults from one explicitly selected overload. Expression defaults
 /// require the owning SQL binder and are not evaluated or silently discarded here.
-pub fn decode_macro_defaults(overload: &vgi_protocol::generated::protocol_types::MacroOverload) -> Result<Vec<(String, ArrayRef)>> {
+pub fn decode_macro_defaults(
+    overload: &vgi_protocol::generated::protocol_types::MacroOverload,
+) -> Result<Vec<(String, ArrayRef)>> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for parameter in &overload.parameters {
@@ -297,12 +299,19 @@ pub fn decode_macro_defaults(overload: &vgi_protocol::generated::protocol_types:
             return Err(RpcError::type_error("duplicate macro parameter"));
         }
         if parameter.default_expression.is_some() {
-            return Err(RpcError::type_error("expression default requires the owning SQL binder"));
+            return Err(RpcError::type_error(
+                "expression default requires the owning SQL binder",
+            ));
         }
         if let Some(bytes) = &parameter.default_value {
             let batch = vgi_protocol::ipc::read_batch(&bytes.0)?;
-            if batch.num_rows() != 1 || batch.num_columns() != 1 || batch.schema().field(0).name() != &parameter.name {
-                return Err(RpcError::type_error("macro default requires one row and one column named for its parameter"));
+            if batch.num_rows() != 1
+                || batch.num_columns() != 1
+                || batch.schema().field(0).name() != &parameter.name
+            {
+                return Err(RpcError::type_error(
+                    "macro default requires one row and one column named for its parameter",
+                ));
             }
             result.push((parameter.name.clone(), batch.column(0).clone()));
         }
@@ -1977,12 +1986,10 @@ mod setting_spec_tests {
             vec![Arc::new(StringArray::from(vec!["seven"]))],
         )
         .unwrap();
-        assert!(
-            SettingSpec::decode(&encoded_setting(Some(&default)))
-                .unwrap_err()
-                .message
-                .contains("does not match")
-        );
+        assert!(SettingSpec::decode(&encoded_setting(Some(&default)))
+            .unwrap_err()
+            .message
+            .contains("does not match"));
     }
 }
 
@@ -1991,17 +1998,36 @@ mod macro_default_tests {
     use super::*;
     use arrow_array::{Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use vgi_protocol::generated::protocol_types::{MacroOverload, MacroParameter, QueryEvaluationContext};
+    use vgi_protocol::generated::protocol_types::{
+        MacroOverload, MacroParameter, QueryEvaluationContext,
+    };
 
     fn overload(value: Option<i64>) -> MacroOverload {
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
-            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef]).unwrap();
-        MacroOverload { parameters: vec![MacroParameter { name: "x".into(), declared_type: None,
-            default_value: Some(Bytes::from(vgi_protocol::ipc::write_batch(&batch).unwrap())),
-            default_expression: None, documentation: Some("typed default".into()) }],
-            definition: "x".into(), profile: "duckdb.macro.v1".into(), schema_path: vec!["main".into()], macro_type: "scalar".into(),
-            evaluation_context: QueryEvaluationContext { timezone: "UTC".into(), collation: "binary".into(),
-                default_order: "asc".into(), default_null_order: "nulls_last".into(), preserve_insertion_order: true } }
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+        )
+        .unwrap();
+        MacroOverload {
+            parameters: vec![MacroParameter {
+                name: "x".into(),
+                declared_type: None,
+                default_value: Some(Bytes::from(vgi_protocol::ipc::write_batch(&batch).unwrap())),
+                default_expression: None,
+                documentation: Some("typed default".into()),
+            }],
+            definition: "x".into(),
+            profile: "duckdb.macro.v1".into(),
+            schema_path: vec!["main".into()],
+            macro_type: "scalar".into(),
+            evaluation_context: QueryEvaluationContext {
+                timezone: "UTC".into(),
+                collation: "binary".into(),
+                default_order: "asc".into(),
+                default_null_order: "nulls_last".into(),
+                preserve_insertion_order: true,
+            },
+        }
     }
 
     #[test]
@@ -2021,7 +2047,10 @@ mod macro_default_tests {
         value.parameters[0].default_value = None;
         assert!(decode_macro_defaults(&value).unwrap().is_empty());
         value.parameters[0].default_expression = Some(Bytes::from(vec![1]));
-        assert!(decode_macro_defaults(&value).unwrap_err().message.contains("owning SQL binder"));
+        assert!(decode_macro_defaults(&value)
+            .unwrap_err()
+            .message
+            .contains("owning SQL binder"));
     }
 }
 
@@ -2224,11 +2253,10 @@ mod load_catalog_tests {
         ]);
         let snap = c.load_catalog(&attached(true), Some(&previous)).unwrap();
         assert_eq!(snap.source, CatalogLoadSource::PerSchema);
-        assert!(
-            snap.fallback_reason
-                .unwrap()
-                .contains("older than the known version 5")
-        );
+        assert!(snap
+            .fallback_reason
+            .unwrap()
+            .contains("older than the known version 5"));
         assert_eq!(
             calls(&log),
             ["catalog_contents", "catalog_contents", "catalog_schemas"]

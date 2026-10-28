@@ -76,9 +76,9 @@ pub fn serialize_catalog_info(model: &CatalogModel) -> Result<Vec<u8>> {
     };
 
     let name = Arc::new(StringArray::from(vec![model.name.clone()])) as ArrayRef;
-    let impl_ver = Arc::new(StringArray::from(vec![
-        model.implementation_version.clone(),
-    ])) as ArrayRef;
+    let impl_ver = Arc::new(StringArray::from(vec![model
+        .implementation_version
+        .clone()])) as ArrayRef;
     let data_ver = Arc::new(StringArray::from(vec![model.data_version_spec.clone()])) as ArrayRef;
 
     // attach_option_specs: list<binary>, one list of the serialized specs.
@@ -776,7 +776,7 @@ pub fn scalar_function_info(f: &dyn ScalarFunction) -> Result<FunctionInfo> {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
             Schema::new(vec![
-                Field::new("result", DataType::Null, false).with_metadata(m),
+                Field::new("result", DataType::Null, false).with_metadata(m)
             ])
         }
     };
@@ -865,9 +865,12 @@ pub fn aggregate_function_info(
         (None, Err(_)) => {
             let mut m = HashMap::new();
             m.insert("vgi:any".to_string(), "true".to_string());
-            Arc::new(Schema::new(vec![
-                Field::new("result", DataType::Null, false).with_metadata(m),
-            ]))
+            Arc::new(Schema::new(vec![Field::new(
+                "result",
+                DataType::Null,
+                false,
+            )
+            .with_metadata(m)]))
         }
     };
     fi.output_schema = Bytes::from(ipc::write_schema_ref(&out)?);
@@ -906,13 +909,16 @@ pub fn schema_info(
 pub type AttachPayloadHook =
     std::sync::Arc<dyn Fn(Option<&arrow_array::RecordBatch>) -> Result<Vec<u8>> + Send + Sync>;
 
+/// Provider callback selecting available and agreed capability records from an offer.
+pub type CapabilityAgreementHook = fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>;
+
 /// A declarative catalog: named schemas with views, macros, and tables.
 #[derive(Default, Clone)]
 pub struct CatalogModel {
     /// Provider-owned capability selection from the client's serialized offer.
     /// The returned records are available and selected CatalogCapabilities IPC;
     /// selected profiles must be offered, supported and include prerequisites.
-    pub capability_agreement: Option<fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>>,
+    pub capability_agreement: Option<CapabilityAgreementHook>,
     /// Catalog name advertised by `catalog_catalogs` (discovery).
     pub name: String,
     pub schemas: Vec<CatSchema>,
@@ -1933,10 +1939,9 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("without a registered Rust evaluator")
-        );
+        assert!(err
+            .to_string()
+            .contains("without a registered Rust evaluator"));
     }
 
     /// A minimal scalar whose `metadata()` advertises SQL examples.
@@ -2209,22 +2214,18 @@ mod tests {
     #[test]
     fn test_constraint_keys_encode_typed_values() {
         // Numeric choices and default encode as JSON scalars/arrays (not strings).
-        let specs = vec![
-            ArgSpec::const_arg("level", 0, "int64", "Level")
-                .with_choices([1, 2, 3])
-                .with_default(2),
-        ];
+        let specs = vec![ArgSpec::const_arg("level", 0, "int64", "Level")
+            .with_choices([1, 2, 3])
+            .with_default(2)];
         let schema = build_arg_schema(&specs);
         let meta = schema.field(0).metadata();
         assert_eq!(meta.get("vgi_choices").map(String::as_str), Some("[1,2,3]"));
         assert_eq!(meta.get("vgi_default").map(String::as_str), Some("2"));
 
         // Boolean and list defaults encode faithfully.
-        let specs = vec![
-            ArgSpec::const_arg("flag", -1, "boolean", "Flag")
-                .with_default(true)
-                .with_choices([true, false]),
-        ];
+        let specs = vec![ArgSpec::const_arg("flag", -1, "boolean", "Flag")
+            .with_default(true)
+            .with_choices([true, false])];
         let schema = build_arg_schema(&specs);
         let meta = schema.field(0).metadata();
         assert_eq!(meta.get("vgi_default").map(String::as_str), Some("true"));
@@ -2312,14 +2313,12 @@ mod tests {
         let decoded = ipc::read_schema(&bytes).expect("read arguments_schema");
         let docs = macro_parameter_docs_from_schema(&decoded);
         assert_eq!(docs.len(), 2);
-        assert!(
-            docs.iter()
-                .any(|(n, d)| n == "val" && d == "Value to clamp"),
-        );
-        assert!(
-            docs.iter()
-                .any(|(n, d)| n == "hi" && d == "Upper bound — µ ≥ note"),
-        );
+        assert!(docs
+            .iter()
+            .any(|(n, d)| n == "val" && d == "Value to clamp"),);
+        assert!(docs
+            .iter()
+            .any(|(n, d)| n == "hi" && d == "Upper bound — µ ≥ note"),);
         assert!(
             !docs.iter().any(|(n, _)| n == "lo"),
             "undocumented parameter must not appear in the decoded docs",
@@ -2331,7 +2330,10 @@ mod tests {
         let info = macro_info(&path("main"), &macro_with_docs()).unwrap();
         assert_eq!(info.overloads.len(), 1);
         let overload = &info.overloads[0];
-        assert_eq!(overload.parameters[0].documentation.as_deref(), Some("Value to clamp"));
+        assert_eq!(
+            overload.parameters[0].documentation.as_deref(),
+            Some("Value to clamp")
+        );
         assert!(overload.parameters[1].declared_type.is_none());
         assert!(overload.parameters[1].default_value.is_some());
         assert_eq!(overload.schema_path, path("main"));
@@ -2764,19 +2766,17 @@ mod attach_option_secret_tests {
     #[test]
     fn required_plus_default_is_still_refused_when_secret() {
         let default: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
-        assert!(
-            serialize_attach_option_spec_with_flags(
-                "both",
-                "",
-                &DataType::Utf8,
-                Some(&default),
-                AttachOptionFlags {
-                    required: true,
-                    secret: true,
-                },
-            )
-            .is_err()
-        );
+        assert!(serialize_attach_option_spec_with_flags(
+            "both",
+            "",
+            &DataType::Utf8,
+            Some(&default),
+            AttachOptionFlags {
+                required: true,
+                secret: true,
+            },
+        )
+        .is_err());
     }
 
     #[test]

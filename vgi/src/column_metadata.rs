@@ -1,7 +1,7 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 use arrow_schema::{DataType, Field, Schema};
-use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt;
 

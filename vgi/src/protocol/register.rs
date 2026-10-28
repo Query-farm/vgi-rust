@@ -18,7 +18,7 @@ use vgi_rpc::{CallContext, Request, Result, RpcServer, StreamResult};
 
 use crate::dispatch::Dispatcher;
 
-pub use super::vgi_service::{VgiService, not_implemented};
+pub use super::vgi_service::{not_implemented, VgiService};
 
 /// Register all VGI methods against `srv`, backed by `disp`.
 pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {

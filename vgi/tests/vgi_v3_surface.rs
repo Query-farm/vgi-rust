@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch};
-use vgi::VGI_PROTOCOL_NAME;
-use vgi::protocol::register::{UNIMPLEMENTED_METHODS, not_implemented};
+use vgi::protocol::register::{not_implemented, UNIMPLEMENTED_METHODS};
 use vgi::worker::Worker;
+use vgi::VGI_PROTOCOL_NAME;
 use vgi_rpc::metadata::{
     ERROR_CODE_KEY, ERROR_KIND_KEY, LOG_MESSAGE_KEY, PROTOCOL_KEY, PROTOCOL_VERSION_KEY,
     REQUEST_VERSION, REQUEST_VERSION_KEY, RPC_METHOD_KEY,
@@ -113,8 +113,8 @@ fn unimplemented_methods_answer_unimplemented() {
 /// A one-row, schema-valid params batch for `method`: every column non-null
 /// (a placeholder value), every nullable column null.
 fn well_formed_params(method: &str) -> RecordBatch {
-    use arrow_array::StringArray;
     use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::StringArray;
     use arrow_schema::DataType;
     let schema = vgi::wire::params_schema_for(method);
     let columns: Vec<ArrayRef> = schema

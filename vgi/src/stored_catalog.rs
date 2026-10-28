@@ -50,7 +50,7 @@ use vgi_rpc::{Bytes, DictString, Request, Result, RpcError};
 
 use crate::catalog;
 use crate::catalog_contents::{
-    CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest, finish,
+    finish, CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest,
 };
 use crate::protocol::dtos::{
     CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
@@ -237,7 +237,11 @@ impl StoredCatalog {
     }
 
     fn reported_version(&self, state: &State) -> i64 {
-        if self.versioned { state.version } else { 0 }
+        if self.versioned {
+            state.version
+        } else {
+            0
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -428,7 +432,11 @@ impl StoredCatalog {
                     ));
                 }
                 crate::column_metadata::validate_column_metadata_ipc(&q.columns.0)?;
-                crate::column_expressions::validate(crate::ipc::read_schema(&q.columns.0)?.as_ref(), &q.schema_path, false)?;
+                crate::column_expressions::validate(
+                    crate::ipc::read_schema(&q.columns.0)?.as_ref(),
+                    &q.schema_path,
+                    false,
+                )?;
                 // Reject malformed or unauthorized NOT NULL claims before effects.
                 require_unconstrained_columns(crate::ipc::read_schema(&q.columns.0)?.as_ref())?;
                 self.mutate(
@@ -1418,7 +1426,8 @@ mod tests {
                 })
                 .unwrap();
                 let columns = crate::ipc::read_schema(&raw).unwrap();
-                let table = catalog::CatTable::new(name, columns.clone(), "", Vec::new(), None, None);
+                let table =
+                    catalog::CatTable::new(name, columns.clone(), "", Vec::new(), None, None);
                 let discovery = catalog::table_info(&path(&["main"]), &table, None);
                 if group == "invalid" {
                     assert!(discovery.is_err(), "published {name}");
@@ -1491,11 +1500,9 @@ mod tests {
             transaction_opaque_data: None,
         })
         .unwrap();
-        assert!(
-            session
-                .call("catalog_index_option_definitions", options)
-                .is_err()
-        );
+        assert!(session
+            .call("catalog_index_option_definitions", options)
+            .is_err());
         assert_eq!(session.version(), before);
         let after_tables: Vec<TableInfo> =
             session.list("catalog_schema_contents_tables", &["main"]);
@@ -1557,13 +1564,11 @@ mod tests {
                 request: Bytes::from(crate::ipc::write_batch(&inner).unwrap()),
             })
             .unwrap();
-            assert!(
-                session
-                    .call("catalog_table_create", batch)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("nonnullable")
-            );
+            assert!(session
+                .call("catalog_table_create", batch)
+                .unwrap_err()
+                .to_string()
+                .contains("nonnullable"));
         }
         assert_eq!(session.version(), before);
         let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
