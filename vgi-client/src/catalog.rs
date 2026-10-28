@@ -26,9 +26,13 @@ use crate::wire_call::{call, call_batch, call_items, call_unit, envelope};
 /// Metadata supplied when creating or replacing a regular view.
 #[derive(Clone, Debug, Default)]
 pub struct ViewCreateOptions {
+    /// Ordered output-column aliases, or an empty list to retain query names.
     pub aliases: Vec<String>,
+    /// Optional view comment; an empty string is distinct from no comment.
     pub comment: Option<String>,
+    /// Provider-defined metadata tags attached to the view.
     pub tags: Vec<(String, String)>,
+    /// Comments keyed by the final output-column name.
     pub column_comments: Vec<(String, String)>,
 }
 
