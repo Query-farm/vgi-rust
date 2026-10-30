@@ -31,6 +31,8 @@
 //! - [`protocol::enums`] — dictionary-encoded enum payloads
 //! - [`wire`] — `to_batch` / `from_batch` plus [`wire::params_schema_for`]
 //! - [`ipc`] — Arrow IPC stream read/write helpers
+//! - [`constraints`] — the canonical constraint-record codec and catalog
+//!   capability profiles
 
 /// VGI wire protocol version advertised to the C++ extension.
 ///
@@ -52,14 +54,16 @@ pub const VGI_PROTOCOL_VERSION: &str = "3.0.0";
 /// could address them all. `vgi.v3` is the canonical wire name across every
 /// port.
 ///
-/// The major version is part of the name on purpose. An incompatible major
+/// The major version is part of the name on purpose: an incompatible major
 /// becomes a *different* name — and therefore an honest 404 rather than a
-/// confusing mid-stream failure — and `vgi.v2` can be served beside `vgi.v3`
-/// while clients migrate.
+/// confusing mid-stream failure. This SDK serves only `vgi.v3`; it has no
+/// `vgi.v2` implementation to host beside it, so a 2.x client must be served
+/// by a worker built on an earlier SDK release.
 pub const VGI_PROTOCOL_NAME: &str = "vgi.v3";
 
 pub mod cache_control;
 pub mod catalog;
+pub mod constraints;
 pub mod generated;
 pub mod ipc;
 pub mod protocol;

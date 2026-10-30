@@ -38,7 +38,14 @@
 //! [`CatalogContentsEtag::ContentHash`].
 //!
 //! Tables created here are metadata only: they appear in every listing with
-//! their columns and constraints, but have no rows to scan.
+//! their columns, but have no rows to scan and no write path.
+//!
+//! **No constraints.** Because nothing is ever written, the catalog has no
+//! write path on which to *enforce* a constraint, so it attests none: it
+//! negotiates no constraint profiles, `CREATE TABLE` with NOT NULL / PRIMARY
+//! KEY / UNIQUE / CHECK / FOREIGN KEY is refused, and every column is served
+//! nullable. Event logs written before `vgi.v3` that recorded such facts replay
+//! with the facts dropped (and a `log` warning).
 
 use std::sync::Arc;
 
@@ -421,8 +428,15 @@ impl StoredCatalog {
                 let boxed: p::CatalogTableCreateParams = wire::from_batch(&req.batch)?;
                 let q: TableCreateRequest =
                     wire::from_batch(&crate::ipc::read_batch(&boxed.request.0)?)?;
-                if !q.constraint_definitions.is_empty()
-                    || q.comment.is_some()
+                if !q.constraint_definitions.is_empty() {
+                    return Err(RpcError::method_not_implemented(format!(
+                        "catalog '{}' does not support CREATE TABLE constraints (NOT NULL, \
+                         PRIMARY KEY, UNIQUE, CHECK, FOREIGN KEY): its tables are metadata \
+                         only, with no write path that could enforce them",
+                        self.name
+                    )));
+                }
+                if q.comment.is_some()
                     || q.tags.is_some()
                     || q.options.is_some()
                     || q.layout.is_some()
@@ -629,9 +643,16 @@ enum Event {
         path: Vec<String>,
         name: String,
         columns: Vec<u8>,
+        // Legacy constraint facts. Logs written by 0.47 and earlier may carry
+        // them; this catalog has no write path to enforce them, so replay drops
+        // them (see `State::apply`). New events always write them empty.
+        #[serde(default)]
         not_null: Vec<i32>,
+        #[serde(default)]
         unique: Vec<Vec<i32>>,
+        #[serde(default)]
         check: Vec<String>,
+        #[serde(default)]
         primary_key: Vec<Vec<i32>>,
         on_conflict: OnConflict,
     },
@@ -673,16 +694,12 @@ enum Event {
 struct StoredTable {
     name: String,
     columns: Vec<u8>,
-    not_null: Vec<i32>,
-    unique: Vec<Vec<i32>>,
-    check: Vec<String>,
-    primary_key: Vec<Vec<i32>>,
 }
 
 impl StoredTable {
     fn info(&self, path: &[String]) -> Result<TableInfo> {
         crate::column_metadata::validate_column_metadata_ipc(&self.columns)?;
-        let mut t = catalog::CatTable::new(
+        let t = catalog::CatTable::new(
             &self.name,
             crate::ipc::read_schema(&self.columns)?,
             "",
@@ -690,10 +707,6 @@ impl StoredTable {
             None,
             None,
         );
-        t.not_null = self.not_null.clone();
-        t.unique = self.unique.clone();
-        t.check = self.check.clone();
-        t.primary_key = self.primary_key.clone();
         catalog::table_info(path, &t, None)
     }
 }
@@ -938,13 +951,24 @@ impl State {
                 primary_key,
                 on_conflict,
             } => {
+                if !(not_null.is_empty()
+                    && unique.is_empty()
+                    && check.is_empty()
+                    && primary_key.is_empty())
+                {
+                    // A pre-vgi.v3 log: the facts cannot be served as canonical
+                    // records (this catalog enforces nothing), and keeping them
+                    // would fail every listing of the schema. The columns are
+                    // served nullable.
+                    log::warn!(
+                        "stored catalog table '{}.{name}': dropping legacy NOT NULL / UNIQUE / \
+                         PRIMARY KEY / CHECK facts replayed from a pre-vgi.v3 DDL log",
+                        path.join(".")
+                    );
+                }
                 let table = StoredTable {
                     name: name.clone(),
                     columns: columns.clone(),
-                    not_null: not_null.clone(),
-                    unique: unique.clone(),
-                    check: check.clone(),
-                    primary_key: primary_key.clone(),
                 };
                 let schema = self.schema_mut(path)?;
                 if schema.view(name).is_some() {
@@ -1120,9 +1144,11 @@ fn require_unconstrained_columns(schema: &Schema) -> Result<()> {
             ));
         }
         if !field.is_nullable() {
-            return Err(RpcError::method_not_implemented(
-                "catalog_table_create: nonnullable user columns require canonical constraints",
-            ));
+            return Err(RpcError::method_not_implemented(format!(
+                "catalog_table_create: column '{}' is non-nullable, but this catalog does not \
+                 support NOT NULL (no write path enforces it)",
+                field.name()
+            )));
         }
         if let DataType::Struct(children) = field.data_type() {
             for child in children {
@@ -1429,7 +1455,19 @@ mod tests {
                 let table =
                     catalog::CatTable::new(name, columns.clone(), "", Vec::new(), None, None);
                 let discovery = catalog::table_info(&path(&["main"]), &table, None);
-                if group == "invalid" {
+                if name == "legacy_generated_only" {
+                    // Serving a catalog table translates the legacy key to the
+                    // canonical pair owned by the table's schema.
+                    let info = discovery.unwrap();
+                    let served = crate::ipc::read_schema(&info.columns.0).unwrap();
+                    for field in served.fields() {
+                        let meta = field.metadata();
+                        assert!(!meta.contains_key("generated_expression"), "{name}");
+                        if meta.contains_key(crate::column_expressions::GENERATED) {
+                            assert_eq!(meta[crate::column_expressions::GENERATION], "virtual");
+                        }
+                    }
+                } else if group == "invalid" {
                     assert!(discovery.is_err(), "published {name}");
                 } else {
                     let info = discovery.unwrap();
@@ -1536,7 +1574,9 @@ mod tests {
             })
             .unwrap();
             let err = session.call("catalog_table_create", batch).unwrap_err();
-            assert!(err.to_string().contains("profiles"));
+            assert!(err
+                .to_string()
+                .contains("does not support CREATE TABLE constraints"));
         }
         for field in [
             Field::new("a", DataType::Utf8, false),
@@ -1568,7 +1608,7 @@ mod tests {
                 .call("catalog_table_create", batch)
                 .unwrap_err()
                 .to_string()
-                .contains("nonnullable"));
+                .contains("does not support NOT NULL"));
         }
         assert_eq!(session.version(), before);
         let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
@@ -1975,5 +2015,63 @@ mod tests {
 
     fn inner_of(result: RecordBatch) -> RecordBatch {
         inner(result)
+    }
+
+    /// A DDL log written by 0.47 (pre-vgi.v3) recorded NOT NULL / PRIMARY KEY
+    /// facts on the table event. Replay drops them: the table lists, with its
+    /// columns served nullable, and so does `catalog_contents`.
+    #[test]
+    fn pre_v3_log_with_legacy_constraints_replays() {
+        let session = Session::new(StoredCatalog::new("mem"));
+        let columns = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let legacy = serde_json::json!({
+            "TableCreate": {
+                "path": ["main"],
+                "name": "users",
+                "columns": crate::ipc::write_schema(&columns).unwrap(),
+                "not_null": [0],
+                "unique": [[1]],
+                "check": ["id > 0"],
+                "primary_key": [[0]],
+                "on_conflict": "Error"
+            }
+        });
+        session.store.append(
+            &session.cat.scope(&session.session),
+            LOG_NS,
+            LOG_KEY,
+            serde_json::to_vec(&legacy).unwrap(),
+        );
+        // An event written without the (now optional) legacy keys also replays.
+        let modern = serde_json::json!({
+            "TableCreate": {
+                "path": ["main"],
+                "name": "plain",
+                "columns": crate::ipc::write_schema(&columns).unwrap(),
+                "on_conflict": "Error"
+            }
+        });
+        session.store.append(
+            &session.cat.scope(&session.session),
+            LOG_NS,
+            LOG_KEY,
+            serde_json::to_vec(&modern).unwrap(),
+        );
+        let tables: Vec<TableInfo> = session.list("catalog_schema_contents_tables", &["main"]);
+        assert_eq!(tables.len(), 2);
+        for table in &tables {
+            assert!(table.constraints.is_empty());
+            let served = crate::ipc::read_schema(&table.columns.0).unwrap();
+            assert!(
+                served.fields().iter().all(|f| f.is_nullable()),
+                "{}",
+                table.name
+            );
+        }
+        let response = session.contents(None);
+        assert!(!response.not_modified && response.tables.is_some());
     }
 }

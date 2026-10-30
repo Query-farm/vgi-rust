@@ -2955,15 +2955,17 @@ impl Dispatcher {
     /// `catalog_schema_contents_tables`, and `SchemaContents.tables`.
     fn table_items(&self, req: &Request, path: &[String]) -> Result<Vec<Bytes>> {
         let infos: Vec<TableInfo> = match self.schema_for_req(req, path) {
-            Some(s) => s
-                .tables
-                .iter()
-                .map(|t| {
-                    let scan_schema =
-                        self.resolve_table_function_schema(req, &t.scan_function, path);
-                    catalog::table_info(path, t, scan_schema.as_deref())
-                })
-                .collect::<Result<_>>()?,
+            Some(s) => {
+                s.validate_foreign_keys()?;
+                s.tables
+                    .iter()
+                    .map(|t| {
+                        let scan_schema =
+                            self.resolve_table_function_schema(req, &t.scan_function, path);
+                        catalog::table_info(path, t, scan_schema.as_deref())
+                    })
+                    .collect::<Result<_>>()?
+            }
             None => Vec::new(),
         };
         catalog::serialize_items(infos)
@@ -3129,8 +3131,11 @@ impl Dispatcher {
         let table_name = read_string_col(req, "name")?;
         let at_unit = read_opt_string_col(req, "at_unit");
         let at_value = read_opt_string_col(req, "at_value");
-        let infos: Vec<TableInfo> = self
-            .schema_for_req(req, &schema_path)
+        let schema = self.schema_for_req(req, &schema_path);
+        if let Some(s) = schema {
+            s.validate_foreign_keys()?;
+        }
+        let infos: Vec<TableInfo> = schema
             .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
             .map(|t| {
                 let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
@@ -3219,6 +3224,7 @@ impl Dispatcher {
 
     /// Return the table view for a requested time-travel `AT` clause (the
     /// version's columns + scan), or the table unchanged when not time-travel.
+    #[allow(deprecated)] // an older version never inherits the legacy fields
     fn at_version(
         t: &catalog::CatTable,
         at_unit: Option<&str>,

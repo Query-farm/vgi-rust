@@ -673,3 +673,44 @@ fn catalog_enum_columns_carry_python_member_names() {
 
     client.detach(&cat).expect("detach");
 }
+
+/// The default attach offers the constraint read profiles, the worker selects
+/// them because its fixture tables carry records, and the client decodes the
+/// records with the public codec. Offering nothing selects nothing.
+#[test]
+fn default_attach_negotiates_and_decodes_constraint_records() {
+    use vgi_client::constraints::{ConstraintKind, CONSTRAINT_RECORDS_READ, ROW_SCALAR_EXPRESSION};
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("catalog_attach");
+    let selected = cat.selected_capabilities().expect("selected capabilities");
+    assert_eq!(
+        selected.read,
+        vec![CONSTRAINT_RECORDS_READ, ROW_SCALAR_EXPRESSION]
+    );
+    let tables = client.tables(&cat, "data").expect("tables");
+    let departments = tables
+        .iter()
+        .find(|t| t.name == "departments")
+        .expect("departments");
+    let records = vgi_client::table_constraints(departments).expect("decode records");
+    assert!(records
+        .iter()
+        .any(|r| r.kind == ConstraintKind::PrimaryKey && r.is_readable()));
+    client.detach(&cat).expect("detach");
+
+    let bare = client
+        .attach(
+            "example",
+            AttachOptions {
+                catalog_capabilities: None,
+                ..Default::default()
+            },
+        )
+        .expect("catalog_attach without an offer");
+    assert!(bare.selected_capabilities().unwrap().read.is_empty());
+    client.detach(&bare).expect("detach");
+}

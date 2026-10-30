@@ -148,6 +148,7 @@ pub mod pushdown;
 pub mod secrets;
 pub mod settings;
 pub mod split_token;
+mod sql_expression;
 pub mod statistics;
 pub mod storage;
 pub mod stored_catalog;

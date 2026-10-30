@@ -1,5 +1,20 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
-//! Canonical VIRTUAL carriers; validation does not evaluate SQL.
+//! Canonical VIRTUAL generated-column carriers.
+//!
+//! A generated column is a field carrying [`GENERATED`] (canonical base64
+//! `SqlExpression` IPC, see [`generated_metadata`]) and [`GENERATION`]
+//! (`virtual`). Serving checks the rules the DuckDB extension applies at
+//! ATTACH (`ReadNativeColumnGenerated` / `ValidateNativeGeneratedColumns`):
+//! VIRTUAL only; nullable; BOOLEAN / signed integer / VARCHAR (`Utf8`) type, not
+//! an extension type; no default; the default evaluation context; and the
+//! bounded expression grammar (literals, unqualified column references of those
+//! types, `CAST`, comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `COALESCE`,
+//! `+ - * % || abs lower upper`). It does not bind SQL or infer its result
+//! type, which DuckDB still checks.
+//!
+//! The legacy `generated_expression` key (raw SQL) is translated to the
+//! canonical pair when serving a catalog table
+//! ([`translate_legacy_generated`]).
 use arrow_array::Array;
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine;
@@ -52,7 +67,7 @@ fn expression(value: &SqlExpression, owner: &[String]) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn encoded(value: &str, owner: &[String]) -> Result<()> {
+pub(crate) fn encoded(value: &str, owner: &[String]) -> Result<SqlExpression> {
     if value.is_empty() || value.len() > 4 * MAXIMUM.div_ceil(3) {
         return Err(invalid("invalid expression size"));
     }
@@ -93,7 +108,9 @@ pub(crate) fn encoded(value: &str, owner: &[String]) -> Result<()> {
     if cursor.position() != bytes.len() as u64 {
         return Err(invalid("trailing expression IPC"));
     }
-    expression(&crate::wire::from_batch::<SqlExpression>(&row)?, owner)
+    let value = crate::wire::from_batch::<SqlExpression>(&row)?;
+    expression(&value, owner)?;
+    Ok(value)
 }
 /// Translate the convenience SQL value using an explicit owner and default context.
 pub fn generated_metadata(sql: &str, owner: &[String]) -> Result<String> {
@@ -113,6 +130,81 @@ pub fn generated_metadata(sql: &str, owner: &[String]) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD
         .encode(crate::ipc::write_batch(&crate::wire::to_batch(value)?)?))
 }
+/// The legacy field-metadata key carrying a generated column's raw SQL.
+pub const LEGACY_GENERATED: &str = "generated_expression";
+
+/// Translate the legacy `generated_expression` key (raw DuckDB SQL) on each
+/// top-level field to the canonical [`GENERATED`] / [`GENERATION`] (`virtual`)
+/// pair owned by `owner`. Unambiguous only when the field carries neither
+/// canonical key; a field mixing both is an error. Other fields are unchanged.
+pub fn translate_legacy_generated(schema: &Schema, owner: &[String]) -> Result<Schema> {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| f.metadata().contains_key(LEGACY_GENERATED))
+    {
+        return Ok(schema.clone());
+    }
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| -> Result<Field> {
+            let mut metadata = f.metadata().clone();
+            let Some(sql) = metadata.remove(LEGACY_GENERATED) else {
+                return Ok(f.as_ref().clone());
+            };
+            if metadata.contains_key(GENERATED) || metadata.contains_key(GENERATION) {
+                return Err(invalid(&format!(
+                    "column '{}' carries both legacy {LEGACY_GENERATED} and canonical \
+                     {GENERATED}/{GENERATION} metadata; keep only the canonical pair",
+                    f.name()
+                )));
+            }
+            metadata.insert(GENERATED.to_string(), generated_metadata(&sql, owner)?);
+            metadata.insert(GENERATION.to_string(), "virtual".to_string());
+            Ok(f.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// The extension's top-level generated-column rules for `f`, whose canonical
+/// carrier `value` already decoded: nullable, a supported type, the default
+/// evaluation context, and the bounded grammar over `schema`'s columns.
+fn generated_column(f: &Field, value: &str, schema: &Schema, owner: &[String]) -> Result<()> {
+    let name = f.name();
+    if !f.is_nullable() {
+        return Err(invalid(&format!(
+            "generated column '{name}' must be nullable (DuckDB reads only nullable VIRTUAL \
+             columns; drop the NOT_NULL/PRIMARY_KEY record naming it)"
+        )));
+    }
+    if f.metadata().contains_key("ARROW:extension:name")
+        || !crate::sql_expression::generated_type(f.data_type())
+    {
+        return Err(invalid(&format!(
+            "generated column '{name}' has type {}; DuckDB generated columns must be Boolean, \
+             Int8..Int64 or Utf8",
+            f.data_type()
+        )));
+    }
+    let expression = encoded(value, owner)?;
+    if !vgi_protocol::constraints::is_default_evaluation_context(&expression.evaluation_context) {
+        return Err(invalid(&format!(
+            "generated column '{name}': DuckDB reads only the default evaluation context \
+             (UTC / binary / asc / nulls_last / preserve_insertion_order)"
+        )));
+    }
+    if owner.len() != 1 {
+        return Err(invalid(&format!(
+            "generated column '{name}': DuckDB reads generated columns only in one-component \
+             schemas"
+        )));
+    }
+    crate::sql_expression::check_generated(&expression.sql, schema)
+        .map_err(|e| invalid(&format!("generated column '{name}': {}", e.message)))
+}
+
 pub fn validate(schema: &Schema, owner: &[String], allow_generated: bool) -> Result<()> {
     fn field(f: &Field, owner: &[String], allow_generated: bool) -> Result<()> {
         let values = f.metadata();
@@ -123,9 +215,10 @@ pub fn validate(schema: &Schema, owner: &[String], allow_generated: bool) -> Res
                 return Err(invalid("unknown generated metadata version"));
             }
         }
-        if values.contains_key("generated_expression") {
+        if values.contains_key(LEGACY_GENERATED) {
             return Err(invalid(
-                "legacy generated expression requires explicit canonical translation",
+                "legacy generated_expression metadata is translated only on top-level catalog \
+                 table columns; use vgi::column_expressions::generated_metadata",
             ));
         }
         if values.contains_key(GENERATED) != values.contains_key(GENERATION) {
@@ -176,8 +269,22 @@ pub fn validate(schema: &Schema, owner: &[String], allow_generated: bool) -> Res
         }
         Ok(())
     }
+    let mut physical = false;
+    let mut generated = false;
     for f in schema.fields() {
         field(f, owner, allow_generated)?;
+        match f.metadata().get(GENERATED) {
+            Some(value) => {
+                generated_column(f, value, schema, owner)?;
+                generated = true;
+            }
+            None => physical |= !f.metadata().contains_key("is_row_id"),
+        }
+    }
+    if generated && !physical {
+        return Err(invalid(
+            "a table with generated columns needs at least one physical column",
+        ));
     }
     Ok(())
 }

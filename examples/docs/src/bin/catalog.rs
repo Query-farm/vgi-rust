@@ -35,7 +35,8 @@ use vgi::{Result, RpcError};
 /// table without calling the worker at all.
 fn cities_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        // Non-nullable: the canonical NOT_NULL record below must agree.
+        // Non-nullable to match the scan output. Serving takes nullability from
+        // the canonical records: the NOT_NULL record below is the claim, not this flag.
         Field::new("name", DataType::Utf8, false),
         Field::new("population", DataType::Int64, true),
     ]))

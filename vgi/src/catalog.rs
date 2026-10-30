@@ -917,7 +917,9 @@ pub type AttachPayloadHook =
 /// [`CONSTRAINT_RECORDS_READ`](crate::constraints::CONSTRAINT_RECORDS_READ) and
 /// [`ROW_SCALAR_EXPRESSION`](crate::constraints::ROW_SCALAR_EXPRESSION) itself
 /// whenever a served table carries records, merging them with this hook's
-/// result.
+/// result. A catalog that serves records the model cannot see — e.g. from a
+/// [`contents_provider`](CatalogModel::contents_provider) — sets
+/// [`crate::constraints::constraint_read_agreement`] as this hook.
 pub type CapabilityAgreementHook = fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>;
 
 /// A declarative catalog: named schemas with views, macros, and tables.
@@ -1045,6 +1047,26 @@ impl CatalogModel {
                 !t.constraints.is_empty()
                     || t.constraint_versions.values().any(|(c, _)| !c.is_empty())
             })
+    }
+
+    /// Serve every table of every schema (base and per-data-version) the way
+    /// `catalog_schema_contents_tables` would, without a worker: the legacy
+    /// fields, generated columns, constraint records (ATTACH rules and
+    /// cross-table FOREIGN KEY targets). Call it from a worker's own tests to
+    /// fail with the table, constraint and path instead of at DuckDB ATTACH.
+    pub fn validate_tables(&self) -> Result<()> {
+        for schema in self
+            .schemas
+            .iter()
+            .chain(self.version_schemas.values().flatten())
+        {
+            schema.validate_foreign_keys()?;
+            let path = schema.effective_path();
+            for table in &schema.tables {
+                table_info(&path, table, None)?;
+            }
+        }
+        Ok(())
     }
 
     /// The `(available, selected)` CatalogCapabilities for an attach: the
@@ -1194,10 +1216,10 @@ pub struct CatMacro {
     /// Default values for trailing parameters: `(param_name, int64 default)`.
     pub defaults: Vec<(String, i64)>,
     /// Per-parameter descriptions: `(param_name, description)`. Names must
-    /// appear in `parameters`. Descriptions flow over the wire via the macro
-    /// `arguments_schema`'s `vgi_doc` field metadata (the same channel functions
-    /// use for per-argument docs), so the DuckDB extension's
-    /// `vgi_function_arguments()` can surface them. Empty = no per-parameter docs.
+    /// appear in `parameters`. Each description travels as the canonical
+    /// `MacroOverload.parameters[i].documentation` of the macro's overload, so
+    /// the DuckDB extension's `vgi_function_arguments()` can surface it. Empty =
+    /// no per-parameter docs.
     pub parameter_docs: Vec<(String, String)>,
 }
 
@@ -1206,10 +1228,12 @@ pub struct CatMacro {
 pub struct CatTable {
     /// Explicit canonical ConstraintInfo IPC records, with provider-owned
     /// identities — build them with [`crate::constraints::constraint_record`].
-    /// Served only when every record is `ENFORCED` + `ALL_ROWS` and the
-    /// columns' Arrow nullability matches the NOT_NULL/PRIMARY_KEY paths (see
-    /// [`crate::constraints::validate_table_constraints`]). Any record makes
-    /// the catalog negotiate the constraint read profiles at ATTACH.
+    /// Served only when they pass the extension's ATTACH checks (see
+    /// [`crate::constraints::validate_table_constraints`]). Serving sets each
+    /// column's Arrow nullability from the NOT_NULL/PRIMARY_KEY paths (see
+    /// [`crate::constraints::served_columns`]): a non-nullable field no record
+    /// names is served nullable. Any record makes the catalog negotiate the
+    /// constraint read profiles at ATTACH.
     pub constraints: Vec<Bytes>,
     pub definition_revision: Option<Bytes>,
     /// Authoritative canonical records and revision for each historical version.
@@ -1222,11 +1246,41 @@ pub struct CatTable {
     pub scan_arguments: Vec<u8>,
     pub comment: Option<String>,
     pub cardinality: Option<i64>,
+    /// Legacy NOT NULL column indices — not sent under `vgi.v3`; serving a
+    /// table that sets this fails.
+    #[deprecated(
+        note = "not sent under vgi.v3 (serving fails); push NOT_NULL records built with \
+                vgi::constraints::ConstraintRecord / constraint_record onto `constraints`"
+    )]
     pub not_null: Vec<i32>,
+    /// Legacy PRIMARY KEY column indices — not sent under `vgi.v3`; serving a
+    /// table that sets this fails.
+    #[deprecated(
+        note = "not sent under vgi.v3 (serving fails); push a PRIMARY_KEY record built with \
+                vgi::constraints::ConstraintRecord / constraint_record onto `constraints`"
+    )]
     pub primary_key: Vec<Vec<i32>>,
+    /// Legacy UNIQUE column indices — not sent under `vgi.v3`; serving a table
+    /// that sets this fails.
+    #[deprecated(
+        note = "not sent under vgi.v3 (serving fails); push UNIQUE records built with \
+                vgi::constraints::ConstraintRecord / constraint_record onto `constraints`"
+    )]
     pub unique: Vec<Vec<i32>>,
+    /// Legacy CHECK SQL — not sent under `vgi.v3`; serving a table that sets
+    /// this fails.
+    #[deprecated(
+        note = "not sent under vgi.v3 (serving fails); push CHECK records built with \
+                vgi::constraints::ConstraintRecord / constraint_record onto `constraints`"
+    )]
     pub check: Vec<String>,
     pub tags: Vec<(String, String)>,
+    /// Legacy foreign keys — not sent under `vgi.v3`; serving a table that
+    /// sets this fails.
+    #[deprecated(
+        note = "not sent under vgi.v3 (serving fails); push FOREIGN_KEY records built with \
+                vgi::constraints::ConstraintRecord / constraint_record onto `constraints`"
+    )]
     pub foreign_keys: Vec<ForeignKey>,
     /// When true, the scan function is inlined in `TableInfo.scan_function` and
     /// the C++ extension skips `catalog_table_scan_function_get`. When false
@@ -1267,6 +1321,7 @@ pub struct CatTable {
 /// is not a table — so this fills it with an empty schema rather than blocking
 /// the `..Default::default()` spelling that `CatalogModel` and `CatSchema`
 /// already support. Set it.
+#[allow(deprecated)] // initializes the legacy constraint fields empty
 impl Default for CatTable {
     fn default() -> Self {
         Self {
@@ -1426,7 +1481,11 @@ pub struct ForeignKey {
     pub referenced_schema_path: Option<Vec<String>>,
 }
 
-/// Serialize a foreign key to its IPC `foreign_key_constraints` entry.
+/// Serialize a foreign key to its legacy IPC `foreign_key_constraints` entry.
+#[deprecated(
+    note = "vgi.v3 has no foreign_key_constraints column; build a FOREIGN_KEY record with \
+            vgi::constraints::ConstraintRecord / constraint_record"
+)]
 pub fn serialize_foreign_key(schema_path: &[String], fk: &ForeignKey) -> Result<Vec<u8>> {
     let info = crate::protocol::dtos::ForeignKeyInfo {
         fk_columns: fk.columns.clone(),
@@ -1442,6 +1501,7 @@ pub fn serialize_foreign_key(schema_path: &[String], fk: &ForeignKey) -> Result<
 
 impl CatTable {
     /// Constructor with the new metadata fields defaulted empty.
+    #[allow(deprecated)] // initializes the legacy constraint fields empty
     pub fn new(
         name: &str,
         columns: SchemaRef,
@@ -1518,6 +1578,19 @@ impl CatalogModel {
 }
 
 impl CatSchema {
+    /// Check that every FOREIGN KEY record among this schema's tables
+    /// references an existing PRIMARY KEY / UNIQUE record of a table in this
+    /// schema (see [`crate::constraints::validate_foreign_key_targets`]).
+    /// Serving a table runs this for its schema.
+    pub fn validate_foreign_keys(&self) -> Result<()> {
+        crate::constraints::validate_foreign_key_targets(
+            &self.effective_path(),
+            self.tables
+                .iter()
+                .map(|t| (t.name.as_str(), t.constraints.as_slice())),
+        )
+    }
+
     /// Raw schema path, falling back to the legacy one-level `name` field.
     pub fn effective_path(&self) -> Vec<String> {
         if self.path.is_empty() {
@@ -1607,30 +1680,56 @@ fn validate_required_filters(
     Ok(())
 }
 
+/// The Arrow columns a table is served with, after every check the DuckDB
+/// extension runs at ATTACH:
+///
+/// 1. the legacy constraint fields must be empty (they are not sent under
+///    `vgi.v3`);
+/// 2. legacy `generated_expression` field metadata is translated to the
+///    canonical `vgi.column.generated.v1` / `vgi.column.generation.v1` pair,
+///    owned by `schema_path`;
+/// 3. the canonical constraint records must pass
+///    [`crate::constraints::validate_table_constraints`], and each field's
+///    nullability is set from them ([`crate::constraints::served_columns`]);
+/// 4. column metadata and generated-column rules are checked on the result.
+pub fn served_table_columns(schema_path: &[String], t: &CatTable) -> Result<Schema> {
+    #[allow(deprecated)]
+    let legacy = [
+        ("not_null", !t.not_null.is_empty()),
+        ("unique", !t.unique.is_empty()),
+        ("primary_key", !t.primary_key.is_empty()),
+        ("check", !t.check.is_empty()),
+        ("foreign_keys", !t.foreign_keys.is_empty()),
+    ];
+    if let Some((field, _)) = legacy.iter().find(|(_, set)| *set) {
+        return Err(vgi_rpc::RpcError::method_not_implemented(format!(
+            "Table '{}': CatTable::{field} (and the other legacy constraint fields) is not \
+             sent under vgi.v3; build canonical records with \
+             vgi::constraints::ConstraintRecord + vgi::constraints::constraint_record and push \
+             them onto CatTable::constraints instead",
+            t.name
+        )));
+    }
+    let named = |mut e: vgi_rpc::RpcError| {
+        e.message = format!("Table '{}': {}", t.name, e.message);
+        e
+    };
+    let columns = crate::column_expressions::translate_legacy_generated(&t.columns, schema_path)
+        .map_err(named)?;
+    let served =
+        crate::constraints::served_columns(schema_path, &t.name, &columns, &t.constraints)?;
+    crate::column_metadata::validate_column_metadata(&served)?;
+    crate::column_expressions::validate(&served, schema_path, true).map_err(named)?;
+    Ok(served)
+}
+
 pub fn table_info(
     schema_path: &[String],
     t: &CatTable,
     scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
-    crate::column_metadata::validate_column_metadata(&t.columns)?;
-    crate::column_expressions::validate(&t.columns, schema_path, true)?;
-    if !t.not_null.is_empty()
-        || !t.unique.is_empty()
-        || !t.primary_key.is_empty()
-        || !t.check.is_empty()
-        || !t.foreign_keys.is_empty()
-    {
-        return Err(vgi_rpc::RpcError::method_not_implemented(format!(
-            "Table '{}': not_null/unique/primary_key/check/foreign_keys are not sent under \
-             vgi.v3; declare canonical records with vgi::constraints::constraint_record in \
-             `constraints` instead",
-            t.name
-        )));
-    }
-    // The extension fails the ATTACH when these disagree; fail here with the
-    // table and column path instead.
-    crate::constraints::validate_table_constraints(&t.name, &t.columns, &t.constraints)?;
+    let columns = served_table_columns(schema_path, t)?;
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
     //
@@ -1655,7 +1754,7 @@ pub fn table_info(
         tags: t.tags.clone(),
         name: t.name.clone(),
         schema_path: schema_path.to_vec(),
-        columns: Bytes::from(ipc::write_schema_ref(&t.columns)?),
+        columns: Bytes::from(ipc::write_schema(&columns)?),
         constraints: t.constraints.clone(),
         definition_revision: t.definition_revision.clone(),
         write_result_modes: Vec::new(),
@@ -1797,6 +1896,10 @@ pub fn macro_info(
 /// when there is no doc), the exact same mechanism functions use for per-argument
 /// docs. This helper is for local presentation only: catalog discovery and CREATE
 /// use canonical overload parameters. Returns empty IPC bytes for no parameters.
+#[deprecated(
+    note = "vgi.v3 macros carry no arguments_schema; parameter docs travel as \
+            `MacroOverload.parameters[i].documentation` (set `CatMacro::parameter_docs`)"
+)]
 pub fn build_macro_arguments_schema(m: &CatMacro) -> Result<Vec<u8>> {
     // Nothing to carry: no parameters and no docs -> emit nothing.
     if m.parameters.is_empty() && m.parameter_docs.is_empty() {
@@ -1900,6 +2003,7 @@ pub fn arc(schema: Schema) -> Arc<Schema> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the legacy fields and helpers they replace
 mod tests {
     use super::*;
     use crate::function::{ArgSpec, ArgumentMonotonicity, FunctionExample, ProcessParams};
@@ -2445,6 +2549,199 @@ mod tests {
         let info = table_info(&path("data"), &table, None).unwrap();
         assert_eq!(info.constraints[0].0, unique.0);
         assert_eq!(info.definition_revision.unwrap().0, vec![0, 255]);
+    }
+
+    /// Serving rewrites nullability to the records: an unnamed non-nullable
+    /// field (top-level, nested STRUCT child, function-backed table) is served
+    /// nullable, a record-named field non-nullable, the row id untouched.
+    #[test]
+    fn served_nullability_follows_the_records() {
+        use crate::constraints::{constraint_record, ConstraintKind, ConstraintRecord};
+        let columns = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "s",
+                DataType::Struct(vec![Field::new("x", DataType::Float64, false)].into()),
+                false,
+            ),
+            Field::new("rowid", DataType::Int64, false).with_metadata(HashMap::from([(
+                "is_row_id".to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let served = |t: &CatTable| {
+            let info = table_info(&path("data"), t, None).unwrap();
+            ipc::read_schema(&info.columns.0).unwrap()
+        };
+        // A function-backed table with no records.
+        struct Scan;
+        impl crate::table_function::TableFunction for Scan {
+            fn name(&self) -> &str {
+                "scan"
+            }
+            fn metadata(&self) -> crate::function::FunctionMetadata {
+                Default::default()
+            }
+            fn argument_specs(&self) -> Vec<crate::function::ArgSpec> {
+                Vec::new()
+            }
+            fn on_bind(
+                &self,
+                _p: &crate::function::BindParams,
+            ) -> Result<crate::function::BindResponse> {
+                Err(vgi_rpc::RpcError::runtime_error("not bound in this test"))
+            }
+            fn producer(
+                &self,
+                _p: &crate::function::ProcessParams,
+            ) -> Result<Box<dyn crate::table_function::TableProducer>> {
+                Err(vgi_rpc::RpcError::runtime_error("not run in this test"))
+            }
+        }
+        let backed = CatTable::with_function("t", columns.clone(), Arc::new(Scan), None, None);
+        let schema = served(&backed);
+        assert!(schema.field(0).is_nullable() && schema.field(2).is_nullable());
+        let DataType::Struct(children) = schema.field(2).data_type() else {
+            panic!("struct")
+        };
+        assert!(children[0].is_nullable());
+        assert!(!schema.field(3).is_nullable(), "row id is untouched");
+        // Records naming `name` (nullable in Arrow) and `s.x`.
+        let mut t = CatTable::new("t", columns, "scan", Vec::new(), None, None);
+        t.constraints = [
+            ConstraintRecord::new(&["data"], "t", "t.pk", ConstraintKind::PrimaryKey)
+                .with_columns(&[&["name"]])
+                .enforced(),
+            ConstraintRecord::new(&["data"], "t", "t.sx", ConstraintKind::NotNull)
+                .with_columns(&[&["s", "x"]])
+                .enforced(),
+        ]
+        .iter()
+        .map(|r| constraint_record(r).unwrap())
+        .collect();
+        let schema = served(&t);
+        assert!(schema.field(0).is_nullable());
+        assert!(!schema.field(1).is_nullable());
+        let DataType::Struct(children) = schema.field(2).data_type() else {
+            panic!("struct")
+        };
+        assert!(schema.field(2).is_nullable() && !children[0].is_nullable());
+    }
+
+    #[test]
+    fn legacy_generated_expression_is_translated_when_serving() {
+        let generated = |key: &str, sql: &str| {
+            Field::new("doubled", DataType::Int64, true)
+                .with_metadata(HashMap::from([(key.to_string(), sql.to_string())]))
+        };
+        let columns = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            generated("generated_expression", "n * 2"),
+        ]));
+        let t = CatTable::new("t", columns, "scan", Vec::new(), None, None);
+        let info = table_info(&path("data"), &t, None).unwrap();
+        let served = ipc::read_schema(&info.columns.0).unwrap();
+        let meta = served.field(1).metadata();
+        assert!(!meta.contains_key("generated_expression"));
+        assert_eq!(meta[crate::column_expressions::GENERATION], "virtual");
+        assert_eq!(
+            meta[crate::column_expressions::GENERATED],
+            crate::column_expressions::generated_metadata("n * 2", &path("data")).unwrap()
+        );
+        // Outside the extension's grammar or types: refused with the table.
+        for (field, needle) in [
+            (
+                generated("generated_expression", "n / 2"),
+                "unsupported scalar function",
+            ),
+            (
+                Field::new("f", DataType::Float64, true).with_metadata(HashMap::from([(
+                    "generated_expression".to_string(),
+                    "1".to_string(),
+                )])),
+                "must be Boolean",
+            ),
+        ] {
+            let columns = Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, true),
+                field,
+            ]));
+            let t = CatTable::new("t", columns, "scan", Vec::new(), None, None);
+            let e = table_info(&path("data"), &t, None).unwrap_err().to_string();
+            assert!(e.contains("Table 't'") && e.contains(needle), "{e}");
+        }
+        // A NOT_NULL record over a generated column cannot be served.
+        use crate::constraints::{constraint_record, ConstraintKind, ConstraintRecord};
+        let columns = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            generated("generated_expression", "n * 2"),
+        ]));
+        let mut t = CatTable::new("t", columns, "scan", Vec::new(), None, None);
+        t.constraints = vec![constraint_record(
+            &ConstraintRecord::new(&["data"], "t", "t.nn", ConstraintKind::NotNull)
+                .with_columns(&[&["doubled"]])
+                .enforced(),
+        )
+        .unwrap()];
+        let e = table_info(&path("data"), &t, None).unwrap_err().to_string();
+        assert!(e.contains("must be nullable"), "{e}");
+    }
+
+    #[test]
+    fn model_validation_checks_foreign_key_targets() {
+        use crate::constraints::{
+            constraint_record, ConstraintKind, ConstraintRecord, ForeignKeyReference,
+        };
+        let table = |name: &str, records: Vec<ConstraintRecord>| {
+            let mut t = CatTable::new(
+                name,
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                "scan",
+                Vec::new(),
+                None,
+                None,
+            );
+            t.constraints = records
+                .iter()
+                .map(|r| constraint_record(r).unwrap())
+                .collect();
+            t
+        };
+        let mut fk = ConstraintRecord::new(&["data"], "orders", "o.fk", ConstraintKind::ForeignKey)
+            .with_columns(&[&["id"]])
+            .enforced();
+        fk.references = Some(ForeignKeyReference {
+            schema_path: path("data"),
+            table: "users".into(),
+            columns: vec![vec!["id".into()]],
+            constraint_id: "u.pk".into(),
+        });
+        let pk = ConstraintRecord::new(&["data"], "users", "u.pk", ConstraintKind::PrimaryKey)
+            .with_columns(&[&["id"]])
+            .enforced();
+        let model = |tables: Vec<CatTable>| CatalogModel {
+            schemas: vec![CatSchema {
+                name: "data".into(),
+                tables,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        model(vec![
+            table("users", vec![pk]),
+            table("orders", vec![fk.clone()]),
+        ])
+        .validate_tables()
+        .unwrap();
+        let e = model(vec![table("orders", vec![fk])])
+            .validate_tables()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("constraint 'o.fk'") && e.contains("table 'users'"),
+            "{e}"
+        );
     }
 
     #[test]

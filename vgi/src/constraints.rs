@@ -6,7 +6,11 @@
 //! IPC records in [`CatTable::constraints`](crate::catalog::CatTable::constraints).
 //! The worker *attests* each fact: the SDK never derives a record from data or
 //! from the legacy `not_null` / `primary_key` / `unique` / `check` /
-//! `foreign_keys` descriptor fields, which stay rejected.
+//! `foreign_keys` descriptor fields, which stay rejected (and are
+//! `#[deprecated]`).
+//!
+//! The record codec itself lives in [`vgi_protocol::constraints`] (so clients
+//! can decode records without this crate) and is re-exported here.
 //!
 //! The DuckDB `vgi` extension reads these records only when:
 //!
@@ -14,14 +18,18 @@
 //!    [`ROW_SCALAR_EXPRESSION`] for CHECK). The SDK advertises and selects both
 //!    automatically for a [`CatalogModel`](crate::catalog::CatalogModel) whose
 //!    tables carry records — see [`select_read_profiles`];
-//! 2. every record is [`ConstraintEnforcement::Enforced`] +
-//!    [`ConstraintValidation::AllRows`];
+//! 2. every record passes the extension's ATTACH checks — ENFORCED + ALL_ROWS,
+//!    owned by the serving table and schema, unique identities and SQL labels,
+//!    at most one PRIMARY KEY, resolvable column paths, same-schema
+//!    NO ACTION/RESTRICT foreign keys, numeric-comparison CHECKs. The SDK runs
+//!    the same checks when serving ([`validate_table_constraints`]), so a
+//!    worker's own tests fail with the table, constraint and path instead of
+//!    DuckDB failing the ATTACH;
 //! 3. every table's Arrow nullability equals membership in the NOT_NULL ∪
-//!    PRIMARY_KEY column-path set, descending through ordinary STRUCTs.
-//!
-//! The SDK checks 2 and 3 when serving a table
-//! ([`validate_table_constraints`]), so a worker's own tests fail with the
-//! table and column path instead of DuckDB failing the ATTACH.
+//!    PRIMARY_KEY column-path set, descending through ordinary STRUCTs. The SDK
+//!    makes this true when serving ([`served_columns`]): a field no record names
+//!    is served nullable, a field a record names is served non-nullable. A
+//!    non-nullable Arrow field is therefore never itself a claim.
 //!
 //! ```
 //! use vgi::constraints::{
@@ -42,433 +50,41 @@
 //! assert_eq!(record.columns, vec![vec!["id".to_string()]]);
 //! ```
 
-use std::collections::HashSet;
-use std::fmt;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Fields, Schema};
-use vgi_rpc::{Bytes, DictString, Result, RpcError, VgiArrow};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
+use vgi_rpc::{Bytes, Result, RpcError};
 
-use crate::{ipc, wire};
-
-/// The generated wire records, for authors who need the raw shapes.
-pub use vgi_protocol::generated::protocol_types::{
-    CatalogCapabilities, CatalogObjectRef, ConstraintDefinition, ConstraintInfo,
-    ForeignKeyDefinition, QueryEvaluationContext, SqlExpression,
+pub use vgi_protocol::constraints::{
+    catalog_capabilities, client_catalog_capabilities, constraint_record, decode_record,
+    default_evaluation_context, encode_record, is_default_evaluation_context,
+    normalize_read_profiles, read_catalog_capabilities, read_constraint_record,
+    select_read_profiles, CatalogCapabilities, CatalogObjectRef, ConstraintDefinition,
+    ConstraintEnforcement, ConstraintInfo, ConstraintKind, ConstraintRecord, ConstraintValidation,
+    ForeignKeyDefinition, ForeignKeyReference, QueryEvaluationContext, SqlExpression,
+    CONSTRAINT_RECORDS_READ, ROW_SCALAR_EXPRESSION,
 };
-
-/// Read profile: the catalog serves canonical `ConstraintInfo` records.
-pub const CONSTRAINT_RECORDS_READ: &str = "vgi.constraint.records.read.v1";
-/// Read profile: CHECK constraints carry DuckDB scalar SQL expressions.
-/// Selected only alongside [`CONSTRAINT_RECORDS_READ`].
-pub const ROW_SCALAR_EXPRESSION: &str = "vgi.expression.duckdb.scalar.v1";
 
 /// Field-metadata key marking the synthetic row-id column (exempt from the
 /// nullability rule, as in the extension).
 const ROW_ID_METADATA_KEY: &str = "is_row_id";
 
-/// Bound on STRUCT nesting walked by [`validate_table_constraints`].
+/// Bound on STRUCT nesting walked when serving.
 const MAX_DEPTH: usize = 64;
+/// The extension's per-table bounds.
+const MAX_RECORDS: usize = 1024;
+const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PATHS: usize = 1024;
+const MAX_IDENTIFIER: usize = 4096;
 
-macro_rules! wire_enum {
-    ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident => $wire:literal),+ $(,)? }) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum $name {
-            $($(#[$vmeta])* $variant),+
-        }
-
-        impl $name {
-            /// The canonical wire spelling.
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $wire),+
-                }
-            }
-
-            /// Parse the canonical wire spelling.
-            pub fn parse(value: &str) -> Result<Self> {
-                match value {
-                    $($wire => Ok(Self::$variant),)+
-                    other => Err(RpcError::value_error(format!(
-                        concat!("unknown ", stringify!($name), " '{}'"),
-                        other
-                    ))),
-                }
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(self.as_str())
-            }
-        }
-    };
-}
-
-wire_enum!(
-    /// The constraint's kind.
-    ConstraintKind {
-        /// One column path must never be NULL.
-        NotNull => "NOT_NULL",
-        /// The table's (single) primary key; implies NOT NULL on every path.
-        PrimaryKey => "PRIMARY_KEY",
-        /// Non-NULL key tuples are distinct.
-        Unique => "UNIQUE",
-        /// A DuckDB scalar expression holds for every row.
-        Check => "CHECK",
-        /// Non-NULL key tuples exist in a referenced PRIMARY KEY / UNIQUE key.
-        ForeignKey => "FOREIGN_KEY",
+fn empty_capabilities() -> CatalogCapabilities {
+    CatalogCapabilities {
+        read: Vec::new(),
+        ddl: Vec::new(),
+        write: Vec::new(),
+        transaction: Vec::new(),
     }
-);
-
-wire_enum!(
-    /// Whether the authority enforces the constraint on every write path.
-    ConstraintEnforcement {
-        /// Every write path enforces the constraint.
-        Enforced => "ENFORCED",
-        /// Informational only; DuckDB will not read the record.
-        MetadataOnly => "METADATA_ONLY",
-    }
-);
-
-wire_enum!(
-    /// Coverage of existing rows. Only `AllRows` justifies engine facts.
-    ConstraintValidation {
-        /// Every row the table can return satisfies the constraint.
-        AllRows => "ALL_ROWS",
-        /// Only rows written after the constraint was declared.
-        FutureWrites => "FUTURE_WRITES",
-        /// Never validated.
-        Unvalidated => "UNVALIDATED",
-    }
-);
-
-/// The key a FOREIGN_KEY record references.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForeignKeyReference {
-    /// Schema path of the referenced table.
-    pub schema_path: Vec<String>,
-    /// Referenced table name.
-    pub table: String,
-    /// Referenced column paths, matching the local paths' arity.
-    pub columns: Vec<Vec<String>>,
-    /// `id` of the referenced table's PRIMARY_KEY or UNIQUE record.
-    pub constraint_id: String,
-}
-
-/// One canonical constraint, in authoring vocabulary.
-///
-/// [`constraint_record`] encodes it as `ConstraintInfo` IPC;
-/// [`read_constraint_record`] is the inverse. There is deliberately no
-/// `Default`: `enforcement` and `validation` are the provider's attestation and
-/// must be stated. DuckDB reads only `Enforced` + `AllRows` records, so state
-/// that only when every row the table can ever return satisfies the constraint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConstraintRecord {
-    /// Schema path of the owning table.
-    pub schema_path: Vec<String>,
-    /// Owning table name.
-    pub table: String,
-    /// Stable provider-owned identity, unique within the table. Never derived
-    /// by the SDK.
-    pub id: String,
-    pub kind: ConstraintKind,
-    /// Raw component paths, e.g. `[["id"]]` or `[["bbox", "xmin"]]`; empty for
-    /// CHECK.
-    pub columns: Vec<Vec<String>>,
-    pub enforcement: ConstraintEnforcement,
-    pub validation: ConstraintValidation,
-    /// Optional SQL label (`CONSTRAINT <name>`).
-    pub declared_name: Option<String>,
-    /// CHECK only: a DuckDB scalar expression over the table's columns.
-    pub check_sql: Option<String>,
-    /// FOREIGN_KEY only: the referenced key and its constraint identity.
-    pub references: Option<ForeignKeyReference>,
-}
-
-impl ConstraintRecord {
-    /// A record skeleton with no columns, attested `METADATA_ONLY` +
-    /// `UNVALIDATED` — the honest default, which serving rejects because DuckDB
-    /// will not read it. Call [`enforced`](Self::enforced) (or set
-    /// `enforcement`/`validation`) once the provider guarantees the fact for
-    /// every row the table can return.
-    pub fn new(schema_path: &[&str], table: &str, id: &str, kind: ConstraintKind) -> Self {
-        Self {
-            schema_path: schema_path.iter().map(|s| (*s).to_string()).collect(),
-            table: table.to_string(),
-            id: id.to_string(),
-            kind,
-            columns: Vec::new(),
-            enforcement: ConstraintEnforcement::MetadataOnly,
-            validation: ConstraintValidation::Unvalidated,
-            declared_name: None,
-            check_sql: None,
-            references: None,
-        }
-    }
-
-    /// Set the constrained column paths.
-    pub fn with_columns(mut self, columns: &[&[&str]]) -> Self {
-        self.columns = paths(columns);
-        self
-    }
-
-    /// Attest `ENFORCED` + `ALL_ROWS`: every row the table can return satisfies
-    /// this constraint.
-    pub fn enforced(mut self) -> Self {
-        self.enforcement = ConstraintEnforcement::Enforced;
-        self.validation = ConstraintValidation::AllRows;
-        self
-    }
-
-    /// Whether DuckDB will read this record (`ENFORCED` + `ALL_ROWS`).
-    pub fn is_readable(&self) -> bool {
-        self.enforcement == ConstraintEnforcement::Enforced
-            && self.validation == ConstraintValidation::AllRows
-    }
-
-    /// Encode as `ConstraintInfo` IPC; see [`constraint_record`].
-    pub fn encode(&self) -> Result<Bytes> {
-        constraint_record(self)
-    }
-}
-
-fn paths(columns: &[&[&str]]) -> Vec<Vec<String>> {
-    columns
-        .iter()
-        .map(|path| path.iter().map(|c| (*c).to_string()).collect())
-        .collect()
-}
-
-fn encode<T: VgiArrow>(value: T) -> Result<Bytes> {
-    Ok(Bytes::from(ipc::write_batch(&wire::to_batch(value)?)?))
-}
-
-fn decode<T: VgiArrow>(bytes: &[u8]) -> Result<T> {
-    wire::from_batch(&ipc::read_batch(bytes)?)
-}
-
-fn object_ref(
-    kind: &str,
-    schema_path: &[String],
-    name: &str,
-    owner: Option<&str>,
-) -> Result<Bytes> {
-    encode(CatalogObjectRef {
-        kind: kind.to_string(),
-        schema_path: schema_path.to_vec(),
-        name: name.to_string(),
-        owner_table: owner.map(str::to_string),
-    })
-}
-
-fn check_shape(spec: &ConstraintRecord) -> Result<()> {
-    let invalid = |message: &str| {
-        Err(RpcError::value_error(format!(
-            "constraint '{}' on table '{}': {message}",
-            spec.id, spec.table
-        )))
-    };
-    if spec.id.is_empty() || spec.id.contains('\0') {
-        return invalid("id must be nonempty without NUL");
-    }
-    if spec.table.is_empty() {
-        return invalid("owning table must be named");
-    }
-    let is_check = spec.kind == ConstraintKind::Check;
-    let is_fk = spec.kind == ConstraintKind::ForeignKey;
-    if is_check != spec.check_sql.is_some() {
-        return invalid("check_sql is required for CHECK and only CHECK");
-    }
-    if is_check != spec.columns.is_empty() {
-        return invalid(if is_check {
-            "CHECK takes no column paths"
-        } else {
-            "requires column paths"
-        });
-    }
-    if spec
-        .columns
-        .iter()
-        .any(|p| p.is_empty() || p.iter().any(|c| c.is_empty() || c.contains('\0')))
-    {
-        return invalid("column paths must be nonempty components without NUL");
-    }
-    if spec.kind == ConstraintKind::NotNull && spec.columns.len() != 1 {
-        return invalid("NOT_NULL requires exactly one column path");
-    }
-    if is_fk != spec.references.is_some() {
-        return invalid("references is required for FOREIGN_KEY and only FOREIGN_KEY");
-    }
-    if let Some(target) = &spec.references {
-        if target.columns.len() != spec.columns.len() {
-            return invalid("foreign key local and referenced arity must match");
-        }
-        if target.constraint_id.is_empty() {
-            return invalid("foreign key must name the referenced key's constraint id");
-        }
-    }
-    Ok(())
-}
-
-/// Encode one canonical `ConstraintInfo` record for
-/// [`CatTable::constraints`](crate::catalog::CatTable::constraints).
-///
-/// Validates the record's shape (nonempty identity, CHECK ⇔ `check_sql`,
-/// FOREIGN_KEY ⇔ `references`, NOT_NULL takes one path, FK arity). It encodes
-/// whatever enforcement/validation the provider attests; serving rejects a
-/// record DuckDB would not read.
-pub fn constraint_record(spec: &ConstraintRecord) -> Result<Bytes> {
-    check_shape(spec)?;
-    let check_expression = spec
-        .check_sql
-        .as_ref()
-        .map(|sql| {
-            encode(SqlExpression {
-                sql: sql.clone(),
-                profile: ROW_SCALAR_EXPRESSION.to_string(),
-                schema_path: spec.schema_path.clone(),
-                evaluation_context: QueryEvaluationContext {
-                    timezone: "UTC".into(),
-                    collation: "binary".into(),
-                    default_order: "asc".into(),
-                    default_null_order: "nulls_last".into(),
-                    preserve_insertion_order: true,
-                },
-            })
-        })
-        .transpose()?;
-    let foreign_key = spec
-        .references
-        .as_ref()
-        .map(|target| {
-            encode(ForeignKeyDefinition {
-                referenced_table: object_ref("table", &target.schema_path, &target.table, None)?,
-                referenced_column_paths: target.columns.clone(),
-                r#match: DictString("SIMPLE".into()),
-                on_update: DictString("NO_ACTION".into()),
-                on_delete: DictString("NO_ACTION".into()),
-            })
-        })
-        .transpose()?;
-    let referenced_constraint = spec
-        .references
-        .as_ref()
-        .map(|target| {
-            object_ref(
-                "constraint",
-                &target.schema_path,
-                &target.constraint_id,
-                Some(&target.table),
-            )
-        })
-        .transpose()?;
-    encode(ConstraintInfo {
-        r#ref: object_ref("constraint", &spec.schema_path, &spec.id, Some(&spec.table))?,
-        definition: encode(ConstraintDefinition {
-            kind: DictString(spec.kind.as_str().into()),
-            column_paths: spec.columns.clone(),
-            declared_name: spec.declared_name.clone(),
-            check_expression,
-            foreign_key,
-        })?,
-        enforcement: DictString(spec.enforcement.as_str().into()),
-        validation: DictString(spec.validation.as_str().into()),
-        referenced_constraint,
-    })
-}
-
-/// Decode a `TableInfo.constraints` entry (the inverse of
-/// [`constraint_record`]). Fails on an unknown kind / enforcement / validation,
-/// a non-constraint identity, or a record whose shape [`constraint_record`]
-/// would refuse to build.
-pub fn read_constraint_record(bytes: &[u8]) -> Result<ConstraintRecord> {
-    let info: ConstraintInfo = decode(bytes)?;
-    let identity: CatalogObjectRef = decode(&info.r#ref.0)?;
-    if identity.kind != "constraint" {
-        return Err(RpcError::value_error(format!(
-            "constraint record identity has kind '{}', expected 'constraint'",
-            identity.kind
-        )));
-    }
-    let definition: ConstraintDefinition = decode(&info.definition.0)?;
-    let check_sql = definition
-        .check_expression
-        .as_ref()
-        .map(|raw| decode::<SqlExpression>(&raw.0).map(|e| e.sql))
-        .transpose()?;
-    let references = match &definition.foreign_key {
-        None => None,
-        Some(raw) => {
-            let fk: ForeignKeyDefinition = decode(&raw.0)?;
-            let target: CatalogObjectRef = decode(&fk.referenced_table.0)?;
-            let key = info
-                .referenced_constraint
-                .as_ref()
-                .map(|raw| decode::<CatalogObjectRef>(&raw.0))
-                .transpose()?
-                .ok_or_else(|| {
-                    RpcError::value_error("FOREIGN_KEY record lacks referenced_constraint")
-                })?;
-            Some(ForeignKeyReference {
-                schema_path: target.schema_path,
-                table: target.name,
-                columns: fk.referenced_column_paths,
-                constraint_id: key.name,
-            })
-        }
-    };
-    let record = ConstraintRecord {
-        schema_path: identity.schema_path,
-        table: identity.owner_table.unwrap_or_default(),
-        id: identity.name,
-        kind: ConstraintKind::parse(&definition.kind.0)?,
-        columns: definition.column_paths,
-        enforcement: ConstraintEnforcement::parse(&info.enforcement.0)?,
-        validation: ConstraintValidation::parse(&info.validation.0)?,
-        declared_name: definition.declared_name,
-        check_sql,
-        references,
-    };
-    check_shape(&record)?;
-    Ok(record)
-}
-
-/// The client-offered profiles from `available`, sorted and deduplicated.
-///
-/// `client_capabilities` is the attach request's serialized
-/// `ClientCapabilities`; its `catalog.read` list is the offer. A
-/// [`ROW_SCALAR_EXPRESSION`] read is selected only alongside
-/// [`CONSTRAINT_RECORDS_READ`].
-pub fn select_read_profiles(
-    available: &[String],
-    client_capabilities: Option<&[u8]>,
-) -> Result<Vec<String>> {
-    let Some(raw) = client_capabilities.filter(|raw| !raw.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let client: crate::protocol::dtos::ClientCapabilities = decode(raw)?;
-    let offered = match client.catalog {
-        Some(catalog) if !catalog.0.is_empty() => decode::<CatalogCapabilities>(&catalog.0)?.read,
-        _ => Vec::new(),
-    };
-    let selected: Vec<String> = available
-        .iter()
-        .filter(|p| offered.contains(p))
-        .cloned()
-        .collect();
-    Ok(require_records_for_scalar(selected))
-}
-
-/// Sort, dedupe, and drop the scalar-expression profile unless constraint
-/// records are also selected.
-fn require_records_for_scalar(mut read: Vec<String>) -> Vec<String> {
-    read.sort();
-    read.dedup();
-    if !read.iter().any(|p| p == CONSTRAINT_RECORDS_READ) {
-        read.retain(|p| p != ROW_SCALAR_EXPRESSION);
-    }
-    read
 }
 
 fn sorted_union(a: Vec<String>, b: Vec<String>) -> Vec<String> {
@@ -496,27 +112,15 @@ pub(crate) fn agree_capabilities(
         return Ok(hook);
     }
     let selected_read = select_read_profiles(auto_read, client_capabilities)?;
-    let empty = || CatalogCapabilities {
-        read: Vec::new(),
-        ddl: Vec::new(),
-        write: Vec::new(),
-        transaction: Vec::new(),
-    };
     let (available, selected) = match hook {
-        None => (empty(), empty()),
-        Some((available, selected)) => {
-            let read = |raw: &Bytes| -> Result<CatalogCapabilities> {
-                if raw.0.is_empty() {
-                    Ok(empty())
-                } else {
-                    decode(&raw.0)
-                }
-            };
-            (read(&available)?, read(&selected)?)
-        }
+        None => (empty_capabilities(), empty_capabilities()),
+        Some((available, selected)) => (
+            read_catalog_capabilities(&available.0)?,
+            read_catalog_capabilities(&selected.0)?,
+        ),
     };
     let merge = |base: CatalogCapabilities, read: Vec<String>| CatalogCapabilities {
-        read: require_records_for_scalar(sorted_union(base.read, read)),
+        read: normalize_read_profiles(sorted_union(base.read, read)),
         ddl: sorted_union(base.ddl, Vec::new()),
         write: sorted_union(base.write, Vec::new()),
         transaction: sorted_union(base.transaction, Vec::new()),
@@ -524,7 +128,17 @@ pub(crate) fn agree_capabilities(
     // Advertising is not selecting: every implemented profile is available.
     let available = merge(available, auto_read.to_vec());
     let selected = merge(selected, selected_read);
-    Ok(Some((encode(available)?, encode(selected)?)))
+    Ok(Some((encode_record(available)?, encode_record(selected)?)))
+}
+
+/// The `(available, selected)` agreement for a catalog that serves records
+/// but is not a [`CatalogModel`](crate::catalog::CatalogModel) — e.g. a
+/// custom `catalog_attach` handler: advertise both constraint read profiles
+/// and select those `client_capabilities` offers. Put the pair in
+/// `CatalogAttachResult.catalog_capabilities` / `selected_capabilities`.
+pub fn constraint_read_agreement(client_capabilities: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
+    agree_capabilities(&read_profiles_for(true), None, client_capabilities)?
+        .ok_or_else(|| RpcError::runtime_error("constraint read agreement was empty"))
 }
 
 /// Read profiles the SDK implements for a table set: constraint records (with
@@ -554,101 +168,419 @@ fn ordinary_struct_children(field: &Field) -> Option<&Fields> {
     Some(children)
 }
 
+fn identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_IDENTIFIER && !value.contains('\0')
+}
+
+fn is_row_id(field: &Field) -> bool {
+    field.metadata().contains_key(ROW_ID_METADATA_KEY)
+}
+
+/// The extension's `ResolveNotNullPath`: the first top-level field named
+/// `path[0]` (not the row id), then unique children of ordinary STRUCTs.
+fn resolve_path(columns: &Schema, path: &[String]) -> std::result::Result<(), String> {
+    let missing = || {
+        format!(
+            "column path {} is missing, ambiguous or the synthetic row-id column",
+            path.join(".")
+        )
+    };
+    let Some(mut field) = columns.fields().iter().find(|f| f.name() == &path[0]) else {
+        return Err(missing());
+    };
+    if is_row_id(field) {
+        return Err(missing());
+    }
+    for part in &path[1..] {
+        let Some(children) = ordinary_struct_children(field) else {
+            return Err(format!(
+                "column path {} must traverse ordinary STRUCT fields, not storage members \
+                 or extension/logical types",
+                path.join(".")
+            ));
+        };
+        let mut matches = children.iter().filter(|c| c.name() == part);
+        match (matches.next(), matches.next()) {
+            (Some(child), None) => field = child,
+            _ => return Err(missing()),
+        }
+    }
+    Ok(())
+}
+
+/// The raw FK / CHECK payloads [`read_constraint_record`] summarizes away.
+fn check_payloads(
+    raw: &[u8],
+    schema_path: &[String],
+    record: &ConstraintRecord,
+) -> std::result::Result<(), String> {
+    let info: ConstraintInfo = decode_record(raw).map_err(|e| e.message)?;
+    let definition: ConstraintDefinition =
+        decode_record(&info.definition.0).map_err(|e| e.message)?;
+    if let Some(expression) = &definition.check_expression {
+        let expression: SqlExpression = decode_record(&expression.0).map_err(|e| e.message)?;
+        if expression.profile != ROW_SCALAR_EXPRESSION {
+            return Err(format!(
+                "CHECK expression profile '{}' is not {ROW_SCALAR_EXPRESSION}",
+                expression.profile
+            ));
+        }
+        if expression.schema_path != schema_path {
+            return Err(format!(
+                "CHECK expression belongs to schema {:?}, not {schema_path:?}",
+                expression.schema_path
+            ));
+        }
+        if !is_default_evaluation_context(&expression.evaluation_context) {
+            return Err(
+                "CHECK evaluation context must be UTC / binary / asc / nulls_last / \
+                 preserve_insertion_order"
+                    .into(),
+            );
+        }
+    }
+    if let (Some(fk), Some(key)) = (&definition.foreign_key, &info.referenced_constraint) {
+        let fk: ForeignKeyDefinition = decode_record(&fk.0).map_err(|e| e.message)?;
+        let table: CatalogObjectRef =
+            decode_record(&fk.referenced_table.0).map_err(|e| e.message)?;
+        let key: CatalogObjectRef = decode_record(&key.0).map_err(|e| e.message)?;
+        if table.kind != "table" || table.owner_table.is_some() {
+            return Err("FOREIGN KEY referenced_table must be a table reference".into());
+        }
+        if key.kind != "constraint" {
+            return Err("FOREIGN KEY referenced_constraint must be a constraint reference".into());
+        }
+        if table.schema_path != schema_path || key.schema_path != schema_path {
+            return Err(format!(
+                "FOREIGN KEY must reference a key in the same schema {schema_path:?} \
+                 (references {:?})",
+                table.schema_path
+            ));
+        }
+        if key.owner_table.as_deref() != Some(table.name.as_str()) {
+            return Err(format!(
+                "FOREIGN KEY referenced constraint '{}' is not owned by referenced table '{}'",
+                key.name, table.name
+            ));
+        }
+        if fk.r#match.0 != "SIMPLE" {
+            return Err(format!(
+                "FOREIGN KEY MATCH {} is unsupported; use SIMPLE",
+                fk.r#match.0
+            ));
+        }
+        for (label, action) in [
+            ("ON UPDATE", &fk.on_update.0),
+            ("ON DELETE", &fk.on_delete.0),
+        ] {
+            if action != "NO_ACTION" && action != "RESTRICT" {
+                return Err(format!(
+                    "FOREIGN KEY {label} {action} is unsupported; only NO_ACTION / RESTRICT"
+                ));
+            }
+        }
+        let target = record.references.as_ref().map(|r| &r.columns);
+        if target.is_some_and(|paths| paths.iter().any(|p| p.len() != 1)) {
+            return Err("FOREIGN KEY referenced columns must be top-level columns".into());
+        }
+    }
+    Ok(())
+}
+
+fn check_paths(paths: &[Vec<String>]) -> std::result::Result<(), String> {
+    if paths.len() > MAX_PATHS {
+        return Err(format!("more than {MAX_PATHS} column paths"));
+    }
+    let mut seen = HashSet::new();
+    for path in paths {
+        if path.is_empty() || path.len() > MAX_DEPTH {
+            return Err("empty or oversized column path".into());
+        }
+        if !path.iter().all(|c| identifier(c)) {
+            return Err("column path components must be nonempty identifiers without NUL".into());
+        }
+        if !seen.insert(path) {
+            return Err(format!("duplicate column path {}", path.join(".")));
+        }
+    }
+    Ok(())
+}
+
+/// Decode and check a table's records exactly as the extension does at
+/// ATTACH (`DecodeNativeConstraints`), except nullability, which serving
+/// normalizes. Returns the decoded records.
+fn checked_records(
+    schema_path: &[String],
+    table: &str,
+    columns: &Schema,
+    constraints: &[Bytes],
+) -> Result<Vec<ConstraintRecord>> {
+    let fail = |message: String| {
+        Err(RpcError::value_error(format!(
+            "Table '{}.{table}': {message}",
+            schema_path.join(".")
+        )))
+    };
+    if constraints.len() > MAX_RECORDS {
+        return fail(format!("more than {MAX_RECORDS} constraint records"));
+    }
+    let mut total = 0;
+    for raw in constraints {
+        total += raw.0.len();
+        if raw.0.is_empty() || raw.0.len() > MAX_RECORD_BYTES || total > MAX_RECORD_BYTES {
+            return fail("constraint records exceed the 8 MiB size limit (or one is empty)".into());
+        }
+    }
+    let mut records = Vec::with_capacity(constraints.len());
+    let mut ids = HashSet::new();
+    let mut labels = HashSet::new();
+    let mut primary_key: Option<String> = None;
+    for (index, raw) in constraints.iter().enumerate() {
+        let record = match read_constraint_record(&raw.0) {
+            Ok(record) => record,
+            Err(e) => {
+                return fail(format!(
+                    "constraint record #{index} is not a canonical ConstraintInfo: {}",
+                    e.message
+                ))
+            }
+        };
+        let id = record.id.clone();
+        let constraint = |message: String| fail(format!("constraint '{id}': {message}"));
+        if schema_path.len() != 1 || record.schema_path != schema_path {
+            return constraint(format!(
+                "belongs to schema {:?}; records must name the serving table's one-component \
+                 schema {schema_path:?}",
+                record.schema_path
+            ));
+        }
+        if record.table != table {
+            return constraint(format!("is owned by table '{}'", record.table));
+        }
+        if !identifier(&record.id) || !identifier(&record.table) {
+            return constraint("identity must be nonempty identifiers without NUL".into());
+        }
+        if !ids.insert(record.id.clone()) {
+            return fail(format!("duplicate constraint identity '{id}'"));
+        }
+        if !record.is_readable() {
+            return constraint(format!(
+                "is {}/{}; DuckDB accepts only ENFORCED + ALL_ROWS records",
+                record.enforcement, record.validation
+            ));
+        }
+        if let Some(label) = &record.declared_name {
+            if !identifier(label) {
+                return constraint("declared_name must be a nonempty identifier".into());
+            }
+            if !labels.insert(label.to_ascii_lowercase()) {
+                return constraint(format!(
+                    "duplicate SQL constraint name '{label}' (names compare case-insensitively)"
+                ));
+            }
+        }
+        if let Err(e) = check_paths(&record.columns) {
+            return constraint(e);
+        }
+        if let Some(target) = &record.references {
+            if let Err(e) = check_paths(&target.columns) {
+                return constraint(format!("referenced columns: {e}"));
+            }
+        }
+        if let Err(e) = check_payloads(&raw.0, schema_path, &record) {
+            return constraint(e);
+        }
+        match record.kind {
+            ConstraintKind::Check => {
+                let sql = record.check_sql.as_deref().unwrap_or_default();
+                if let Err(e) = crate::sql_expression::check_numeric_comparison(sql, columns) {
+                    return constraint(e.message);
+                }
+            }
+            ConstraintKind::NotNull => {
+                if let Err(e) = resolve_path(columns, &record.columns[0]) {
+                    return constraint(e);
+                }
+            }
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::ForeignKey => {
+                for path in &record.columns {
+                    if path.len() != 1 {
+                        return constraint(format!(
+                            "column path {} is nested; DuckDB supports nested paths only for \
+                             NOT_NULL",
+                            path.join(".")
+                        ));
+                    }
+                    if let Err(e) = resolve_path(columns, path) {
+                        return constraint(e);
+                    }
+                }
+                if record.kind == ConstraintKind::PrimaryKey {
+                    if let Some(first) = primary_key.replace(record.id.clone()) {
+                        return constraint(format!(
+                            "is a second PRIMARY KEY (table already has '{first}')"
+                        ));
+                    }
+                }
+            }
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
 /// Check a table's records the way the DuckDB extension does at ATTACH.
 ///
-/// Every record must decode, belong to `table`, carry a unique identity and be
-/// `ENFORCED` + `ALL_ROWS`; and for every field (descending through ordinary
-/// STRUCTs — not those tagged `ARROW:extension:name` or `vgi.logical_type.*`),
-/// Arrow nullability must be the complement of membership in the NOT_NULL ∪
-/// PRIMARY_KEY column-path set. The top-level `is_row_id` column is exempt.
-/// Applies to every table, including one with no records (then every field
-/// must be nullable). Errors name the table, constraint and column path.
+/// Every record must decode; belong to `table` in `schema_path` (a
+/// one-component schema path, as the extension requires); carry a unique
+/// identity and, when set, a case-insensitively unique `declared_name`; and be
+/// `ENFORCED` + `ALL_ROWS`. A table has at most one PRIMARY KEY. NOT_NULL paths
+/// must resolve (descending only through ordinary STRUCTs — not those tagged
+/// `ARROW:extension:name` or `vgi.logical_type.*`); PRIMARY KEY / UNIQUE /
+/// FOREIGN KEY paths must be top-level columns. A FOREIGN KEY must reference a
+/// key in the same schema, `MATCH SIMPLE`, with `NO_ACTION` / `RESTRICT`
+/// actions (see also [`validate_foreign_key_targets`]). A CHECK must be one
+/// numeric comparison of primitive signed numeric columns and numeric literals.
+/// Errors name the table, constraint and column path.
+///
+/// Arrow nullability is *not* checked: serving rewrites it to match the records
+/// (see [`served_columns`]).
 pub fn validate_table_constraints(
+    schema_path: &[String],
     table: &str,
     columns: &Schema,
     constraints: &[Bytes],
 ) -> Result<()> {
-    let fail = |message: String| Err(RpcError::value_error(format!("Table '{table}': {message}")));
-    let mut required: HashSet<Vec<String>> = HashSet::new();
-    let mut ids: HashSet<String> = HashSet::new();
-    for (index, raw) in constraints.iter().enumerate() {
-        let record = read_constraint_record(&raw.0).map_err(|e| {
-            RpcError::value_error(format!(
-                "Table '{table}': constraint record #{index} is not a canonical ConstraintInfo: {e}"
-            ))
-        })?;
-        if record.table != table {
-            return fail(format!(
-                "constraint '{}' is owned by table '{}'",
-                record.id, record.table
-            ));
-        }
-        if !ids.insert(record.id.clone()) {
-            return fail(format!("duplicate constraint identity '{}'", record.id));
-        }
-        if !record.is_readable() {
-            return fail(format!(
-                "constraint '{}' is {}/{}; DuckDB accepts only ENFORCED + ALL_ROWS records",
-                record.id, record.enforcement, record.validation
-            ));
-        }
-        if matches!(
-            record.kind,
-            ConstraintKind::NotNull | ConstraintKind::PrimaryKey
-        ) {
-            required.extend(record.columns);
-        }
+    checked_records(schema_path, table, columns, constraints).map(|_| ())
+}
+
+/// The columns as DuckDB must see them: [`validate_table_constraints`], then
+/// every field's nullability set to membership in the NOT_NULL ∪ PRIMARY_KEY
+/// path set (descending through ordinary STRUCTs; the top-level `is_row_id`
+/// column is left untouched). A non-nullable field no record names is served
+/// nullable; a nullable field a record names is served non-nullable — the
+/// ENFORCED + ALL_ROWS record is the attestation. Metadata is preserved.
+pub fn served_columns(
+    schema_path: &[String],
+    table: &str,
+    columns: &Schema,
+    constraints: &[Bytes],
+) -> Result<Schema> {
+    let records = checked_records(schema_path, table, columns, constraints)?;
+    let required: HashSet<Vec<String>> = records
+        .into_iter()
+        .filter(|r| matches!(r.kind, ConstraintKind::NotNull | ConstraintKind::PrimaryKey))
+        .flat_map(|r| r.columns)
+        .collect();
+    let fields = normalize_fields(columns.fields(), &[], &required)?;
+    Ok(Schema::new_with_metadata(
+        fields,
+        columns.metadata().clone(),
+    ))
+}
+
+fn normalize_fields(
+    fields: &Fields,
+    prefix: &[String],
+    required: &HashSet<Vec<String>>,
+) -> Result<Fields> {
+    if prefix.len() > MAX_DEPTH {
+        return Err(RpcError::value_error(format!(
+            "column nesting exceeds {MAX_DEPTH} levels"
+        )));
     }
-    let mut named: HashSet<Vec<String>> = HashSet::new();
-    fn walk(
-        table: &str,
-        fields: &Fields,
-        prefix: &[String],
-        required: &HashSet<Vec<String>>,
-        named: &mut HashSet<Vec<String>>,
-    ) -> Result<()> {
-        if prefix.len() > MAX_DEPTH {
-            return Err(RpcError::value_error(format!(
-                "Table '{table}': column nesting exceeds {MAX_DEPTH} levels"
-            )));
-        }
-        for field in fields {
-            if prefix.is_empty() && field.metadata().contains_key(ROW_ID_METADATA_KEY) {
-                continue;
+    fields
+        .iter()
+        .map(|field| -> Result<FieldRef> {
+            if prefix.is_empty() && is_row_id(field) {
+                return Ok(field.clone());
             }
             let mut path = prefix.to_vec();
             path.push(field.name().clone());
-            let is_required = required.contains(&path);
-            if field.is_nullable() == is_required {
-                let dotted = path.join(".");
-                return Err(RpcError::value_error(if is_required {
-                    format!(
-                        "Table '{table}': column {dotted} is in a NOT_NULL/PRIMARY_KEY record \
-                         but its Arrow field is nullable; mark the field non-nullable"
-                    )
-                } else {
-                    format!(
-                        "Table '{table}': column {dotted} is non-nullable in Arrow but no \
-                         NOT_NULL/PRIMARY_KEY record names it; declare one with \
-                         vgi::constraints::constraint_record or make the field nullable"
-                    )
-                }));
-            }
-            if is_required {
-                named.insert(path.clone());
-            }
+            let nullable = !required.contains(&path);
+            let mut out = field.as_ref().clone().with_nullable(nullable);
             if let Some(children) = ordinary_struct_children(field) {
-                walk(table, children, &path, required, named)?;
+                out = out.with_data_type(DataType::Struct(normalize_fields(
+                    children, &path, required,
+                )?));
+            }
+            Ok(if out == **field {
+                field.clone()
+            } else {
+                Arc::new(out)
+            })
+        })
+        .collect()
+}
+
+/// Check that every FOREIGN KEY among one schema's tables references an
+/// existing table of that schema and, on it, an existing PRIMARY KEY or UNIQUE
+/// record whose column set equals the FK's referenced columns.
+///
+/// `tables` is `(table name, its constraint records)` for every table in
+/// `schema_path`. Records that do not decode are skipped here (serving the
+/// table reports them).
+pub fn validate_foreign_key_targets<'a>(
+    schema_path: &[String],
+    tables: impl IntoIterator<Item = (&'a str, &'a [Bytes])>,
+) -> Result<()> {
+    let decoded: Vec<(&str, Vec<ConstraintRecord>)> = tables
+        .into_iter()
+        .map(|(name, records)| {
+            let records = records
+                .iter()
+                .filter_map(|raw| read_constraint_record(&raw.0).ok())
+                .collect();
+            (name, records)
+        })
+        .collect();
+    let keys: HashMap<String, &[ConstraintRecord]> = decoded
+        .iter()
+        .map(|(name, records)| (name.to_ascii_lowercase(), records.as_slice()))
+        .collect();
+    for (table, records) in &decoded {
+        for record in records {
+            let Some(target) = &record.references else {
+                continue;
+            };
+            let fail = |message: String| {
+                Err(RpcError::value_error(format!(
+                    "Table '{}.{table}': constraint '{}': {message}",
+                    schema_path.join("."),
+                    record.id
+                )))
+            };
+            let Some(target_records) = keys.get(&target.table.to_ascii_lowercase()) else {
+                return fail(format!(
+                    "FOREIGN KEY references table '{}', which this schema does not serve",
+                    target.table
+                ));
+            };
+            let Some(key) = target_records.iter().find(|r| r.id == target.constraint_id) else {
+                return fail(format!(
+                    "FOREIGN KEY references constraint '{}', which table '{}' does not declare",
+                    target.constraint_id, target.table
+                ));
+            };
+            if !matches!(
+                key.kind,
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique
+            ) {
+                return fail(format!(
+                    "FOREIGN KEY references '{}', a {} constraint; it must be a PRIMARY_KEY or \
+                     UNIQUE",
+                    key.id, key.kind
+                ));
+            }
+            let want: HashSet<&Vec<String>> = target.columns.iter().collect();
+            let have: HashSet<&Vec<String>> = key.columns.iter().collect();
+            if want != have {
+                return fail(format!(
+                    "FOREIGN KEY referenced columns {:?} differ from key '{}' columns {:?}",
+                    target.columns, key.id, key.columns
+                ));
             }
         }
-        Ok(())
-    }
-    walk(table, columns.fields(), &[], &required, &mut named)?;
-    if let Some(path) = required.iter().find(|path| !named.contains(*path)) {
-        return fail(format!(
-            "NOT_NULL/PRIMARY_KEY record names column {}, which is not an ordinary column path",
-            path.join(".")
-        ));
     }
     Ok(())
 }
@@ -656,6 +588,10 @@ pub fn validate_table_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn main() -> Vec<String> {
+        vec!["main".to_string()]
+    }
 
     fn pk(table: &str, id: &str, column: &[&str]) -> ConstraintRecord {
         ConstraintRecord::new(&["main"], table, id, ConstraintKind::PrimaryKey)
@@ -669,64 +605,31 @@ mod tests {
             .enforced()
     }
 
-    #[test]
-    fn every_kind_round_trips() {
-        let mut check = ConstraintRecord::new(&["main"], "t", "t.check", ConstraintKind::Check);
-        check.check_sql = Some("a >= 0".into());
-        check.declared_name = Some("a_positive".into());
-        let mut fk = ConstraintRecord::new(&["main"], "t", "t.fk", ConstraintKind::ForeignKey)
-            .with_columns(&[&["b"]])
+    fn fk(
+        table: &str,
+        id: &str,
+        column: &str,
+        target: &str,
+        key: &str,
+        key_col: &str,
+    ) -> ConstraintRecord {
+        let mut spec = ConstraintRecord::new(&["main"], table, id, ConstraintKind::ForeignKey)
+            .with_columns(&[&[column]])
             .enforced();
-        fk.references = Some(ForeignKeyReference {
-            schema_path: vec!["main".into()],
-            table: "u".into(),
-            columns: vec![vec!["id".into()]],
-            constraint_id: "u.pk".into(),
+        spec.references = Some(ForeignKeyReference {
+            schema_path: main(),
+            table: target.into(),
+            columns: vec![vec![key_col.into()]],
+            constraint_id: key.into(),
         });
-        let unique = ConstraintRecord::new(&["main"], "t", "t.uq", ConstraintKind::Unique)
-            .with_columns(&[&["a"], &["s", "x"]]);
-        for spec in [
-            pk("t", "t.pk", &["a"]),
-            not_null("t", "t.nn", &["s", "x"]),
-            unique,
-            check,
-            fk,
-        ] {
-            let bytes = constraint_record(&spec).unwrap();
-            assert_eq!(read_constraint_record(&bytes.0).unwrap(), spec);
-            assert_eq!(spec.encode().unwrap().0, bytes.0);
-        }
+        spec
     }
 
-    #[test]
-    fn builder_rejects_malformed_shapes() {
-        let base = || ConstraintRecord::new(&["main"], "t", "id", ConstraintKind::NotNull);
-        // No columns.
-        assert!(constraint_record(&base()).is_err());
-        // NOT_NULL with two paths.
-        assert!(constraint_record(&base().with_columns(&[&["a"], &["b"]])).is_err());
-        // Empty identity.
-        let mut empty = base().with_columns(&[&["a"]]);
-        empty.id.clear();
-        assert!(constraint_record(&empty).is_err());
-        // CHECK with columns / without SQL.
-        let check = ConstraintRecord::new(&["main"], "t", "c", ConstraintKind::Check);
-        assert!(constraint_record(&check).is_err());
-        let mut check_cols = check.clone().with_columns(&[&["a"]]);
-        check_cols.check_sql = Some("a > 0".into());
-        assert!(constraint_record(&check_cols).is_err());
-        // FK without references / arity mismatch.
-        let fk = ConstraintRecord::new(&["main"], "t", "f", ConstraintKind::ForeignKey)
-            .with_columns(&[&["a"]]);
-        assert!(constraint_record(&fk).is_err());
-        let mut arity = fk;
-        arity.references = Some(ForeignKeyReference {
-            schema_path: vec!["main".into()],
-            table: "u".into(),
-            columns: vec![vec!["x".into()], vec!["y".into()]],
-            constraint_id: "u.pk".into(),
-        });
-        assert!(constraint_record(&arity).is_err());
+    fn check(table: &str, id: &str, sql: &str) -> ConstraintRecord {
+        let mut spec =
+            ConstraintRecord::new(&["main"], table, id, ConstraintKind::Check).enforced();
+        spec.check_sql = Some(sql.into());
+        spec
     }
 
     fn records(specs: &[ConstraintRecord]) -> Vec<Bytes> {
@@ -736,12 +639,25 @@ mod tests {
             .collect()
     }
 
+    fn validate(schema: &Schema, specs: &[ConstraintRecord]) -> Result<()> {
+        validate_table_constraints(&main(), "t", schema, &records(specs))
+    }
+
+    fn err(schema: &Schema, specs: &[ConstraintRecord]) -> String {
+        validate(schema, specs).unwrap_err().to_string()
+    }
+
+    fn two_ints() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ])
+    }
+
     #[test]
     fn only_enforced_all_rows_records_are_served() {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
-        assert!(
-            validate_table_constraints("t", &schema, &records(&[pk("t", "k", &["a"])])).is_ok()
-        );
+        assert!(validate(&schema, &[pk("t", "k", &["a"])]).is_ok());
         for (enforcement, validation) in [
             (
                 ConstraintEnforcement::MetadataOnly,
@@ -759,113 +675,250 @@ mod tests {
             let mut spec = pk("t", "k", &["a"]);
             spec.enforcement = enforcement;
             spec.validation = validation;
-            let err = validate_table_constraints("t", &schema, &records(&[spec]))
-                .unwrap_err()
-                .to_string();
+            let e = err(&schema, &[spec]);
             assert!(
-                err.contains("Table 't'") && err.contains("constraint 'k'"),
-                "{err}"
+                e.contains("Table 'main.t'") && e.contains("constraint 'k'"),
+                "{e}"
             );
-            assert!(err.contains("ENFORCED + ALL_ROWS"), "{err}");
+            assert!(e.contains("ENFORCED + ALL_ROWS"), "{e}");
         }
     }
 
     #[test]
-    fn records_must_belong_to_the_table_and_be_unique() {
-        let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+    fn records_must_belong_to_the_table_and_schema() {
+        let schema = two_ints();
+        assert!(err(&schema, &[pk("other", "k", &["a"])]).contains("owned by table 'other'"));
+        let foreign = ConstraintRecord::new(&["other"], "t", "k", ConstraintKind::PrimaryKey)
+            .with_columns(&[&["a"]])
+            .enforced();
+        let e = err(&schema, &[foreign]);
         assert!(
-            validate_table_constraints("t", &schema, &records(&[pk("other", "k", &["a"])]))
-                .is_err()
+            e.contains("constraint 'k'") && e.contains("belongs to schema"),
+            "{e}"
         );
-        let dup = records(&[pk("t", "k", &["a"]), not_null("t", "k", &["a"])]);
-        assert!(validate_table_constraints("t", &schema, &dup).is_err());
-        assert!(validate_table_constraints("t", &schema, &[Bytes::from(vec![1, 2])]).is_err());
+        // The extension reads one-component schema paths only.
+        let nested = vec!["a".to_string(), "b".to_string()];
+        let deep = ConstraintRecord::new(&["a", "b"], "t", "k", ConstraintKind::PrimaryKey)
+            .with_columns(&[&["a"]])
+            .enforced();
+        assert!(validate_table_constraints(&nested, "t", &schema, &records(&[deep])).is_err());
+        let e = err(&schema, &[pk("t", "k", &["a"]), not_null("t", "k", &["b"])]);
+        assert!(e.contains("duplicate constraint identity 'k'"), "{e}");
+        assert!(
+            validate_table_constraints(&main(), "t", &schema, &[Bytes::from(vec![1, 2])]).is_err()
+        );
     }
 
     #[test]
-    fn nullability_must_match_records_on_every_table() {
-        let nullable = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
-        let required = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
-        // A table with no records: every field must be nullable.
-        assert!(validate_table_constraints("t", &nullable, &[]).is_ok());
-        let err = validate_table_constraints("t", &required, &[])
-            .unwrap_err()
-            .to_string();
+    fn declared_names_primary_keys_and_paths_follow_attach() {
+        let schema = two_ints();
+        let mut a = not_null("t", "n1", &["a"]);
+        a.declared_name = Some("Label".into());
+        let mut b = not_null("t", "n2", &["b"]);
+        b.declared_name = Some("label".into());
+        let e = err(&schema, &[a, b]);
         assert!(
-            err.contains("Table 't'") && err.contains("column a is non-nullable"),
-            "{err}"
+            e.contains("constraint 'n2'") && e.contains("duplicate SQL constraint name"),
+            "{e}"
         );
-        // A NOT_NULL record over a nullable field.
-        let err =
-            validate_table_constraints("t", &nullable, &records(&[not_null("t", "n", &["a"])]))
-                .unwrap_err()
-                .to_string();
+        let e = err(&schema, &[pk("t", "p1", &["a"]), pk("t", "p2", &["b"])]);
         assert!(
-            err.contains("column a is in a NOT_NULL/PRIMARY_KEY record"),
-            "{err}"
+            e.contains("constraint 'p2'") && e.contains("second PRIMARY KEY"),
+            "{e}"
         );
-        // The row-id column is exempt.
+        let e = err(&schema, &[not_null("t", "n", &["zz"])]);
+        assert!(
+            e.contains("constraint 'n'") && e.contains("column path zz"),
+            "{e}"
+        );
+        let unique = ConstraintRecord::new(&["main"], "t", "u", ConstraintKind::Unique)
+            .with_columns(&[&["a"], &["a"]])
+            .enforced();
+        assert!(err(&schema, &[unique]).contains("duplicate column path a"));
+        let unique = ConstraintRecord::new(&["main"], "t", "u", ConstraintKind::Unique)
+            .with_columns(&[&["missing"]])
+            .enforced();
+        assert!(err(&schema, &[unique]).contains("column path missing"));
+        // Row id is synthetic.
         let row_id = Schema::new(vec![Field::new("rowid", DataType::Int64, false)
-            .with_metadata([(ROW_ID_METADATA_KEY.to_string(), "true".to_string())])]);
-        assert!(validate_table_constraints("t", &row_id, &[]).is_ok());
-        // A record naming a column that does not exist.
-        let err =
-            validate_table_constraints("t", &nullable, &records(&[not_null("t", "n", &["zz"])]))
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("column zz"), "{err}");
+            .with_metadata(std::collections::HashMap::from([(
+                ROW_ID_METADATA_KEY.to_string(),
+                "true".to_string(),
+            )]))]);
+        assert!(validate(&row_id, &[not_null("t", "n", &["rowid"])]).is_err());
     }
 
     #[test]
-    fn nullability_recurses_into_ordinary_structs_only() {
-        let inner = |nullable| {
-            Fields::from(vec![
-                Field::new("x", DataType::Float64, nullable),
-                Field::new("y", DataType::Float64, true),
-            ])
-        };
-        let schema = |nullable, metadata: Option<(&str, &str)>| {
-            let mut field = Field::new("s", DataType::Struct(inner(nullable)), true);
+    fn nested_paths_only_for_not_null_through_ordinary_structs() {
+        let inner = Fields::from(vec![Field::new("x", DataType::Float64, true)]);
+        let schema = |metadata: Option<(&str, &str)>| {
+            let mut field = Field::new("s", DataType::Struct(inner.clone()), true);
             if let Some((k, v)) = metadata {
-                field = field.with_metadata([(k.to_string(), v.to_string())]);
+                field = field.with_metadata(std::collections::HashMap::from([(
+                    k.to_string(),
+                    v.to_string(),
+                )]));
             }
             Schema::new(vec![field])
         };
-        let nested = records(&[not_null("t", "sx", &["s", "x"])]);
-        assert!(validate_table_constraints("t", &schema(false, None), &nested).is_ok());
-        let err = validate_table_constraints("t", &schema(true, None), &nested)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("column s.x is in a NOT_NULL"), "{err}");
-        let err = validate_table_constraints("t", &schema(false, None), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("column s.x is non-nullable"), "{err}");
-        // Extension / logical-type structs are opaque: their children are not walked.
+        assert!(validate(&schema(None), &[not_null("t", "sx", &["s", "x"])]).is_ok());
+        let unique = ConstraintRecord::new(&["main"], "t", "u", ConstraintKind::Unique)
+            .with_columns(&[&["s", "x"]])
+            .enforced();
+        assert!(err(&schema(None), &[unique]).contains("nested"));
         for key in ["ARROW:extension:name", "vgi.logical_type.name"] {
-            let opaque = schema(false, Some((key, "geo")));
-            assert!(validate_table_constraints("t", &opaque, &[]).is_ok());
-            assert!(validate_table_constraints("t", &opaque, &nested).is_err());
+            let e = err(
+                &schema(Some((key, "geo"))),
+                &[not_null("t", "sx", &["s", "x"])],
+            );
+            assert!(e.contains("ordinary STRUCT"), "{e}");
         }
     }
 
+    #[test]
+    fn check_sql_follows_the_numeric_comparison_rule() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]);
+        assert!(validate(&schema, &[check("t", "c", "a >= 0")]).is_ok());
+        for sql in ["a + 1 > 0", "s > 0", "a > 0 AND a < 9", "length(s) > 0"] {
+            let e = err(&schema, &[check("t", "c", sql)]);
+            assert!(
+                e.contains("constraint 'c'") && e.contains("CHECK"),
+                "{sql}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_keys_must_stay_in_schema_with_supported_actions() {
+        let schema = two_ints();
+        assert!(validate(&schema, &[fk("t", "f", "a", "u", "u.pk", "id")]).is_ok());
+        let mut cross = fk("t", "f", "a", "u", "u.pk", "id");
+        cross.references.as_mut().unwrap().schema_path = vec!["other".into()];
+        assert!(err(&schema, &[cross]).contains("same schema"));
+        // A hand-built record with CASCADE.
+        let raw = constraint_record(&fk("t", "f", "a", "u", "u.pk", "id")).unwrap();
+        let mut info: ConstraintInfo = decode_record(&raw.0).unwrap();
+        let mut definition: ConstraintDefinition = decode_record(&info.definition.0).unwrap();
+        let mut foreign: ForeignKeyDefinition =
+            decode_record(&definition.foreign_key.unwrap().0).unwrap();
+        foreign.on_delete = vgi_rpc::DictString("CASCADE".into());
+        definition.foreign_key = Some(encode_record(foreign).unwrap());
+        info.definition = encode_record(definition).unwrap();
+        let e = validate_table_constraints(&main(), "t", &schema, &[encode_record(info).unwrap()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ON DELETE CASCADE"), "{e}");
+    }
+
+    #[test]
+    fn foreign_key_targets_resolve_across_the_schema() {
+        let users = records(&[pk("u", "u.pk", &["id"])]);
+        let orders = records(&[fk("o", "o.fk", "user_id", "u", "u.pk", "id")]);
+        let ok = [("u", users.as_slice()), ("o", orders.as_slice())];
+        assert!(validate_foreign_key_targets(&main(), ok).is_ok());
+        let e = validate_foreign_key_targets(&main(), [("o", orders.as_slice())])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("constraint 'o.fk'") && e.contains("table 'u'"),
+            "{e}"
+        );
+        let wrong_key = records(&[fk("o", "o.fk", "user_id", "u", "u.missing", "id")]);
+        let e = validate_foreign_key_targets(
+            &main(),
+            [("u", users.as_slice()), ("o", wrong_key.as_slice())],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("u.missing"), "{e}");
+        let wrong_cols = records(&[fk("o", "o.fk", "user_id", "u", "u.pk", "other")]);
+        assert!(validate_foreign_key_targets(
+            &main(),
+            [("u", users.as_slice()), ("o", wrong_cols.as_slice())]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn serving_normalizes_nullability_to_the_records() {
+        let inner = Fields::from(vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ]);
+        let columns = Schema::new_with_metadata(
+            vec![
+                Field::new("a", DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::from([("comment".to_string(), "kept".to_string())]),
+                ),
+                Field::new("b", DataType::Int64, true),
+                Field::new("s", DataType::Struct(inner), false),
+                Field::new("rowid", DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::from([(
+                        ROW_ID_METADATA_KEY.to_string(),
+                        "true".to_string(),
+                    )]),
+                ),
+            ],
+            std::collections::HashMap::from([("schema".to_string(), "meta".to_string())]),
+        );
+        // No records: every user field (and nested child) is served nullable;
+        // the row id is untouched.
+        let served = served_columns(&main(), "t", &columns, &[]).unwrap();
+        assert!(served.field(0).is_nullable());
+        assert_eq!(served.field(0).metadata()["comment"], "kept");
+        assert_eq!(served.metadata()["schema"], "meta");
+        let DataType::Struct(children) = served.field(2).data_type() else {
+            panic!()
+        };
+        assert!(served.field(2).is_nullable());
+        assert!(children.iter().all(|c| c.is_nullable()));
+        assert!(!served.field(3).is_nullable());
+        // Record-named fields are served non-nullable, even when the Arrow field
+        // was nullable.
+        let named = records(&[pk("t", "k", &["b"]), not_null("t", "sx", &["s", "x"])]);
+        let served = served_columns(&main(), "t", &columns, &named).unwrap();
+        assert!(served.field(0).is_nullable());
+        assert!(!served.field(1).is_nullable());
+        let DataType::Struct(children) = served.field(2).data_type() else {
+            panic!()
+        };
+        assert!(served.field(2).is_nullable());
+        assert!(!children[0].is_nullable());
+        assert!(children[1].is_nullable());
+        // Opaque structs keep their children as declared.
+        let opaque = Schema::new(vec![Field::new(
+            "g",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "x",
+                DataType::Float64,
+                false,
+            )])),
+            false,
+        )
+        .with_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "geo".to_string(),
+        )]))]);
+        let served = served_columns(&main(), "t", &opaque, &[]).unwrap();
+        assert!(served.field(0).is_nullable());
+        let DataType::Struct(children) = served.field(0).data_type() else {
+            panic!()
+        };
+        assert!(!children[0].is_nullable());
+    }
+
     fn offer(read: &[&str]) -> Bytes {
-        encode(crate::protocol::dtos::ClientCapabilities {
+        encode_record(crate::protocol::dtos::ClientCapabilities {
             engine: "test".into(),
             native_formats: vec![],
             catalogs: vec![],
             can_stream: true,
             filter_encodings: vec![],
             query_pushdown: None,
-            catalog: Some(
-                encode(CatalogCapabilities {
-                    read: read.iter().map(|s| (*s).to_string()).collect(),
-                    ddl: vec![],
-                    write: vec![],
-                    transaction: vec![],
-                })
-                .unwrap(),
-            ),
+            catalog: Some(catalog_capabilities(read, &[], &[], &[]).unwrap()),
         })
         .unwrap()
     }
@@ -900,24 +953,13 @@ mod tests {
             .unwrap()
             .is_none());
         // Records, no hook.
-        let (available, selected) =
-            agree_capabilities(&read_profiles_for(true), None, Some(&client.0))
-                .unwrap()
-                .unwrap();
-        let available: CatalogCapabilities = decode(&available.0).unwrap();
-        let selected: CatalogCapabilities = decode(&selected.0).unwrap();
+        let (available, selected) = constraint_read_agreement(Some(&client.0)).unwrap();
+        let available = read_catalog_capabilities(&available.0).unwrap();
+        let selected = read_catalog_capabilities(&selected.0).unwrap();
         assert_eq!(available.read, vec![r, s]);
         assert_eq!(selected.read, vec![r, s]);
         // Records plus a hook selecting an extra profile: union, deduplicated.
-        let caps = |read: &[&str]| {
-            encode(CatalogCapabilities {
-                read: read.iter().map(|s| (*s).to_string()).collect(),
-                ddl: vec![],
-                write: vec![],
-                transaction: vec![],
-            })
-            .unwrap()
-        };
+        let caps = |read: &[&str]| catalog_capabilities(read, &[], &[], &[]).unwrap();
         let hook = (
             caps(&[r, "vgi.index.read.v1"]),
             caps(&[r, "vgi.index.read.v1"]),
@@ -926,15 +968,15 @@ mod tests {
             agree_capabilities(&read_profiles_for(true), Some(hook), Some(&client.0))
                 .unwrap()
                 .unwrap();
-        let available: CatalogCapabilities = decode(&available.0).unwrap();
-        let selected: CatalogCapabilities = decode(&selected.0).unwrap();
+        let available = read_catalog_capabilities(&available.0).unwrap();
+        let selected = read_catalog_capabilities(&selected.0).unwrap();
         assert_eq!(available.read, vec![r, s, "vgi.index.read.v1"]);
         assert_eq!(selected.read, vec![r, s, "vgi.index.read.v1"]);
         // No offer: advertised, nothing selected.
-        let (_, selected) = agree_capabilities(&read_profiles_for(true), None, None)
+        let (_, selected) = constraint_read_agreement(None).unwrap();
+        assert!(read_catalog_capabilities(&selected.0)
             .unwrap()
-            .unwrap();
-        let selected: CatalogCapabilities = decode(&selected.0).unwrap();
-        assert!(selected.read.is_empty());
+            .read
+            .is_empty());
     }
 }

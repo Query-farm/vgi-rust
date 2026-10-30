@@ -9,6 +9,10 @@ use std::sync::{
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
+use vgi_protocol::constraints::{
+    client_catalog_capabilities, encode_record, read_catalog_capabilities, read_constraint_record,
+    CatalogCapabilities, ConstraintRecord,
+};
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     AttachCatalogInfo, CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
@@ -621,6 +625,20 @@ impl AttachedCatalog {
         &self.info
     }
 
+    /// The catalog profiles the worker selected from
+    /// [`AttachOptions::catalog_capabilities`] (empty when it selected none).
+    /// [`CONSTRAINT_RECORDS_READ`](vgi_protocol::constraints::CONSTRAINT_RECORDS_READ)
+    /// in `read` means its tables carry canonical constraint records; decode them
+    /// with [`table_constraints`].
+    pub fn selected_capabilities(&self) -> Result<CatalogCapabilities> {
+        read_catalog_capabilities(
+            self.info
+                .selected_capabilities
+                .as_ref()
+                .map_or(&[][..], |b| b.0.as_slice()),
+        )
+    }
+
     /// The raw root schema a bare table name resolves in, or no implicit default.
     pub fn default_schema(&self) -> Option<&str> {
         self.info.default_schema.as_deref()
@@ -684,7 +702,7 @@ impl AttachedCatalog {
 }
 
 /// How to attach.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AttachOptions {
     /// IPC-encoded attach options, if the catalog declares any.
     pub options: Option<Bytes>,
@@ -692,6 +710,33 @@ pub struct AttachOptions {
     pub data_version_spec: Option<String>,
     /// Pin the read to a worker implementation version.
     pub implementation_version: Option<String>,
+    /// The catalog profiles offered as `ClientCapabilities.catalog`. The
+    /// default offers [`client_catalog_capabilities`]: canonical constraint
+    /// records and their scalar CHECK expressions, which this client decodes
+    /// with [`table_constraints`]. `None` offers nothing, so the worker selects
+    /// no catalog profile.
+    pub catalog_capabilities: Option<CatalogCapabilities>,
+}
+
+impl Default for AttachOptions {
+    fn default() -> Self {
+        AttachOptions {
+            options: None,
+            data_version_spec: None,
+            implementation_version: None,
+            catalog_capabilities: Some(client_catalog_capabilities()),
+        }
+    }
+}
+
+/// Decode a table's canonical `ConstraintInfo` records
+/// (`TableInfo.constraints`).
+pub fn table_constraints(table: &TableInfo) -> Result<Vec<ConstraintRecord>> {
+    table
+        .constraints
+        .iter()
+        .map(|raw| read_constraint_record(&raw.0))
+        .collect()
 }
 
 impl std::fmt::Debug for AttachOptions {
@@ -706,6 +751,7 @@ impl std::fmt::Debug for AttachOptions {
             )
             .field("data_version_spec", &self.data_version_spec)
             .field("implementation_version", &self.implementation_version)
+            .field("catalog_capabilities", &self.catalog_capabilities)
             .finish()
     }
 }
@@ -723,7 +769,10 @@ impl VgiClient {
     pub fn attach(&mut self, name: &str, options: AttachOptions) -> Result<AttachedCatalog> {
         let capabilities = ClientCapabilities {
             query_pushdown: None,
-            catalog: None,
+            catalog: options
+                .catalog_capabilities
+                .map(encode_record)
+                .transpose()?,
             engine: "vgi-rust".to_string(),
             native_formats: Vec::new(),
             catalogs: Vec::new(),

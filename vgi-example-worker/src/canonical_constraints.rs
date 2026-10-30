@@ -315,6 +315,8 @@ mod tests {
             .iter()
             .find(|table| table.name == "versioned_constraints")
             .unwrap();
+        let path = data.effective_path();
+        model.validate_tables().unwrap();
         assert_eq!(versioned.constraint_versions.len(), 3);
         assert_eq!(versioned.constraint_versions[&1].0.len(), 1);
         assert_eq!(versioned.constraint_versions[&2].0.len(), 4);
@@ -328,10 +330,11 @@ mod tests {
         assert!(first.columns.field_with_name("name").unwrap().is_nullable());
         for version in &versioned.time_travel {
             let (records, _) = &versioned.constraint_versions[&version.version];
-            validate_table_constraints(&versioned.name, &version.columns, records).unwrap();
+            validate_table_constraints(&path, &versioned.name, &version.columns, records).unwrap();
         }
         for table in &data.tables {
-            validate_table_constraints(&table.name, &table.columns, &table.constraints).unwrap();
+            validate_table_constraints(&path, &table.name, &table.columns, &table.constraints)
+                .unwrap();
             for raw in &table.constraints {
                 let record = read_constraint_record(&raw.0).unwrap();
                 assert_eq!(record.enforcement, ConstraintEnforcement::Enforced);
