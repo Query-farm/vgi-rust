@@ -2400,16 +2400,11 @@ impl Dispatcher {
         // per-session scope id carried back on every request as the storage
         // scope (so two ATTACH sessions of the same catalog stay isolated).
         if let Some(sec) = self.secondary.iter().find(|c| c.name == dto.name) {
-            let agreement = sec
-                .capability_agreement
-                .map(|hook| {
-                    hook(
-                        dto.client_capabilities
-                            .as_ref()
-                            .map(|value| value.0.as_slice()),
-                    )
-                })
-                .transpose()?;
+            let agreement = sec.capability_agreement_for(
+                dto.client_capabilities
+                    .as_ref()
+                    .map(|value| value.0.as_slice()),
+            )?;
             let mut scope = self.next_execution_id();
             debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
             if let Some(hook) = &sec.attach_payload {
@@ -2522,17 +2517,11 @@ impl Dispatcher {
             } else {
                 self.attach_bytes()
             };
-        let agreement = self
-            .catalog
-            .capability_agreement
-            .map(|hook| {
-                hook(
-                    dto.client_capabilities
-                        .as_ref()
-                        .map(|value| value.0.as_slice()),
-                )
-            })
-            .transpose()?;
+        let agreement = self.catalog.capability_agreement_for(
+            dto.client_capabilities
+                .as_ref()
+                .map(|value| value.0.as_slice()),
+        )?;
         let result = CatalogAttachResult {
             catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
             selected_capabilities: agreement.map(|value| value.1),
@@ -5788,18 +5777,12 @@ fn normalize_function_type(t: &str) -> Option<String> {
 #[cfg(test)]
 mod canonical_constraint_version_tests {
     use super::*;
+    use crate::constraints::{constraint_record, ConstraintKind, ConstraintRecord};
     use arrow_schema::{DataType, Field, Schema};
-    use vgi_protocol::generated::protocol_types::{
-        CatalogObjectRef, ConstraintDefinition, ConstraintInfo,
-    };
-
-    fn record<T: vgi_rpc::VgiArrow>(value: T) -> Bytes {
-        Bytes::from(ipc::write_batch(&wire::to_batch(value).unwrap()).unwrap())
-    }
 
     #[test]
     fn current_constraint_records_are_not_reused_for_historical_snapshots() {
-        let columns = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let columns = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let mut table = catalog::CatTable::new("t", columns.clone(), "scan", vec![], None, None);
         table.time_travel = [1, 2]
             .into_iter()
@@ -5811,24 +5794,17 @@ mod canonical_constraint_version_tests {
                 timestamp_year: Some(2020 + version as i32),
             })
             .collect();
-        table.constraints = vec![record(ConstraintInfo {
-            r#ref: record(CatalogObjectRef {
-                kind: "constraint".into(),
-                schema_path: vec!["main".into()],
-                name: "stable-current-key".into(),
-                owner_table: Some("t".into()),
-            }),
-            definition: record(ConstraintDefinition {
-                kind: vgi_rpc::DictString("NOT_NULL".into()),
-                column_paths: vec![vec!["a".into()]],
-                declared_name: None,
-                check_expression: None,
-                foreign_key: None,
-            }),
-            enforcement: vgi_rpc::DictString("METADATA_ONLY".into()),
-            validation: vgi_rpc::DictString("UNVALIDATED".into()),
-            referenced_constraint: None,
-        })];
+        table.constraints = vec![constraint_record(
+            &ConstraintRecord::new(
+                &["main"],
+                "t",
+                "stable-current-key",
+                ConstraintKind::NotNull,
+            )
+            .with_columns(&[&["a"]])
+            .enforced(),
+        )
+        .unwrap()];
         table.definition_revision = Some(Bytes::from(b"current-revision".to_vec()));
         for (unit, value) in [(None, None), (Some("VERSION"), Some("2"))] {
             let current = Dispatcher::at_version(&table, unit, value).unwrap();
@@ -7499,6 +7475,126 @@ mod catalog_contents_tests {
             assert_eq!(attached.catalog_capabilities.unwrap().0, capabilities.0);
             assert_eq!(attached.selected_capabilities.unwrap().0, capabilities.0);
             assert!(d.handle_catalog_attach(&make_request(None)).is_err());
+        }
+    }
+
+    #[test]
+    fn declarative_constraint_records_negotiate_read_profiles_without_hook() {
+        use crate::constraints::{
+            constraint_record, ConstraintKind, ConstraintRecord, CONSTRAINT_RECORDS_READ,
+            ROW_SCALAR_EXPRESSION,
+        };
+        use vgi_protocol::generated::protocol_types::CatalogCapabilities;
+        let caps = |read: &[&str]| {
+            Bytes::from(
+                ipc::write_batch(
+                    &wire::to_batch(CatalogCapabilities {
+                        read: read.iter().map(|s| (*s).to_string()).collect(),
+                        ddl: vec![],
+                        write: vec![],
+                        transaction: vec![],
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let offer = |read: &[&str]| {
+            Bytes::from(
+                ipc::write_batch(
+                    &wire::to_batch(ClientCapabilities {
+                        engine: "duckdb".into(),
+                        native_formats: vec![],
+                        catalogs: vec![],
+                        can_stream: true,
+                        filter_encodings: vec![],
+                        catalog: Some(caps(read)),
+                        query_pushdown: None,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let attach = |d: &Dispatcher, name: &str, offer: Option<Bytes>| {
+            let inner_req = wire::to_batch(CatalogAttachRequest {
+                name: name.into(),
+                options: None,
+                data_version_spec: None,
+                implementation_version: None,
+                client_capabilities: offer,
+            })
+            .unwrap();
+            let batch = wire::to_batch(p::CatalogAttachParams {
+                request: Bytes::from(ipc::write_batch(&inner_req).unwrap()),
+            })
+            .unwrap();
+            let result = d
+                .handle_catalog_attach(&request("catalog_attach", batch))
+                .unwrap()
+                .unwrap();
+            wire::from_batch::<CatalogAttachResult>(&inner(result)).unwrap()
+        };
+        let read = |raw: Option<Bytes>| -> Vec<String> {
+            let caps: CatalogCapabilities =
+                wire::from_batch(&ipc::read_batch(&raw.unwrap().0).unwrap()).unwrap();
+            caps.read
+        };
+
+        // Without records the SDK says nothing.
+        let plain = dispatcher();
+        let attached = attach(&plain, "cat", Some(offer(&[CONSTRAINT_RECORDS_READ])));
+        assert!(attached.catalog_capabilities.is_none());
+        assert!(attached.selected_capabilities.is_none());
+
+        let constrained = |name: &str| {
+            let mut table = catalog::CatTable::new(
+                "t",
+                Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+                "t_scan",
+                Vec::new(),
+                None,
+                None,
+            );
+            table.constraints = vec![constraint_record(
+                &ConstraintRecord::new(&["data"], "t", "t.pk", ConstraintKind::PrimaryKey)
+                    .with_columns(&[&["x"]])
+                    .enforced(),
+            )
+            .unwrap()];
+            catalog::CatalogModel {
+                name: name.into(),
+                schemas: vec![catalog::CatSchema {
+                    name: "data".into(),
+                    tables: vec![table],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        };
+        let mut d = Dispatcher::new("cat");
+        d.set_catalog(constrained("cat"));
+        d.register_secondary_catalog(constrained("secondary"), Vec::new());
+        assert!(d.catalog.capability_agreement.is_none());
+        let both = [CONSTRAINT_RECORDS_READ, ROW_SCALAR_EXPRESSION];
+        for name in ["cat", "secondary"] {
+            let attached = attach(
+                &d,
+                name,
+                Some(offer(&[ROW_SCALAR_EXPRESSION, CONSTRAINT_RECORDS_READ])),
+            );
+            assert_eq!(read(attached.catalog_capabilities), both);
+            assert_eq!(read(attached.selected_capabilities), both);
+            // Only what the client offers is selected; everything is advertised.
+            let attached = attach(&d, name, Some(offer(&[CONSTRAINT_RECORDS_READ])));
+            assert_eq!(read(attached.catalog_capabilities), both);
+            assert_eq!(
+                read(attached.selected_capabilities),
+                [CONSTRAINT_RECORDS_READ]
+            );
+            let attached = attach(&d, name, None);
+            assert_eq!(read(attached.catalog_capabilities), both);
+            assert!(read(attached.selected_capabilities).is_empty());
         }
     }
 

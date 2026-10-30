@@ -910,6 +910,14 @@ pub type AttachPayloadHook =
     std::sync::Arc<dyn Fn(Option<&arrow_array::RecordBatch>) -> Result<Vec<u8>> + Send + Sync>;
 
 /// Provider callback selecting available and agreed capability records from an offer.
+///
+/// Receives the attach request's serialized `ClientCapabilities` (if any) and
+/// returns `(available, selected)` `CatalogCapabilities` IPC. Not needed for
+/// canonical constraint records: the SDK advertises and selects
+/// [`CONSTRAINT_RECORDS_READ`](crate::constraints::CONSTRAINT_RECORDS_READ) and
+/// [`ROW_SCALAR_EXPRESSION`](crate::constraints::ROW_SCALAR_EXPRESSION) itself
+/// whenever a served table carries records, merging them with this hook's
+/// result.
 pub type CapabilityAgreementHook = fn(Option<&[u8]>) -> Result<(Bytes, Bytes)>;
 
 /// A declarative catalog: named schemas with views, macros, and tables.
@@ -918,6 +926,8 @@ pub struct CatalogModel {
     /// Provider-owned capability selection from the client's serialized offer.
     /// The returned records are available and selected CatalogCapabilities IPC;
     /// selected profiles must be offered, supported and include prerequisites.
+    /// Optional for constraint records, which the SDK negotiates automatically
+    /// (see [`CatalogModel::has_constraint_records`]).
     pub capability_agreement: Option<CapabilityAgreementHook>,
     /// Catalog name advertised by `catalog_catalogs` (discovery).
     pub name: String,
@@ -1020,6 +1030,39 @@ impl CatalogModel {
             .and_then(|v| self.version_schemas.get(v))
             .map(|v| v.as_slice())
             .unwrap_or(&self.schemas)
+    }
+
+    /// Whether any table this catalog can serve — in any data version or
+    /// time-travel snapshot — carries canonical constraint records. When true,
+    /// `catalog_attach` advertises the constraint read profiles and selects
+    /// those the client offers, without a [`CapabilityAgreementHook`].
+    pub fn has_constraint_records(&self) -> bool {
+        self.schemas
+            .iter()
+            .chain(self.version_schemas.values().flatten())
+            .flat_map(|schema| &schema.tables)
+            .any(|t| {
+                !t.constraints.is_empty()
+                    || t.constraint_versions.values().any(|(c, _)| !c.is_empty())
+            })
+    }
+
+    /// The `(available, selected)` CatalogCapabilities for an attach: the
+    /// automatic constraint read profiles merged with
+    /// [`capability_agreement`](Self::capability_agreement)'s result.
+    pub(crate) fn capability_agreement_for(
+        &self,
+        client_capabilities: Option<&[u8]>,
+    ) -> Result<Option<(Bytes, Bytes)>> {
+        let hook = self
+            .capability_agreement
+            .map(|hook| hook(client_capabilities))
+            .transpose()?;
+        crate::constraints::agree_capabilities(
+            &crate::constraints::read_profiles_for(self.has_constraint_records()),
+            hook,
+            client_capabilities,
+        )
     }
 }
 
@@ -1161,7 +1204,12 @@ pub struct CatMacro {
 /// A function-backed catalog table: scanned by `scan_function(scan_args)`.
 #[derive(Clone)]
 pub struct CatTable {
-    /// Explicit canonical ConstraintInfo IPC records, with provider-owned identities.
+    /// Explicit canonical ConstraintInfo IPC records, with provider-owned
+    /// identities — build them with [`crate::constraints::constraint_record`].
+    /// Served only when every record is `ENFORCED` + `ALL_ROWS` and the
+    /// columns' Arrow nullability matches the NOT_NULL/PRIMARY_KEY paths (see
+    /// [`crate::constraints::validate_table_constraints`]). Any record makes
+    /// the catalog negotiate the constraint read profiles at ATTACH.
     pub constraints: Vec<Bytes>,
     pub definition_revision: Option<Bytes>,
     /// Authoritative canonical records and revision for each historical version.
@@ -1573,10 +1621,16 @@ pub fn table_info(
         || !t.check.is_empty()
         || !t.foreign_keys.is_empty()
     {
-        return Err(vgi_rpc::RpcError::method_not_implemented(
-            "legacy constraint metadata requires explicit canonical records",
-        ));
+        return Err(vgi_rpc::RpcError::method_not_implemented(format!(
+            "Table '{}': not_null/unique/primary_key/check/foreign_keys are not sent under \
+             vgi.v3; declare canonical records with vgi::constraints::constraint_record in \
+             `constraints` instead",
+            t.name
+        )));
     }
+    // The extension fails the ATTACH when these disagree; fail here with the
+    // table and column path instead.
+    crate::constraints::validate_table_constraints(&t.name, &t.columns, &t.constraints)?;
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
     //
@@ -2376,10 +2430,20 @@ mod tests {
         table.not_null = vec![0];
         assert!(table_info(&path("data"), &table, None).is_err());
         table.not_null.clear();
+        // Canonical records pass through byte-for-byte; garbage never does.
         table.constraints = vec![Bytes::from(vec![1, 2])];
+        assert!(table_info(&path("data"), &table, None).is_err());
+        use crate::constraints::{constraint_record, ConstraintKind, ConstraintRecord};
+        let unique = constraint_record(
+            &ConstraintRecord::new(&["data"], "rff", "rff.a.unique", ConstraintKind::Unique)
+                .with_columns(&[&["a"]])
+                .enforced(),
+        )
+        .unwrap();
+        table.constraints = vec![unique.clone()];
         table.definition_revision = Some(Bytes::from(vec![0, 255]));
         let info = table_info(&path("data"), &table, None).unwrap();
-        assert_eq!(info.constraints[0].0, vec![1, 2]);
+        assert_eq!(info.constraints[0].0, unique.0);
         assert_eq!(info.definition_revision.unwrap().0, vec![0, 255]);
     }
 

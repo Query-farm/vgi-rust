@@ -2,69 +2,33 @@
 //! Canonical fixture identities, qualified against the immutable scan arrays.
 
 use vgi::catalog::CatTable;
-use vgi_protocol::generated::protocol_types::{
-    CatalogObjectRef, ConstraintDefinition, ConstraintInfo, ForeignKeyDefinition,
-    QueryEvaluationContext, SqlExpression,
+use vgi::constraints::{
+    constraint_record, read_constraint_record, ConstraintKind, ConstraintRecord,
+    ForeignKeyReference,
 };
-use vgi_rpc::{Bytes, DictString, VgiArrow};
+use vgi_rpc::Bytes;
 
-fn record<T: VgiArrow>(value: T) -> Bytes {
-    let batch = vgi::wire::to_batch(value).expect("valid fixture record");
-    Bytes::from(vgi::ipc::write_batch(&batch).expect("fixture IPC"))
+// Fixture declarations start as the honest METADATA_ONLY + UNVALIDATED
+// attestation; `qualify_catalog` upgrades each to ENFORCED + ALL_ROWS only
+// after checking it against the immutable rows the table serves.
+fn spec(table: &str, id: &str, kind: ConstraintKind, columns: &[&str]) -> ConstraintRecord {
+    let paths: Vec<&[&str]> = columns.iter().map(std::slice::from_ref).collect();
+    ConstraintRecord::new(&["data"], table, id, kind).with_columns(&paths)
 }
 
-fn reference(kind: &str, name: &str, owner: Option<&str>) -> Bytes {
-    record(CatalogObjectRef {
-        kind: kind.into(),
-        schema_path: vec!["data".into()],
-        name: name.into(),
-        owner_table: owner.map(str::to_string),
-    })
-}
-
-fn paths(columns: &[&str]) -> Vec<Vec<String>> {
-    columns.iter().map(|name| vec![(*name).into()]).collect()
-}
-
-fn definition(kind: &str, columns: &[&str]) -> ConstraintDefinition {
-    ConstraintDefinition {
-        kind: DictString(kind.into()),
-        column_paths: paths(columns),
-        declared_name: None,
-        check_expression: None,
-        foreign_key: None,
-    }
-}
-
-fn info(table: &str, id: &str, definition: ConstraintDefinition, target: Option<Bytes>) -> Bytes {
-    record(ConstraintInfo {
-        r#ref: reference("constraint", id, Some(table)),
-        definition: record(definition),
-        enforcement: DictString("METADATA_ONLY".into()),
-        validation: DictString("UNVALIDATED".into()),
-        referenced_constraint: target,
-    })
+fn record(spec: &ConstraintRecord) -> Bytes {
+    constraint_record(spec).expect("valid fixture record")
 }
 
 pub fn constraint(table: &str, id: &str, kind: &str, columns: &[&str]) -> Bytes {
-    info(table, id, definition(kind, columns), None)
+    let kind = ConstraintKind::parse(kind).expect("fixture constraint kind");
+    record(&spec(table, id, kind, columns))
 }
 
 pub fn check(table: &str, id: &str, sql: &str) -> Bytes {
-    let mut def = definition("CHECK", &[]);
-    def.check_expression = Some(record(SqlExpression {
-        sql: sql.into(),
-        profile: "vgi.expression.duckdb.scalar.v1".into(),
-        schema_path: vec!["data".into()],
-        evaluation_context: QueryEvaluationContext {
-            timezone: "UTC".into(),
-            collation: "binary".into(),
-            default_order: "asc".into(),
-            default_null_order: "nulls_last".into(),
-            preserve_insertion_order: true,
-        },
-    }));
-    info(table, id, def, None)
+    let mut check = spec(table, id, ConstraintKind::Check, &[]);
+    check.check_sql = Some(sql.into());
+    record(&check)
 }
 
 pub fn foreign_key(
@@ -75,20 +39,14 @@ pub fn foreign_key(
     key: &str,
     target_columns: &[&str],
 ) -> Bytes {
-    let mut def = definition("FOREIGN_KEY", columns);
-    def.foreign_key = Some(record(ForeignKeyDefinition {
-        referenced_table: reference("table", target, None),
-        referenced_column_paths: paths(target_columns),
-        r#match: DictString("SIMPLE".into()),
-        on_update: DictString("NO_ACTION".into()),
-        on_delete: DictString("NO_ACTION".into()),
-    }));
-    info(
-        table,
-        id,
-        def,
-        Some(reference("constraint", key, Some(target))),
-    )
+    let mut fk = spec(table, id, ConstraintKind::ForeignKey, columns);
+    fk.references = Some(ForeignKeyReference {
+        schema_path: vec!["data".into()],
+        table: target.into(),
+        columns: target_columns.iter().map(|c| vec![(*c).into()]).collect(),
+        constraint_id: key.into(),
+    });
+    record(&fk)
 }
 
 pub fn set_constraints(table: &mut CatTable, constraints: Vec<Bytes>) {
@@ -105,10 +63,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use vgi::catalog::CatalogModel;
 use vgi_rpc::{Result, RpcError};
-
-fn decode<T: VgiArrow>(raw: &Bytes) -> Result<T> {
-    vgi::wire::from_batch(&vgi::ipc::read_batch(&raw.0)?)
-}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Value {
@@ -160,20 +114,16 @@ fn qualify_records(
     let mut required = HashSet::new();
     let mut result = Vec::new();
     for raw in records {
-        let mut info: ConstraintInfo = decode(raw)?;
-        let definition: ConstraintDefinition = decode(&info.definition)?;
-        let cols = columns(batch, &definition.column_paths)?;
-        match definition.kind.0.as_str() {
-            "NOT_NULL" => {
+        let record = read_constraint_record(&raw.0)?;
+        let cols = columns(batch, &record.columns)?;
+        match record.kind {
+            ConstraintKind::NotNull => {
                 if cols.len() != 1 || cols[0].null_count() != 0 {
                     return Err(RpcError::value_error("immutable fixture violates NOT_NULL"));
                 }
-                required.insert(definition.column_paths[0][0].clone());
+                required.insert(record.columns[0][0].clone());
             }
-            "PRIMARY_KEY" | "UNIQUE" => {
-                if cols.is_empty() {
-                    return Err(RpcError::value_error("empty immutable fixture key"));
-                }
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
                 let mut seen = HashSet::new();
                 for row in 0..batch.num_rows() {
                     match key(&cols, row)? {
@@ -184,7 +134,7 @@ fn qualify_records(
                                 ));
                             }
                         }
-                        None if definition.kind.0 == "PRIMARY_KEY" => {
+                        None if record.kind == ConstraintKind::PrimaryKey => {
                             return Err(RpcError::value_error(
                                 "immutable fixture primary key is NULL",
                             ));
@@ -192,27 +142,12 @@ fn qualify_records(
                         _ => (),
                     }
                 }
-                if definition.kind.0 == "PRIMARY_KEY" {
-                    required.extend(definition.column_paths.iter().map(|path| path[0].clone()));
+                if record.kind == ConstraintKind::PrimaryKey {
+                    required.extend(record.columns.iter().map(|path| path[0].clone()));
                 }
             }
-            "CHECK" => {
-                let expression: SqlExpression = decode(
-                    definition
-                        .check_expression
-                        .as_ref()
-                        .ok_or_else(|| RpcError::value_error("missing fixture CHECK"))?,
-                )?;
-                let context = expression.evaluation_context;
-                if expression.sql != "budget >= 0"
-                    || expression.schema_path != ["data"]
-                    || expression.profile != "vgi.expression.duckdb.scalar.v1"
-                    || context.timezone != "UTC"
-                    || context.collation != "binary"
-                    || context.default_order != "asc"
-                    || context.default_null_order != "nulls_last"
-                    || !context.preserve_insertion_order
-                {
+            ConstraintKind::Check => {
+                if record.check_sql.as_deref() != Some("budget >= 0") {
                     return Err(RpcError::value_error("unsupported immutable fixture CHECK"));
                 }
                 let values = batch
@@ -227,37 +162,24 @@ fn qualify_records(
                     return Err(RpcError::value_error("immutable fixture violates CHECK"));
                 }
             }
-            "FOREIGN_KEY" => {
-                let fk: ForeignKeyDefinition = decode(
-                    definition
-                        .foreign_key
-                        .as_ref()
-                        .ok_or_else(|| RpcError::value_error("missing fixture FK"))?,
-                )?;
-                let target: CatalogObjectRef = decode(&fk.referenced_table)?;
-                let target_key: CatalogObjectRef = decode(
-                    info.referenced_constraint
-                        .as_ref()
-                        .ok_or_else(|| RpcError::value_error("missing referenced key"))?,
-                )?;
-                if target.kind != "table"
-                    || target.schema_path != ["data"]
-                    || target.name != "departments"
-                    || target_key.owner_table.as_deref() != Some("departments")
-                    || target_key.name != "fixture.departments.primary"
-                    || fk.r#match.0 != "SIMPLE"
-                    || fk.on_update.0 != "NO_ACTION"
-                    || fk.on_delete.0 != "NO_ACTION"
-                    || fk.referenced_column_paths != [vec!["id".to_string()]]
+            ConstraintKind::ForeignKey => {
+                let target = record
+                    .references
+                    .as_ref()
+                    .ok_or_else(|| RpcError::value_error("missing fixture FK"))?;
+                if target.schema_path != ["data"]
+                    || target.table != "departments"
+                    || target.constraint_id != "fixture.departments.primary"
+                    || target.columns != [vec!["id".to_string()]]
                 {
                     return Err(RpcError::value_error(
                         "unsupported immutable fixture FK target",
                     ));
                 }
                 let target_batch = targets
-                    .get(&target.name)
+                    .get(&target.table)
                     .ok_or_else(|| RpcError::value_error("missing immutable target rows"))?;
-                let target_cols = columns(target_batch, &fk.referenced_column_paths)?;
+                let target_cols = columns(target_batch, &target.columns)?;
                 let mut keys = HashSet::new();
                 for row in 0..target_batch.num_rows() {
                     let value = key(&target_cols, row)?
@@ -276,15 +198,9 @@ fn qualify_records(
                     }
                 }
             }
-            _ => {
-                return Err(RpcError::value_error(
-                    "unsupported immutable fixture constraint",
-                ));
-            }
         }
-        info.enforcement = DictString("ENFORCED".into());
-        info.validation = DictString("ALL_ROWS".into());
-        result.push(record(info));
+        // Checked against every row the table can return: attest it.
+        result.push(constraint_record(&record.enforced())?);
     }
     Ok((result, required))
 }
@@ -305,6 +221,9 @@ fn required_schema(schema: &Schema, required: &HashSet<String>) -> Arc<Schema> {
     ))
 }
 
+/// Qualify every declared fixture fact against the immutable rows and attest
+/// it. The SDK negotiates the constraint read profiles itself (no
+/// `capability_agreement` hook) and re-checks the records when serving.
 pub fn qualify_catalog(model: &mut CatalogModel) -> Result<()> {
     let targets = crate::table::static_scan::fixture_rows();
     for schema in &mut model.schemas {
@@ -320,21 +239,15 @@ pub fn qualify_catalog(model: &mut CatalogModel) -> Result<()> {
                     let definitions: Vec<Bytes> = table
                         .constraints
                         .iter()
-                        .filter_map(|raw| {
-                            let info: ConstraintInfo = decode(raw).expect("fixture info");
-                            let definition: ConstraintDefinition =
-                                decode(&info.definition).expect("fixture definition");
-                            if version.version == 1
-                                && (definition.kind.0 != "NOT_NULL"
-                                    || definition.column_paths != paths(&["id"]))
-                                || definition.kind.0 == "UNIQUE" && version.version < 2
-                                || definition.kind.0 == "FOREIGN_KEY" && version.version < 3
-                            {
-                                None
-                            } else {
-                                Some(raw.clone())
-                            }
+                        .filter(|raw| {
+                            let record = read_constraint_record(&raw.0).expect("fixture record");
+                            !(version.version == 1
+                                && (record.kind != ConstraintKind::NotNull
+                                    || record.columns != [vec!["id".to_string()]])
+                                || record.kind == ConstraintKind::Unique && version.version < 2
+                                || record.kind == ConstraintKind::ForeignKey && version.version < 3)
                         })
+                        .cloned()
                         .collect();
                     let (shape, cols) =
                         crate::table::versioned_scan::VersionedConstraintsScan::build(
@@ -377,59 +290,21 @@ pub fn qualify_catalog(model: &mut CatalogModel) -> Result<()> {
             }
         }
     }
-    model.capability_agreement = Some(capability_agreement);
     Ok(())
-}
-
-fn capability_agreement(client: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
-    use vgi::protocol::dtos::ClientCapabilities;
-    use vgi_protocol::generated::protocol_types::CatalogCapabilities;
-    let read = vec![
-        "vgi.constraint.records.read.v1".to_string(),
-        "vgi.expression.duckdb.scalar.v1".to_string(),
-    ];
-    let mut selected = Vec::new();
-    if let Some(raw) = client {
-        let client: ClientCapabilities = vgi::wire::from_batch(&vgi::ipc::read_batch(raw)?)?;
-        if let Some(raw) = client.catalog {
-            let offer: CatalogCapabilities = decode(&raw)?;
-            selected.extend(
-                read.iter()
-                    .filter(|name| offer.read.contains(name))
-                    .cloned(),
-            );
-        }
-    }
-    // This catalog's CHECK facts use the scalar expression profile. Do not
-    // select their enclosing read contract without its prerequisite.
-    if !selected
-        .iter()
-        .any(|name| name == "vgi.expression.duckdb.scalar.v1")
-    {
-        selected.retain(|name| name != "vgi.constraint.records.read.v1");
-    }
-    Ok((
-        record(CatalogCapabilities {
-            read,
-            ddl: vec![],
-            write: vec![],
-            transaction: vec![],
-        }),
-        record(CatalogCapabilities {
-            read: selected,
-            ddl: vec![],
-            write: vec![],
-            transaction: vec![],
-        }),
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vgi::constraints::{
+        validate_table_constraints, ConstraintEnforcement, ConstraintValidation,
+    };
+
     #[test]
     fn immutable_rows_qualify_every_current_and_historical_fact() {
         let model = crate::catalog_def::build();
+        assert!(model.has_constraint_records());
+        assert!(model.capability_agreement.is_none());
         let data = model
             .schemas
             .iter()
@@ -451,11 +326,16 @@ mod tests {
             .unwrap();
         assert!(!first.columns.field_with_name("id").unwrap().is_nullable());
         assert!(first.columns.field_with_name("name").unwrap().is_nullable());
+        for version in &versioned.time_travel {
+            let (records, _) = &versioned.constraint_versions[&version.version];
+            validate_table_constraints(&versioned.name, &version.columns, records).unwrap();
+        }
         for table in &data.tables {
+            validate_table_constraints(&table.name, &table.columns, &table.constraints).unwrap();
             for raw in &table.constraints {
-                let info: ConstraintInfo = decode(raw).unwrap();
-                assert_eq!(info.enforcement.0, "ENFORCED");
-                assert_eq!(info.validation.0, "ALL_ROWS");
+                let record = read_constraint_record(&raw.0).unwrap();
+                assert_eq!(record.enforcement, ConstraintEnforcement::Enforced);
+                assert_eq!(record.validation, ConstraintValidation::AllRows);
             }
         }
     }
@@ -496,49 +376,5 @@ mod tests {
             &["id"],
         )];
         assert!(qualify_records(&records, &bad, &targets).is_err());
-    }
-    #[test]
-    fn absent_offer_selects_no_profiles() {
-        let (_, selected) = capability_agreement(None).unwrap();
-        let decoded: vgi_protocol::generated::protocol_types::CatalogCapabilities =
-            decode(&selected).unwrap();
-        assert!(decoded.read.is_empty());
-        assert!(decoded.write.is_empty());
-    }
-
-    #[test]
-    fn offered_profiles_are_intersected_with_check_prerequisite() {
-        use vgi::protocol::dtos::ClientCapabilities;
-        use vgi_protocol::generated::protocol_types::CatalogCapabilities;
-        let read = "vgi.constraint.records.read.v1";
-        let scalar = "vgi.expression.duckdb.scalar.v1";
-        for (offered, expected) in [
-            (vec![read], vec![]),
-            (vec![scalar], vec![scalar]),
-            (vec![read, scalar, "vgi.unknown.v1"], vec![read, scalar]),
-        ] {
-            let offer = record(ClientCapabilities {
-                engine: "test".into(),
-                native_formats: vec![],
-                catalogs: vec![],
-                can_stream: true,
-                filter_encodings: vec![],
-                query_pushdown: None,
-                catalog: Some(record(CatalogCapabilities {
-                    read: offered.into_iter().map(str::to_string).collect(),
-                    ddl: vec![],
-                    write: vec![],
-                    transaction: vec![],
-                })),
-            });
-            let (_, selected) = capability_agreement(Some(&offer.0)).unwrap();
-            let selected: CatalogCapabilities = decode(&selected).unwrap();
-            assert_eq!(selected.read, expected);
-            assert!(
-                selected.ddl.is_empty()
-                    && selected.write.is_empty()
-                    && selected.transaction.is_empty()
-            );
-        }
     }
 }

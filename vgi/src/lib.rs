@@ -131,6 +131,7 @@ pub mod catalog_snapshot;
 pub mod catalog_snapshot_s3;
 pub mod column_expressions;
 pub mod column_metadata;
+pub mod constraints;
 pub mod copy_from;
 pub mod copy_to;
 pub mod diagnostics;

@@ -25,6 +25,7 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::arguments::Arguments;
 use vgi::catalog::{CatSchema, CatTable, CatView, CatalogModel};
+use vgi::constraints::{constraint_record, ConstraintKind, ConstraintRecord};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{TableFunction, TableProducer};
 use vgi::vgi_rpc::OutputCollector;
@@ -34,7 +35,8 @@ use vgi::{Result, RpcError};
 /// table without calling the worker at all.
 fn cities_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
+        // Non-nullable: the canonical NOT_NULL record below must agree.
+        Field::new("name", DataType::Utf8, false),
         Field::new("population", DataType::Int64, true),
     ]))
 }
@@ -144,8 +146,20 @@ fn main() {
         scan_arguments: Arguments::serialize_scan_args(&[Arc::new(Int64Array::from(vec![0i64]))])
             .unwrap_or_default(),
         comment: Some("Every city the worker knows about".to_string()),
-        // Column 0 (`name`) is NOT NULL — surfaced in duckdb_columns().
-        not_null: vec![0],
+        // `name` is NOT NULL — surfaced in duckdb_columns(). The worker attests
+        // it (every row it can return has a name) with a canonical record;
+        // the SDK negotiates the constraint read profile at ATTACH.
+        constraints: vec![constraint_record(
+            &ConstraintRecord::new(
+                &["data"],
+                "cities",
+                "cities.name.not_null",
+                ConstraintKind::NotNull,
+            )
+            .with_columns(&[&["name"]])
+            .enforced(),
+        )
+        .expect("valid constraint record")],
         ..Default::default()
     };
 

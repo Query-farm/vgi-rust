@@ -22,11 +22,13 @@ pub const SOURCE_ALIAS: &str = "datafusion_source_alias";
 
 const EVENTS_SCAN: &str = "datafusion_companion_events_scan";
 
+// Nullable: a non-nullable catalog column is a NOT_NULL claim, which vgi.v3
+// accepts only as an attested canonical record. These tables declare none.
 fn events_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("label", DataType::Utf8, false),
-        Field::new("weight", DataType::Int64, false),
+        Field::new("id", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("weight", DataType::Int64, true),
     ]))
 }
 
