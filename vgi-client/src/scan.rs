@@ -14,11 +14,14 @@
 //! Pushdown (projection, filters, ORDER BY, TABLESAMPLE) rides the init
 //! request, so it is decided after bind and before the first row.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_ord::sort::{LexicographicalComparator, SortColumn};
+use arrow_schema::{DataType, Schema, SchemaRef, SortOptions};
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
@@ -1128,7 +1131,7 @@ fn validate_transform_spec(
     transform: &TransformSpec,
     bound: &BoundFunction,
     context: &str,
-) -> Result<()> {
+) -> Result<Option<DataType>> {
     if transform.id.is_empty() || !transform.id.contains('/') {
         return Err(RpcError::runtime_error(format!(
             "function `{}`: {context} has invalid unversioned transform id `{}`",
@@ -1143,6 +1146,7 @@ fn validate_transform_spec(
             transform.id
         )));
     }
+    let mut input_types = Vec::with_capacity(transform.inputs.len());
     for (input_index, input) in transform.inputs.iter().enumerate() {
         let path: FieldPath =
             decode_distribution_record(input, &format!("{context}.inputs[{input_index}]"))?;
@@ -1153,18 +1157,47 @@ fn validate_transform_spec(
                 transform.id
             )));
         }
-        if bound
+        let field = bound
             .output_schema()
             .field_with_name(&path.components[0])
-            .is_err()
-        {
-            return Err(RpcError::runtime_error(format!(
-                "function `{}`: {context} transform `{}` names unknown field `{}`",
-                bound.function_name(),
-                transform.id,
-                path.components.join(".")
-            )));
+            .map_err(|_| {
+                RpcError::runtime_error(format!(
+                    "function `{}`: {context} transform `{}` names unknown field `{}`",
+                    bound.function_name(),
+                    transform.id,
+                    path.components.join(".")
+                ))
+            })?;
+        let mut data_type = field.data_type();
+        for component in path.components.iter().skip(1) {
+            let DataType::Struct(fields) = data_type else {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: {context} transform `{}` names unknown field `{}`",
+                    bound.function_name(),
+                    transform.id,
+                    path.components.join(".")
+                )));
+            };
+            let mut matches = fields.iter().filter(|field| field.name() == component);
+            let Some(field) = matches.next() else {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: {context} transform `{}` names unknown field `{}`",
+                    bound.function_name(),
+                    transform.id,
+                    path.components.join(".")
+                )));
+            };
+            if matches.next().is_some() {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: {context} transform `{}` names ambiguous field `{}`",
+                    bound.function_name(),
+                    transform.id,
+                    path.components.join(".")
+                )));
+            }
+            data_type = field.data_type();
         }
+        input_types.push(data_type.clone());
     }
     if let Some(parameters) = &transform.parameters {
         let batch = ipc::read_batch(&parameters.0).map_err(|error| {
@@ -1183,7 +1216,10 @@ fn validate_transform_spec(
             )));
         }
     }
-    Ok(())
+    Ok((transform.id == "vgi.identity/1"
+        && transform.inputs.len() == 1
+        && transform.parameters.is_none())
+    .then(|| input_types[0].clone()))
 }
 
 fn validate_bounds(
@@ -1264,14 +1300,15 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                 bound.function_name()
             )));
         }
+        let mut key_types = Vec::with_capacity(grouping.keys.len());
         for (key_index, key) in grouping.keys.iter().enumerate() {
             let transform: TransformSpec =
                 decode_distribution_record(key, &format!("key_grouping.keys[{key_index}]"))?;
-            validate_transform_spec(
+            key_types.push(validate_transform_spec(
                 &transform,
                 bound,
                 &format!("key_grouping.keys[{key_index}]"),
-            )?;
+            )?);
         }
         for (split_index, split) in plan.splits.iter().enumerate() {
             let Some(key_value) = &split.key_value else {
@@ -1288,6 +1325,18 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                     key_value.num_columns(),
                     grouping.keys.len()
                 )));
+            }
+            for (key_index, expected) in key_types.iter().enumerate() {
+                if let Some(expected) = expected {
+                    if key_value.column(key_index).data_type() != expected {
+                        return Err(RpcError::runtime_error(format!(
+                            "function `{}`: split {split_index} key_value column {key_index} has type {:?}, expected {:?}",
+                            bound.function_name(),
+                            key_value.column(key_index).data_type(),
+                            expected
+                        )));
+                    }
+                }
             }
         }
     } else if let Some((split_index, _)) = plan
@@ -1309,6 +1358,8 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                 bound.function_name()
             )));
         }
+        let mut range_keys = Vec::with_capacity(range.keys.len());
+        let mut key_types = Vec::with_capacity(range.keys.len());
         for (key_index, key) in range.keys.iter().enumerate() {
             let key: RangeKey =
                 decode_distribution_record(key, &format!("range_partitioning.keys[{key_index}]"))?;
@@ -1316,11 +1367,11 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                 &key.transform,
                 &format!("range_partitioning.keys[{key_index}].transform"),
             )?;
-            validate_transform_spec(
+            key_types.push(validate_transform_spec(
                 &transform,
                 bound,
                 &format!("range_partitioning.keys[{key_index}]"),
-            )?;
+            )?);
             if !matches!(
                 key.direction.0.as_str(),
                 enums::order_by_direction::ASC | enums::order_by_direction::DESC
@@ -1333,6 +1384,7 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                     bound.function_name()
                 )));
             }
+            range_keys.push(key);
         }
         let split_points = ipc::read_batch(&range.split_points.0).map_err(|error| {
             RpcError::runtime_error(format!(
@@ -1348,6 +1400,44 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
                 split_points.num_columns(),
                 range.keys.len()
             )));
+        }
+        for (key_index, expected) in key_types.iter().enumerate() {
+            if let Some(expected) = expected {
+                if split_points.column(key_index).data_type() != expected {
+                    return Err(RpcError::runtime_error(format!(
+                        "function `{}`: range split-point column {key_index} has type {:?}, expected {:?}",
+                        bound.function_name(),
+                        split_points.column(key_index).data_type(),
+                        expected
+                    )));
+                }
+            }
+        }
+        let sort_columns = split_points
+            .columns()
+            .iter()
+            .zip(&range_keys)
+            .map(|(values, key)| SortColumn {
+                values: Arc::clone(values),
+                options: Some(SortOptions {
+                    descending: key.direction.0 == enums::order_by_direction::DESC,
+                    nulls_first: key.null_order.0 == enums::order_by_null_order::NULLS_FIRST,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let comparator = LexicographicalComparator::try_new(&sort_columns).map_err(|error| {
+            RpcError::runtime_error(format!(
+                "function `{}`: range split points cannot be ordered: {error}",
+                bound.function_name()
+            ))
+        })?;
+        for row in 1..split_points.num_rows() {
+            if comparator.compare(row - 1, row) != CmpOrdering::Less {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: range split points must be strictly ordered by the declared comparator",
+                    bound.function_name()
+                )));
+            }
         }
         let range_count = split_points.num_rows().saturating_add(1);
         for (split_index, split) in plan.splits.iter().enumerate() {
@@ -1493,14 +1583,18 @@ impl VgiClient {
             scope: "catalog".to_string(),
             ..Default::default()
         };
-        let mut cursor: Option<Bytes> = None;
+        // Every non-empty continuation is a disjoint, exhaustive branch of
+        // the remaining enumeration. Drain all of them serially: taking only
+        // the first silently drops sibling branches, while parallel fetching
+        // buys little here because planning already runs synchronously.
+        let mut pending_cursors = VecDeque::from([None]);
         let mut pages = 0usize;
         let mut first_key_grouping: Option<Bytes> = None;
         let mut first_range_partitioning: Option<Bytes> = None;
         let mut key_grouping_consistent = true;
         let mut range_partitioning_consistent = true;
 
-        loop {
+        while let Some(cursor) = pending_cursors.pop_front() {
             if pages >= MAX_PAGES {
                 return Err(RpcError::runtime_error(format!(
                     "function `{}`: worker exceeded the scan-planning page cap ({MAX_PAGES} \
@@ -1559,6 +1653,18 @@ impl VgiClient {
                 },
             )?;
 
+            let page_has_any_cursor = response
+                .next_cursors
+                .as_ref()
+                .is_some_and(|cursors| !cursors.is_empty());
+            let page_cursors = response
+                .next_cursors
+                .iter()
+                .flatten()
+                .filter(|next| !next.0.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+
             if pages == 1 {
                 first_key_grouping = response.key_grouping.clone();
                 first_range_partitioning = response.range_partitioning.clone();
@@ -1571,6 +1677,22 @@ impl VgiClient {
             for blob in &response.splits {
                 let split_index = plan.splits.len();
                 let split: ScanSplit = wire::from_batch(&ipc::read_batch(&blob.0)?)?;
+                if split.token.0.is_empty()
+                    && (split_index != 0
+                        || response.splits.len() != 1
+                        || page_has_any_cursor
+                        || response.key_grouping.is_some()
+                        || response.range_partitioning.is_some()
+                        || response
+                            .partitioning
+                            .as_ref()
+                            .is_some_and(|items| !items.is_empty()))
+                {
+                    return Err(RpcError::runtime_error(format!(
+                        "function `{}`: the empty-token whole-scan sentinel must be the sole split, with no continuation or distribution claim",
+                        bound.function_name()
+                    )));
+                }
                 plan.splits.push(ScanSplitInfo {
                     token: split.token.0.clone(),
                     estimated_rows: split.estimated_rows,
@@ -1636,15 +1758,7 @@ impl VgiClient {
                 }
             }
 
-            // Only the FIRST cursor is followed. Parallel enumeration is sound
-            // only if the cursors partition the remaining work disjointly, and
-            // that is a worker obligation with no enforcement — so this client
-            // takes the serial path, which every worker supports, rather than
-            // trusting a contract it cannot check.
-            match response.next_cursors.iter().flatten().next() {
-                Some(next) if !next.0.is_empty() => cursor = Some(next.clone()),
-                _ => break,
-            }
+            pending_cursors.extend(page_cursors.into_iter().map(Some));
         }
 
         // Distribution is a whole-plan promise. A page that changes or omits
@@ -2457,7 +2571,8 @@ mod tests {
             })?;
             let response = PlanResponse {
                 splits: vec![Bytes(ipc::write_batch(&split)?)],
-                next_cursors: first.then(|| vec![Bytes(b"next".to_vec())]),
+                next_cursors: first
+                    .then(|| vec![Bytes(b"next".to_vec()), Bytes(b"sibling".to_vec())]),
                 execution_id: Some(Bytes(
                     if first {
                         b"plan-exec".as_slice()
@@ -2572,7 +2687,7 @@ mod tests {
         };
         let plan = client.plan(&bound_stub(), &options).unwrap();
 
-        assert_eq!(plan.splits.len(), 2);
+        assert_eq!(plan.splits.len(), 3);
         assert_eq!(plan.execution_id.as_ref().unwrap().0, b"plan-exec");
         assert_eq!(plan.init_opaque_data.as_ref().unwrap().0, b"plan-state");
         assert_eq!(plan.max_workers, Some(2));
@@ -2596,9 +2711,10 @@ mod tests {
         assert_eq!(plan.splits[0].location_ids.as_deref(), Some([0].as_slice()));
 
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(requests[0].cursor.is_none());
         assert_eq!(requests[1].cursor.as_ref().unwrap().0, b"next");
+        assert_eq!(requests[2].cursor.as_ref().unwrap().0, b"sibling");
         assert_eq!(requests[0].join_keys.as_ref().unwrap()[0].0, b"keys");
         assert_eq!(requests[0].max_splits_per_response, Some(1));
         assert!(!requests[0].filters_complete);
@@ -2637,6 +2753,75 @@ mod tests {
         };
         let error = validate_plan_metadata(&plan, &bound_stub()).unwrap_err();
         assert!(error.message.contains("location id 1"), "{}", error.message);
+    }
+
+    fn identity_range_plan(points: RecordBatch) -> ScanPlan {
+        let path = wire::to_batch(FieldPath {
+            components: vec!["a".to_string()],
+        })
+        .unwrap();
+        let transform = wire::to_batch(TransformSpec {
+            id: "vgi.identity/1".to_string(),
+            inputs: vec![Bytes(ipc::write_batch(&path).unwrap())],
+            parameters: None,
+        })
+        .unwrap();
+        let key = wire::to_batch(RangeKey {
+            transform: Bytes(ipc::write_batch(&transform).unwrap()),
+            direction: DictString(enums::order_by_direction::ASC.to_string()),
+            null_order: DictString(enums::order_by_null_order::NULLS_LAST.to_string()),
+        })
+        .unwrap();
+        ScanPlan {
+            splits: vec![ScanSplitInfo {
+                token: b"token".to_vec(),
+                estimated_rows: None,
+                rows_exact: false,
+                estimated_bytes: None,
+                key_value: None,
+                range_index: Some(0),
+                column_bounds: None,
+                partition_bounds: None,
+                column_statistics: None,
+                location_ids: None,
+                start_position: None,
+                end_position: None,
+            }],
+            range_partitioning: Some(RangePartitioning {
+                keys: vec![Bytes(ipc::write_batch(&key).unwrap())],
+                split_points: Bytes(ipc::write_batch(&points).unwrap()),
+            }),
+            ..ScanPlan::default()
+        }
+    }
+
+    #[test]
+    fn identity_range_metadata_validates_output_type_and_strict_order() {
+        let wrong_type = RecordBatch::try_new(
+            Arc::new(schema(&[("a", DataType::Utf8)])),
+            vec![Arc::new(StringArray::from(vec!["one"]))],
+        )
+        .unwrap();
+        let error =
+            validate_plan_metadata(&identity_range_plan(wrong_type), &bound_stub()).unwrap_err();
+        assert!(
+            error.message.contains("expected Int64"),
+            "{}",
+            error.message
+        );
+
+        let unsorted = RecordBatch::try_new(
+            Arc::new(schema(&[("a", DataType::Int64)])),
+            vec![Arc::new(Int64Array::from(vec![2, 1]))],
+        )
+        .unwrap();
+        let error =
+            validate_plan_metadata(&identity_range_plan(unsorted), &bound_stub()).unwrap_err();
+        assert!(
+            error.message.contains("strictly ordered"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
