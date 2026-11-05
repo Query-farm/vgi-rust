@@ -341,6 +341,10 @@ pub struct PlanOutcome {
     /// Hoisted location names. Individual splits refer to these by index through
     /// [`PlannedSplit::location_ids`].
     pub locations: Option<Vec<String>>,
+    /// Exact transformed-key grouping shared by every split.
+    pub key_grouping: Option<crate::protocol::dtos::KeyGrouping>,
+    /// Exact half-open range distribution shared by every split.
+    pub range_partitioning: Option<crate::protocol::dtos::RangePartitioning>,
     /// How single-valued partition columns are derived. Report this only when
     /// every split has exact single-valued [`PlannedSplit::partition_bounds`].
     pub partitioning: Option<Vec<crate::protocol::dtos::PartitionTransform>>,
@@ -366,6 +370,13 @@ pub struct PlannedSplit {
     /// Load-bearing for engines that bin-pack; `None` degrades them to
     /// round-robin by count. A greedily-claiming client needs no cost model.
     pub estimated_bytes: Option<i64>,
+    /// One-row transformed key tuple aligned with the plan's key grouping.
+    pub key_value: Option<Vec<u8>>,
+    /// Zero-based range owned by this split.
+    pub range_index: Option<i64>,
+    /// Two-row containment/pruning bounds.
+    pub column_bounds: Option<Vec<u8>>,
+    /// Deprecated protocol-2 spelling retained during migration.
     /// 2-row (min, max) batch in the existing `vgi_partition_values` encoding.
     pub partition_bounds: Option<Vec<u8>>,
     pub column_statistics: Option<Vec<u8>>,
@@ -376,6 +387,24 @@ pub struct PlannedSplit {
 }
 
 impl PlannedSplit {
+    /// Attach a one-row exact transformed key tuple.
+    pub fn with_key_value(mut self, batch: &arrow_array::RecordBatch) -> vgi_rpc::Result<Self> {
+        self.key_value = Some(crate::ipc::write_batch(batch)?);
+        Ok(self)
+    }
+
+    /// Assign this split to one zero-based range.
+    pub fn with_range_index(mut self, range_index: i64) -> Self {
+        self.range_index = Some(range_index);
+        self
+    }
+
+    /// Attach a two-row containment/pruning batch.
+    pub fn with_column_bounds(mut self, batch: &arrow_array::RecordBatch) -> vgi_rpc::Result<Self> {
+        self.column_bounds = Some(crate::ipc::write_batch(batch)?);
+        Ok(self)
+    }
+
     /// Attach a two-row `(min, max)` Arrow batch of partition bounds.
     pub fn with_partition_bounds(
         mut self,

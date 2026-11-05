@@ -42,9 +42,10 @@
 /// schema names with ordered schema paths, allowing arbitrary nesting without
 /// losing identifier boundaries. Protocol 2.1 adds the optional
 /// `catalog_contents` bulk-load RPC, advertised via
-/// `CatalogAttachResult.supports_catalog_contents`. Protocol 3.0 is the combined
+/// `CatalogAttachResult.supports_catalog_contents`. Protocol 3.1 adds portable
+/// split key grouping and range distribution metadata to the combined
 /// breaking catalog/query successor, routed as `vgi.v3`.
-pub const VGI_PROTOCOL_VERSION: &str = "3.0.0";
+pub const VGI_PROTOCOL_VERSION: &str = "3.1.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///

@@ -399,7 +399,7 @@ fn transactions_are_optional_and_round_trip_when_offered() {
     client.detach(&cat).expect("detach");
 }
 
-/// `catalog_contents` (protocol 3.0.0): the example worker advertises it, and
+/// `catalog_contents` (protocol 3.1.0): the example worker advertises it, and
 /// one call returns every schema the per-schema calls list — parents first —
 /// with each kind holding exactly what the matching per-schema call returns.
 #[test]
