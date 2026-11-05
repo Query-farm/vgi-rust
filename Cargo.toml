@@ -4,7 +4,7 @@ members = ["vgi-protocol", "vgi-client", "vgi", "vgi-example-worker", "vgi-stora
 
 
 [workspace.package]
-version = "0.48.0"
+version = "0.48.1"
 edition = "2021"
 rust-version = "1.97"
 license-file = "LICENSE"
@@ -13,38 +13,41 @@ homepage = "https://query.farm"
 repository = "https://github.com/Query-farm/vgi-rust"
 
 [workspace.dependencies]
-# Published on crates.io. For local co-development against an unreleased
-# vgi-rpc, add an (uncommitted) `[patch.crates-io]` pointing at the checkout:
-#   [patch.crates-io]
-#   vgi-rpc = { path = "../vgi-rpc-rust/vgi-rpc" }
+# The path and patch entries below keep this release candidate on the
+# coordinated Arrow-compatible RPC patch until 0.32.3 is published.
 # Base features carry NO http (axum/tokio/mio/zstd) so the crate stays
 # wasm-buildable. Native crates that need the HTTP stack re-enable it via their
 # own feature (`vgi`'s `transport-http`, or an explicit `features = ["http"]`).
-vgi-rpc = { version = "0.32", default-features = false, features = ["macros", "stream-codec", "shm"] }
+vgi-rpc = { version = "0.32.3", path = "../vgi-rpc-rust-arrow59/vgi-rpc", default-features = false, features = ["macros", "stream-codec", "shm"] }
 # The direction-agnostic wire protocol (DTOs + Arrow codec + IPC helpers), shared
 # by the worker framework and any client. Kept feature-free and wasm-buildable.
-vgi-protocol = { version = "0.48.0", path = "vgi-protocol" }
+vgi-protocol = { version = "0.48.1", path = "vgi-protocol" }
 # The VGI protocol client (attach, discovery, function calls).
-vgi-client = { version = "0.48.0", path = "vgi-client" }
+vgi-client = { version = "0.48.1", path = "vgi-client" }
 # Transport-level RPC client the VGI client is built on.
-vgi-rpc-client = { version = "0.32", default-features = false }
-arrow = { version = "60", default-features = false, features = ["ipc"] }
-arrow-array = "60"
-arrow-buffer = "60"
-arrow-data = "60"
-arrow-ipc = "60"
-arrow-schema = "60"
-arrow-select = "60"
-arrow-row = "60"
-arrow-cast = "60"
-arrow-arith = "60"
-arrow-ord = "60"
+vgi-rpc-client = { version = "0.32.3", path = "../vgi-rpc-rust-arrow59/vgi-rpc-client", default-features = false }
+arrow = { version = "59.2.0", default-features = false, features = ["ipc"] }
+arrow-array = "59.2.0"
+arrow-buffer = "59.2.0"
+arrow-data = "59.2.0"
+arrow-ipc = "59.2.0"
+arrow-schema = "59.2.0"
+arrow-select = "59.2.0"
+arrow-row = "59.2.0"
+arrow-cast = "59.2.0"
+arrow-arith = "59.2.0"
+arrow-ord = "59.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pure-Rust regex (wasm-safe) for enforcing const-argument `pattern` constraints.
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
+
+[patch.crates-io]
+vgi-rpc = { path = "../vgi-rpc-rust-arrow59/vgi-rpc" }
+vgi-rpc-client = { path = "../vgi-rpc-rust-arrow59/vgi-rpc-client" }
+vgi-rpc-macros = { path = "../vgi-rpc-rust-arrow59/vgi-rpc-macros" }
 
 [profile.release]
 opt-level = 2
