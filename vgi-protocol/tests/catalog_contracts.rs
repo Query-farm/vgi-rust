@@ -2,6 +2,7 @@
 
 use std::io::Cursor;
 
+use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use base64::Engine;
@@ -12,6 +13,115 @@ use vgi_protocol::generated::protocol_types::{
 };
 use vgi_protocol::wire::{from_batch, to_batch};
 use vgi_rpc::VgiArrow;
+
+#[test]
+fn protocol_31_partition_distribution_decodes_python_golden_plan() {
+    use vgi_protocol::protocol::dtos::{
+        FieldPath, KeyGrouping, PlanResponse, RangePartitioning, ScanSplit, TransformSpec,
+    };
+
+    let path: FieldPath = round_trip("partition_field_path");
+    assert_eq!(path.components, ["customer", "region"]);
+
+    let transform: TransformSpec = round_trip("partition_parameterized_transform");
+    assert_eq!(transform.id, "example.bucket/2");
+    let parameters = StreamReader::try_new(Cursor::new(transform.parameters.unwrap().0), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parameters
+            .column_by_name("buckets")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        16
+    );
+    assert_eq!(
+        parameters
+            .column_by_name("algorithm")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "murmur3"
+    );
+    assert!(parameters
+        .column_by_name("nulls_equal")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .value(0));
+
+    let grouping: KeyGrouping = round_trip("partition_key_grouping");
+    assert_eq!(grouping.keys.len(), 2);
+    let ranges: RangePartitioning = round_trip("partition_range_partitioning");
+    assert_eq!(ranges.keys.len(), 2);
+    let points = StreamReader::try_new(Cursor::new(ranges.split_points.0), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let regions = points
+        .column_by_name("customer.region")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(regions.is_null(0));
+    assert_eq!(regions.value(1), "east");
+    assert_eq!(regions.value(3), "west");
+    let times = points
+        .column_by_name("event_time")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert!(times.is_null(0));
+    assert_eq!(
+        (times.value(1), times.value(2), times.value(3)),
+        (20, 10, 99)
+    );
+
+    let split: ScanSplit = round_trip("partition_scan_split");
+    assert_eq!(split.range_index, Some(2));
+    assert_eq!(split.location_ids.as_deref(), Some([0, 1].as_slice()));
+    let key = StreamReader::try_new(Cursor::new(split.key_value.unwrap().0), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        key.column_by_name("customer.region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "east"
+    );
+
+    let plan: PlanResponse = round_trip("partition_plan_response");
+    assert_eq!(plan.max_workers, Some(3));
+    assert_eq!(
+        plan.locations.as_deref(),
+        Some(["worker-a".to_string(), "worker-b".to_string()].as_slice())
+    );
+    assert_eq!(
+        plan.key_grouping.unwrap().0,
+        fixture("partition_key_grouping")
+    );
+    assert_eq!(
+        plan.range_partitioning.unwrap().0,
+        fixture("partition_range_partitioning")
+    );
+    assert_eq!(plan.splits[0].0, fixture("partition_scan_split"));
+}
 
 #[test]
 fn attach_default_schema_preserves_null_and_raw_names() {

@@ -21,11 +21,14 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi::cache_control::{CacheControl, ConditionalRequest};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
-use vgi::protocol::dtos::{PartitionTransform, SortField, TableFunctionPlanRequest};
+use vgi::protocol::dtos::{
+    FieldPath, KeyGrouping, PartitionTransform, RangeKey, RangePartitioning, SortField,
+    TableFunctionPlanRequest, TransformSpec,
+};
 use vgi::split_token::{PlanOutcome, PlannedSplit};
 use vgi::statistics::{CatColStat, StatValue};
 use vgi::table_function::{resume, TableFunction, TableProducer};
-use vgi_rpc::{DictString, Result, RpcError};
+use vgi_rpc::{Bytes, DictString, Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
     w.register_table(SplitScan::new(
@@ -1641,6 +1644,36 @@ impl TableFunction for SplitPartitioned {
         _request: &TableFunctionPlanRequest,
     ) -> Result<Option<PlanOutcome>> {
         let rows = params.arguments.named_i64("rows_per_country").unwrap_or(5);
+        let path = vgi::wire::to_batch(FieldPath {
+            components: vec!["country".to_string()],
+        })?;
+        let transform = vgi::wire::to_batch(TransformSpec {
+            id: "vgi.identity/1".to_string(),
+            inputs: vec![Bytes(vgi::ipc::write_batch(&path)?)],
+            parameters: None,
+        })?;
+        let transform_bytes = vgi::ipc::write_batch(&transform)?;
+        let grouping = KeyGrouping {
+            keys: vec![Bytes(transform_bytes.clone())],
+        };
+        let range_key = vgi::wire::to_batch(RangeKey {
+            transform: Bytes(transform_bytes),
+            direction: DictString(vgi::protocol::enums::order_by_direction::ASC.to_string()),
+            null_order: DictString(
+                vgi::protocol::enums::order_by_null_order::NULLS_LAST.to_string(),
+            ),
+        })?;
+        let split_points = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "country",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "DE", "JP", "US",
+            ]))],
+        )
+        .map_err(|error| RpcError::runtime_error(error.to_string()))?;
         // The payload names the partition by INDEX, so a redemption reads the
         // same partition however many times it runs and in whichever process.
         Ok(Some(PlanOutcome {
@@ -1650,6 +1683,11 @@ impl TableFunction for SplitPartitioned {
             execution_id: Some(SPLIT_PLAN_EXECUTION_ID.to_vec()),
             init_opaque_data: Some(SPLIT_PLAN_OPAQUE.to_vec()),
             locations: Some(vec!["local".to_string()]),
+            key_grouping: Some(grouping),
+            range_partitioning: Some(RangePartitioning {
+                keys: vec![Bytes(vgi::ipc::write_batch(&range_key)?)],
+                split_points: Bytes(vgi::ipc::write_batch(&split_points)?),
+            }),
             partitioning: Some(vec![PartitionTransform {
                 column: "country".to_string(),
                 transform: "identity".to_string(),
@@ -1678,6 +1716,22 @@ impl TableFunction for SplitPartitioned {
                     )
                     .map_err(|error| RpcError::runtime_error(error.to_string()))?;
                     let base = i * 100;
+                    let key_value = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new(
+                            "country",
+                            DataType::Utf8,
+                            true,
+                        )])),
+                        vec![Arc::new(arrow_array::StringArray::from(vec![country]))],
+                    )
+                    .map_err(|error| RpcError::runtime_error(error.to_string()))?;
+                    let range_index = match country {
+                        "BR" => 0,
+                        "DE" => 1,
+                        "JP" => 2,
+                        "US" => 3,
+                        _ => unreachable!("fixture country is closed"),
+                    };
                     PlannedSplit {
                         payload: i.to_le_bytes().to_vec(),
                         estimated_rows: Some(rows.max(0)),
@@ -1686,6 +1740,9 @@ impl TableFunction for SplitPartitioned {
                         location_ids: Some(vec![0]),
                         ..Default::default()
                     }
+                    .with_key_value(&key_value)?
+                    .with_range_index(range_index)
+                    .with_column_bounds(&bounds)?
                     .with_partition_bounds(&bounds)?
                     .with_column_statistics(&[
                         CatColStat {
