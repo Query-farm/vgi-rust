@@ -2,7 +2,8 @@
 
 //! Scan functions backing the `rff_*` catalog tables that exercise
 //! `Table.required_filters` (the C++ optimizer enforces the
-//! WHERE-filter requirement; the worker just serves the metadata + rows).
+//! WHERE-filter requirement). Protocol 3 also requires the backing functions
+//! to declare who evaluates every pushed predicate.
 
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
 use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
+use vgi::FilterHandling;
 use vgi_rpc::{Result, RpcError};
 
 pub fn register(w: &mut vgi::Worker) {
@@ -93,10 +95,9 @@ impl TableFunction for RffRowidScan {
             description: "rff_rowid — row_id virtual column + bbox.* required filters".to_string(),
             categories: vec!["catalog".into()],
             projection_pushdown: true,
-            filter_pushdown: true,
-            auto_apply_filters: true,
             ..Default::default()
         }
+        .with_filter_handling(FilterHandling::Sdk)
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![]
@@ -258,6 +259,7 @@ impl TableFunction for RffScan {
             categories: vec!["catalog".into()],
             ..Default::default()
         }
+        .with_filter_handling(FilterHandling::Sdk)
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![]
