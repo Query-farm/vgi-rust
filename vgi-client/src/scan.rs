@@ -23,8 +23,8 @@ use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
     BindRequest, BindResponse, CardinalityRequest, DynamicToStringRequest, DynamicToStringResponse,
-    GlobalInitResponse, InitRequest, PartitionTransform, PlanResponse, ScanSplit, SortField,
-    TableFunctionPlanRequest,
+    FieldPath, GlobalInitResponse, InitRequest, KeyGrouping, PartitionTransform, PlanResponse,
+    RangeKey, RangePartitioning, ScanSplit, SortField, TableFunctionPlanRequest, TransformSpec,
 };
 use vgi_protocol::protocol::enums;
 use vgi_protocol::{ipc, wire};
@@ -937,7 +937,13 @@ pub struct ScanSplitInfo {
     /// planning time. `None` degrades such an engine to round-robin by count;
     /// a greedily-claiming engine needs no cost model at all.
     pub estimated_bytes: Option<i64>,
-    /// Two-row `(min, max)` partition bounds in Arrow form.
+    /// One-row transformed key tuple aligned with [`ScanPlan::key_grouping`].
+    pub key_value: Option<RecordBatch>,
+    /// Zero-based range owned by this split.
+    pub range_index: Option<i64>,
+    /// Two-row `(min, max)` containment/pruning bounds in Arrow form.
+    pub column_bounds: Option<RecordBatch>,
+    /// Deprecated protocol-2 spelling retained during migration.
     pub partition_bounds: Option<RecordBatch>,
     /// Per-column optimizer statistics in VGI's canonical Arrow form.
     pub column_statistics: Option<RecordBatch>,
@@ -982,6 +988,10 @@ pub struct ScanPlan {
     pub scope: String,
     /// Hoisted location names indexed by [`ScanSplitInfo::location_ids`].
     pub locations: Option<Vec<String>>,
+    /// Exact transformed key grouping, when every split is single-valued.
+    pub key_grouping: Option<KeyGrouping>,
+    /// Exact half-open range distribution and split points.
+    pub range_partitioning: Option<RangePartitioning>,
     /// Storage partition transforms, when every split is single-valued.
     pub partitioning: Option<Vec<PartitionTransform>>,
     /// Ordering guaranteed within each individual split.
@@ -1086,6 +1096,19 @@ fn decode_plan_items<T: VgiArrow>(values: Option<&[Bytes]>, field: &str) -> Resu
         .transpose()
 }
 
+fn decode_plan_record<T: VgiArrow>(value: Option<&Bytes>, field: &str) -> Result<Option<T>> {
+    value
+        .map(|value| {
+            let batch = ipc::read_batch(&value.0).map_err(|error| {
+                RpcError::runtime_error(format!("invalid {field} IPC: {}", error.message))
+            })?;
+            wire::from_batch(&batch).map_err(|error| {
+                RpcError::runtime_error(format!("invalid {field} value: {}", error.message))
+            })
+        })
+        .transpose()
+}
+
 fn decode_split_batch(value: Bytes, split: usize, field: &str) -> Result<RecordBatch> {
     ipc::read_batch(&value.0).map_err(|error| {
         RpcError::runtime_error(format!(
@@ -1093,6 +1116,111 @@ fn decode_split_batch(value: Bytes, split: usize, field: &str) -> Result<RecordB
             error.message
         ))
     })
+}
+
+fn decode_distribution_record<T: VgiArrow>(value: &Bytes, field: &str) -> Result<T> {
+    decode_plan_record(Some(value), field)?.ok_or_else(|| {
+        RpcError::runtime_error(format!("missing required distribution record {field}"))
+    })
+}
+
+fn validate_transform_spec(
+    transform: &TransformSpec,
+    bound: &BoundFunction,
+    context: &str,
+) -> Result<()> {
+    if transform.id.is_empty() || !transform.id.contains('/') {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: {context} has invalid unversioned transform id `{}`",
+            bound.function_name(),
+            transform.id
+        )));
+    }
+    if transform.inputs.is_empty() {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: {context} transform `{}` has no input fields",
+            bound.function_name(),
+            transform.id
+        )));
+    }
+    for (input_index, input) in transform.inputs.iter().enumerate() {
+        let path: FieldPath =
+            decode_distribution_record(input, &format!("{context}.inputs[{input_index}]"))?;
+        if path.components.is_empty() || path.components.iter().any(String::is_empty) {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: {context} transform `{}` has an empty field path",
+                bound.function_name(),
+                transform.id
+            )));
+        }
+        if bound
+            .output_schema()
+            .field_with_name(&path.components[0])
+            .is_err()
+        {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: {context} transform `{}` names unknown field `{}`",
+                bound.function_name(),
+                transform.id,
+                path.components.join(".")
+            )));
+        }
+    }
+    if let Some(parameters) = &transform.parameters {
+        let batch = ipc::read_batch(&parameters.0).map_err(|error| {
+            RpcError::runtime_error(format!(
+                "function `{}`: invalid {context} parameters IPC: {}",
+                bound.function_name(),
+                error.message
+            ))
+        })?;
+        if batch.num_rows() != 1 {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: {context} transform `{}` parameters have {} rows, expected 1",
+                bound.function_name(),
+                transform.id,
+                batch.num_rows()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bounds(
+    bounds: &RecordBatch,
+    bound: &BoundFunction,
+    split_index: usize,
+    field_name: &str,
+) -> Result<()> {
+    if bounds.num_rows() != 2 {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: split {split_index} {field_name} has {} rows, expected 2",
+            bound.function_name(),
+            bounds.num_rows()
+        )));
+    }
+    for field in bounds.schema().fields() {
+        let output = bound
+            .output_schema()
+            .field_with_name(field.name())
+            .map_err(|_| {
+                RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} {field_name} names unknown column `{}`",
+                    bound.function_name(),
+                    field.name()
+                ))
+            })?;
+        if output.data_type() != field.data_type() {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: split {split_index} {field_name} column `{}` has type {:?}, expected {:?}",
+                bound.function_name(),
+                field.name(),
+                field.data_type(),
+                output.data_type()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> {
@@ -1129,6 +1257,124 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
         }
     }
 
+    if let Some(grouping) = &plan.key_grouping {
+        if grouping.keys.is_empty() {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: key_grouping has no keys",
+                bound.function_name()
+            )));
+        }
+        for (key_index, key) in grouping.keys.iter().enumerate() {
+            let transform: TransformSpec =
+                decode_distribution_record(key, &format!("key_grouping.keys[{key_index}]"))?;
+            validate_transform_spec(
+                &transform,
+                bound,
+                &format!("key_grouping.keys[{key_index}]"),
+            )?;
+        }
+        for (split_index, split) in plan.splits.iter().enumerate() {
+            let Some(key_value) = &split.key_value else {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} has no key_value for key_grouping",
+                    bound.function_name()
+                )));
+            };
+            if key_value.num_rows() != 1 || key_value.num_columns() != grouping.keys.len() {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} key_value shape is {}x{}, expected 1x{}",
+                    bound.function_name(),
+                    key_value.num_rows(),
+                    key_value.num_columns(),
+                    grouping.keys.len()
+                )));
+            }
+        }
+    } else if let Some((split_index, _)) = plan
+        .splits
+        .iter()
+        .enumerate()
+        .find(|(_, split)| split.key_value.is_some())
+    {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: split {split_index} has key_value but the plan has no key_grouping",
+            bound.function_name()
+        )));
+    }
+
+    if let Some(range) = &plan.range_partitioning {
+        if range.keys.is_empty() {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: range_partitioning has no keys",
+                bound.function_name()
+            )));
+        }
+        for (key_index, key) in range.keys.iter().enumerate() {
+            let key: RangeKey =
+                decode_distribution_record(key, &format!("range_partitioning.keys[{key_index}]"))?;
+            let transform: TransformSpec = decode_distribution_record(
+                &key.transform,
+                &format!("range_partitioning.keys[{key_index}].transform"),
+            )?;
+            validate_transform_spec(
+                &transform,
+                bound,
+                &format!("range_partitioning.keys[{key_index}]"),
+            )?;
+            if !matches!(
+                key.direction.0.as_str(),
+                enums::order_by_direction::ASC | enums::order_by_direction::DESC
+            ) || !matches!(
+                key.null_order.0.as_str(),
+                enums::order_by_null_order::NULLS_FIRST | enums::order_by_null_order::NULLS_LAST
+            ) {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: range_partitioning key {key_index} has invalid ordering",
+                    bound.function_name()
+                )));
+            }
+        }
+        let split_points = ipc::read_batch(&range.split_points.0).map_err(|error| {
+            RpcError::runtime_error(format!(
+                "function `{}`: invalid range_partitioning split_points IPC: {}",
+                bound.function_name(),
+                error.message
+            ))
+        })?;
+        if split_points.num_columns() != range.keys.len() {
+            return Err(RpcError::runtime_error(format!(
+                "function `{}`: range split-point width is {}, expected {}",
+                bound.function_name(),
+                split_points.num_columns(),
+                range.keys.len()
+            )));
+        }
+        let range_count = split_points.num_rows().saturating_add(1);
+        for (split_index, split) in plan.splits.iter().enumerate() {
+            let valid = split
+                .range_index
+                .and_then(|value| usize::try_from(value).ok())
+                .is_some_and(|value| value < range_count);
+            if !valid {
+                return Err(RpcError::runtime_error(format!(
+                    "function `{}`: split {split_index} has invalid range_index {:?}; expected 0..{range_count}",
+                    bound.function_name(),
+                    split.range_index
+                )));
+            }
+        }
+    } else if let Some((split_index, _)) = plan
+        .splits
+        .iter()
+        .enumerate()
+        .find(|(_, split)| split.range_index.is_some())
+    {
+        return Err(RpcError::runtime_error(format!(
+            "function `{}`: split {split_index} has range_index but the plan has no range_partitioning",
+            bound.function_name()
+        )));
+    }
+
     if plan
         .partitioning
         .as_ref()
@@ -1145,32 +1391,11 @@ fn validate_plan_metadata(plan: &ScanPlan, bound: &BoundFunction) -> Result<()> 
     }
 
     for (split_index, split) in plan.splits.iter().enumerate() {
+        if let Some(bounds) = &split.column_bounds {
+            validate_bounds(bounds, bound, split_index, "column_bounds")?;
+        }
         if let Some(bounds) = &split.partition_bounds {
-            if bounds.num_rows() != 2 {
-                return Err(RpcError::runtime_error(format!(
-                    "function `{}`: split {split_index} partition_bounds has {} rows, expected 2",
-                    bound.function_name(),
-                    bounds.num_rows()
-                )));
-            }
-            for field in bounds.schema().fields() {
-                let output = bound.output_schema().field_with_name(field.name()).map_err(|_| {
-                    RpcError::runtime_error(format!(
-                        "function `{}`: split {split_index} partition_bounds names unknown column `{}`",
-                        bound.function_name(),
-                        field.name()
-                    ))
-                })?;
-                if output.data_type() != field.data_type() {
-                    return Err(RpcError::runtime_error(format!(
-                        "function `{}`: split {split_index} partition bound `{}` has type {:?}, expected {:?}",
-                        bound.function_name(),
-                        field.name(),
-                        field.data_type(),
-                        output.data_type()
-                    )));
-                }
-            }
+            validate_bounds(bounds, bound, split_index, "partition_bounds")?;
         }
     }
 
@@ -1270,6 +1495,10 @@ impl VgiClient {
         };
         let mut cursor: Option<Bytes> = None;
         let mut pages = 0usize;
+        let mut first_key_grouping: Option<Bytes> = None;
+        let mut first_range_partitioning: Option<Bytes> = None;
+        let mut key_grouping_consistent = true;
+        let mut range_partitioning_consistent = true;
 
         loop {
             if pages >= MAX_PAGES {
@@ -1330,6 +1559,15 @@ impl VgiClient {
                 },
             )?;
 
+            if pages == 1 {
+                first_key_grouping = response.key_grouping.clone();
+                first_range_partitioning = response.range_partitioning.clone();
+            } else {
+                key_grouping_consistent &= response.key_grouping == first_key_grouping;
+                range_partitioning_consistent &=
+                    response.range_partitioning == first_range_partitioning;
+            }
+
             for blob in &response.splits {
                 let split_index = plan.splits.len();
                 let split: ScanSplit = wire::from_batch(&ipc::read_batch(&blob.0)?)?;
@@ -1338,6 +1576,15 @@ impl VgiClient {
                     estimated_rows: split.estimated_rows,
                     rows_exact: split.rows_exact,
                     estimated_bytes: split.estimated_bytes,
+                    key_value: split
+                        .key_value
+                        .map(|value| decode_split_batch(value, split_index, "key_value"))
+                        .transpose()?,
+                    range_index: split.range_index,
+                    column_bounds: split
+                        .column_bounds
+                        .map(|value| decode_split_batch(value, split_index, "column_bounds"))
+                        .transpose()?,
                     partition_bounds: split
                         .partition_bounds
                         .map(|value| decode_split_batch(value, split_index, "partition_bounds"))
@@ -1374,6 +1621,10 @@ impl VgiClient {
                 plan.estimated_total_bytes = response.estimated_total_bytes;
                 plan.catalog_version = response.catalog_version;
                 plan.locations = response.locations.clone();
+                plan.key_grouping =
+                    decode_plan_record(response.key_grouping.as_ref(), "key_grouping")?;
+                plan.range_partitioning =
+                    decode_plan_record(response.range_partitioning.as_ref(), "range_partitioning")?;
                 plan.partitioning =
                     decode_plan_items(response.partitioning.as_deref(), "partitioning")?;
                 plan.sort_order = decode_plan_items(response.sort_order.as_deref(), "sort_order")?;
@@ -1393,6 +1644,24 @@ impl VgiClient {
             match response.next_cursors.iter().flatten().next() {
                 Some(next) if !next.0.is_empty() => cursor = Some(next.clone()),
                 _ => break,
+            }
+        }
+
+        // Distribution is a whole-plan promise. A page that changes or omits
+        // the first page's value makes only the optimizer claim unusable; the
+        // split enumeration is still complete and safe to scan. Clear the
+        // corresponding split-local values as well so validation cannot
+        // mistake them for orphaned metadata.
+        if !key_grouping_consistent {
+            plan.key_grouping = None;
+            for split in &mut plan.splits {
+                split.key_value = None;
+            }
+        }
+        if !range_partitioning_consistent {
+            plan.range_partitioning = None;
+            for split in &mut plan.splits {
+                split.range_index = None;
             }
         }
 
@@ -2057,6 +2326,9 @@ mod tests {
                 estimated_rows: None,
                 rows_exact: false,
                 estimated_bytes: None,
+                key_value: None,
+                range_index: None,
+                column_bounds: None,
                 partition_bounds: None,
                 column_statistics: None,
                 location_ids: None,
@@ -2077,6 +2349,8 @@ mod tests {
                 catalog_version: None,
                 scope: "catalog".to_string(),
                 locations: None,
+                key_grouping: None,
+                range_partitioning: None,
                 partitioning: Some(Vec::new()),
                 sort_order: Some(Vec::new()),
                 cache_max_age_seconds: None,
@@ -2140,12 +2414,20 @@ mod tests {
                 vec![Arc::new(StringArray::from(vec!["a"]))],
             )
             .unwrap();
+            let key_value = RecordBatch::try_new(
+                Arc::new(schema(&[("key", DataType::Int64)])),
+                vec![Arc::new(Int64Array::from(vec![if first { 1 } else { 2 }]))],
+            )
+            .unwrap();
             let split = wire::to_batch(ScanSplit {
                 payload: Bytes(Vec::new()),
                 token: Bytes(if first { b"split-0" } else { b"split-1" }.to_vec()),
                 estimated_rows: Some(10),
                 rows_exact: true,
                 estimated_bytes: Some(80),
+                key_value: Some(Bytes(ipc::write_batch(&key_value)?)),
+                range_index: None,
+                column_bounds: None,
                 partition_bounds: Some(Bytes(ipc::write_batch(&bounds)?)),
                 column_statistics: Some(Bytes(ipc::write_batch(&statistics)?)),
                 location_ids: Some(vec![0]),
@@ -2161,6 +2443,17 @@ mod tests {
                 column: "c".to_string(),
                 direction: DictString(enums::order_by_direction::ASC.to_string()),
                 nulls: DictString(enums::order_by_null_order::NULLS_LAST.to_string()),
+            })?;
+            let path = wire::to_batch(FieldPath {
+                components: vec![if first { "a" } else { "b" }.to_string()],
+            })?;
+            let transform = wire::to_batch(TransformSpec {
+                id: "vgi.identity/1".to_string(),
+                inputs: vec![Bytes(ipc::write_batch(&path)?)],
+                parameters: None,
+            })?;
+            let grouping = wire::to_batch(KeyGrouping {
+                keys: vec![Bytes(ipc::write_batch(&transform)?)],
             })?;
             let response = PlanResponse {
                 splits: vec![Bytes(ipc::write_batch(&split)?)],
@@ -2188,6 +2481,8 @@ mod tests {
                 catalog_version: Some(if first { 7 } else { 99 }),
                 scope: if first { "transaction" } else { "catalog" }.to_string(),
                 locations: Some(vec![if first { "host-a" } else { "wrong" }.to_string()]),
+                key_grouping: Some(Bytes(ipc::write_batch(&grouping)?)),
+                range_partitioning: None,
                 partitioning: Some(vec![Bytes(ipc::write_batch(&partitioning)?)]),
                 sort_order: Some(vec![Bytes(ipc::write_batch(&sort)?)]),
                 cache_max_age_seconds: Some(if first { 60 } else { 1 }),
@@ -2288,6 +2583,8 @@ mod tests {
             Some(["host-a".to_string()].as_slice())
         );
         assert_eq!(plan.partitioning.as_ref().unwrap()[0].transform, "identity");
+        assert!(plan.key_grouping.is_none());
+        assert!(plan.splits.iter().all(|split| split.key_value.is_none()));
         assert_eq!(plan.sort_order.as_ref().unwrap()[0].column, "c");
         assert_eq!(plan.cache_max_age_seconds, Some(60));
         assert_eq!(plan.start_position.as_deref(), Some(b"begin".as_slice()));
@@ -2327,6 +2624,9 @@ mod tests {
                 estimated_rows: None,
                 rows_exact: false,
                 estimated_bytes: None,
+                key_value: None,
+                range_index: None,
+                column_bounds: None,
                 partition_bounds: None,
                 column_statistics: None,
                 location_ids: Some(vec![1]),

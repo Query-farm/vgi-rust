@@ -714,6 +714,13 @@ pub struct PlanResponse {
     /// A hoisted host list; splits index into it, which keeps a large plan off
     /// the coordinator heap.
     pub locations: Option<Vec<String>>,
+    /// Serialized [`KeyGrouping`] when every split owns one exact transformed
+    /// key tuple.
+    pub key_grouping: Option<Bytes>,
+    /// Serialized [`RangePartitioning`] with exact ordered split points.
+    pub range_partitioning: Option<Bytes>,
+    /// Deprecated protocol-2 transform list. Protocol 3 producers use
+    /// `key_grouping` and/or `range_partitioning`.
     /// Serialized partition transforms. NOT derivable from a split's partition
     /// values: `country=US` does not say whether partitions are
     /// `identity(country)` or `bucket(16, user_id)`. Report nothing here unless
@@ -779,6 +786,13 @@ pub struct ScanSplit {
     /// SplitWeight). `None` degrades them to round-robin by count; DuckDB claims
     /// greedily and needs no cost model at all.
     pub estimated_bytes: Option<i64>,
+    /// One-row transformed key tuple aligned with the plan's key grouping.
+    pub key_value: Option<Bytes>,
+    /// Zero-based range owned by this split.
+    pub range_index: Option<i64>,
+    /// Two-row containment/pruning bounds. Never an exact grouping key.
+    pub column_bounds: Option<Bytes>,
+    /// Deprecated protocol-2 spelling for column bounds.
     /// 2-row (min, max) batch in the existing `vgi_partition_values` encoding.
     pub partition_bounds: Option<Bytes>,
     pub column_statistics: Option<Bytes>,
@@ -1069,7 +1083,8 @@ pub struct AttachCatalogInfo {
 /// see [`crate::generated::protocol_types`]. Re-exported here at their
 /// historical paths.
 pub use crate::generated::protocol_types::{
-    CatalogAttachResult, CatalogContentsResponse, SchemaContents,
+    CatalogAttachResult, CatalogContentsResponse, FieldPath, KeyGrouping, RangeKey,
+    RangePartitioning, SchemaContents, TransformSpec,
 };
 
 // ---------------------------------------------------------------------------

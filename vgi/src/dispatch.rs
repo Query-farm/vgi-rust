@@ -3391,6 +3391,9 @@ impl Dispatcher {
                 estimated_rows: None,
                 rows_exact: false,
                 estimated_bytes: None,
+                key_value: None,
+                range_index: None,
+                column_bounds: None,
                 partition_bounds: None,
                 column_statistics: None,
                 location_ids: None,
@@ -3409,6 +3412,8 @@ impl Dispatcher {
                 catalog_version: None,
                 scope: "catalog".to_string(),
                 locations: None,
+                key_grouping: None,
+                range_partitioning: None,
                 partitioning: Some(Vec::new()),
                 sort_order: Some(Vec::new()),
                 cache_max_age_seconds: None,
@@ -3485,6 +3490,9 @@ impl Dispatcher {
                 estimated_rows: s.estimated_rows,
                 rows_exact: s.rows_exact,
                 estimated_bytes: s.estimated_bytes,
+                key_value: s.key_value.clone().map(Bytes::from),
+                range_index: s.range_index,
+                column_bounds: s.column_bounds.clone().map(Bytes::from),
                 partition_bounds: s.partition_bounds.clone().map(Bytes::from),
                 column_statistics: s.column_statistics.clone().map(Bytes::from),
                 location_ids: s.location_ids.clone(),
@@ -3524,6 +3532,18 @@ impl Dispatcher {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
+        let key_grouping = outcome
+            .key_grouping
+            .clone()
+            .map(|value| wire::to_batch(value).and_then(|batch| ipc::write_batch(&batch)))
+            .transpose()?
+            .map(Bytes::from);
+        let range_partitioning = outcome
+            .range_partitioning
+            .clone()
+            .map(|value| wire::to_batch(value).and_then(|batch| ipc::write_batch(&batch)))
+            .transpose()?
+            .map(Bytes::from);
 
         Ok(Some(wire::to_result_batch(PlanResponse {
             splits,
@@ -3547,6 +3567,8 @@ impl Dispatcher {
                 .clone()
                 .unwrap_or_else(|| "catalog".to_string()),
             locations: outcome.locations.clone(),
+            key_grouping,
+            range_partitioning,
             partitioning,
             sort_order,
             cache_max_age_seconds: outcome.cache_max_age_seconds,
