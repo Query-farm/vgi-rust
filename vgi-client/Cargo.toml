@@ -21,6 +21,9 @@ default = ["http", "oauth"]
 testing = ["dep:arrow-row", "dep:arrow-buffer", "dep:serde_json"]
 # HTTP transport (reqwest-blocking under the hood, via vgi-rpc-client).
 http = ["vgi-rpc-client/http"]
+# Native reqwest backend for applications that want a ready-to-use HTTP
+# transport rather than injecting their own HttpClient executor.
+reqwest = ["http", "vgi-rpc-client/reqwest"]
 # Native authenticated HTTP semantics over Iroh. Kept opt-in because it adds
 # the Iroh/QUIC runtime to native builds.
 iroh = ["http", "vgi-rpc-client/iroh", "dep:vgi-rpc-iroh", "dep:iroh", "dep:tokio"]
@@ -48,7 +51,7 @@ disk-cache = [
 vgi-protocol = { workspace = true }
 vgi-rpc = { workspace = true }
 vgi-rpc-client = { workspace = true }
-vgi-rpc-iroh = { version = "0.32.3", path = "../../vgi-rpc-rust-arrow59/vgi-rpc-iroh", optional = true }
+vgi-rpc-iroh = { version = "0.32.3", optional = true }
 iroh = { version = "1.1.0", default-features = false, features = ["tls-ring"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 arrow-array = { workspace = true }
