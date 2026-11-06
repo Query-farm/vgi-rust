@@ -65,8 +65,8 @@ publish = false
 [dependencies]
 vgi = { path = "$REPO/vgi" }
 vgi-rpc = $VGI_RPC_DEP
-arrow-array = "60"
-arrow-schema = "60"
+arrow-array = "59"
+arrow-schema = "59"
 
 [workspace]
 EOF

@@ -48,8 +48,8 @@ example below needs):
 [dependencies]
 vgi = "0.48"
 vgi-rpc = "0.32"
-arrow-array = "60"
-arrow-schema = "60"
+arrow-array = "59"
+arrow-schema = "59"
 ```
 
 **2. Write a function and serve it:**
