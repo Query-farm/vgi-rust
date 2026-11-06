@@ -88,7 +88,11 @@ impl TableProducer for LogDrain {
             self.conditional_answered = true;
             match self.cache_behavior {
                 BufferedCacheBehavior::Revalidate => {
-                    std::thread::sleep(std::time::Duration::from_millis(75));
+                    // Keep the validating flight open long enough for the
+                    // other independently launched buffered lifecycles to
+                    // reach it even on a loaded CI runner. This fixture is
+                    // specifically testing overlapping-request coalescing.
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                     self.metadata = Some(
                         buffered_revalidation_control(false)
                             .with_not_modified()
