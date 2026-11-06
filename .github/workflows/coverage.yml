@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VGI_REF: 2890cd43c28431004dea5b06ea5760f4a4b9a611
+  VGI_REF: b3276d91fb2834578cbef437b1d62383fda3da32
   VGI_NATIVE_RUNNER_BRANCH: v2.0
 
 jobs:
