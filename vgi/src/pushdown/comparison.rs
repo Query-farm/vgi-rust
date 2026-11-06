@@ -9,7 +9,7 @@
 
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum, Float32Array, Float64Array, Scalar};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, SortOptions};
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -134,6 +134,50 @@ macro_rules! float_comparator {
 float_comparator!(float32_compare, Float32Array, f32);
 float_comparator!(float64_compare, Float64Array, f64);
 
+fn nested_compare(left: &dyn Array, right: &dyn Array, op: &str) -> Result<BooleanArray> {
+    if left.len() != right.len() && left.len() != 1 && right.len() != 1 {
+        return Err(ArrowError::InvalidArgumentError(
+            "incompatible lengths".into(),
+        ));
+    }
+    let compare = arrow_ord::ord::make_comparator(left, right, SortOptions::default())?;
+    let n = if left.len() == 1 {
+        right.len()
+    } else {
+        left.len()
+    };
+    let li = |i| if left.len() == 1 { 0 } else { i };
+    let ri = |i| if right.len() == 1 { 0 } else { i };
+    let values = BooleanBuffer::collect_bool(n, |i| {
+        let (ln, rn) = (left.is_null(li(i)), right.is_null(ri(i)));
+        let ordering = compare(li(i), ri(i));
+        let ordered = match op {
+            "eq" | "not_distinct_from" => ordering.is_eq(),
+            "ne" | "distinct_from" => !ordering.is_eq(),
+            "lt" => ordering.is_lt(),
+            "le" => !ordering.is_gt(),
+            "gt" => ordering.is_gt(),
+            "ge" => !ordering.is_lt(),
+            _ => false,
+        };
+        ordered
+            || match op {
+                "distinct_from" => ln != rn,
+                "not_distinct_from" => ln && rn,
+                _ => false,
+            }
+    });
+    if !matches!(
+        op,
+        "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "distinct_from" | "not_distinct_from"
+    ) {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "unknown comparison {op}"
+        )));
+    }
+    Ok(finish_float(left, right, values, op))
+}
+
 pub(super) fn sql_compare(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result<BooleanArray> {
     if let (Some(left), Some(right)) = (
         left.as_any().downcast_ref::<Float32Array>(),
@@ -147,5 +191,49 @@ pub(super) fn sql_compare(left: &ArrayRef, right: &ArrayRef, op: &str) -> Result
     ) {
         return float64_compare(left, right, op);
     }
+    if left.data_type().is_nested() || right.data_type().is_nested() {
+        return nested_compare(left.as_ref(), right.as_ref(), op);
+    }
     arrow_compare(left, right, op)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, StructArray};
+    use arrow_schema::{DataType, Field, Fields};
+
+    use super::sql_compare;
+
+    #[test]
+    fn nested_equality_broadcasts_a_struct_literal() {
+        let fields: Fields = vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]
+        .into();
+        let rows: ArrayRef = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1])),
+                Arc::new(Int64Array::from(vec![10, 20, 11])),
+            ],
+            None,
+        ));
+        let literal: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+            None,
+        ));
+
+        let result = sql_compare(&rows, &literal, "eq").unwrap();
+        assert_eq!(
+            result.iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(false), Some(false)]
+        );
+    }
 }

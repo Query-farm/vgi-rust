@@ -1622,6 +1622,13 @@ impl TableFunction for SplitPartitioned {
                 .with_ge(0.0)
                 .with_default(5),
             ArgSpec::const_arg(
+                "key_mode",
+                -1,
+                "varchar",
+                "Test-only Protocol 3.1 key shape: valid, missing, two_rows, or wrong_type",
+            )
+            .with_default("valid"),
+            ArgSpec::const_arg(
                 "require_plan_context",
                 -1,
                 "boolean",
@@ -1644,6 +1651,10 @@ impl TableFunction for SplitPartitioned {
         _request: &TableFunctionPlanRequest,
     ) -> Result<Option<PlanOutcome>> {
         let rows = params.arguments.named_i64("rows_per_country").unwrap_or(5);
+        let key_mode = params
+            .arguments
+            .named_str("key_mode")
+            .unwrap_or_else(|| "valid".to_string());
         let path = vgi::wire::to_batch(FieldPath {
             components: vec!["country".to_string()],
         })?;
@@ -1716,14 +1727,41 @@ impl TableFunction for SplitPartitioned {
                     )
                     .map_err(|error| RpcError::runtime_error(error.to_string()))?;
                     let base = i * 100;
-                    let key_value = RecordBatch::try_new(
-                        Arc::new(Schema::new(vec![Field::new(
-                            "country",
-                            DataType::Utf8,
-                            true,
-                        )])),
-                        vec![Arc::new(arrow_array::StringArray::from(vec![country]))],
-                    )
+                    let key_value = match key_mode.as_str() {
+                        "missing" => None,
+                        "two_rows" => Some(RecordBatch::try_new(
+                            Arc::new(Schema::new(vec![Field::new(
+                                "country",
+                                DataType::Utf8,
+                                true,
+                            )])),
+                            vec![Arc::new(arrow_array::StringArray::from(vec![
+                                country, country,
+                            ]))],
+                        )),
+                        "wrong_type" => Some(RecordBatch::try_new(
+                            Arc::new(Schema::new(vec![Field::new(
+                                "country",
+                                DataType::Int64,
+                                true,
+                            )])),
+                            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+                        )),
+                        "valid" => Some(RecordBatch::try_new(
+                            Arc::new(Schema::new(vec![Field::new(
+                                "country",
+                                DataType::Utf8,
+                                true,
+                            )])),
+                            vec![Arc::new(arrow_array::StringArray::from(vec![country]))],
+                        )),
+                        other => {
+                            return Err(RpcError::runtime_error(format!(
+                                "unknown split_partitioned key_mode: {other}"
+                            )))
+                        }
+                    }
+                    .transpose()
                     .map_err(|error| RpcError::runtime_error(error.to_string()))?;
                     let range_index = match country {
                         "BR" => 0,
@@ -1732,40 +1770,45 @@ impl TableFunction for SplitPartitioned {
                         "US" => 3,
                         _ => unreachable!("fixture country is closed"),
                     };
-                    PlannedSplit {
+                    let split = PlannedSplit {
                         payload: i.to_le_bytes().to_vec(),
                         estimated_rows: Some(rows.max(0)),
                         rows_exact: true,
                         estimated_bytes: Some(rows.max(0) * 16),
                         location_ids: Some(vec![0]),
                         ..Default::default()
-                    }
-                    .with_key_value(&key_value)?
-                    .with_range_index(range_index)
-                    .with_column_bounds(&bounds)?
-                    .with_partition_bounds(&bounds)?
-                    .with_column_statistics(&[
-                        CatColStat {
-                            column_name: "country".to_string(),
-                            min: StatValue::Utf8(country.to_string()),
-                            max: StatValue::Utf8(country.to_string()),
-                            has_null: false,
-                            has_not_null: rows > 0,
-                            distinct_count: Some((rows > 0) as i64),
-                            contains_unicode: Some(false),
-                            max_string_length: Some(country.len() as u64),
-                        },
-                        CatColStat {
-                            column_name: "sales".to_string(),
-                            min: StatValue::Int64(base + 1),
-                            max: StatValue::Int64(base + rows.max(1)),
-                            has_null: false,
-                            has_not_null: rows > 0,
-                            distinct_count: Some(rows.max(0)),
-                            contains_unicode: None,
-                            max_string_length: None,
-                        },
-                    ])
+                    };
+                    let split = if let Some(key_value) = key_value.as_ref() {
+                        split.with_key_value(key_value)?
+                    } else {
+                        split
+                    };
+                    split
+                        .with_range_index(range_index)
+                        .with_column_bounds(&bounds)?
+                        .with_partition_bounds(&bounds)?
+                        .with_column_statistics(&[
+                            CatColStat {
+                                column_name: "country".to_string(),
+                                min: StatValue::Utf8(country.to_string()),
+                                max: StatValue::Utf8(country.to_string()),
+                                has_null: false,
+                                has_not_null: rows > 0,
+                                distinct_count: Some((rows > 0) as i64),
+                                contains_unicode: Some(false),
+                                max_string_length: Some(country.len() as u64),
+                            },
+                            CatColStat {
+                                column_name: "sales".to_string(),
+                                min: StatValue::Int64(base + 1),
+                                max: StatValue::Int64(base + rows.max(1)),
+                                has_null: false,
+                                has_not_null: rows > 0,
+                                distinct_count: Some(rows.max(0)),
+                                contains_unicode: None,
+                                max_string_length: None,
+                            },
+                        ])
                 })
                 .collect::<Result<Vec<_>>>()?,
             ..Default::default()
