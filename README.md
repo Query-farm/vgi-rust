@@ -181,6 +181,22 @@ the output schema, and `process` (or the buffering / aggregate lifecycle methods
 See [filter ownership and typed pruning](docs/filtering-and-pruning.md) for safe
 external-data scans using `FilterHandling::Sdk` and partial-column candidate masks.
 
+**Multi-batch table producers must be resumable over HTTP.** HTTP carries one
+batch per response and rebuilds the producer from a continuation token each
+turn; the SDK does not drain a multi-batch producer inside the first turn. A
+`TableProducer` that returns more than one batch must serialize its scan
+position — add `vgi::resume_fields!(cursor, rows_emitted);` (the fields that
+advance) to the `impl TableProducer`, or implement `resume_supported` /
+`encode_resume` / `restore_resume` — otherwise the scan fails over HTTP with
+"cannot serve an HTTP continuation". Pipe / unix / tcp transports are
+unaffected; single-batch producers need nothing.
+
+**Argument constraints are enforced.** `ArgSpec::with_choices` / `with_ge` /
+`with_le` / `with_gt` / `with_lt` / `with_pattern` are checked at bind time
+(before `on_bind`) for positional const args and named-only args alike; an
+absent named arg is checked via its `with_default`. `pattern` is an
+**unanchored search** (JSON Schema semantics) — use `^…$` for a full match.
+
 A table-in-out function answers each input batch with one reply. To answer one
 input with several (one upstream API page per reply), emit each but the last with
 `EmitOptions { more: true, .. }`, record where to pick up with

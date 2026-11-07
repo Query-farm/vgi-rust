@@ -2075,7 +2075,11 @@ fn render_filters(pf: &vgi::pushdown::PushdownFilters) -> String {
     cols.dedup();
     let mut parts = Vec::new();
     for c in cols {
-        if let Some(b) = pf.get_column_bounds(&c) {
+        // Deliberately the legacy integer view: the rendered text is compared
+        // byte-for-byte with the other SDKs' `get_column_bounds`.
+        #[allow(deprecated)]
+        let bounds = pf.get_column_bounds(&c);
+        if let Some(b) = bounds {
             if let Some(min) = b.min {
                 parts.push(format!("{c}>={min}"));
             }

@@ -124,8 +124,30 @@ pub struct ColumnBounds {
     pub max: Option<i64>,
 }
 
+/// One `column <op> literal` comparison with its typed literal value.
+///
+/// [`Filter::Constant`] names the column and operator but (for compatibility)
+/// carries no value; [`PushdownFilters::constant_filters`] returns these
+/// instead. `op` is normalised so the column is on the left (`5 < n` is
+/// reported as `n gt 5`), and `value` is the 1-row Arrow literal exactly as
+/// DuckDB sent it — no integer cast, so floats, decimals, strings and
+/// timestamps keep their type.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConstantFilter {
+    /// Top-level column the comparison constrains.
+    pub column_name: String,
+    /// `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `distinct_from`, `not_distinct_from`.
+    pub op: String,
+    /// The literal as a 1-row Arrow array.
+    pub value: ArrayRef,
+}
+
 #[derive(Debug, Clone)]
 pub enum Filter {
+    /// A `column <op> literal` comparison. The literal value is not carried
+    /// here; read it with [`PushdownFilters::constant_filters`] (typed) or
+    /// [`PushdownFilters::get_column_constant`] (equality only).
     Constant {
         column_name: String,
         op: String,
@@ -640,6 +662,38 @@ impl PushdownFilters {
             .iter()
             .find_map(|p| constant_for(&p.expression, column))
     }
+    /// Every conjunctive `column <op> literal` comparison, with its typed value.
+    ///
+    /// Walks each pushed predicate and the children of `AND` nodes; `OR`/`NOT`
+    /// subtrees are skipped because no single comparison inside them
+    /// constrains every row. Only direct top-level column references count
+    /// (struct-field and cast/arithmetic operands are skipped). A bare BOOLEAN
+    /// predicate (`WHERE flag` / `WHERE NOT flag`) is reported as `flag eq
+    /// true/false`. This is the value-carrying companion of [`Self::filters`]:
+    ///
+    /// ```ignore
+    /// for c in filters.constant_filters() {
+    ///     if c.column_name == "price" && c.op == "ge" {
+    ///         let min = c.value.as_primitive::<Float64Type>().value(0); // 9.99, not 9
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// For pruning, prefer [`Self::column_domain`], which also folds `IN`,
+    /// `OR`, NULL tests and exclusive endpoints into one typed domain.
+    pub fn constant_filters(&self) -> Vec<ConstantFilter> {
+        let mut out = Vec::new();
+        for predicate in &self.predicates {
+            collect_constant_filters(&predicate.expression, &mut out);
+        }
+        out
+    }
+    /// The [`Self::constant_filters`] that constrain `column`.
+    pub fn get_column_constant_filters(&self, column: &str) -> Vec<ConstantFilter> {
+        let mut out = self.constant_filters();
+        out.retain(|c| c.column_name == column);
+        out
+    }
     pub fn get_column_values_i64(&self, column: &str) -> Option<Vec<i64>> {
         let casted = arrow_cast::cast(&self.get_column_values(column)?, &DataType::Int64).ok()?;
         let values = casted.as_primitive::<arrow_array::types::Int64Type>();
@@ -650,14 +704,28 @@ impl PushdownFilters {
                 .collect(),
         )
     }
+    /// `(value count, integer min, integer max)` — built on the integer-only
+    /// [`Self::get_column_bounds`], so it shares that method's truncation.
     pub fn column_summary(&self, column: &str) -> (usize, Option<i64>, Option<i64>) {
         let values = self.get_column_values_i64(column).unwrap_or_default();
+        #[allow(deprecated)]
         let bounds = self.get_column_bounds(column);
         let (min, max) = bounds
             .map(|bounds| (bounds.min, bounds.max))
             .unwrap_or((None, None));
         (values.len(), min, max)
     }
+    /// Legacy integer-only bounds for `column`.
+    ///
+    /// Every literal is cast to `i64`, so a float or decimal bound is
+    /// truncated (`price > 9.99` reports `min = 10` after the exclusive
+    /// `+1`, `price < 9.99` reports `max = 8`) and non-numeric columns report
+    /// nothing. Use [`Self::column_domain`] for typed, NULL-aware pruning
+    /// bounds, or [`Self::constant_filters`] for the raw typed literals.
+    #[deprecated(
+        since = "0.49.3",
+        note = "casts literals to i64 (truncating floats/decimals); use `column_domain` for typed bounds or `constant_filters` for typed literals"
+    )]
     pub fn get_column_bounds(&self, column: &str) -> Option<ColumnBounds> {
         self.predicates
             .iter()
@@ -1827,6 +1895,45 @@ fn constant_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
         },
     }
 }
+fn collect_constant_filters(expression: &Expr, out: &mut Vec<ConstantFilter>) {
+    if let Some((name, value)) = boolean_column_leaf(expression) {
+        out.push(ConstantFilter {
+            column_name: name.into(),
+            op: "eq".into(),
+            value: Arc::new(BooleanArray::from(vec![value])) as ArrayRef,
+        });
+        return;
+    }
+    match expression {
+        Expr::And(children) => {
+            for child in children {
+                collect_constant_filters(child, out);
+            }
+        }
+        Expr::Comparison { op, left, right } => {
+            let (column, literal, op) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { name, .. }, Expr::Literal(v)) => (name, v, op.as_str()),
+                (Expr::Literal(v), Expr::Column { name, .. }) => {
+                    let flipped = match op.as_str() {
+                        "gt" => "lt",
+                        "ge" => "le",
+                        "lt" => "gt",
+                        "le" => "ge",
+                        other => other,
+                    };
+                    (name, v, flipped)
+                }
+                _ => return,
+            };
+            out.push(ConstantFilter {
+                column_name: column.clone(),
+                op: op.into(),
+                value: literal.clone(),
+            });
+        }
+        _ => {}
+    }
+}
 fn in_values_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
     match expression {
         Expr::In {
@@ -2351,8 +2458,10 @@ mod tests {
         .unwrap();
         assert_eq!(state.apply(&batch).unwrap().num_rows(), 1);
         assert_eq!(state.filtered_columns(), HashSet::from(["n".to_string()]));
+        #[allow(deprecated)]
+        let bounds = state.get_column_bounds("n");
         assert_eq!(
-            state.get_column_bounds("n"),
+            bounds,
             Some(ColumnBounds {
                 min: Some(3),
                 max: None,
@@ -2362,6 +2471,66 @@ mod tests {
             state.format_repr(),
             "PushdownFilters([ConstantFilter(n > 2)])"
         );
+    }
+
+    fn float_comparisons(json_expr: &str, values: Vec<f64>) -> PushdownFilters {
+        let json = format!(
+            r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{{"id":"p","revision":0,"mode":"required","source":"query","expression":{json_expr}}}]}}"#
+        );
+        let fields = (0..values.len())
+            .map(|i| Arc::new(Field::new(format!("value_{i}"), DataType::Float64, true)))
+            .collect();
+        let arrays = values
+            .into_iter()
+            .map(|v| Arc::new(arrow_array::Float64Array::from(vec![v])) as ArrayRef)
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
+        PushdownFilters::parse_with_schema(&encode(&json, fields, arrays), schema).unwrap()
+    }
+
+    #[test]
+    fn constant_filters_expose_typed_float_values() {
+        // `x >= 1.5 AND 9.75 > x` — the second operand order is reversed.
+        let state = float_comparisons(
+            r#"{"node":"and","children":[{"node":"comparison","op":"ge","left":{"node":"column_ref","column_index":0,"column_name":"x"},"right":{"node":"literal","value_ref":0}},{"node":"comparison","op":"gt","left":{"node":"literal","value_ref":1},"right":{"node":"column_ref","column_index":0,"column_name":"x"}}]}"#,
+            vec![1.5, 9.75],
+        );
+        let got = state.get_column_constant_filters("x");
+        assert_eq!(got.len(), 2);
+        let as_f64 = |c: &ConstantFilter| {
+            c.value
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(0)
+        };
+        assert_eq!((got[0].op.as_str(), as_f64(&got[0])), ("ge", 1.5));
+        assert_eq!((got[1].op.as_str(), as_f64(&got[1])), ("lt", 9.75));
+        assert!(state.get_column_constant_filters("y").is_empty());
+        // The legacy integer view truncates; the typed one does not.
+        #[allow(deprecated)]
+        let legacy = state.get_column_bounds("x").unwrap();
+        assert_eq!(legacy.min, Some(1));
+    }
+
+    #[test]
+    fn constant_filters_skip_or_subtrees() {
+        let state = float_comparisons(
+            r#"{"node":"or","children":[{"node":"comparison","op":"eq","left":{"node":"column_ref","column_index":0,"column_name":"x"},"right":{"node":"literal","value_ref":0}},{"node":"comparison","op":"eq","left":{"node":"column_ref","column_index":0,"column_name":"x"},"right":{"node":"literal","value_ref":1}}]}"#,
+            vec![1.0, 2.0],
+        );
+        assert!(state.constant_filters().is_empty());
+    }
+
+    #[test]
+    fn constant_filters_report_bare_boolean_columns() {
+        let state =
+            PushdownFilters::parse_with_schema(&bool_predicate(FLAG), bool_schema()).unwrap();
+        let got = state.constant_filters();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].column_name.as_str(), got[0].op.as_str()),
+            ("flag", "eq")
+        );
+        assert!(got[0].value.as_boolean().value(0));
     }
 
     #[test]

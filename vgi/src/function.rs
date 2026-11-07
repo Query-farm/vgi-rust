@@ -127,7 +127,8 @@ pub struct ArgSpec {
     pub gt: Option<f64>,
     /// Exclusive upper bound, value < lt (`vgi_range`).
     pub lt: Option<f64>,
-    /// Regex the value must match (`vgi_pattern`).
+    /// Regex the value must match (`vgi_pattern`). Unanchored search
+    /// (JSON Schema / ECMA-262 semantics): anchor with `^…$` for a full match.
     pub pattern: Option<String>,
     /// Default value for the argument (`vgi_default`).
     pub default: Option<serde_json::Value>,
@@ -239,7 +240,9 @@ impl ArgSpec {
         self
     }
 
-    /// Regex the value must match (`vgi_pattern`).
+    /// Regex the value must match (`vgi_pattern`). Enforced as an
+    /// **unanchored search** (JSON Schema / ECMA-262 semantics, the same in
+    /// every VGI SDK): `"[0-9]"` accepts `"ab1"`; use `"^…$"` for a full match.
     pub fn with_pattern(mut self, pattern: &str) -> Self {
         self.pattern = Some(pattern.to_string());
         self
@@ -287,81 +290,165 @@ pub fn validate_type_bounds(specs: &[ArgSpec], input_schema: Option<&SchemaRef>)
 /// range (`ge`/`le`/`gt`/`lt`), and `pattern` constraints are validated once
 /// here — mirroring the Python SDK, so a discovered constraint (surfaced via
 /// `vgi_function_arguments()`) is actually binding. A violating value returns an
-/// `RpcError::value_error` coded `INVALID_ARGUMENT`; a null const value skips
-/// its value constraints, and column (non-const) arguments are not enforced
-/// here (type bounds are [`validate_type_bounds`]'s job).
+/// `RpcError::value_error` coded `INVALID_ARGUMENT`.
+///
+/// * Positional const args (`position >= 0`, `is_const`) are read by position.
+/// * Named-only args (`position < 0`) are always bind-time scalars in SQL
+///   (`arg := value`), so they are read by name and checked the same way. An
+///   absent named arg is checked through its declared `default` (if any), so
+///   a default that violates its own constraints is reported rather than
+///   silently handed to the function; an absent arg with no default passes.
+/// * A null value skips its value constraints, and positional column
+///   (non-const) arguments are not enforced here (type bounds are
+///   [`validate_type_bounds`]'s job).
+///
+/// `pattern` is an **unanchored search** (JSON Schema / ECMA-262 semantics,
+/// identical across every VGI SDK): `"[0-9]"` accepts `"ab1"`. Anchor it
+/// explicitly (`"^[A-Z]{2}$"`) to require a full match.
 pub fn validate_arg_constraints(
     specs: &[ArgSpec],
     args: &crate::arguments::Arguments,
 ) -> Result<()> {
     for spec in specs {
-        if !spec.is_const || spec.position < 0 {
+        if !has_value_constraints(spec) {
             continue;
         }
-        let pos = spec.position as usize;
+        let (value, from_default) = if spec.position >= 0 {
+            if !spec.is_const {
+                continue;
+            }
+            (ConstValue::positional(args, spec.position as usize), false)
+        } else if args.named.contains_key(spec.name.as_str()) {
+            (ConstValue::named(args, &spec.name), false)
+        } else if let Some(default) = &spec.default {
+            (ConstValue::json(default), true)
+        } else {
+            continue;
+        };
+        check_value(spec, &value).map_err(|detail| {
+            if from_default {
+                constraint_err(spec, &format!("declared default {detail}"))
+            } else {
+                constraint_err(spec, &detail)
+            }
+        })?;
+    }
+    Ok(())
+}
 
-        // Numeric range — const_f64 widens int and float; None = null/non-numeric.
-        if spec.ge.is_some() || spec.le.is_some() || spec.gt.is_some() || spec.lt.is_some() {
-            if let Some(v) = args.const_f64(pos) {
-                if let Some(ge) = spec.ge {
-                    if v < ge {
-                        return Err(constraint_err(
-                            spec,
-                            &format!("must be >= {}", fmt_bound(ge)),
-                        ));
-                    }
-                }
-                if let Some(le) = spec.le {
-                    if v > le {
-                        return Err(constraint_err(
-                            spec,
-                            &format!("must be <= {}", fmt_bound(le)),
-                        ));
-                    }
-                }
-                if let Some(gt) = spec.gt {
-                    if v <= gt {
-                        return Err(constraint_err(
-                            spec,
-                            &format!("must be > {}", fmt_bound(gt)),
-                        ));
-                    }
-                }
-                if let Some(lt) = spec.lt {
-                    if v >= lt {
-                        return Err(constraint_err(
-                            spec,
-                            &format!("must be < {}", fmt_bound(lt)),
-                        ));
-                    }
-                }
+fn has_value_constraints(spec: &ArgSpec) -> bool {
+    spec.ge.is_some()
+        || spec.le.is_some()
+        || spec.gt.is_some()
+        || spec.lt.is_some()
+        || spec.pattern.is_some()
+        || spec.choices.as_ref().is_some_and(|c| !c.is_empty())
+}
+
+/// A scalar argument value viewed through the three lenses the constraints
+/// need. All `None` = null/absent (constraints skipped).
+#[derive(Debug, Default)]
+struct ConstValue {
+    /// String view (string-typed values only).
+    s: Option<String>,
+    /// Numeric view (int and float widened to f64).
+    f: Option<f64>,
+    /// Bool view (only when not numeric — `const_bool` has an int8 fallback).
+    b: Option<bool>,
+}
+
+impl ConstValue {
+    fn positional(args: &crate::arguments::Arguments, pos: usize) -> Self {
+        let f = args.const_f64(pos);
+        Self {
+            s: args.const_str(pos),
+            b: if f.is_none() {
+                args.const_bool(pos)
+            } else {
+                None
+            },
+            f,
+        }
+    }
+
+    fn named(args: &crate::arguments::Arguments, name: &str) -> Self {
+        let f = args.named_f64(name);
+        Self {
+            s: args.named_str(name),
+            b: if f.is_none() {
+                args.named_bool(name)
+            } else {
+                None
+            },
+            f,
+        }
+    }
+
+    fn json(v: &serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::String(s) => Self {
+                s: Some(s.clone()),
+                ..Default::default()
+            },
+            serde_json::Value::Number(n) => Self {
+                f: n.as_f64(),
+                ..Default::default()
+            },
+            serde_json::Value::Bool(b) => Self {
+                b: Some(*b),
+                ..Default::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        self.s.is_none() && self.f.is_none() && self.b.is_none()
+    }
+}
+
+/// Run `spec`'s value constraints against `v`; `Err` carries the detail text.
+fn check_value(spec: &ArgSpec, v: &ConstValue) -> std::result::Result<(), String> {
+    // Numeric range — None = null/non-numeric.
+    if let Some(x) = v.f {
+        if let Some(ge) = spec.ge {
+            if x < ge {
+                return Err(format!("must be >= {}", fmt_bound(ge)));
             }
         }
-
-        // Closed choice set.
-        if let Some(choices) = &spec.choices {
-            if !choices.is_empty() && !const_in_choices(args, pos, choices) {
-                return Err(constraint_err(
-                    spec,
-                    &format!(
-                        "must be one of {}",
-                        serde_json::Value::Array(choices.clone())
-                    ),
-                ));
+        if let Some(le) = spec.le {
+            if x > le {
+                return Err(format!("must be <= {}", fmt_bound(le)));
             }
         }
+        if let Some(gt) = spec.gt {
+            if x <= gt {
+                return Err(format!("must be > {}", fmt_bound(gt)));
+            }
+        }
+        if let Some(lt) = spec.lt {
+            if x >= lt {
+                return Err(format!("must be < {}", fmt_bound(lt)));
+            }
+        }
+    }
 
-        // Regex pattern (string args).
-        if let Some(pattern) = &spec.pattern {
-            if let Some(s) = args.const_str(pos) {
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if !re.is_match(&s) {
-                        return Err(constraint_err(
-                            spec,
-                            &format!("must match pattern {pattern}"),
-                        ));
-                    }
-                }
+    // Closed choice set.
+    if let Some(choices) = &spec.choices {
+        if !choices.is_empty() && !value_in_choices(v, choices) {
+            return Err(format!(
+                "must be one of {}",
+                serde_json::Value::Array(choices.clone())
+            ));
+        }
+    }
+
+    // Regex pattern (string args) — unanchored search, see
+    // [`validate_arg_constraints`].
+    if let (Some(pattern), Some(s)) = (&spec.pattern, &v.s) {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            if !re.is_match(s) {
+                return Err(format!("must match pattern {pattern}"));
             }
         }
     }
@@ -381,31 +468,19 @@ fn fmt_bound(v: f64) -> String {
     }
 }
 
-/// Whether a present const value equals one of the declared choices. A null or
-/// absent const returns true (the choice check is skipped, matching Python).
-fn const_in_choices(
-    args: &crate::arguments::Arguments,
-    pos: usize,
-    choices: &[serde_json::Value],
-) -> bool {
-    let s = args.const_str(pos);
-    let f = args.const_f64(pos);
-    // Only treat as bool when it isn't numeric (const_bool has an int8 fallback).
-    let b = if f.is_none() {
-        args.const_bool(pos)
-    } else {
-        None
-    };
-    if s.is_none() && f.is_none() && b.is_none() {
+/// Whether a present value equals one of the declared choices. A null or
+/// absent value returns true (the choice check is skipped, matching Python).
+fn value_in_choices(v: &ConstValue, choices: &[serde_json::Value]) -> bool {
+    if v.is_null() {
         return true; // null / absent — skip
     }
     choices.iter().any(|c| match c {
-        serde_json::Value::String(cs) => s.as_deref() == Some(cs.as_str()),
-        serde_json::Value::Number(n) => match (n.as_f64(), f) {
-            (Some(a), Some(v)) => a == v,
+        serde_json::Value::String(cs) => v.s.as_deref() == Some(cs.as_str()),
+        serde_json::Value::Number(n) => match (n.as_f64(), v.f) {
+            (Some(a), Some(x)) => a == x,
             _ => false,
         },
-        serde_json::Value::Bool(cb) => b == Some(*cb),
+        serde_json::Value::Bool(cb) => v.b == Some(*cb),
         _ => false,
     })
 }
@@ -964,6 +1039,103 @@ mod constraint_tests {
         let specs = vec![ArgSpec::const_arg("code", 0, "varchar", "").with_pattern("^[A-Z]{2}$")];
         assert!(validate_arg_constraints(&specs, &args_str("AB")).is_ok());
         assert!(validate_arg_constraints(&specs, &args_str("abc")).is_err());
+    }
+
+    fn args_named(name: &str, a: ArrayRef) -> crate::arguments::Arguments {
+        let mut args = crate::arguments::Arguments::default();
+        args.named.insert(name.to_string(), a);
+        args
+    }
+
+    fn named_i64(name: &str, v: i64) -> crate::arguments::Arguments {
+        args_named(name, Arc::new(Int64Array::from(vec![v])))
+    }
+
+    fn named_str(name: &str, v: &str) -> crate::arguments::Arguments {
+        args_named(name, Arc::new(StringArray::from(vec![v])))
+    }
+
+    #[test]
+    fn named_range_enforced() {
+        let specs = vec![ArgSpec::const_arg("step", -1, "int64", "")
+            .with_ge(1.0)
+            .with_le(100.0)];
+        assert!(validate_arg_constraints(&specs, &named_i64("step", 5)).is_ok());
+        let err = validate_arg_constraints(&specs, &named_i64("step", 0)).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+        assert!(err.to_string().contains("must be >= 1"), "{err}");
+        assert!(validate_arg_constraints(&specs, &named_i64("step", 101)).is_err());
+    }
+
+    #[test]
+    fn named_exclusive_range_enforced() {
+        let specs = vec![ArgSpec::const_arg("ratio", -1, "double", "")
+            .with_gt(0.0)
+            .with_lt(1.0)];
+        let ok = args_named(
+            "ratio",
+            Arc::new(arrow_array::Float64Array::from(vec![0.5])),
+        );
+        let bad = args_named(
+            "ratio",
+            Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+        );
+        assert!(validate_arg_constraints(&specs, &ok).is_ok());
+        assert!(validate_arg_constraints(&specs, &bad).is_err());
+    }
+
+    #[test]
+    fn named_choices_enforced() {
+        let specs =
+            vec![ArgSpec::const_arg("unit", -1, "varchar", "").with_choices(["mm", "cm", "m"])];
+        assert!(validate_arg_constraints(&specs, &named_str("unit", "cm")).is_ok());
+        assert!(validate_arg_constraints(&specs, &named_str("unit", "xx")).is_err());
+    }
+
+    #[test]
+    fn named_pattern_enforced() {
+        let specs = vec![ArgSpec::const_arg("code", -1, "varchar", "").with_pattern("^[A-Z]{2}$")];
+        assert!(validate_arg_constraints(&specs, &named_str("code", "AB")).is_ok());
+        assert!(validate_arg_constraints(&specs, &named_str("code", "abc")).is_err());
+    }
+
+    #[test]
+    fn pattern_is_unanchored_search() {
+        let specs = vec![ArgSpec::const_arg("s", -1, "varchar", "").with_pattern("[0-9]")];
+        assert!(validate_arg_constraints(&specs, &named_str("s", "ab1cd")).is_ok());
+        assert!(validate_arg_constraints(&specs, &named_str("s", "abcd")).is_err());
+        let pos = vec![ArgSpec::const_arg("s", 0, "varchar", "").with_pattern("[0-9]")];
+        assert!(validate_arg_constraints(&pos, &args_str("ab1cd")).is_ok());
+    }
+
+    #[test]
+    fn named_null_skips_constraints() {
+        let specs = vec![ArgSpec::const_arg("step", -1, "int64", "").with_ge(1.0)];
+        let null = args_named("step", Arc::new(Int64Array::from(vec![None::<i64>])));
+        assert!(validate_arg_constraints(&specs, &null).is_ok());
+    }
+
+    #[test]
+    fn absent_named_with_valid_default_passes() {
+        let specs = vec![ArgSpec::const_arg("step", -1, "int64", "")
+            .with_ge(1.0)
+            .with_default(10)];
+        let empty = crate::arguments::Arguments::default();
+        assert!(validate_arg_constraints(&specs, &empty).is_ok());
+        // Absent without a default also passes.
+        let no_default = vec![ArgSpec::const_arg("step", -1, "int64", "").with_ge(1.0)];
+        assert!(validate_arg_constraints(&no_default, &empty).is_ok());
+    }
+
+    #[test]
+    fn absent_named_with_violating_default_fails() {
+        let specs = vec![ArgSpec::const_arg("unit", -1, "varchar", "")
+            .with_choices(["mm", "cm"])
+            .with_default("km")];
+        let err =
+            validate_arg_constraints(&specs, &crate::arguments::Arguments::default()).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{err}");
+        assert!(err.to_string().contains("declared default"), "{err}");
     }
 
     #[test]

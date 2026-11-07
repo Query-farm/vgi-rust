@@ -102,6 +102,36 @@
 //! [`ProcessParams`] carries per-call context (settings, secrets, pushdown
 //! hints) into the work method.
 //!
+//! ## Multi-batch table producers must be resumable over HTTP
+//!
+//! Over the HTTP transport every response carries **one** batch, and the next
+//! turn rebuilds the producer from a continuation token. A table producer that
+//! returns more than one batch from `next_batch` therefore **must** serialize
+//! its scan position, or the scan fails over HTTP with "cannot serve an HTTP
+//! continuation" (pipe / unix / tcp are unaffected). The SDK does not drain a
+//! multi-batch producer inside the first HTTP turn. Name the fields that
+//! advance with [`resume_fields!`]:
+//!
+//! ```ignore
+//! impl TableProducer for MyProducer {
+//!     fn next_batch(&mut self, out: &mut OutputCollector) -> Result<Option<RecordBatch>> { ... }
+//!     vgi::resume_fields!(cursor, rows_emitted);
+//! }
+//! ```
+//!
+//! or implement `resume_supported` / `encode_resume` / `restore_resume` by hand.
+//! Single-batch producers need nothing.
+//!
+//! ## Argument constraints are enforced at bind time
+//!
+//! [`ArgSpec`] constraints (`with_choices`, `with_ge`/`le`/`gt`/`lt`,
+//! `with_pattern`) are advertised through `vgi_function_arguments()` **and**
+//! enforced before `on_bind` runs, for positional const args and named-only
+//! (`position = -1`) args alike; an absent named arg is checked via its declared
+//! `with_default`. Violations fail with `INVALID_ARGUMENT`. `pattern` is an
+//! **unanchored search** (JSON Schema / ECMA-262 semantics, the same in every
+//! VGI SDK) — anchor with `^…$` to require a full match.
+//!
 //! # Beyond functions
 //!
 //! [`Worker::set_catalog`] exposes a full catalog — schemas, function-backed

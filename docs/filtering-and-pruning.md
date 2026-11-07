@@ -115,7 +115,10 @@ widens unsupported expressions, arithmetic/cast inversion, nested-field domains,
 and Arrow types without a supported scalar ordering. For example, `x IN (1, 3)`
 may return `[1, 3]`, retaining `2` as an extra candidate. Domains are not exact
 filters or selectivity estimates. The older integer-only `get_column_bounds`
-helper remains available; new pruning code should use this API.
+helper is deprecated: it casts every literal to `i64`, truncating float and
+decimal bounds. New pruning code should use this API; to read the raw typed
+literal of each `column <op> literal` comparison, use
+`PushdownFilters::constant_filters()` (or `get_column_constant_filters(col)`).
 
 Both methods read the current filter state after each applied delta. Recompute
 when filters change instead of caching a domain or candidate mask indefinitely.

@@ -586,6 +586,10 @@ fn non_resumable_scan_is_refused_over_http() {
         "expected a resumability refusal naming the cause"
     );
     assert!(
+        text.contains("vgi::resume_fields!"),
+        "the refusal must name the one-line fix"
+    );
+    assert!(
         r.values.len() < count as usize,
         "a refused scan must not claim to have returned every row"
     );

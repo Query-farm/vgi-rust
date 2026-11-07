@@ -5525,9 +5525,11 @@ impl vgi_rpc::ProducerState for TableProducerState {
                      HTTP continuation: it does not serialize a scan position, so \
                      resuming would restart it at row 0 and repeat rows already sent. \
                      vgi-rpc's lock-step producer protocol allows one batch per \
-                     response. Use a byte-stream transport (pipe / unix / tcp), or \
-                     implement resume_supported/encode_resume/restore_resume on the \
-                     producer.",
+                     response. Make the producer resumable — add \
+                     `vgi::resume_fields!(cursor, ...)` naming the fields that \
+                     advance, or implement resume_supported/encode_resume/\
+                     restore_resume — or use a byte-stream transport \
+                     (pipe / unix / tcp).",
                     self.producer_label()
                 )));
             }
@@ -5572,7 +5574,9 @@ impl vgi_rpc::ProducerState for TableProducerState {
                  a scan position, so resuming would restart it at row 0 and repeat rows \
                  already sent. vgi-rpc's lock-step producer protocol requires a resumable \
                  producer for any stream emitting more than one batch. Use a byte-stream \
-                 transport (pipe / unix / tcp), or implement resume on the producer.",
+                 transport (pipe / unix / tcp), or make the producer resumable with \
+                 `vgi::resume_fields!(cursor, ...)` (or resume_supported/encode_resume/\
+                 restore_resume).",
             )),
             Some(bytes) => {
                 // Re-encode the (static) bind blob with the producer's CURRENT
