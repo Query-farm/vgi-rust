@@ -673,6 +673,8 @@ fn apply_metadata(fi: &mut FunctionInfo, meta: &FunctionMetadata) -> Result<()> 
     fi.streaming_partitioned = meta.streaming_partitioned;
     fi.late_materialization = Some(meta.late_materialization);
     fi.required_settings = meta.required_settings.clone();
+    crate::secrets::validate_lookups(&meta.required_secrets)
+        .map_err(|e| vgi_rpc::RpcError::value_error(format!("function '{}': {e}", fi.name)))?;
     fi.required_secrets = meta
         .required_secrets
         .iter()
@@ -2059,6 +2061,51 @@ mod tests {
             let err = apply_metadata(&mut info, &invalid).unwrap_err();
             assert!(err.to_string().contains("filter"));
         }
+    }
+
+    #[test]
+    fn required_secrets_every_form_is_advertised_and_empty_type_rejected() {
+        use crate::secrets::SecretLookup;
+        let meta = FunctionMetadata {
+            required_secrets: vec![
+                "vgi_example".into(),
+                SecretLookup::of_type("vgi_example").with_scope("vgi-conformance://a/"),
+                SecretLookup::of_type("s3").with_name("prod"),
+            ],
+            ..Default::default()
+        };
+        let mut info = default_function_info("f", "table");
+        apply_metadata(&mut info, &meta).unwrap();
+        let got: Vec<_> = info
+            .required_secrets
+            .iter()
+            .map(|r| {
+                (
+                    r.secret_type.as_str(),
+                    r.scope.as_deref(),
+                    r.secret_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("vgi_example", None, None),
+                ("vgi_example", Some("vgi-conformance://a/"), None),
+                ("s3", None, Some("prod")),
+            ]
+        );
+
+        let bad = FunctionMetadata {
+            required_secrets: vec!["".into()],
+            ..Default::default()
+        };
+        let mut info = default_function_info("needs_secret", "table");
+        let err = apply_metadata(&mut info, &bad).unwrap_err().to_string();
+        assert!(
+            err.contains("needs_secret") && err.contains("secret_type"),
+            "{err}"
+        );
     }
 
     #[test]

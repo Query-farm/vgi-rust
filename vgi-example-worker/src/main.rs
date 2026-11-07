@@ -28,6 +28,7 @@ mod narrow_bind;
 mod same_name;
 mod scalar;
 mod secret_cache;
+mod secret_lookup;
 mod table;
 mod table_in_out;
 mod ticket_probe;
@@ -67,6 +68,8 @@ fn main() {
     // Secret-dependent cacheable fixtures, one per kind (producer / scalar /
     // blended map): cached per secret fingerprint. See secret_cache.rs.
     secret_cache::register(&mut worker);
+    // Secret-lookup conformance fixtures (vgi docs/secret_lookup_fixtures.md).
+    secret_lookup::register(&mut worker);
     buffering::register(&mut worker);
     aggregate::register(&mut worker);
     register_secrets_and_settings(&mut worker);

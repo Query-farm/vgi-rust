@@ -1120,6 +1120,7 @@ impl Dispatcher {
             // C++ resolves them and re-binds with `resolved_secrets_provided`.
             if !params.resolved_secrets_provided {
                 let lookups = f.secret_lookups(&params);
+                crate::secrets::validate_lookups(&lookups)?;
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
@@ -1172,6 +1173,7 @@ impl Dispatcher {
             // `process` via `params.secrets`.
             if !params.resolved_secrets_provided {
                 let lookups = f.secret_lookups(&params);
+                crate::secrets::validate_lookups(&lookups)?;
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
@@ -1224,6 +1226,7 @@ impl Dispatcher {
             // C++ resolves them and re-binds with `resolved_secrets_provided`.
             if !params.resolved_secrets_provided {
                 let lookups = f.secret_lookups(&params);
+                crate::secrets::validate_lookups(&lookups)?;
                 if !lookups.is_empty() {
                     let resp = BindResponse {
                         output_schema: Bytes::from(Vec::new()),
@@ -1272,6 +1275,7 @@ impl Dispatcher {
         // Two-phase secret resolution.
         if !params.resolved_secrets_provided {
             let lookups = f.secret_lookups(&params);
+            crate::secrets::validate_lookups(&lookups)?;
             if !lookups.is_empty() {
                 let resp = BindResponse {
                     output_schema: Bytes::from(Vec::new()),

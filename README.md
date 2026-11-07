@@ -217,6 +217,16 @@ unaffected; single-batch producers need nothing.
 absent named arg is checked via its `with_default`. `pattern` is an
 **unanchored search** (JSON Schema semantics) — use `^…$` for a full match.
 
+**Select secrets by type, not by column name.** Resolved secrets arrive keyed by
+their unique DuckDB *name* (an unnamed `CREATE SECRET (TYPE s3, ...)` is
+`__default_s3`), so `params.secrets.by_name.get("s3")` misses most of them. Use
+`Secrets::get` / `lookup` (by type: unscoped first, else first by name),
+`Secrets::require` (fails the bind naming the type), `Secrets::named(name, type)`
+and `Secrets::for_scope_of_type(path, type)` (longest scope prefix, unscoped
+fallback). Declare requirements as `required_secrets: vec!["s3".into()]` or
+`SecretLookup::of_type("s3").with_scope("s3://bucket/")`; a lookup with an empty
+type is rejected rather than silently sent.
+
 A table-in-out function answers each input batch with one reply. To answer one
 input with several (one upstream API page per reply), emit each but the last with
 `EmitOptions { more: true, .. }`, record where to pick up with
