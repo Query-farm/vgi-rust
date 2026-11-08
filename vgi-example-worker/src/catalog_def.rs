@@ -321,17 +321,20 @@ fn planned_days_tables() -> Vec<CatTable> {
                 days.push(day);
             }
         }
-        // Record what the worker saw so tests can assert the predicates arrived.
-        // Byte-identical to vgi-python's `json.dump` (key order, separators).
-        let record = format!(
-            r#"{{"received_filters": {}, "days": [{}]}}"#,
-            request.pushdown_filters.is_some(),
-            days.iter()
-                .map(|d| format!("\"2026-10-{:02}\"", d + 1))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let _ = std::fs::write(branch_path("planned_days_last_plan.json"), record);
+        // Record the days a FILTERED planning call kept, so tests can assert the
+        // predicates arrived. Unfiltered calls (e.g. `vgi_table_branches()` from
+        // concurrently running tests) must not overwrite it. Byte-identical to
+        // vgi-python's `json.dump` (key order, separators).
+        if request.pushdown_filters.is_some() {
+            let record = format!(
+                r#"{{"received_filters": true, "days": [{}]}}"#,
+                days.iter()
+                    .map(|d| format!("\"2026-10-{:02}\"", d + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = std::fs::write(branch_path("planned_days_last_plan.json"), record);
+        }
         let files: Vec<String> = days.iter().map(|d| planned_day_file(*d)).collect();
         let branches = if files.is_empty() {
             Vec::new()
