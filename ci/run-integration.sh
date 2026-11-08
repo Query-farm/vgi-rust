@@ -221,7 +221,6 @@ case "$TRANSPORT" in
   stdio)
     # Subprocess transport (the primary lane). Every query spawns a fresh worker.
     export VGI_TEST_WORKER="$VGI_WORKER_BIN"
-    export VGI_TEST_DEDICATED_WORKER="$VGI_WORKER_BIN"
     if [ "$WINDOWS" = "0" ]; then
       export VGI_VERSIONED_WORKER="$WV"
       export VGI_VERSIONED_TABLES_WORKER="$WVT"
@@ -234,7 +233,6 @@ case "$TRANSPORT" in
   launch)
     # AF_UNIX launcher transport (pooled workers). Unix-only.
     export VGI_TEST_WORKER="launch:${VGI_WORKER_BIN}"
-    export VGI_TEST_DEDICATED_WORKER="$VGI_WORKER_BIN"
     export VGI_REQUIRE_LAUNCHER_TRANSPORT=1
     export VGI_VERSIONED_WORKER="launch:${WV}"
     export VGI_VERSIONED_TABLES_WORKER="launch:${WVT}"
@@ -335,10 +333,12 @@ rc=0
 # (VGI_SECRET_LOOKUP_FIXTURES, vgi-example-worker/src/secret_lookup.rs),
 # and by 5 more for the five writable_tx/*.test files
 # (VGI_WRITABLE_TX_FIXTURES, vgi-example-worker/src/txfix.rs).
+# stdio and launch each dropped by 2 when table_buffering_{worker_crash,
+# pool_recovery}.test moved to vgi test_deferred/crash_recovery/.
 TOTAL_EXECUTED=0
 case "$TRANSPORT" in
-  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-265}" ;;
-  launch) MIN_EXECUTED="${MIN_EXECUTED:-270}" ;;
+  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-263}" ;;
+  launch) MIN_EXECUTED="${MIN_EXECUTED:-268}" ;;
   http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-255}"; else MIN_EXECUTED="${MIN_EXECUTED:-260}"; fi ;;
 esac
 
