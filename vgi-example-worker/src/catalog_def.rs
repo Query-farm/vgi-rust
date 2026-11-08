@@ -248,7 +248,8 @@ fn branch_dir() -> String {
 
 /// Protocol 3.2 filtered scan planning fixtures
 /// (`test/sql/integration/catalog/scan_planning_*.test`): five days of data,
-/// one parquet file per day under `{branch_dir}/planned_days/`. The tests
+/// one parquet file per day, `{branch_dir}/planned_days_<YYYY-MM-DD>.parquet`
+/// (flat: the tests' DuckDB `COPY` cannot create directories). The tests
 /// create the files for the first four days only — the 2026-10-05 file never
 /// exists, so any scan that fails to prune that day errors with "No files
 /// found", and a passing query proves the pruning happened. Mirrors
@@ -256,12 +257,8 @@ fn branch_dir() -> String {
 const PLANNED_DAYS_FIRST: i32 = 20_727; // 2026-10-01 as days since the epoch
 const PLANNED_DAYS: i32 = 5;
 
-fn planned_dir() -> String {
-    branch_path("planned_days")
-}
-
 fn planned_day_file(day: i32) -> String {
-    format!("{}/2026-10-{:02}.parquet", planned_dir(), day + 1)
+    branch_path(&format!("planned_days_2026-10-{:02}.parquet", day + 1))
 }
 
 fn planned_day_stats(day: i32) -> Vec<vgi::statistics::CatColStat> {
@@ -325,15 +322,16 @@ fn planned_days_tables() -> Vec<CatTable> {
             }
         }
         // Record what the worker saw so tests can assert the predicates arrived.
-        let record = serde_json::json!({
-            "received_filters": request.pushdown_filters.is_some(),
-            "days": days.iter().map(|d| format!("2026-10-{:02}", d + 1)).collect::<Vec<_>>(),
-        });
-        let _ = std::fs::create_dir_all(planned_dir());
-        let _ = std::fs::write(
-            format!("{}/last_plan.json", planned_dir()),
-            record.to_string(),
+        // Byte-identical to vgi-python's `json.dump` (key order, separators).
+        let record = format!(
+            r#"{{"received_filters": {}, "days": [{}]}}"#,
+            request.pushdown_filters.is_some(),
+            days.iter()
+                .map(|d| format!("\"2026-10-{:02}\"", d + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+        let _ = std::fs::write(branch_path("planned_days_last_plan.json"), record);
         let files: Vec<String> = days.iter().map(|d| planned_day_file(*d)).collect();
         let branches = if files.is_empty() {
             Vec::new()
@@ -1050,6 +1048,16 @@ fn data_tables() -> Vec<CatTable> {
         t
     };
     tables.extend(planned_days_tables());
+    // Protocol 3.2: branch_filter must be ONE expression. "n < 5, n > 2" parses
+    // as two; 3.1 clients silently kept the first, a 3.2 client rejects it.
+    tables.push(mb(
+        "multi_branch_comma_filter",
+        "Protocol 3.2: multi-expression branch_filter is rejected",
+        vec![vgi::catalog::CatBranch {
+            branch_filter: Some("n < 5, n > 2".to_string()),
+            ..seq(10)
+        }],
+    ));
     tables.push(mb(
         "multi_branch_numbers",
         "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",
