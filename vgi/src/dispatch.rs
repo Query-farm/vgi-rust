@@ -367,6 +367,10 @@ pub struct Dispatcher {
     /// worker. `None` everywhere else, where every ticket is
     /// `attach_ticket_invalid`.
     pub(crate) ticket_key: Option<Vec<u8>>,
+    /// Root of the key secret ATTACH options are encrypted under
+    /// ([`crate::attach_options`]): the explicitly configured key, else the
+    /// HTTP signing key. `None`: the host-local key file.
+    pub(crate) secret_root: Option<Vec<u8>>,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -414,6 +418,7 @@ impl Dispatcher {
             stored: Vec::new(),
             opaque: None,
             ticket_key: None,
+            secret_root: None,
         }
     }
 
@@ -2432,15 +2437,20 @@ impl Dispatcher {
             let mut scope = self.next_execution_id();
             debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
             let options = attach_options_record(&dto)?;
+            let (plain, secret) = self.split_attach_options(sec, options.as_ref());
             if let Some(hook) = &sec.attach_payload {
-                scope.extend_from_slice(&hook(options.as_ref())?);
+                let payload = hook(options.as_ref())?;
+                refuse_secret_in_payload(&sec.name, &payload, secret.as_ref())?;
+                scope.extend_from_slice(&payload);
             }
             let supports_transactions = supports_transactions_for(sec, options.as_ref())?;
+            let mut value = encode_secondary_opaque(&sec.name, &scope);
+            self.append_options_trailer(&mut value, None, plain.as_ref(), secret.as_ref())?;
             let result = CatalogAttachResult {
                 catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
                 selected_capabilities: agreement.map(|value| value.1),
                 query_pushdown: None,
-                attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
+                attach_opaque_data: Bytes::from(value),
                 supports_transactions,
                 supports_time_travel: sec.supports_time_travel,
                 catalog_version_frozen: sec.catalog_version_frozen,
@@ -2471,7 +2481,13 @@ impl Dispatcher {
         // attach_opaque_data (`<version>\0<id>`) so per-request catalog handlers
         // can select the right object set without server-side session state.
         let options_record = attach_options_record(&dto)?;
-        let attach_opaque_data = if let Some(hook) = &self.catalog.attach_payload {
+        let (plain_options, secret_options) =
+            self.split_attach_options(&self.catalog, options_record.as_ref());
+        // The attach's fresh 16-byte id (sealing rule 6): the id of the
+        // declarative-options record, and what the secret options are bound to.
+        let attach_uuid: [u8; crate::attach_options::ATTACH_UUID_LEN] = rand::random();
+        let mut format_a = false;
+        let mut attach_opaque_data = if let Some(hook) = &self.catalog.attach_payload {
             // The main-catalog attach hook: the payload rides the same
             // `<marker><name>\0<session id><payload>` encoding a secondary
             // catalog's does, so `attach_payload()` reads both.
@@ -2485,7 +2501,9 @@ impl Dispatcher {
                 )));
             }
             let mut scope = self.next_execution_id();
-            scope.extend_from_slice(&hook(options_record.as_ref())?);
+            let payload = hook(options_record.as_ref())?;
+            refuse_secret_in_payload(&dto.name, &payload, secret_options.as_ref())?;
+            scope.extend_from_slice(&payload);
             encode_secondary_opaque(self.primary_catalog_name(), &scope)
         } else if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
             // Merge the user-supplied options over the declared defaults and
@@ -2496,7 +2514,8 @@ impl Dispatcher {
                 .as_ref()
                 .map(|b| ipc::read_batch(&b.0))
                 .transpose()?;
-            // Secret options never enter the value, sealed or not: it is
+            // Secret options never enter this record, sealed or not (they
+            // travel encrypted in the options trailer instead): it is
             // also persisted server-side (`bufattach`) and, on an OS-owned
             // transport, travels in plaintext.
             let secret = catalog::secret_attach_option_names(&self.catalog.attach_option_specs);
@@ -2527,13 +2546,8 @@ impl Dispatcher {
                 .collect::<Result<_>>()?;
             let merged = RecordBatch::try_new(default_batch.schema(), cols)
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-            let id = self.attach_bytes();
-            let mut v: Vec<u8> = id
-                .iter()
-                .copied()
-                .chain(std::iter::repeat(0))
-                .take(16)
-                .collect();
+            format_a = true;
+            let mut v: Vec<u8> = attach_uuid.to_vec();
             v.push(0);
             v.extend_from_slice(&ipc::write_batch(&merged)?);
             v
@@ -2553,6 +2567,19 @@ impl Dispatcher {
         } else {
             self.attach_bytes()
         };
+        // The declarative-options record already carries the non-secret
+        // options; otherwise the trailer does.
+        let plain_for_trailer = if format_a {
+            None
+        } else {
+            plain_options.as_ref()
+        };
+        self.append_options_trailer(
+            &mut attach_opaque_data,
+            Some(&attach_uuid),
+            plain_for_trailer,
+            secret_options.as_ref(),
+        )?;
         let agreement = self.catalog.capability_agreement_for(
             dto.client_capabilities
                 .as_ref()
@@ -2605,6 +2632,45 @@ impl Dispatcher {
                 .unwrap_or(self.catalog_contents),
         };
         Ok(Some(wire::to_result_batch(result)?))
+    }
+
+    /// `options` split into the non-secret and the secret (supplied, non-NULL)
+    /// options `model` declares.
+    fn split_attach_options(
+        &self,
+        model: &catalog::CatalogModel,
+        options: Option<&RecordBatch>,
+    ) -> (Option<RecordBatch>, Option<RecordBatch>) {
+        match options {
+            Some(o) => crate::attach_options::split_secret(
+                o,
+                &catalog::secret_attach_option_names(&model.attach_option_specs),
+            ),
+            None => (None, None),
+        }
+    }
+
+    /// Append the SDK's options trailer (see [`crate::attach_options`]) to an
+    /// attach value when there is anything to carry, bound to `uuid` (a
+    /// fresh one when `None`).
+    fn append_options_trailer(
+        &self,
+        value: &mut Vec<u8>,
+        uuid: Option<&[u8; crate::attach_options::ATTACH_UUID_LEN]>,
+        plain: Option<&RecordBatch>,
+        secret: Option<&RecordBatch>,
+    ) -> Result<()> {
+        if plain.is_none() && secret.is_none() {
+            return Ok(());
+        }
+        let uuid = uuid.copied().unwrap_or_else(rand::random);
+        value.extend(crate::attach_options::encode_trailer(
+            &uuid,
+            plain,
+            secret,
+            self.secret_root.as_deref(),
+        )?);
+        Ok(())
     }
 
     /// IPC-serialized `FunctionInfo` records for the primary catalog's
@@ -5877,6 +5943,30 @@ pub fn attach_payload(attach_opaque_data: &[u8]) -> Option<Vec<u8>> {
     secondary_attach_payload(attach_opaque_data)
 }
 
+/// Refuse an attach payload that carries a secret option's value in
+/// plaintext: secrets reach functions through
+/// [`crate::attach_options::attach_options`], encrypted. (Values shorter than
+/// 4 bytes are not checked: too likely to match by accident.)
+fn refuse_secret_in_payload(
+    catalog_name: &str,
+    payload: &[u8],
+    secret: Option<&RecordBatch>,
+) -> Result<()> {
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    for value in crate::attach_options::secret_value_bytes(secret) {
+        if value.len() >= 4 && payload.windows(value.len()).any(|w| w == value.as_slice()) {
+            return Err(RpcError::value_error(format!(
+                "catalog '{catalog_name}': the attach_payload hook returned a secret attach \
+                 option's value; secrets reach functions encrypted through \
+                 vgi::attach_options::attach_options, never in attach bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The attach request's one-row options record (`None` when it named none).
 fn attach_options_record(dto: &CatalogAttachRequest) -> Result<Option<RecordBatch>> {
     dto.options
@@ -5910,7 +6000,7 @@ fn encode_secondary_opaque(name: &str, scope: &[u8]) -> Vec<u8> {
 /// Decode a secondary-catalog attach blob into `(catalog_name, scope)`, or
 /// `None` when the marker is absent (a primary/version-shaped catalog).
 fn decode_secondary_opaque(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
-    let rest = bytes.strip_prefix(SEC_MARKER)?;
+    let rest = crate::attach_options::strip_trailer(bytes).strip_prefix(SEC_MARKER)?;
     let sep = rest.iter().position(|&b| b == 0)?;
     let name = String::from_utf8(rest[..sep].to_vec()).ok()?;
     Some((name, rest[sep + 1..].to_vec()))

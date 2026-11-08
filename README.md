@@ -274,11 +274,17 @@ writable table with constraint records makes the catalog negotiate
 `BindParams::transaction_opaque_data` and `ProcessParams::transaction_opaque_data`
 — on every transport, including HTTP where the SDK seals it on the wire.
 
-`CatalogModel::attach_payload` (main or secondary catalog) turns the ATTACH
-options — secret ones included — into bytes that ride in `attach_opaque_data`
-(sealed over HTTP); functions and hooks read them with
-`vgi::catalog::attach_payload`. See `vgi-example-worker/src/txfix.rs` for all
-three together.
+Every ATTACH option — **secret ones included** — reaches functions and
+transaction hooks through one accessor, `vgi::attach_options::attach_options(
+params.attach_opaque_data...)`. Options declared `secret` (API keys, tokens) are
+encrypted by the SDK inside `attach_opaque_data` with a key the client never
+has (an HKDF subkey of `Worker::attach_secret_key`, else the HTTP signing key,
+else a host-local key file shared by VGI workers on the host), so they are
+never in plaintext on any transport. Never copy a secret into your own attach
+bytes: `CatalogModel::attach_payload` is for the catalog's own non-secret bytes
+(read back with `vgi::catalog::attach_payload`) and refuses a payload that
+contains a secret value. See `vgi-example-worker/src/txfix.rs` for all of it
+together.
 
 ## Transports
 

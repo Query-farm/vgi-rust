@@ -24,7 +24,7 @@ concurrency:
 
 env:
   # Match the test suite to the native runner built from this exact revision.
-  VGI_REF: c4a9fea7668b4a85d22dd439ba2888e3a409925c
+  VGI_REF: 22140b06cd7967c1f43d4b59a231716fe3a9423f
   VGI_NATIVE_RUNNER_BRANCH: v2.0
 
 jobs:

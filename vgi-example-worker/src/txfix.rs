@@ -7,9 +7,10 @@
 //! Built only from the SDK's public API:
 //!
 //! - ATTACH options `transactional` (BOOLEAN, default false) and `token`
-//!   (VARCHAR, **secret**), packed by the main catalog's
-//!   [`attach_payload`](vgi::catalog::CatalogModel::attach_payload) hook and
-//!   read back in every function with [`vgi::catalog::attach_payload`];
+//!   (VARCHAR, **secret**), read in every function and hook with
+//!   [`vgi::attach_options::attach_options`] — the SDK encrypts the secret
+//!   `token` inside `attach_opaque_data`, so it is never there in plaintext
+//!   (`whoami().token_in_attach_data` checks that);
 //! - `main.items` declares an UPDATE function and its result mode through
 //!   [`CatTable::writes`](vgi::catalog::CatTable::writes); its scan emits the
 //!   row id ([`vgi::write_results::row_id_field`]) with projection pushdown;
@@ -54,7 +55,6 @@ use vgi_rpc::{Result, RpcError};
 
 /// The catalog's name (and `VGI_WORKER_CATALOG_NAME` that selects it).
 pub const CATALOG_NAME: &str = "txfix";
-const MAGIC: &[u8] = b"txfix1:";
 
 fn err(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
@@ -63,7 +63,7 @@ fn err(e: impl std::fmt::Display) -> RpcError {
 // ------------------------------------------------------------ ATTACH options
 
 /// The attach's options as every function sees them.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct AttachOptions {
     token: Option<String>,
     transactional: bool,
@@ -104,22 +104,17 @@ fn options_of(options: Option<&RecordBatch>) -> AttachOptions {
     }
 }
 
-/// The main catalog's attach hook: the options (secret `token` included)
-/// become this attach's payload. Sealed on the wire over HTTP.
-fn encode_attach(options: Option<&RecordBatch>) -> Result<Vec<u8>> {
-    let mut out = MAGIC.to_vec();
-    out.extend(serde_json::to_vec(&options_of(options)).map_err(err)?);
-    Ok(out)
-}
-
+/// The attach's options through the SDK's public accessor (the secret `token`
+/// decrypted). An attach that named no option has none.
 fn decode_attach(attach_opaque_data: Option<&[u8]>) -> Result<AttachOptions> {
-    attach_opaque_data
-        .and_then(vgi::catalog::attach_payload)
-        .and_then(|p| p.strip_prefix(MAGIC).map(<[u8]>::to_vec))
-        .and_then(|json| serde_json::from_slice(&json).ok())
-        .ok_or_else(|| {
-            RpcError::value_error("txfix: attach_opaque_data missing or not minted by this worker")
-        })
+    let opts = vgi::attach_options::attach_options(attach_opaque_data.unwrap_or_default())?;
+    Ok(AttachOptions {
+        token: opts.as_ref().and_then(|o| o.string("token")),
+        transactional: opts
+            .as_ref()
+            .and_then(|o| o.boolean("transactional"))
+            .unwrap_or(false),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -595,16 +590,25 @@ fn whoami_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("token", DataType::Utf8, true),
         Field::new("transactional", DataType::Boolean, true),
+        Field::new("token_in_attach_data", DataType::Boolean, true),
     ]))
 }
 
 fn whoami_rows(p: &ProcessParams) -> Result<RecordBatch> {
-    let o = decode_attach(p.attach_opaque_data.as_deref())?;
+    let raw = p.attach_opaque_data.as_deref().unwrap_or_default();
+    let o = decode_attach(Some(raw))?;
+    // Whether the token's bytes appear in the attach bytes this function was
+    // handed (opened on HTTP, raw elsewhere): they must not.
+    let in_data = o
+        .token
+        .as_ref()
+        .map(|t| !t.is_empty() && raw.windows(t.len()).any(|w| w == t.as_bytes()));
     RecordBatch::try_new(
         whoami_schema(),
         vec![
             Arc::new(StringArray::from(vec![o.token])),
             Arc::new(BooleanArray::from(vec![o.transactional])),
+            Arc::new(BooleanArray::from(vec![in_data.unwrap_or(false)])),
         ],
     )
     .map_err(err)
@@ -837,7 +841,6 @@ pub fn catalog() -> CatalogModel {
                 .to_string(),
         ),
         attach_option_specs: vec![transactional, token],
-        attach_payload: Some(Arc::new(encode_attach)),
         transactions: Some(Arc::new(TxfixTransactions)),
         schemas: vec![CatSchema {
             name: "main".to_string(),
@@ -912,18 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_options_round_trip_through_the_payload() {
-        let o = options(Some("tok-123"), Some(true));
-        let payload = encode_attach(Some(&o)).unwrap();
-        assert!(payload.starts_with(MAGIC));
-        let decoded: AttachOptions = serde_json::from_slice(&payload[MAGIC.len()..]).unwrap();
-        assert_eq!(
-            decoded,
-            AttachOptions {
-                token: Some("tok-123".into()),
-                transactional: true
-            }
-        );
+    fn transactions_are_decided_by_the_transactional_option() {
         assert!(TxfixTransactions
             .supports_transactions(Some(&options(Some("x"), Some(true))))
             .unwrap());

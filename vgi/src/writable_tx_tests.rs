@@ -589,6 +589,118 @@ fn the_exchange_blob_keeps_the_transaction_across_http_continuations() {
     assert_eq!(back.transaction_opaque_data, vec![7; 16]);
 }
 
+// ------------------------------------------------------- secret options
+
+fn secret_spec(name: &str) -> Vec<u8> {
+    catalog::serialize_attach_option_spec_with_flags(
+        name,
+        "a credential",
+        &DataType::Utf8,
+        None,
+        catalog::AttachOptionFlags {
+            required: false,
+            secret: true,
+        },
+    )
+    .unwrap()
+}
+
+fn with_column(batch: &RecordBatch, name: &str, value: &str) -> RecordBatch {
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut cols = batch.columns().to_vec();
+    fields.push(Field::new(name, DataType::Utf8, true));
+    cols.push(Arc::new(StringArray::from(vec![value])));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Stdio-style (no sealer): the secret is encrypted in the value the client
+/// holds and functions get, and the accessor returns it with the plain options.
+#[test]
+fn secret_options_are_encrypted_and_read_through_the_accessor() {
+    let secret = "sk-stdio-secret-value";
+    let opts = with_column(&options("t", Some(true)), "api_key", secret);
+    let mut plain = Dispatcher::new("cat");
+    plain.secret_root = Some(b"test-root".to_vec());
+    plain.set_catalog(CatalogModel {
+        name: "cat".into(),
+        attach_option_specs: vec![secret_spec("api_key")],
+        ..Default::default()
+    });
+    let mut sec_model = model(&Log::default(), false);
+    sec_model.name = "sec".into();
+    sec_model.attach_payload = None;
+    sec_model.attach_option_specs = vec![secret_spec("api_key")];
+    plain.register_secondary_catalog(sec_model, Vec::new());
+    for name in ["cat", "sec"] {
+        let a = attach_with(&plain, name, Some(&opts), None)
+            .unwrap()
+            .attach_opaque_data
+            .0;
+        assert!(!contains(&a, secret.as_bytes()), "{name}: plaintext secret");
+        let got = crate::attach_options::attach_options(&a).unwrap().unwrap();
+        assert_eq!(got.string("api_key").as_deref(), Some(secret), "{name}");
+        assert_eq!(got.string("token").as_deref(), Some("t"), "{name}");
+        assert_eq!(got.boolean("transactional"), Some(true), "{name}");
+    }
+    // Declarative defaults (`<uuid>\0<ipc>`): defaults merged, secret added.
+    let mut d = Dispatcher::new("cat");
+    d.secret_root = Some(b"test-root".to_vec());
+    d.set_catalog(CatalogModel {
+        name: "cat".into(),
+        attach_option_specs: vec![secret_spec("api_key")],
+        attach_options_default_batch: Some(
+            ipc::write_batch(&with_column(&options("dflt", None), "api_key", "")).unwrap(),
+        ),
+        ..Default::default()
+    });
+    let supplied = with_column(&options("x", None), "api_key", secret);
+    let a = attach_with(&d, "cat", Some(&supplied), None)
+        .unwrap()
+        .attach_opaque_data
+        .0;
+    assert!(!contains(&a, secret.as_bytes()));
+    // A hand-written `<16-byte id>\0<ipc>` reader still parses the record.
+    let legacy = ipc::read_batch(&a[17..]).unwrap();
+    assert!(legacy.column_by_name("api_key").is_none());
+    let got = crate::attach_options::attach_options(&a).unwrap().unwrap();
+    assert_eq!(got.string("token").as_deref(), Some("x"));
+    assert_eq!(got.string("api_key").as_deref(), Some(secret));
+    // Two attaches get distinct ids (sealing rule 6).
+    let b = attach_with(&d, "cat", None, None)
+        .unwrap()
+        .attach_opaque_data
+        .0;
+    assert_ne!(a[..16], b[..16]);
+}
+
+#[test]
+fn an_attach_payload_carrying_a_secret_is_refused() {
+    let mut d = Dispatcher::new("cat");
+    d.secret_root = Some(b"test-root".to_vec());
+    d.set_catalog(CatalogModel {
+        name: "cat".into(),
+        attach_option_specs: vec![secret_spec("token")],
+        attach_payload: Some(Arc::new(token_payload)),
+        ..Default::default()
+    });
+    let err = attach_with(&d, "cat", Some(&options("sk-leaky-secret", None)), None).unwrap_err();
+    assert!(
+        err.message.contains("secret attach option"),
+        "{}",
+        err.message
+    );
+    assert!(!err.message.contains("sk-leaky-secret"));
+}
+
 // ------------------------------------------------------------- over HTTP
 
 #[cfg(feature = "transport-http")]
@@ -606,7 +718,10 @@ mod http {
     /// `(attach payload, transaction id)` per producer built.
     type Seen = Arc<Mutex<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>>>;
 
-    struct TxProbe(Seen);
+    /// `(api_key through the accessor, api_key bytes present in the raw value)`.
+    type SeenSecret = Arc<Mutex<Vec<(Option<String>, bool)>>>;
+
+    struct TxProbe(Seen, SeenSecret);
 
     impl TableFunction for TxProbe {
         fn name(&self) -> &str {
@@ -629,6 +744,13 @@ mod http {
                 p.attach_opaque_data.as_deref().and_then(attach_payload),
                 p.transaction_opaque_data.clone(),
             ));
+            let raw = p.attach_opaque_data.clone().unwrap_or_default();
+            let key =
+                crate::attach_options::attach_options(&raw)?.and_then(|o| o.string("api_key"));
+            let present = key
+                .as_ref()
+                .is_some_and(|k| raw.windows(k.len()).any(|w| w == k.as_bytes()));
+            self.1.lock().unwrap().push((key, present));
             Ok(Box::new(Empty))
         }
     }
@@ -783,12 +905,20 @@ mod http {
     fn hooks_and_functions_see_the_same_plaintext_over_sealed_http() {
         let log = Log::default();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_secret = SeenSecret::default();
         let mut w = crate::Worker::new();
-        w.register_table(TxProbe(seen.clone()));
-        w.set_catalog(model(&log, false));
+        w.register_table(TxProbe(seen.clone(), seen_secret.clone()));
+        let mut m = model(&log, false);
+        m.attach_option_specs = vec![secret_spec("api_key")];
+        w.set_catalog(m);
         let port = start(w);
 
-        let body = attach_body("txcat", Some(&options("sk-http-secret", Some(true))), None);
+        let opts = with_column(
+            &options("sk-http-secret", Some(true)),
+            "api_key",
+            "sk-api-key-over-http",
+        );
+        let body = attach_body("txcat", Some(&opts), None);
         let attached: CatalogAttachResult = wire::from_batch(&unary_result(
             &post(port, "catalog_attach", frame(&body, "catalog_attach")).unwrap(),
         ))
@@ -854,6 +984,12 @@ mod http {
                 "produce-time tx"
             );
         }
+        // The secret option: decrypted by the accessor, absent from the opened
+        // bytes the function was handed.
+        assert_eq!(
+            *seen_secret.lock().unwrap(),
+            vec![(Some("sk-api-key-over-http".to_string()), false)]
+        );
 
         // A forged (plaintext) transaction value never reaches the hook.
         let forged = wire::to_batch(p::CatalogTransactionRollbackParams {

@@ -54,6 +54,8 @@ pub struct Worker {
     /// Explicitly configured signing key ([`Worker::signing_key`]); otherwise
     /// `VGI_SIGNING_KEY`, otherwise one generated when an HTTP server is built.
     signing_key: Option<Vec<u8>>,
+    /// Explicit root key for secret ATTACH options ([`Worker::attach_secret_key`]).
+    attach_secret_key: Option<Vec<u8>>,
     /// Read only by the HTTP transport.
     #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
     authenticate: Option<vgi_rpc::Authenticate>,
@@ -124,6 +126,7 @@ impl Worker {
             introspect_principals: None,
             grant_keys: None,
             signing_key: None,
+            attach_secret_key: None,
             authenticate: None,
         }
     }
@@ -536,6 +539,15 @@ impl Worker {
         self.signing_key = Some(key.into());
     }
 
+    /// The root key secret ATTACH options are encrypted under (see
+    /// [`crate::attach_options`]); the AEAD key is its HKDF-SHA256 subkey.
+    /// Optional: without it an HTTP worker uses its signing key and a stdio /
+    /// unix-socket / launcher worker the host-local key file. Set the same key
+    /// on every process of a deployment that must open each other's attaches.
+    pub fn attach_secret_key(&mut self, key: impl Into<Vec<u8>>) {
+        self.attach_secret_key = Some(key.into());
+    }
+
     /// Build the configured [`RpcServer`] for stdio, registering every VGI
     /// method. See [`build_server_for`](Self::build_server_for).
     pub fn build_server(self) -> RpcServer {
@@ -586,7 +598,14 @@ impl Worker {
                     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
                     key
                 });
-            disp.opaque = Some(crate::opaque::OpaqueSealer::new(key));
+            disp.opaque = Some(crate::opaque::OpaqueSealer::new(key.clone()));
+            disp.secret_root = Some(key);
+        }
+        if let Some(root) = &self.attach_secret_key {
+            disp.secret_root = Some(root.clone());
+        }
+        if let Some(root) = &disp.secret_root {
+            crate::attach_options::register_root(root);
         }
         let mut tickets: Option<(Vec<u8>, Option<i64>)> = None;
         let identity = if transport.authenticates_callers() {

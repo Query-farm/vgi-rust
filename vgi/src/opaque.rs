@@ -29,8 +29,9 @@
 //! carries one (top-level columns, the boxed `request`, a nested `bind_call`),
 //! and [`OpaqueSealer::seal_result`] seals the two results that mint one. On
 //! the OS-owned transports (stdio, unix, TCP launcher) there is no sealer and
-//! values travel as the dispatcher produced them; secret attach options are
-//! kept out of them regardless.
+//! values travel as the dispatcher produced them. Secret attach options are
+//! never in them in plaintext on any transport: the SDK encrypts them with a
+//! key the client never has (see [`crate::attach_options`]).
 
 use std::sync::Arc;
 

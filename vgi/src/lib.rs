@@ -150,6 +150,7 @@
 
 pub mod aggregate;
 pub mod arguments;
+pub mod attach_options;
 pub mod attach_ticket;
 pub mod buffering;
 

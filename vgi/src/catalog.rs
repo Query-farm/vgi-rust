@@ -1054,7 +1054,8 @@ pub struct CatalogModel {
     /// Serialized `AttachOptionSpec` records (discovery via `catalog_catalogs`),
     /// built with [`serialize_attach_option_spec_with_flags`]. Credential
     /// options (API keys, tokens, passwords) must be declared
-    /// [`secret`](AttachOptionFlags::secret).
+    /// [`secret`](AttachOptionFlags::secret): their values reach functions
+    /// encrypted, through [`crate::attach_options::attach_options`].
     pub attach_option_specs: Vec<Vec<u8>>,
     /// IPC of the one-row default option batch (one column per declared option).
     /// When set, `catalog_attach` merges the user `options` over it and encodes
@@ -1062,30 +1063,26 @@ pub struct CatalogModel {
     pub attach_options_default_batch: Option<Vec<u8>>,
     /// The main-catalog and secondary-catalog attach hook: called at attach,
     /// after required-option validation, with the request's one-row options
-    /// record (`None` when there are none). The record holds every option the
-    /// ATTACH named, **secret options included** (DuckDB redacts those from
-    /// `duckdb_databases()`, but sends them to the worker). The bytes it returns
-    /// ride in this attach's `attach_opaque_data`, which DuckDB sends back on
-    /// every bind/init of the attach, and functions read them back with
+    /// record (`None` when there are none). The bytes it returns ride in this
+    /// attach's `attach_opaque_data`, which DuckDB sends back on every
+    /// bind/init of the attach, and functions read them back with
     /// [`attach_payload`] (on [`BindParams`](crate::BindParams) and
     /// [`ProcessParams`](crate::ProcessParams) alike, and in the
     /// [`CatalogTransactions`] hooks). `None` (the default): the attach carries
     /// no payload.
     ///
-    /// This is how a secret option (an API key, a token) reaches a function.
-    /// Over HTTP the SDK seals `attach_opaque_data` (XChaCha20-Poly1305 under the
-    /// signing key, bound to the caller — see [`crate::opaque`]), so the
-    /// payload is never readable or forgeable off the worker. On the OS-owned
-    /// transports (stdio, the launcher's unix socket) it travels in plaintext
-    /// over the pipe between DuckDB and its own worker process. Either way the
-    /// worker also replays the attach value into its shared storage for
-    /// table-buffering functions, so return only what functions need.
+    /// Use it for the catalog's own non-secret bytes (a resolved endpoint, a
+    /// digest, a session id). **Never put a secret option's value here**: the
+    /// record the hook receives includes secret options (so it can derive a
+    /// digest, say), but a payload containing a secret value is refused at
+    /// ATTACH. Functions read every option — secret ones decrypted — with
+    /// [`crate::attach_options::attach_options`]; the SDK encrypts secret
+    /// values inside `attach_opaque_data` with a key the client never has.
     ///
     /// On the primary catalog the hook replaces the declarative option
     /// encoding: it cannot be combined with
     /// [`attach_options_default_batch`](Self::attach_options_default_batch) or
-    /// [`version_schemas`](Self::version_schemas) (the attach is refused) —
-    /// pack whatever options functions need into the payload instead.
+    /// [`version_schemas`](Self::version_schemas) (the attach is refused).
     pub attach_payload: Option<AttachPayloadHook>,
     /// Transaction hooks and the per-attach `supports_transactions` decision
     /// (see [`CatalogTransactions`]). `None` (the default): every attach
