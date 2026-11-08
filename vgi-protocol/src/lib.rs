@@ -44,8 +44,11 @@
 /// `catalog_contents` bulk-load RPC, advertised via
 /// `CatalogAttachResult.supports_catalog_contents`. Protocol 3.1 adds portable
 /// split key grouping and range distribution metadata to the combined
-/// breaking catalog/query successor, routed as `vgi.v3`.
-pub const VGI_PROTOCOL_VERSION: &str = "3.1.0";
+/// breaking catalog/query successor, routed as `vgi.v3`. Protocol 3.2 adds
+/// filtered scan planning: `TableInfo.scan_planning`, the
+/// `pushdown_filters` parameter of `catalog_table_scan_branches_get`, and
+/// `ScanBranch.row_count` / `ScanBranch.column_statistics`.
+pub const VGI_PROTOCOL_VERSION: &str = "3.2.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///

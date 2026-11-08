@@ -3842,10 +3842,17 @@ impl Dispatcher {
         Ok(Some(wire::nullable_result_batch_from_bytes(&bytes)?))
     }
 
-    /// Multi-branch scan resolution. A single-source table returns one branch
-    /// wrapping its scan function; the list must be non-empty.
+    /// Multi-branch scan resolution. Always asks the table's
+    /// [`ScanBranchPlanner`](crate::scan_planning::ScanBranchPlanner)
+    /// ([`DefaultScanPlanner`](crate::scan_planning::DefaultScanPlanner) when it
+    /// declares none: its declared branches, or one branch wrapping its scan
+    /// function), handing it the protocol 3.2 `pushdown_filters`, decoded
+    /// lazily against the table's served columns.
     pub fn handle_table_scan_branches_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
         use crate::protocol::dtos::{ScanBranch, ScanBranchesResult};
+        use crate::scan_planning::{
+            DefaultScanPlanner, ScanBranchPlanner, ScanPlanRequest, ScanPlanningFilters,
+        };
         let schema_path = read_string_list_col(req, "schema_path")?;
         let table_name = read_string_col(req, "name")?;
         let at_unit = read_opt_string_col(req, "at_unit");
@@ -3863,67 +3870,94 @@ impl Dispatcher {
         // version's scan function + arguments (legacy non-inline path).
         let resolved = Self::at_version(base, at_unit.as_deref(), at_value.as_deref())?;
         let t = &resolved;
-        let mk = |b: ScanBranch| -> Result<Bytes> {
-            Ok(Bytes::from(ipc::write_batch(&wire::to_batch(b)?)?))
+        let filters = read_binary_col(req, "pushdown_filters").map(|raw| {
+            // Column indexes refer to TableInfo.columns: the served columns.
+            let (path, table) = (schema_path.clone(), t.clone());
+            ScanPlanningFilters::with_columns_resolver(raw, move || {
+                Ok(Arc::new(catalog::served_table_columns(&path, &table)?))
+            })
+        });
+        let attach = read_binary_col(req, "attach_opaque_data");
+        let transaction = read_binary_col(req, "transaction_opaque_data");
+        let request = ScanPlanRequest {
+            attach_opaque_data: attach.as_deref(),
+            transaction_opaque_data: transaction.as_deref(),
+            schema_path: &schema_path,
+            table: t,
+            at_unit: at_unit.as_deref(),
+            at_value: at_value.as_deref(),
+            pushdown_filters: filters.as_ref(),
         };
-        let branches: Vec<Bytes> = match &t.branches {
-            // Explicit multi-branch sources (possibly empty — the empty case
-            // exercises the C++ loud-fail rejection).
-            Some(defs) => defs
-                .iter()
-                .map(|d| {
-                    // Function branch only — a catalog-table/format branch
-                    // never carries this field (its schema_path would be
-                    // the SOURCE table's schema, a different, older field:
-                    // source_schema_path).
-                    let branch_schema = (!d.function_name.is_empty()).then(|| {
-                        self.resolve_table_function_schema(req, &d.function_name, &schema_path)
-                            .unwrap_or_else(|| schema_path.clone())
-                    });
-                    mk(ScanBranch {
-                        function_name: d.function_name.clone(),
-                        arguments: Bytes::from(d.scan_arguments.clone()),
-                        branch_filter: d.branch_filter.clone(),
-                        writable: d.writable,
-                        schema_path: branch_schema,
-                        source_catalog: d.source_catalog.clone(),
-                        source_schema_path: d.source_schema_path.clone(),
-                        source_table: d.source_table.clone(),
-                        format_name: d.format_name.clone(),
-                        format_locations: if d.format_locations.is_empty() {
-                            None
-                        } else {
-                            Some(d.format_locations.clone())
-                        },
-                        format_options: if d.format_options.is_empty() {
-                            None
-                        } else {
-                            Some(Bytes::from(d.format_options.clone()))
-                        },
-                    })
-                })
-                .collect::<Result<_>>()?,
-            // Single-source default: one branch wrapping the scan function.
-            None => vec![mk(ScanBranch {
-                function_name: t.scan_function.clone(),
-                arguments: Bytes::from(t.scan_arguments.clone()),
-                branch_filter: None,
-                writable: false,
-                schema_path: Some(
-                    self.resolve_table_function_schema(req, &t.scan_function, &schema_path)
-                        .unwrap_or_else(|| schema_path.clone()),
-                ),
-                source_catalog: None,
-                source_schema_path: None,
-                source_table: None,
-                format_name: None,
-                format_locations: None,
-                format_options: None,
-            })?],
+        let plan = match &t.scan_planner {
+            Some(planner) => planner.plan(&request)?,
+            None => DefaultScanPlanner.plan(&request)?,
         };
+        // Zero branches are passed through: legal for a filtered table, and
+        // for a bind table the client's loud-fail rejection is what a test of
+        // an empty `branches` list exercises.
+        let branches: Vec<Bytes> = plan
+            .branches
+            .iter()
+            .map(|d| {
+                // Function branch only — a catalog-table/format branch never
+                // carries this field (its schema_path would be the SOURCE
+                // table's schema, a different, older field:
+                // source_schema_path).
+                let branch_schema = (!d.function_name.is_empty()).then(|| {
+                    self.resolve_table_function_schema(req, &d.function_name, &schema_path)
+                        .unwrap_or_else(|| schema_path.clone())
+                });
+                if d.row_count.is_some_and(|n| n < 0) {
+                    return Err(RpcError::value_error(format!(
+                        "Table '{table_name}': scan branch row_count must be >= 0, got {}",
+                        d.row_count.unwrap_or_default()
+                    )));
+                }
+                let column_statistics = match &d.column_statistics {
+                    Some(stats) => {
+                        let mut seen = std::collections::HashSet::new();
+                        if let Some(dup) = stats.iter().find(|s| !seen.insert(&s.column_name)) {
+                            return Err(RpcError::value_error(format!(
+                                "Table '{table_name}': scan branch column_statistics names \
+                                 column '{}' more than once",
+                                dup.column_name
+                            )));
+                        }
+                        Some(Bytes::from(crate::statistics::serialize_column_statistics(
+                            stats,
+                        )?))
+                    }
+                    None => None,
+                };
+                let branch = ScanBranch {
+                    function_name: d.function_name.clone(),
+                    arguments: Bytes::from(d.scan_arguments.clone()),
+                    branch_filter: d.branch_filter.clone(),
+                    writable: d.writable,
+                    schema_path: branch_schema,
+                    source_catalog: d.source_catalog.clone(),
+                    source_schema_path: d.source_schema_path.clone(),
+                    source_table: d.source_table.clone(),
+                    format_name: d.format_name.clone(),
+                    format_locations: if d.format_locations.is_empty() {
+                        None
+                    } else {
+                        Some(d.format_locations.clone())
+                    },
+                    format_options: if d.format_options.is_empty() {
+                        None
+                    } else {
+                        Some(Bytes::from(d.format_options.clone()))
+                    },
+                    row_count: d.row_count,
+                    column_statistics,
+                };
+                Ok(Bytes::from(ipc::write_batch(&wire::to_batch(branch)?)?))
+            })
+            .collect::<Result<_>>()?;
         Ok(Some(wire::to_result_batch(ScanBranchesResult {
             branches,
-            required_extensions: t.required_extensions.clone(),
+            required_extensions: plan.required_extensions,
         })?))
     }
 

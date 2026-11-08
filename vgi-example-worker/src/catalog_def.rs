@@ -246,6 +246,153 @@ fn branch_dir() -> String {
     raw.replace('\\', "/").trim_end_matches('/').to_string()
 }
 
+/// Protocol 3.2 filtered scan planning fixtures
+/// (`test/sql/integration/catalog/scan_planning_*.test`): five days of data,
+/// one parquet file per day under `{branch_dir}/planned_days/`. The tests
+/// create the files for the first four days only — the 2026-10-05 file never
+/// exists, so any scan that fails to prune that day errors with "No files
+/// found", and a passing query proves the pruning happened. Mirrors
+/// vgi-python's `planned_days*` fixtures.
+const PLANNED_DAYS_FIRST: i32 = 20_727; // 2026-10-01 as days since the epoch
+const PLANNED_DAYS: i32 = 5;
+
+fn planned_dir() -> String {
+    branch_path("planned_days")
+}
+
+fn planned_day_file(day: i32) -> String {
+    format!("{}/2026-10-{:02}.parquet", planned_dir(), day + 1)
+}
+
+fn planned_day_stats(day: i32) -> Vec<vgi::statistics::CatColStat> {
+    use vgi::statistics::{CatColStat, StatValue};
+    let date = || {
+        StatValue::arrow(Arc::new(arrow_array::Date32Array::from(vec![
+            PLANNED_DAYS_FIRST + day,
+        ])))
+    };
+    vec![CatColStat {
+        column_name: "event_date".to_string(),
+        min: date(),
+        max: date(),
+        has_null: false,
+        has_not_null: true,
+        distinct_count: None,
+        contains_unicode: None,
+        max_string_length: None,
+    }]
+}
+
+/// A `read_parquet` branch over `files` (one string, or a list of them).
+fn planned_read_parquet(files: &[String], as_list: bool) -> vgi::catalog::CatBranch {
+    let arg: ArrayRef = if as_list {
+        let values = arrow_array::StringArray::from(files.to_vec());
+        let offsets = arrow_buffer::OffsetBuffer::from_lengths([files.len()]);
+        Arc::new(arrow_array::ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            offsets,
+            Arc::new(values),
+            None,
+        ))
+    } else {
+        Arc::new(arrow_array::StringArray::from(vec![files[0].clone()]))
+    };
+    vgi::catalog::CatBranch {
+        function_name: "read_parquet".to_string(),
+        scan_arguments: Arguments::serialize_scan_args(&[arg]).unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// `planned_days` (the worker prunes the day files with the query's predicates),
+/// `planned_days_stats` (one branch per day with `event_date` statistics; the
+/// client prunes) and `planned_days_bf` (a bind-time table with one
+/// `branch_filter` per day; the client prunes by contradiction).
+fn planned_days_tables() -> Vec<CatTable> {
+    use vgi::scan_planning::{ScanBranchesPlan, ScanPlanRequest};
+    let columns = || vec![f("event_date", DataType::Date32), f("n", DataType::Int64)];
+    let parquet = || vec!["parquet".to_string()];
+
+    let worker_pruned = |request: &ScanPlanRequest<'_>| -> vgi::Result<ScanBranchesPlan> {
+        let mut days = Vec::new();
+        for day in 0..PLANNED_DAYS {
+            let keep = match request.pushdown_filters {
+                Some(filters) => filters.may_match(&planned_day_stats(day))?,
+                None => true,
+            };
+            if keep {
+                days.push(day);
+            }
+        }
+        // Record what the worker saw so tests can assert the predicates arrived.
+        let record = serde_json::json!({
+            "received_filters": request.pushdown_filters.is_some(),
+            "days": days.iter().map(|d| format!("2026-10-{:02}", d + 1)).collect::<Vec<_>>(),
+        });
+        let _ = std::fs::create_dir_all(planned_dir());
+        let _ = std::fs::write(
+            format!("{}/last_plan.json", planned_dir()),
+            record.to_string(),
+        );
+        let files: Vec<String> = days.iter().map(|d| planned_day_file(*d)).collect();
+        let branches = if files.is_empty() {
+            Vec::new()
+        } else {
+            vec![vgi::catalog::CatBranch {
+                row_count: Some(10 * files.len() as i64),
+                ..planned_read_parquet(&files, true)
+            }]
+        };
+        Ok(ScanBranchesPlan {
+            branches,
+            required_extensions: vec!["parquet".to_string()],
+        })
+    };
+    let client_pruned = |_: &ScanPlanRequest<'_>| -> vgi::Result<ScanBranchesPlan> {
+        Ok(ScanBranchesPlan {
+            branches: (0..PLANNED_DAYS)
+                .map(|day| vgi::catalog::CatBranch {
+                    row_count: Some(10),
+                    column_statistics: Some(planned_day_stats(day)),
+                    ..planned_read_parquet(&[planned_day_file(day)], false)
+                })
+                .collect(),
+            required_extensions: vec!["parquet".to_string()],
+        })
+    };
+
+    let planned = |name: &str, comment: &str| {
+        let mut t = dtable(name, columns(), comment);
+        t.required_extensions = parquet();
+        t
+    };
+    let mut branch_filtered = planned(
+        "planned_days_bf",
+        "Protocol 3.2: pruning by branch_filter contradiction — scan_planning_branch_filter.test",
+    );
+    branch_filtered.branches = Some(
+        (0..PLANNED_DAYS)
+            .map(|day| vgi::catalog::CatBranch {
+                branch_filter: Some(format!("event_date = DATE '2026-10-{:02}'", day + 1)),
+                ..planned_read_parquet(&[planned_day_file(day)], false)
+            })
+            .collect(),
+    );
+    vec![
+        planned(
+            "planned_days",
+            "Protocol 3.2: worker-side pruning of per-day files — scan_planning_filtered.test",
+        )
+        .with_filtered_scan_planning(worker_pruned),
+        planned(
+            "planned_days_stats",
+            "Protocol 3.2: client-side pruning by ScanBranch statistics — scan_planning_stats.test",
+        )
+        .with_filtered_scan_planning(client_pruned),
+        branch_filtered,
+    ]
+}
+
 /// A path under the shared native-branch scratch dir.
 fn branch_path(name: &str) -> String {
     format!("{}/{name}", branch_dir())
@@ -902,6 +1049,7 @@ fn data_tables() -> Vec<CatTable> {
         t.branches = Some(branches);
         t
     };
+    tables.extend(planned_days_tables());
     tables.push(mb(
         "multi_branch_numbers",
         "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",

@@ -15,6 +15,29 @@ pub fn dict(s: &str) -> DictString {
     DictString(s.to_string())
 }
 
+/// `TableInfo.scan_planning` (protocol 3.2.0) — when the client resolves a
+/// table's scan redirect. Unlike the modules around it this is a plain `utf8`
+/// column, not a dictionary-encoded enum, and its values are lower case.
+pub mod scan_planning {
+    /// Resolve the scan redirect at bind time (protocol 3.1 behaviour); the
+    /// default.
+    pub const BIND: &str = "bind";
+    /// Resolve it once per scan, after the client has collected the query's
+    /// predicates on the table, which it sends as `pushdown_filters`.
+    pub const FILTERED: &str = "filtered";
+
+    /// Reject any value other than [`BIND`] and [`FILTERED`].
+    pub fn validate(value: &str) -> vgi_rpc::Result<()> {
+        if value == BIND || value == FILTERED {
+            Ok(())
+        } else {
+            Err(vgi_rpc::RpcError::value_error(format!(
+                "scan_planning must be '{BIND}' or '{FILTERED}', got {value:?}"
+            )))
+        }
+    }
+}
+
 /// `FunctionType` — which registry a function lives in (`FunctionInfo` and
 /// `BindRequest.function_type`).
 ///

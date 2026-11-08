@@ -98,6 +98,43 @@ impl ColumnDomain {
         ))
     }
 
+    /// Could a candidate (a file, partition or scan branch) described by
+    /// `stat` hold a value of this column that satisfies the predicates?
+    ///
+    /// `stat` is a conservative claim about every row of the candidate, as in
+    /// `ScanBranch.column_statistics`: every non-NULL value lies within
+    /// `[min, max]`, `has_null = false` means no NULLs, and
+    /// `has_not_null = false` means the column is entirely NULL. Returns
+    /// `false` only when that claim and this domain provably cannot meet.
+    /// A bound that is NULL, of a type that does not convert to the column's
+    /// type without loss, or of a type without a SQL ordering counts as
+    /// unknown, so the answer errs towards keeping the candidate.
+    pub fn may_match_statistics(&self, stat: &crate::statistics::CatColStat) -> bool {
+        if !stat.has_not_null {
+            // Entirely NULL: only a domain admitting NULL can match.
+            return self.may_be_null;
+        }
+        if stat.has_null && self.may_be_null {
+            return true;
+        }
+        let bound = |value: &crate::statistics::StatValue| {
+            statistic_bound(value, &self.data_type).unwrap_or(Bound::Unbounded)
+        };
+        let (lower, upper) = (bound(&stat.min), bound(&stat.max));
+        let candidate = match (&lower, &upper) {
+            (Bound::Unbounded, Bound::Unbounded) => Self {
+                data_type: self.data_type.clone(),
+                non_null: NonNullDomain::All,
+                may_be_null: false,
+            },
+            _ => self.range(lower, upper),
+        };
+        // An evaluation failure keeps the candidate.
+        self.without_null()
+            .combine(&candidate, true)
+            .map_or(true, |both| !matches!(both.non_null, NonNullDomain::Empty))
+    }
+
     fn empty(&self) -> Self {
         Self {
             data_type: self.data_type.clone(),
@@ -179,6 +216,41 @@ impl ColumnDomain {
             },
         })
     }
+}
+
+/// A statistic bound as an inclusive endpoint of the column's logical type, or
+/// `None` when it is unknown: NULL, of an unordered type, or not convertible to
+/// `data_type` without loss (the conversion must round-trip exactly, so a
+/// `1.5` float bound never becomes an integer `1`).
+fn statistic_bound(
+    value: &crate::statistics::StatValue,
+    data_type: &DataType,
+) -> Option<Bound<Scalar<ArrayRef>>> {
+    if !ordered(data_type) {
+        return None;
+    }
+    let array = dictionary_values(&value.to_array().ok()?).ok()?;
+    if array.len() != 1 || array.is_null(0) {
+        return None;
+    }
+    let typed = if array.data_type() == data_type {
+        array
+    } else {
+        let options = arrow_cast::CastOptions {
+            safe: true,
+            ..Default::default()
+        };
+        let cast = arrow_cast::cast::cast_with_options(&array, data_type, &options).ok()?;
+        if cast.is_null(0) {
+            return None;
+        }
+        let back = arrow_cast::cast::cast_with_options(&cast, array.data_type(), &options).ok()?;
+        if back.is_null(0) || !compare_arrays(&back, &array, "eq").ok()?.value(0) {
+            return None;
+        }
+        cast
+    };
+    Some(Bound::Included(Scalar::new(typed)))
 }
 
 fn scalar_order(left: &Scalar<ArrayRef>, right: &Scalar<ArrayRef>) -> Result<Ordering> {
@@ -361,6 +433,32 @@ impl PushdownFilters {
         Ok(BooleanArray::from(
             possible.into_iter().map(|p| p & 1 != 0).collect::<Vec<_>>(),
         ))
+    }
+
+    /// Could a candidate described by per-column min/max statistics hold a
+    /// row satisfying the filters?
+    ///
+    /// Each [`CatColStat`](crate::statistics::CatColStat) is a conservative
+    /// claim about every row of the candidate (a file, a partition, a scan
+    /// branch), the same claim `ScanBranch.column_statistics` makes. Returns
+    /// `Ok(false)` only when some column's [`column_domain`](Self::column_domain)
+    /// provably cannot meet its statistics; a column missing from the bind
+    /// schema, an unknown bound, or an unsupported predicate counts as "may
+    /// match". Use it to prune a manifest before returning scan branches
+    /// (protocol 3.2 filtered scan planning).
+    pub fn may_match_statistics(&self, stats: &[crate::statistics::CatColStat]) -> Result<bool> {
+        for stat in stats {
+            if self.pruning_field(&stat.column_name).is_err() {
+                continue;
+            }
+            if !self
+                .column_domain(&stat.column_name)?
+                .may_match_statistics(stat)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn pruning_field(&self, name: &str) -> Result<&Field> {

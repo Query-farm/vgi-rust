@@ -176,6 +176,7 @@ pub mod partition;
 pub mod projection;
 pub mod protocol;
 pub mod pushdown;
+pub mod scan_planning;
 pub mod secrets;
 pub mod settings;
 pub mod split_token;

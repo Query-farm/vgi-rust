@@ -767,3 +767,88 @@ fn macro_info_typed_codec_keeps_the_entire_family() {
         }
     }
 }
+
+#[test]
+fn protocol_32_scan_planning_decodes_python_golden_records() {
+    use vgi_protocol::protocol::dtos::{ScanBranch, ScanBranchesResult, TableInfo};
+
+    let branch: ScanBranch = round_trip("scan_planning_branch");
+    assert_eq!(branch.function_name, "read_parquet");
+    assert_eq!(branch.row_count, Some(1000));
+    let statistics = StreamReader::try_new(
+        Cursor::new(branch.column_statistics.clone().expect("statistics").0),
+        None,
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap();
+    let names = statistics
+        .column_by_name("column_name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        names.iter().flatten().collect::<Vec<_>>(),
+        ["event_date", "n"]
+    );
+    let has_null = statistics
+        .column_by_name("has_null")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(!has_null.value(0) && has_null.value(1));
+
+    let result: ScanBranchesResult = round_trip("scan_planning_branches_result");
+    assert_eq!(result.required_extensions, ["parquet"]);
+    assert_eq!(result.branches.len(), 1);
+    assert_eq!(result.branches[0].0, fixture("scan_planning_branch"));
+
+    let empty: ScanBranchesResult = round_trip("scan_planning_empty_branches_result");
+    assert!(empty.branches.is_empty() && empty.required_extensions.is_empty());
+
+    let table: TableInfo = round_trip("scan_planning_table_info");
+    assert_eq!(table.name, "events");
+    assert_eq!(table.scan_planning, "filtered");
+    assert!(table.is_filtered_scan_planning());
+    assert!(table.scan_function.as_ref().is_none_or(|b| b.0.is_empty()));
+    table.validate_scan_planning().unwrap();
+
+    // Every pre-3.2 TableInfo record decodes as the default "bind".
+    let legacy: TableInfo = round_trip("table_info");
+    assert_eq!(legacy.scan_planning, "bind");
+    legacy.validate_scan_planning().unwrap();
+
+    // The pushdown_filters snapshot is one Filter Encoding v2 batch.
+    let filters =
+        StreamReader::try_new(Cursor::new(fixture("scan_planning_pushdown_filters")), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+    assert!(filters.column_by_name("filter_spec").is_some());
+}
+
+#[test]
+fn scan_planning_validation_rejects_unknown_and_inlined_filtered_tables() {
+    use vgi_protocol::protocol::dtos::TableInfo;
+    let mut table: TableInfo = round_trip("scan_planning_table_info");
+    table.scan_planning = "eager".to_string();
+    assert!(table
+        .validate_scan_planning()
+        .unwrap_err()
+        .message
+        .contains("scan_planning must be"));
+    table.scan_planning = "filtered".to_string();
+    table.scan_function = Some(vgi_rpc::Bytes::from(vec![1_u8]));
+    assert!(table
+        .validate_scan_planning()
+        .unwrap_err()
+        .message
+        .contains("inlined"));
+    // An empty scan_function is "not inlined".
+    table.scan_function = Some(vgi_rpc::Bytes::from(Vec::<u8>::new()));
+    table.validate_scan_planning().unwrap();
+}

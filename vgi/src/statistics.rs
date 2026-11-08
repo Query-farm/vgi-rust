@@ -6,9 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
-};
+use arrow_array::builder::{BooleanBuilder, Int64Builder, StringBuilder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, UnionFields};
@@ -25,23 +23,45 @@ pub enum StatValue {
     /// Raw bytes — used for GEOMETRY stats (WKB; the extension reinterprets the
     /// BLOB as the column's GEOMETRY type).
     Binary(Vec<u8>),
+    /// A one-element Arrow array of any type — e.g. a `Date32`, `Timestamp`,
+    /// `Int32` or `Decimal128` statistic that should keep the column's own
+    /// logical type on the wire (as vgi-python's typed `pa.Scalar` does). A
+    /// null element means the bound is unknown.
+    Arrow(ArrayRef),
 }
 impl StatValue {
+    /// A typed statistic from a one-element Arrow array (see [`StatValue::Arrow`]).
+    pub fn arrow(value: ArrayRef) -> Self {
+        StatValue::Arrow(value)
+    }
+
     fn data_type(&self) -> DataType {
         match self {
             StatValue::Int64(_) => DataType::Int64,
             StatValue::Float64(_) => DataType::Float64,
             StatValue::Utf8(_) => DataType::Utf8,
             StatValue::Binary(_) => DataType::Binary,
+            StatValue::Arrow(value) => value.data_type().clone(),
         }
     }
-    fn type_key(&self) -> u8 {
-        match self {
-            StatValue::Int64(_) => 0,
-            StatValue::Float64(_) => 1,
-            StatValue::Utf8(_) => 2,
-            StatValue::Binary(_) => 3,
-        }
+
+    /// The value as a one-element Arrow array.
+    pub fn to_array(&self) -> Result<ArrayRef> {
+        Ok(match self {
+            StatValue::Int64(v) => Arc::new(arrow_array::Int64Array::from(vec![*v])),
+            StatValue::Float64(v) => Arc::new(arrow_array::Float64Array::from(vec![*v])),
+            StatValue::Utf8(v) => Arc::new(arrow_array::StringArray::from(vec![v.as_str()])),
+            StatValue::Binary(v) => Arc::new(arrow_array::BinaryArray::from(vec![v.as_slice()])),
+            StatValue::Arrow(value) => {
+                if value.len() != 1 {
+                    return Err(RpcError::value_error(format!(
+                        "StatValue::Arrow must hold exactly one element, got {}",
+                        value.len()
+                    )));
+                }
+                value.clone()
+            }
+        })
     }
 }
 
@@ -64,69 +84,37 @@ pub struct CatColStat {
 fn build_union(
     stats: &[CatColStat],
     min: bool,
-    order: &[StatValue],
+    order: &[DataType],
 ) -> Result<(UnionFields, ArrayRef)> {
-    let type_ids: Vec<i8> = stats
+    let values: Vec<ArrayRef> = stats
         .iter()
-        .map(|s| {
-            let v = if min { &s.min } else { &s.max };
-            order
-                .iter()
-                .position(|o| o.type_key() == v.type_key())
-                .unwrap_or(0) as i8
-        })
+        .map(|s| if min { &s.min } else { &s.max }.to_array())
+        .collect::<Result<_>>()?;
+    let type_ids: Vec<i8> = values
+        .iter()
+        .map(|v| order.iter().position(|o| o == v.data_type()).unwrap_or(0) as i8)
         .collect();
 
     let mut children: Vec<ArrayRef> = Vec::with_capacity(order.len());
     let mut fields: Vec<(i8, Arc<Field>)> = Vec::with_capacity(order.len());
-    for (code, proto) in order.iter().enumerate() {
-        let dt = proto.data_type();
-        let child: ArrayRef = match dt {
-            DataType::Int64 => {
-                let mut b = Int64Builder::new();
-                for s in stats {
-                    match if min { &s.min } else { &s.max } {
-                        StatValue::Int64(v) if proto.type_key() == 0 => b.append_value(*v),
-                        _ => b.append_null(),
-                    }
+    for (code, dt) in order.iter().enumerate() {
+        let parts: Vec<ArrayRef> = values
+            .iter()
+            .map(|v| {
+                if v.data_type() == dt {
+                    v.clone()
+                } else {
+                    arrow_array::new_null_array(dt, 1)
                 }
-                Arc::new(b.finish())
-            }
-            DataType::Float64 => {
-                let mut b = Float64Builder::new();
-                for s in stats {
-                    match if min { &s.min } else { &s.max } {
-                        StatValue::Float64(v) if proto.type_key() == 1 => b.append_value(*v),
-                        _ => b.append_null(),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Binary => {
-                let mut b = arrow_array::builder::BinaryBuilder::new();
-                for s in stats {
-                    match if min { &s.min } else { &s.max } {
-                        StatValue::Binary(v) if proto.type_key() == 3 => b.append_value(v),
-                        _ => b.append_null(),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            _ => {
-                let mut b = StringBuilder::new();
-                for s in stats {
-                    match if min { &s.min } else { &s.max } {
-                        StatValue::Utf8(v) if proto.type_key() == 2 => b.append_value(v),
-                        _ => b.append_null(),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-        };
+            })
+            .collect();
+        let refs: Vec<&dyn arrow_array::Array> = parts.iter().map(|a| a.as_ref()).collect();
+        let child = arrow_select::concat::concat(&refs)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         children.push(child);
         fields.push((
             code as i8,
-            Arc::new(Field::new(format!("{code}"), dt, true)),
+            Arc::new(Field::new(format!("{code}"), dt.clone(), true)),
         ));
     }
     let union_fields: UnionFields = fields.into_iter().collect();
@@ -147,13 +135,12 @@ pub fn serialize_column_statistics(stats: &[CatColStat]) -> Result<Vec<u8>> {
     }
     // Distinct value types in insertion order (min governs the union layout;
     // max reuses the same field set).
-    let mut order: Vec<StatValue> = Vec::new();
+    let mut order: Vec<DataType> = Vec::new();
     for s in stats {
-        if !order.iter().any(|o| o.type_key() == s.min.type_key()) {
-            order.push(s.min.clone());
-        }
-        if !order.iter().any(|o| o.type_key() == s.max.type_key()) {
-            order.push(s.max.clone());
+        for dt in [s.min.data_type(), s.max.data_type()] {
+            if !order.contains(&dt) {
+                order.push(dt);
+            }
         }
     }
 
@@ -208,4 +195,174 @@ pub fn serialize_column_statistics(stats: &[CatColStat]) -> Result<Vec<u8>> {
     let batch =
         RecordBatch::try_new(schema, cols).map_err(|e| RpcError::runtime_error(e.to_string()))?;
     ipc::write_batch(&batch)
+}
+
+/// Decode a [`serialize_column_statistics`] payload (from any SDK) back into
+/// [`CatColStat`]s, in the order they were serialized.
+///
+/// `Int64` / `Float64` / `Utf8` / `Binary` values decode to their dedicated
+/// [`StatValue`] variants; every other type (and an unknown, NULL bound)
+/// decodes to [`StatValue::Arrow`]. An empty payload (no columns or no rows)
+/// decodes to an empty list.
+pub fn deserialize_column_statistics(bytes: &[u8]) -> Result<Vec<CatColStat>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = ipc::read_schema(bytes)?;
+    if schema.fields().is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch = ipc::read_batch(bytes)?;
+    let invalid = |what: &str| RpcError::type_error(format!("column statistics: {what}"));
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| invalid(&format!("missing column '{name}'")))
+    };
+    let names = column("column_name")?
+        .as_string_opt::<i32>()
+        .ok_or_else(|| invalid("column_name is not utf8"))?;
+    let union = |name: &str| -> Result<&UnionArray> {
+        column(name)?
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .ok_or_else(|| invalid(&format!("{name} is not a union")))
+    };
+    let (mins, maxs) = (union("min")?, union("max")?);
+    let bool_at = |name: &str, row: usize, default: bool| -> Result<bool> {
+        let col = column(name)?
+            .as_boolean_opt()
+            .ok_or_else(|| invalid(&format!("{name} is not boolean")))?;
+        Ok(if col.is_valid(row) {
+            col.value(row)
+        } else {
+            default
+        })
+    };
+    let value_at = |u: &UnionArray, row: usize| -> StatValue {
+        let child = u.value(row);
+        if child.is_null(0) {
+            return StatValue::Arrow(child);
+        }
+        match child.data_type() {
+            DataType::Int64 => StatValue::Int64(
+                child
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+            ),
+            DataType::Float64 => StatValue::Float64(
+                child
+                    .as_primitive::<arrow_array::types::Float64Type>()
+                    .value(0),
+            ),
+            DataType::Utf8 => StatValue::Utf8(child.as_string::<i32>().value(0).to_string()),
+            DataType::Binary => StatValue::Binary(child.as_binary::<i32>().value(0).to_vec()),
+            _ => StatValue::Arrow(child),
+        }
+    };
+    let distinct = column("distinct_count")?
+        .as_primitive_opt::<arrow_array::types::Int64Type>()
+        .ok_or_else(|| invalid("distinct_count is not int64"))?;
+    let max_len = column("max_string_length")?
+        .as_primitive_opt::<arrow_array::types::UInt64Type>()
+        .ok_or_else(|| invalid("max_string_length is not uint64"))?;
+    let unicode = column("contains_unicode")?
+        .as_boolean_opt()
+        .ok_or_else(|| invalid("contains_unicode is not boolean"))?;
+    (0..batch.num_rows())
+        .map(|row| {
+            if names.is_null(row) {
+                return Err(invalid("null column_name"));
+            }
+            Ok(CatColStat {
+                column_name: names.value(row).to_string(),
+                min: value_at(mins, row),
+                max: value_at(maxs, row),
+                has_null: bool_at("has_null", row, true)?,
+                has_not_null: bool_at("has_not_null", row, true)?,
+                distinct_count: distinct.is_valid(row).then(|| distinct.value(row)),
+                contains_unicode: unicode.is_valid(row).then(|| unicode.value(row)),
+                max_string_length: max_len.is_valid(row).then(|| max_len.value(row)),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(name: &str, min: StatValue, max: StatValue) -> CatColStat {
+        CatColStat {
+            column_name: name.to_string(),
+            min,
+            max,
+            has_null: false,
+            has_not_null: true,
+            distinct_count: Some(3),
+            contains_unicode: None,
+            max_string_length: None,
+        }
+    }
+
+    #[test]
+    fn typed_statistics_round_trip() {
+        let day = |d: i32| StatValue::arrow(Arc::new(arrow_array::Date32Array::from(vec![d])));
+        let stats = vec![
+            stat("id", StatValue::Int64(1), StatValue::Int64(9)),
+            stat("day", day(20_000), day(20_004)),
+            stat(
+                "name",
+                StatValue::Utf8("a".into()),
+                StatValue::Utf8("z".into()),
+            ),
+        ];
+        let bytes = serialize_column_statistics(&stats).unwrap();
+        let back = deserialize_column_statistics(&bytes).unwrap();
+        assert_eq!(back.len(), 3);
+        assert!(matches!(back[0].min, StatValue::Int64(1)));
+        assert!(matches!(back[0].max, StatValue::Int64(9)));
+        match (&back[1].min, &back[1].max) {
+            (StatValue::Arrow(lo), StatValue::Arrow(hi)) => {
+                assert_eq!(lo.data_type(), &DataType::Date32);
+                assert_eq!(
+                    lo.as_any()
+                        .downcast_ref::<arrow_array::Date32Array>()
+                        .unwrap()
+                        .value(0),
+                    20_000
+                );
+                assert_eq!(
+                    hi.as_any()
+                        .downcast_ref::<arrow_array::Date32Array>()
+                        .unwrap()
+                        .value(0),
+                    20_004
+                );
+            }
+            _ => panic!("date statistics must stay typed"),
+        }
+        assert!(matches!(&back[2].max, StatValue::Utf8(v) if v == "z"));
+        assert_eq!(back[0].distinct_count, Some(3));
+        assert!(!back[0].has_null && back[0].has_not_null);
+    }
+
+    #[test]
+    fn empty_statistics_decode_empty() {
+        let bytes = serialize_column_statistics(&[]).unwrap();
+        assert!(deserialize_column_statistics(&bytes).unwrap().is_empty());
+        assert!(deserialize_column_statistics(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn arrow_stat_must_be_one_element() {
+        let bad = stat(
+            "x",
+            StatValue::arrow(Arc::new(arrow_array::Int32Array::from(vec![1, 2]))),
+            StatValue::Int64(1),
+        );
+        assert!(serialize_column_statistics(&[bad]).is_err());
+    }
 }

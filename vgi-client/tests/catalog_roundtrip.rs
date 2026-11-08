@@ -360,6 +360,139 @@ fn decodes_and_validates_catalog_scan_branches() {
     client.detach(&cat).expect("detach");
 }
 
+/// A VGI Filter Encoding v2 snapshot over `(event_date date32, n int64)` with
+/// one advisory `event_date <op> DATE <days>` predicate — what a client sends
+/// as protocol 3.2 `pushdown_filters`.
+fn event_date_filter(op: &str, days: i32) -> vgi_client::Bytes {
+    use std::sync::Arc;
+    let document = format!(
+        r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{{"id":"query:0","revision":0,"mode":"advisory","source":"query","expression":{{"node":"comparison","op":"{op}","left":{{"node":"column_ref","column_index":0,"column_name":"event_date"}},"right":{{"node":"literal","value_ref":0}}}}}}]}}"#
+    );
+    let schema = arrow_schema::Schema::new_with_metadata(
+        vec![
+            arrow_schema::Field::new("filter_spec", DataType::Utf8, false),
+            arrow_schema::Field::new("value_0", DataType::Date32, true),
+        ],
+        std::collections::HashMap::from([
+            (
+                "vgi_filter_encoding".to_string(),
+                "vgi.filters.v2".to_string(),
+            ),
+            ("vgi_filter_version".to_string(), "2".to_string()),
+            (
+                "vgi_evaluation_context".to_string(),
+                "vgi.none.v1".to_string(),
+            ),
+        ]),
+    );
+    let batch = arrow_array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(arrow_array::StringArray::from(vec![document])),
+            Arc::new(arrow_array::Date32Array::from(vec![days])),
+        ],
+    )
+    .unwrap();
+    vgi_client::Bytes::from(vgi::ipc::write_batch(&batch).unwrap())
+}
+
+/// Protocol 3.2 filtered scan planning against the example worker's
+/// `planned_days*` fixtures: `scan_planning` decodes, `pushdown_filters`
+/// reach the planner, zero branches are accepted for a filtered table, and
+/// `row_count` / `column_statistics` survive the nested branch IPC.
+#[test]
+fn filtered_scan_planning_round_trips() {
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let table = |client: &mut VgiClient, name: &str| {
+        client
+            .table_get(&cat, "data", name, None)
+            .unwrap_or_else(|error| panic!("catalog_table_get({name}) failed: {error}"))
+            .unwrap_or_else(|| panic!("example worker did not advertise data.{name}"))
+    };
+    // 2026-10-01 .. 2026-10-05 as days since the epoch.
+    const OCT_1: i32 = 20_727;
+
+    let planned = table(&mut client, "planned_days");
+    assert_eq!(planned.scan_planning, "filtered");
+    assert!(
+        planned.scan_function.is_none(),
+        "a filtered table's scan_function must be null"
+    );
+    let all = client
+        .table_scan_branches(&cat, &planned, None)
+        .expect("bind-time planning without filters");
+    let [branch] = all.branches.as_slice() else {
+        panic!("planned_days without filters must return one branch")
+    };
+    assert_eq!(branch.function_name, "read_parquet");
+    assert_eq!(branch.row_count, Some(50));
+    assert_eq!(all.required_extensions, ["parquet"]);
+
+    let pruned = client
+        .table_scan_branches_with_filters(
+            &cat,
+            &planned,
+            None,
+            Some(event_date_filter("ge", OCT_1 + 2)),
+        )
+        .expect("filtered planning");
+    assert_eq!(pruned.branches.len(), 1);
+    assert_eq!(
+        pruned.branches[0].row_count,
+        Some(30),
+        "the worker must prune 10-01 and 10-02 with the predicates"
+    );
+
+    let none = client
+        .table_scan_branches_with_filters(
+            &cat,
+            &planned,
+            None,
+            Some(event_date_filter("gt", OCT_1 + 4)),
+        )
+        .expect("zero branches are legal for a filtered table");
+    assert!(none.branches.is_empty() && none.column_statistics.is_empty());
+
+    let stats = table(&mut client, "planned_days_stats");
+    assert_eq!(stats.scan_planning, "filtered");
+    let stats = client
+        .table_scan_branches(&cat, &stats, None)
+        .expect("decode planned_days_stats");
+    assert_eq!(stats.branches.len(), 5);
+    assert_eq!(stats.column_statistics.len(), 5);
+    for (branch, statistics) in stats.branches.iter().zip(&stats.column_statistics) {
+        assert_eq!(branch.row_count, Some(10));
+        let statistics = statistics.as_ref().expect("branch column_statistics");
+        assert_eq!(statistics.num_rows(), 1);
+        let decoded = vgi::statistics::deserialize_column_statistics(
+            &branch.column_statistics.as_ref().unwrap().0,
+        )
+        .expect("decode branch statistics");
+        assert_eq!(decoded[0].column_name, "event_date");
+        assert!(!decoded[0].has_null);
+    }
+
+    let branch_filtered = table(&mut client, "planned_days_bf");
+    assert_eq!(branch_filtered.scan_planning, "bind");
+    let branch_filtered = client
+        .table_scan_branches(&cat, &branch_filtered, None)
+        .expect("decode planned_days_bf");
+    assert_eq!(
+        branch_filtered.branches[0].branch_filter.as_deref(),
+        Some("event_date = DATE '2026-10-01'")
+    );
+    assert!(branch_filtered
+        .column_statistics
+        .iter()
+        .all(Option::is_none));
+
+    client.detach(&cat).expect("detach");
+}
+
 #[test]
 fn reports_a_catalog_version() {
     let _ = worker_or_skip!();
@@ -399,7 +532,7 @@ fn transactions_are_optional_and_round_trip_when_offered() {
     client.detach(&cat).expect("detach");
 }
 
-/// `catalog_contents` (protocol 3.1.0): the example worker advertises it, and
+/// `catalog_contents` (protocol 3.2.0): the example worker advertises it, and
 /// one call returns every schema the per-schema calls list — parents first —
 /// with each kind holding exactly what the matching per-schema call returns.
 #[test]

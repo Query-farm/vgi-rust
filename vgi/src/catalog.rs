@@ -1453,6 +1453,54 @@ pub struct CatTable {
     /// DuckDB answers `Table '<name>' does not support UPDATE` (etc.). See
     /// [`TableWrites`] and [`crate::write_results`].
     pub writes: TableWrites,
+    /// Protocol 3.2: when the client resolves this table's scan redirect
+    /// (`TableInfo.scan_planning`). [`ScanPlanning::Bind`] (the default) keeps
+    /// 3.1 behaviour; [`ScanPlanning::Filtered`] makes the client call
+    /// `catalog_table_scan_branches_get` once per scan with the query's
+    /// predicates, which reach [`scan_planner`](Self::scan_planner). A filtered
+    /// table cannot set [`inline_scan`](Self::inline_scan) (serving it fails).
+    pub scan_planning: ScanPlanning,
+    /// Protocol 3.2: plans this table's scan branches for every
+    /// `catalog_table_scan_branches_get`, with the query's predicates when the
+    /// table is [`ScanPlanning::Filtered`]. `None` (the default): the declared
+    /// [`branches`](Self::branches), or one branch wrapping the scan function
+    /// (see [`crate::scan_planning::ScanPlanRequest::default_plan`]).
+    pub scan_planner: Option<crate::scan_planning::SharedScanBranchPlanner>,
+}
+
+/// Protocol 3.2 `TableInfo.scan_planning`: when the client resolves a table's
+/// scan redirect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScanPlanning {
+    /// At bind time, with no predicates (protocol 3.1 behaviour).
+    #[default]
+    Bind,
+    /// Once per scan, after the client has collected the query's predicates on
+    /// the table, which it sends as `pushdown_filters`. Zero branches then mean
+    /// "no rows". The scan function cannot be inlined.
+    Filtered,
+}
+
+impl ScanPlanning {
+    /// The wire value (`"bind"` / `"filtered"`).
+    pub fn as_str(self) -> &'static str {
+        use crate::protocol::enums::scan_planning;
+        match self {
+            Self::Bind => scan_planning::BIND,
+            Self::Filtered => scan_planning::FILTERED,
+        }
+    }
+
+    /// Parse a wire value; anything but `"bind"` / `"filtered"` is an error.
+    pub fn parse(value: &str) -> Result<Self> {
+        use crate::protocol::enums::scan_planning;
+        scan_planning::validate(value)?;
+        Ok(if value == scan_planning::FILTERED {
+            Self::Filtered
+        } else {
+            Self::Bind
+        })
+    }
 }
 
 /// A table-in-out function backing one DML operation of a [`CatTable`].
@@ -1628,6 +1676,8 @@ impl Default for CatTable {
             supports_time_travel: false,
             scan_function_impl: None,
             writes: TableWrites::default(),
+            scan_planning: ScanPlanning::Bind,
+            scan_planner: None,
         }
     }
 }
@@ -1749,6 +1799,16 @@ pub struct CatBranch {
     /// COLUMN NAMES are the option names, since an option value may be any Arrow
     /// type. Empty means no options.
     pub format_options: Vec<u8>,
+    /// Protocol 3.2: estimated rows this branch produces before any predicate
+    /// (`ScanBranch.row_count`). Cardinality estimation only; never trusted as
+    /// exact. Must not be negative.
+    pub row_count: Option<i64>,
+    /// Protocol 3.2: conservative statistics for every row this branch produces
+    /// (`ScanBranch.column_statistics`), keyed by the table's declared column
+    /// names; columns may be omitted. The client drops the branch when a query
+    /// predicate is provably false against them, so wrong statistics silently
+    /// lose rows — leave a column out rather than guess. `None`: no statistics.
+    pub column_statistics: Option<Vec<crate::statistics::CatColStat>>,
 }
 
 /// A foreign-key constraint (referenced table in the same schema by default).
@@ -1815,6 +1875,8 @@ impl CatTable {
             supports_time_travel: false,
             scan_function_impl: None,
             writes: TableWrites::default(),
+            scan_planning: ScanPlanning::Bind,
+            scan_planner: None,
         }
     }
 
@@ -1843,6 +1905,21 @@ impl CatTable {
         t.inline_scan = true;
         t.scan_function_impl = Some(function);
         t
+    }
+
+    /// Make this a protocol 3.2 [`ScanPlanning::Filtered`] table planned by
+    /// `planner`: the client sends the query's predicates with every
+    /// `catalog_table_scan_branches_get`, and `planner` chooses the branches.
+    /// Clears [`inline_scan`](Self::inline_scan), which a filtered table cannot
+    /// use.
+    pub fn with_filtered_scan_planning(
+        mut self,
+        planner: impl crate::scan_planning::ScanBranchPlanner + 'static,
+    ) -> Self {
+        self.scan_planning = ScanPlanning::Filtered;
+        self.inline_scan = false;
+        self.scan_planner = Some(std::sync::Arc::new(planner));
+        self
     }
 }
 
@@ -2095,6 +2172,13 @@ pub fn table_info_resolved(
     // table's own schema as a best-effort default (not a guaranteed-correct
     // cross-schema resolution: a globally-registered function's real home may
     // differ from the table's own schema).
+    if t.scan_planning == ScanPlanning::Filtered && t.inline_scan {
+        return Err(vgi_rpc::RpcError::value_error(format!(
+            "Table '{}': scan_planning=Filtered cannot be combined with inline_scan; the scan \
+             redirect must be resolved per query with the query's filters",
+            t.name
+        )));
+    }
     let scan = if t.inline_scan && !t.scan_function.is_empty() {
         ipc::write_batch(&crate::wire::to_batch(scan_function_result(
             scan_function_schema.unwrap_or(schema_path),
@@ -2114,7 +2198,8 @@ pub fn table_info_resolved(
         definition_revision: t.definition_revision.clone(),
         write_result_modes: t.writes.result_modes(),
         supports_column_statistics: !t.statistics.is_empty(),
-        scan_function: Some(Bytes::from(scan)),
+        // A filtered table's scan_function MUST be null on the wire.
+        scan_function: (t.scan_planning == ScanPlanning::Bind).then(|| Bytes::from(scan)),
         insert_function: write_fn(WriteOperation::Insert)?,
         update_function: write_fn(WriteOperation::Update)?,
         delete_function: write_fn(WriteOperation::Delete)?,
@@ -2126,6 +2211,7 @@ pub fn table_info_resolved(
 
         options: None,
         layout: None,
+        scan_planning: t.scan_planning.as_str().to_string(),
     })
 }
 

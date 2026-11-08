@@ -441,6 +441,12 @@ pub struct CatalogScanBranches {
     pub required_extensions: Vec<String>,
     /// Which protocol path produced this result.
     pub resolution: ScanBranchesResolution,
+    /// Protocol 3.2: each branch's decoded `column_statistics` (the
+    /// sparse-union statistics batch, keyed by the table's declared column
+    /// names), aligned with [`branches`](Self::branches); `None` where the
+    /// branch carries none. A client may drop a branch whose statistics prove
+    /// no row can satisfy the query's predicates.
+    pub column_statistics: Vec<Option<RecordBatch>>,
 }
 
 /// One schema and everything in it, decoded — an entry of
@@ -502,9 +508,13 @@ impl SchemaSnapshot {
                 entry.path, schema.path
             )));
         }
+        let tables: Vec<TableInfo> = items(&entry.tables, "tables", path)?;
+        tables
+            .iter()
+            .try_for_each(TableInfo::validate_scan_planning)?;
         Ok(SchemaSnapshot {
             schema,
-            tables: items(&entry.tables, "tables", path)?,
+            tables,
             views: items(&entry.views, "views", path)?,
             scalar_functions: items(&entry.scalar_functions, "scalar_functions", path)?,
             aggregate_functions: items(&entry.aggregate_functions, "aggregate_functions", path)?,
@@ -1234,7 +1244,7 @@ impl VgiClient {
         cat: &AttachedCatalog,
         path: &[String],
     ) -> Result<Vec<TableInfo>> {
-        call_items(
+        let tables: Vec<TableInfo> = call_items(
             self.transport_mut(),
             "catalog_schema_contents_tables",
             p::CatalogSchemaContentsTablesParams {
@@ -1242,7 +1252,11 @@ impl VgiClient {
                 path: path.to_vec(),
                 transaction_opaque_data: cat.txn(),
             },
-        )
+        )?;
+        tables
+            .iter()
+            .try_for_each(TableInfo::validate_scan_planning)?;
+        Ok(tables)
     }
 
     /// Views in a schema.
@@ -1352,6 +1366,9 @@ impl VgiClient {
                 transaction_opaque_data: cat.txn(),
             },
         )?;
+        items
+            .iter()
+            .try_for_each(TableInfo::validate_scan_planning)?;
         Ok(items.into_iter().next())
     }
 
@@ -1405,12 +1422,39 @@ impl VgiClient {
     /// The fallback is deliberately narrow: transport failures and all other
     /// worker errors are returned unchanged rather than being hidden behind a
     /// second RPC.
+    ///
+    /// Sends no `pushdown_filters` (bind-time planning, always permitted, even
+    /// for a `scan_planning = "filtered"` table); see
+    /// [`table_scan_branches_with_filters`](Self::table_scan_branches_with_filters).
     pub fn table_scan_branches(
         &mut self,
         cat: &AttachedCatalog,
         table: &TableInfo,
         at: Option<&At>,
     ) -> Result<CatalogScanBranches> {
+        self.table_scan_branches_with_filters(cat, table, at, None)
+    }
+
+    /// [`table_scan_branches`](Self::table_scan_branches) with protocol 3.2
+    /// `pushdown_filters`: an Arrow IPC stream holding one VGI Filter Encoding
+    /// v2 snapshot batch whose column indexes refer to the table's declared
+    /// columns (`TableInfo.columns`). Meant for a `scan_planning = "filtered"`
+    /// table, called once per scan after the query's predicates are known; send
+    /// only predicates constant at planning time. Advisory: the worker may
+    /// ignore any of them, so the caller still filters every row.
+    ///
+    /// A filtered table may answer with zero branches, meaning the scan
+    /// produces no rows; for a `"bind"` table zero branches are a protocol
+    /// error. Rejects a table whose `scan_planning` is unknown, or that is
+    /// filtered and also inlines `scan_function`.
+    pub fn table_scan_branches_with_filters(
+        &mut self,
+        cat: &AttachedCatalog,
+        table: &TableInfo,
+        at: Option<&At>,
+        pushdown_filters: Option<Bytes>,
+    ) -> Result<CatalogScanBranches> {
+        table.validate_scan_planning()?;
         if cat.scan_branches_capability.load(Ordering::Acquire) == BRANCHES_CAPABILITY_UNSUPPORTED {
             return self.table_scan_function(cat, table, at).map(|legacy| {
                 scan_branches_from_legacy(legacy, ScanBranchesResolution::LegacyCached)
@@ -1427,12 +1471,14 @@ impl VgiClient {
                 at_unit: at.map(|a| a.unit.clone()),
                 at_value: at.map(|a| a.value.clone()),
                 transaction_opaque_data: cat.txn(),
+                pushdown_filters,
             },
         );
 
         match response {
             Ok(response) => {
-                let decoded = decode_scan_branches(response, ScanBranchesResolution::BranchesRpc)?;
+                let decoded =
+                    decode_scan_branches(response, ScanBranchesResolution::BranchesRpc, table)?;
                 cat.scan_branches_capability
                     .store(BRANCHES_CAPABILITY_SUPPORTED, Ordering::Release);
                 Ok(decoded)
@@ -1543,17 +1589,22 @@ fn scan_branches_from_legacy(
             format_name: None,
             format_locations: None,
             format_options: None,
+            row_count: None,
+            column_statistics: None,
         }],
         required_extensions: legacy.required_extensions,
         resolution,
+        column_statistics: vec![None],
     }
 }
 
 fn decode_scan_branches(
     response: ScanBranchesResult,
     resolution: ScanBranchesResolution,
+    table: &TableInfo,
 ) -> Result<CatalogScanBranches> {
-    if response.branches.is_empty() {
+    // Zero branches mean "no rows" for a filtered table (protocol 3.2).
+    if response.branches.is_empty() && !table.is_filtered_scan_planning() {
         return Err(RpcError::value_error(
             "VGI table returned zero scan branches",
         ));
@@ -1583,11 +1634,81 @@ fn decode_scan_branches(
         .collect::<Result<_>>()?;
 
     validate_scan_branches(&branches)?;
+    let column_statistics = decode_branch_statistics(&branches, table)?;
     Ok(CatalogScanBranches {
         branches,
         required_extensions: response.required_extensions,
         resolution,
+        column_statistics,
     })
+}
+
+/// Validate and decode each branch's protocol 3.2 statistics: `row_count`
+/// must not be negative, and `column_statistics` must be a readable
+/// statistics batch naming each of the table's declared columns at most once.
+fn decode_branch_statistics(
+    branches: &[ScanBranch],
+    table: &TableInfo,
+) -> Result<Vec<Option<RecordBatch>>> {
+    let mut declared: Option<arrow_schema::SchemaRef> = None;
+    branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| {
+            if let Some(rows) = branch.row_count.filter(|rows| *rows < 0) {
+                return Err(RpcError::value_error(format!(
+                    "VGI scan branch {index} has negative row_count {rows}"
+                )));
+            }
+            let Some(bytes) = &branch.column_statistics else {
+                return Ok(None);
+            };
+            let batch = vgi_protocol::ipc::read_batch(&bytes.0).map_err(|error| {
+                RpcError::type_error(format!(
+                    "VGI scan branch {index} column_statistics is not a readable IPC batch: {}",
+                    error.message
+                ))
+            })?;
+            if batch.num_columns() == 0 {
+                return Ok(Some(batch));
+            }
+            let names = batch
+                .column_by_name("column_name")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+                .ok_or_else(|| {
+                    RpcError::type_error(format!(
+                        "VGI scan branch {index} column_statistics has no utf8 column_name"
+                    ))
+                })?;
+            let columns = match &declared {
+                Some(columns) => columns.clone(),
+                None => {
+                    let columns = vgi_protocol::ipc::read_schema(&table.columns.0)?;
+                    declared = Some(columns.clone());
+                    columns
+                }
+            };
+            let mut seen = std::collections::HashSet::new();
+            for name in names.iter() {
+                let name = name.ok_or_else(|| {
+                    RpcError::type_error(format!(
+                        "VGI scan branch {index} column_statistics has a null column_name"
+                    ))
+                })?;
+                if columns.field_with_name(name).is_err() {
+                    return Err(RpcError::value_error(format!(
+                        "VGI scan branch {index} column_statistics names unknown column '{name}'"
+                    )));
+                }
+                if !seen.insert(name) {
+                    return Err(RpcError::value_error(format!(
+                        "VGI scan branch {index} column_statistics names column '{name}' more than once"
+                    )));
+                }
+            }
+            Ok(Some(batch))
+        })
+        .collect()
 }
 
 fn validate_scan_branches(branches: &[ScanBranch]) -> Result<()> {
@@ -1891,6 +2012,7 @@ mod attach_option_tests {
 
             options: None,
             layout: None,
+            scan_planning: "bind".to_string(),
         }
     }
 
@@ -2396,6 +2518,7 @@ mod load_catalog_tests {
 
             options: None,
             layout: None,
+            scan_planning: "bind".to_string(),
         };
         let index = IndexInfo {
             comment: None,

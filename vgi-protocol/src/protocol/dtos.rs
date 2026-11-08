@@ -1046,10 +1046,23 @@ pub struct ScanBranch {
     /// *source table's* schema, not this function's own. Added in protocol
     /// 1.5.0. Appended last for consistency with the reference wire contract.
     pub schema_path: Option<SchemaPath>,
+    /// Estimated rows this branch produces before any predicate — cardinality
+    /// estimation only, never trusted as exact. Added in protocol 3.2.0.
+    pub row_count: Option<i64>,
+    /// Conservative per-column statistics for every row this branch produces:
+    /// the same sparse-union payload as `TableInfo.column_statistics`
+    /// (`serialize_column_statistics`), keyed by the table's declared column
+    /// names. A client drops the branch when a query predicate is provably
+    /// false against them. Added in protocol 3.2.0
+    /// (`docs/protocol/scan-planning.md`).
+    pub column_statistics: Option<Bytes>,
 }
 
-/// Response for `catalog_table_scan_branches_get`. The `branches` list must be
-/// non-empty (one entry per physical source; single-source tables return one).
+/// Response for `catalog_table_scan_branches_get`: one entry per physical
+/// source (single-source tables return one). Zero entries are legal only for
+/// a `scan_planning = "filtered"` table, where they mean "the scan produces no
+/// rows" (protocol 3.2.0); for a `"bind"` table zero branches remain a protocol
+/// error.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct ScanBranchesResult {
     pub branches: Vec<Bytes>,
@@ -1264,6 +1277,43 @@ pub struct TableInfo {
     pub required_filters: Vec<Vec<Vec<String>>>,
     pub options: Option<Bytes>,
     pub layout: Option<Bytes>,
+    /// When the client resolves the table's scan redirect:
+    /// [`scan_planning::BIND`](crate::protocol::enums::scan_planning::BIND)
+    /// (3.1 behaviour) or
+    /// [`scan_planning::FILTERED`](crate::protocol::enums::scan_planning::FILTERED)
+    /// (`catalog_table_scan_branches_get` once per scan, with the query's
+    /// predicates as `pushdown_filters`). A filtered table must not inline
+    /// `scan_function`. Added in protocol 3.2.0.
+    pub scan_planning: String,
+}
+
+impl TableInfo {
+    /// Whether this table declares `scan_planning = "filtered"`.
+    ///
+    /// Does not validate; see [`TableInfo::validate_scan_planning`].
+    pub fn is_filtered_scan_planning(&self) -> bool {
+        self.scan_planning == crate::protocol::enums::scan_planning::FILTERED
+    }
+
+    /// Reject an unknown `scan_planning` value, and a `"filtered"` table that
+    /// also inlines a (non-empty) `scan_function` — both protocol errors.
+    pub fn validate_scan_planning(&self) -> vgi_rpc::Result<()> {
+        use crate::protocol::enums::scan_planning;
+        scan_planning::validate(&self.scan_planning).map_err(|mut error| {
+            error.message = format!("table '{}': {}", self.name, error.message);
+            error
+        })?;
+        if self.is_filtered_scan_planning()
+            && self.scan_function.as_ref().is_some_and(|b| !b.0.is_empty())
+        {
+            return Err(vgi_rpc::RpcError::value_error(format!(
+                "table '{}': scan_planning='filtered' cannot be combined with an inlined \
+                 scan_function; the scan redirect must be resolved per query",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// `ViewInfo` item.
@@ -1672,6 +1722,8 @@ mod federation_tests {
             format_locations: None,
             format_options: None,
             schema_path: None,
+            row_count: Some(7),
+            column_statistics: Some(Bytes::from(vec![1, 2, 3])),
         };
         let batch = crate::wire::to_batch(b).unwrap();
         let back: ScanBranch = crate::wire::from_batch(&batch).unwrap();
@@ -1683,6 +1735,8 @@ mod federation_tests {
             Some(["main".to_string()].as_slice())
         );
         assert_eq!(back.source_table.as_deref(), Some("events"));
+        assert_eq!(back.row_count, Some(7));
+        assert_eq!(back.column_statistics.unwrap().0, vec![1, 2, 3]);
     }
 
     #[test]
