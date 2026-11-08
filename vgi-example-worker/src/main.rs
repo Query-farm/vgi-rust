@@ -33,6 +33,7 @@ mod table;
 mod table_in_out;
 mod ticket_probe;
 mod twin_catalogs;
+mod txfix;
 
 use vgi::Worker;
 
@@ -56,6 +57,15 @@ fn main() {
     // RPCs — so the integration suite can be run over both load paths.
     worker.set_catalog_contents(catalog_contents_enabled());
     host_conformance_protocols(&mut worker);
+    // The writable-table / transaction-hook conformance fixture (vgi
+    // docs/writable_tx_fixtures.md): a catalog of its own, so nothing else
+    // this worker serves changes when it is selected.
+    if catalog_name == txfix::CATALOG_NAME {
+        txfix::register(&mut worker);
+        worker.set_catalog(txfix::catalog());
+        run_worker(worker);
+        return;
+    }
     if catalog_name == datafusion_companion::ROOT_CATALOG {
         datafusion_companion::register(&mut worker);
         worker.set_catalog(datafusion_companion::root_catalog());

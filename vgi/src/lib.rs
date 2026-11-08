@@ -188,6 +188,7 @@ pub mod transport;
 pub mod wasm_worker;
 mod window_cache;
 pub mod worker;
+pub mod write_results;
 
 // The wire protocol lives in `vgi-protocol` so a client can speak VGI without
 // depending on this worker framework. Re-exported at the original paths so
@@ -223,6 +224,9 @@ mod function_shape_dispatch_tests;
 
 #[cfg(all(test, feature = "transport-http"))]
 mod continuation_tests;
+
+#[cfg(test)]
+mod writable_tx_tests;
 
 pub use dispatch::FunctionScope;
 pub use function::{

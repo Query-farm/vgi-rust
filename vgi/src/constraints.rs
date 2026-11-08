@@ -94,24 +94,48 @@ fn sorted_union(a: Vec<String>, b: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Write profile: the provider keeps every ENFORCED constraint of a table on
+/// every write path it serves (its INSERT / UPDATE / DELETE functions reject
+/// rows that would violate them). DuckDB writes to a constrained table only
+/// when the attach selected this profile, and checks it before it looks for
+/// the table's write function. Requires [`CONSTRAINT_RECORDS_READ`].
+///
+/// A [`CatalogModel`](crate::catalog::CatalogModel) advertises it — and selects
+/// it when the client offers it alongside the records read — whenever one of
+/// its tables carries constraint records AND declares a write function
+/// ([`CatTable::writes`](crate::catalog::CatTable::writes)), matching the
+/// TypeScript SDK's `catalogWriteProfiles`.
+pub const CONSTRAINT_ENFORCE: &str = "vgi.constraint.enforce.v1";
+
 /// The catalog-capability agreement for an attach: the SDK's automatic
 /// constraint-read profiles (`auto_read`, empty when no served table carries
-/// records) merged with an explicit
+/// records) and write profiles (`auto_write`, [`CONSTRAINT_ENFORCE`] when a
+/// constrained table is writable) merged with an explicit
 /// [`CapabilityAgreementHook`](crate::catalog::CapabilityAgreementHook) result.
 ///
 /// Returns `(available, selected)` `CatalogCapabilities` IPC, or `None` when
 /// neither side has anything to say. A hook result alone is forwarded
 /// byte-for-byte; when both contribute, each category is the sorted union, and
-/// the scalar-expression read stays selected only alongside constraint records.
+/// the scalar-expression read and the enforce write stay selected only
+/// alongside constraint records.
 pub(crate) fn agree_capabilities(
     auto_read: &[String],
+    auto_write: &[String],
     hook: Option<(Bytes, Bytes)>,
     client_capabilities: Option<&[u8]>,
 ) -> Result<Option<(Bytes, Bytes)>> {
-    if auto_read.is_empty() {
+    if auto_read.is_empty() && auto_write.is_empty() {
         return Ok(hook);
     }
     let selected_read = select_read_profiles(auto_read, client_capabilities)?;
+    let offered_write = offered_catalog(client_capabilities)?
+        .map(|c| c.write)
+        .unwrap_or_default();
+    let selected_write: Vec<String> = auto_write
+        .iter()
+        .filter(|p| offered_write.contains(p))
+        .cloned()
+        .collect();
     let (available, selected) = match hook {
         None => (empty_capabilities(), empty_capabilities()),
         Some((available, selected)) => (
@@ -119,16 +143,36 @@ pub(crate) fn agree_capabilities(
             read_catalog_capabilities(&selected.0)?,
         ),
     };
-    let merge = |base: CatalogCapabilities, read: Vec<String>| CatalogCapabilities {
-        read: normalize_read_profiles(sorted_union(base.read, read)),
-        ddl: sorted_union(base.ddl, Vec::new()),
-        write: sorted_union(base.write, Vec::new()),
-        transaction: sorted_union(base.transaction, Vec::new()),
+    let merge = |base: CatalogCapabilities, read: Vec<String>, write: Vec<String>| {
+        let read = normalize_read_profiles(sorted_union(base.read, read));
+        let mut write = sorted_union(base.write, write);
+        // The enforce profile's prerequisite is the records read.
+        if !read.iter().any(|p| p == CONSTRAINT_RECORDS_READ) {
+            write.retain(|p| p != CONSTRAINT_ENFORCE);
+        }
+        CatalogCapabilities {
+            read,
+            ddl: sorted_union(base.ddl, Vec::new()),
+            write,
+            transaction: sorted_union(base.transaction, Vec::new()),
+        }
     };
     // Advertising is not selecting: every implemented profile is available.
-    let available = merge(available, auto_read.to_vec());
-    let selected = merge(selected, selected_read);
+    let available = merge(available, auto_read.to_vec(), auto_write.to_vec());
+    let selected = merge(selected, selected_read, selected_write);
     Ok(Some((encode_record(available)?, encode_record(selected)?)))
+}
+
+/// The client's offered `CatalogCapabilities`, if it sent any.
+fn offered_catalog(client_capabilities: Option<&[u8]>) -> Result<Option<CatalogCapabilities>> {
+    let Some(raw) = client_capabilities.filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let client: vgi_protocol::protocol::dtos::ClientCapabilities = decode_record(raw)?;
+    match client.catalog {
+        Some(catalog) if !catalog.0.is_empty() => Ok(Some(read_catalog_capabilities(&catalog.0)?)),
+        _ => Ok(None),
+    }
 }
 
 /// The `(available, selected)` agreement for a catalog that serves records
@@ -137,8 +181,23 @@ pub(crate) fn agree_capabilities(
 /// and select those `client_capabilities` offers. Put the pair in
 /// `CatalogAttachResult.catalog_capabilities` / `selected_capabilities`.
 pub fn constraint_read_agreement(client_capabilities: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
-    agree_capabilities(&read_profiles_for(true), None, client_capabilities)?
+    agree_capabilities(&read_profiles_for(true), &[], None, client_capabilities)?
         .ok_or_else(|| RpcError::runtime_error("constraint read agreement was empty"))
+}
+
+/// [`constraint_read_agreement`] plus [`CONSTRAINT_ENFORCE`]: for a custom
+/// `catalog_attach` handler whose catalog serves writable tables with
+/// constraint records. Advertises the two read profiles and the enforce write
+/// profile, and selects what `client_capabilities` offers (enforce only
+/// alongside the records read).
+pub fn constraint_write_agreement(client_capabilities: Option<&[u8]>) -> Result<(Bytes, Bytes)> {
+    agree_capabilities(
+        &read_profiles_for(true),
+        &write_profiles_for(true),
+        None,
+        client_capabilities,
+    )?
+    .ok_or_else(|| RpcError::runtime_error("constraint write agreement was empty"))
 }
 
 /// Read profiles the SDK implements for a table set: constraint records (with
@@ -149,6 +208,16 @@ pub(crate) fn read_profiles_for(has_records: bool) -> Vec<String> {
             CONSTRAINT_RECORDS_READ.to_string(),
             ROW_SCALAR_EXPRESSION.to_string(),
         ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Write profiles the SDK advertises for a table set: [`CONSTRAINT_ENFORCE`]
+/// when a table with constraint records also has a write function.
+pub(crate) fn write_profiles_for(writable_constrained: bool) -> Vec<String> {
+    if writable_constrained {
+        vec![CONSTRAINT_ENFORCE.to_string()]
     } else {
         Vec::new()
     }
@@ -947,9 +1016,9 @@ mod tests {
         let client = offer(&[r, s, "vgi.index.read.v1"]);
         // No records: the hook result passes through untouched.
         let hook = (Bytes::from(vec![9]), Bytes::from(vec![8]));
-        let out = agree_capabilities(&[], Some(hook.clone()), Some(&client.0)).unwrap();
+        let out = agree_capabilities(&[], &[], Some(hook.clone()), Some(&client.0)).unwrap();
         assert_eq!(out.unwrap().0 .0, hook.0 .0);
-        assert!(agree_capabilities(&[], None, Some(&client.0))
+        assert!(agree_capabilities(&[], &[], None, Some(&client.0))
             .unwrap()
             .is_none());
         // Records, no hook.
@@ -965,7 +1034,7 @@ mod tests {
             caps(&[r, "vgi.index.read.v1"]),
         );
         let (available, selected) =
-            agree_capabilities(&read_profiles_for(true), Some(hook), Some(&client.0))
+            agree_capabilities(&read_profiles_for(true), &[], Some(hook), Some(&client.0))
                 .unwrap()
                 .unwrap();
         let available = read_catalog_capabilities(&available.0).unwrap();
@@ -978,5 +1047,44 @@ mod tests {
             .unwrap()
             .read
             .is_empty());
+    }
+
+    fn offer_write(read: &[&str], write: &[&str]) -> Bytes {
+        encode_record(crate::protocol::dtos::ClientCapabilities {
+            engine: "test".into(),
+            native_formats: vec![],
+            catalogs: vec![],
+            can_stream: true,
+            filter_encodings: vec![],
+            query_pushdown: None,
+            catalog: Some(catalog_capabilities(read, &[], write, &[]).unwrap()),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn enforce_write_profile_is_negotiated_only_with_records_read() {
+        let r = CONSTRAINT_RECORDS_READ;
+        let s = ROW_SCALAR_EXPRESSION;
+        let e = CONSTRAINT_ENFORCE;
+        let caps = |bytes: &Bytes| read_catalog_capabilities(&bytes.0).unwrap();
+        // Offered with the records read: advertised and selected.
+        let (available, selected) =
+            constraint_write_agreement(Some(&offer_write(&[r, s], &[e]).0)).unwrap();
+        assert_eq!(caps(&available).write, vec![e]);
+        assert_eq!(caps(&selected).write, vec![e]);
+        assert_eq!(caps(&selected).read, vec![r, s]);
+        // Enforce offered without the records read: its prerequisite is
+        // missing, so it is advertised but not selected.
+        let (available, selected) =
+            constraint_write_agreement(Some(&offer_write(&[], &[e]).0)).unwrap();
+        assert_eq!(caps(&available).write, vec![e]);
+        assert!(caps(&selected).write.is_empty());
+        // Not offered: advertised, not selected.
+        let (_, selected) = constraint_write_agreement(Some(&offer(&[r, s]).0)).unwrap();
+        assert!(caps(&selected).write.is_empty());
+        // A read-only catalog never advertises enforce.
+        let (available, _) = constraint_read_agreement(Some(&offer_write(&[r], &[e]).0)).unwrap();
+        assert!(caps(&available).write.is_empty());
     }
 }

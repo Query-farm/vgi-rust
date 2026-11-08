@@ -723,9 +723,17 @@ pub struct BindParams {
     pub resolved_secrets_provided: bool,
     /// Authenticated principal name, if any.
     pub auth_principal: Option<String>,
-    /// Sealed attach state.
+    /// The attach's `attach_opaque_data`, as the worker minted it (plaintext:
+    /// on HTTP the SDK opens the sealed wire value before any function runs).
+    /// Read a catalog's attach payload from it with
+    /// [`crate::catalog::attach_payload`].
     pub attach_opaque_data: Option<Vec<u8>>,
-    /// Sealed transaction state.
+    /// The transaction this call runs in, as minted by `BEGIN` (the catalog's
+    /// [`CatalogTransactions::begin`](crate::catalog::CatalogTransactions::begin)
+    /// hook, or the SDK) — plaintext on every transport, the same bytes the
+    /// commit/rollback hooks receive. DuckDB begins a transaction for every
+    /// statement, autocommit included, on an attach that reports
+    /// `supports_transactions`; `None` on an attach that does not.
     pub transaction_opaque_data: Option<Vec<u8>>,
     /// Cross-process kv/work store (for transaction-scoped caching, etc.).
     pub storage: Option<crate::storage::SharedStorage>,
@@ -760,6 +768,12 @@ impl BindResponse {
 /// Parameters delivered to `process`.
 #[derive(Clone)]
 pub struct ProcessParams {
+    /// The schema to emit: the bind's output narrowed to `projection_ids`.
+    /// A projection may name the same column twice (e.g. the scan behind an
+    /// `UPDATE ... RETURNING`), so this can carry duplicate field names: return
+    /// batches in the full bind schema and let the adapter narrow them, or
+    /// project by position ([`crate::write_results::project_to_output`]) —
+    /// never rebuild output through a name-keyed map.
     pub output_schema: SchemaRef,
     /// Authoritative unprojected bind output schema for Filter Encoding v2.
     pub bind_output_schema: SchemaRef,
@@ -816,7 +830,14 @@ pub struct ProcessParams {
     pub tablesample_percentage: Option<f64>,
     pub tablesample_seed: Option<i64>,
     /// The (plaintext) attach state for this call, when carried by the request.
+    /// Read a catalog's attach payload from it with
+    /// [`crate::catalog::attach_payload`].
     pub attach_opaque_data: Option<Vec<u8>>,
+    /// The (plaintext) transaction this call runs in — the same value as
+    /// [`BindParams::transaction_opaque_data`] for this call's bind, available
+    /// at produce / process time and preserved across HTTP continuations.
+    /// `None` on an attach that does not report `supports_transactions`.
+    pub transaction_opaque_data: Option<Vec<u8>>,
     /// Time-travel `AT (TIMESTAMP|VERSION ...)` clause for this scan, read from
     /// the per-scan bind request carried on the init request. Both `None`
     /// without an AT clause. Function-backed tables read these to time-travel.

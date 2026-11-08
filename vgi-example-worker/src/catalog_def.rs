@@ -1407,6 +1407,7 @@ pub fn versioned() -> CatalogModel {
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
         attach_payload: None,
+        transactions: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
         global_functions: Vec::new(),
@@ -1511,6 +1512,7 @@ pub fn versioned_tables() -> CatalogModel {
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
         attach_payload: None,
+        transactions: None,
         version_schemas,
         global_functions: Vec::new(),
         global_function_prefix: String::new(),
@@ -1554,6 +1556,7 @@ pub fn build() -> CatalogModel {
         attach_option_specs: Vec::new(),
         attach_options_default_batch: None,
         attach_payload: None,
+        transactions: None,
         supported_implementation_versions: Vec::new(),
         version_schemas: std::collections::HashMap::new(),
         // Global-function registration probes, one per function type, so the

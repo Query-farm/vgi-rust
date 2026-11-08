@@ -167,6 +167,15 @@ export VGI_DATABASE_PACKAGE_WORKER="$VGI_WORKER_BIN"
 # (vgi-example-worker/src/secret_lookup.rs, contract in the vgi repo's
 # docs/secret_lookup_fixtures.md), so opt the secret/secret_lookup_*.test files in.
 export VGI_SECRET_LOOKUP_FIXTURES="${VGI_SECRET_LOOKUP_FIXTURES:-1}"
+# The example worker also serves the writable-table / transaction-hook fixture
+# catalog `txfix` (vgi-example-worker/src/txfix.rs, contract in the vgi repo's
+# docs/writable_tx_fixtures.md) through the vgi-worker-txfix wrapper, so opt the
+# writable_tx/*.test files in. VGI_WRITABLE_TX_WORKER (its LOCATION) is set per
+# transport below. Its cross-process state lives under VGI_TXFIX_STATE_DIR —
+# per run, so a rerun never meets a previous run's rows.
+export VGI_WRITABLE_TX_FIXTURES="${VGI_WRITABLE_TX_FIXTURES:-1}"
+export VGI_TXFIX_STATE_DIR="${VGI_TXFIX_STATE_DIR:-$STAGE/txfix-state}"
+mkdir -p "$VGI_TXFIX_STATE_DIR"
 # NOT exported here. bearer_auth/bearer_token.test gates on this variable
 # (`require-env VGI_TEST_BEARER_TOKEN`) and its very first statement is an
 # ATTACH carrying the `bearer_token` option — which the client rejects at bind
@@ -198,6 +207,7 @@ WV="$HERE/wrappers/vgi-worker-versioned"
 WVT="$HERE/wrappers/vgi-worker-versioned-tables"
 WAO="$HERE/wrappers/vgi-worker-attach-options"
 WBP="$HERE/wrappers/vgi-worker-bad-protocol"
+WTX="$HERE/wrappers/vgi-worker-txfix"
 
 # Serve the versioned + versioned_tables catalogs over HTTP on every Unix lane:
 # attach/versioned_tables_*_http and attach/versioning_http attach an http://
@@ -217,6 +227,7 @@ case "$TRANSPORT" in
       export VGI_VERSIONED_TABLES_WORKER="$WVT"
       export VGI_ATTACH_OPTIONS_WORKER="$WAO"
       export VGI_BAD_PROTOCOL_WORKER="$WBP"
+      export VGI_WRITABLE_TX_WORKER="$WTX"
       boot_versioned_http
     fi
     ;;
@@ -229,6 +240,7 @@ case "$TRANSPORT" in
     export VGI_VERSIONED_TABLES_WORKER="launch:${WVT}"
     export VGI_ATTACH_OPTIONS_WORKER="launch:${WAO}"
     export VGI_BAD_PROTOCOL_WORKER="launch:${WBP}"
+    export VGI_WRITABLE_TX_WORKER="launch:${WTX}"
     boot_versioned_http
     ;;
   http)
@@ -255,6 +267,10 @@ case "$TRANSPORT" in
       boot_http_worker "$WVT" && export VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:${BOOTED_PORT}"
       boot_http_worker "$WAO" && export VGI_ATTACH_OPTIONS_HTTP_WORKER="http://localhost:${BOOTED_PORT}"
     fi
+    # The txfix fixture is the same binary in its own catalog, so it boots
+    # directly (no shell wrapper) and runs on Windows too.
+    boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=txfix" \
+      && export VGI_WRITABLE_TX_WORKER="http://localhost:${BOOTED_PORT}"
     ;;
   *)
     echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http)"; exit 1 ;;
@@ -316,12 +332,14 @@ rc=0
 # gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only) started running against
 # this worker's contents_* fixture catalogs (vgi-example-worker/src/contents_fixtures.rs),
 # and by 5 again for the five secret/secret_lookup_*.test files
-# (VGI_SECRET_LOOKUP_FIXTURES, vgi-example-worker/src/secret_lookup.rs).
+# (VGI_SECRET_LOOKUP_FIXTURES, vgi-example-worker/src/secret_lookup.rs),
+# and by 5 more for the five writable_tx/*.test files
+# (VGI_WRITABLE_TX_FIXTURES, vgi-example-worker/src/txfix.rs).
 TOTAL_EXECUTED=0
 case "$TRANSPORT" in
-  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-260}" ;;
-  launch) MIN_EXECUTED="${MIN_EXECUTED:-265}" ;;
-  http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-250}"; else MIN_EXECUTED="${MIN_EXECUTED:-255}"; fi ;;
+  stdio)  MIN_EXECUTED="${MIN_EXECUTED:-265}" ;;
+  launch) MIN_EXECUTED="${MIN_EXECUTED:-270}" ;;
+  http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-255}"; else MIN_EXECUTED="${MIN_EXECUTED:-260}"; fi ;;
 esac
 
 # run_unittest — invoke haybarn-unittest, streaming its output, and additionally

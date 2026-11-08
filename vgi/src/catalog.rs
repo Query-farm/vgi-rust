@@ -14,7 +14,7 @@ use crate::ipc;
 use crate::protocol::dtos::{FunctionInfo, RequiredSecret, SchemaInfo};
 use crate::protocol::enums;
 
-pub use crate::dispatch::secondary_attach_payload;
+pub use crate::dispatch::{attach_payload, secondary_attach_payload};
 
 /// The default schema name every registered function lives under.
 pub const MAIN_SCHEMA: &str = "main";
@@ -907,6 +907,94 @@ pub fn schema_info(
 // Declarative catalog model (views / macros / function-backed tables)
 // ---------------------------------------------------------------------------
 
+/// Catalog transaction hooks: the worker's half of `BEGIN` / `COMMIT` /
+/// `ROLLBACK` on an attached catalog (the TypeScript SDK's
+/// `transactionBegin` / `transactionCommit` / `transactionRollback`, plus its
+/// per-attach `supports_transactions`).
+///
+/// Install one on [`CatalogModel::transactions`] (primary or secondary
+/// catalog); the worker then serves `catalog_transaction_begin` / `_commit` /
+/// `_rollback` through it on every transport — no custom server needed.
+///
+/// Every hook sees **plaintext** opaque values: on HTTP, where the SDK seals
+/// `attach_opaque_data` and `transaction_opaque_data` on the wire, they are
+/// opened before the hook runs, and the id `begin` returns is sealed after.
+/// The transaction id a hook sees is byte-for-byte the one functions see in
+/// [`BindParams::transaction_opaque_data`](crate::BindParams::transaction_opaque_data)
+/// and [`ProcessParams::transaction_opaque_data`](crate::ProcessParams::transaction_opaque_data).
+///
+/// DuckDB opens a transaction for every statement on an attach whose result
+/// said `supports_transactions` — an autocommit statement is a one-statement
+/// transaction (begin at bind, commit after it runs) — and never calls these
+/// hooks for an attach that said `false`.
+///
+/// A worker served by a pool of processes (stdio, the launcher, HTTP) may run
+/// `begin`, the statement's functions and `commit` in different processes, so
+/// keep pending state in shared storage (a file, a database, the worker's
+/// [`crate::storage`]) keyed by the transaction id, not in `self`.
+///
+/// ```
+/// use arrow_array::Array as _;
+/// use vgi::catalog::CatalogTransactions;
+/// use vgi::Result;
+///
+/// struct Journal;
+/// impl CatalogTransactions for Journal {
+///     fn supports_transactions(&self, options: Option<&arrow_array::RecordBatch>) -> Result<bool> {
+///         // Per attach: only `ATTACH ... (transactional true)` is transactional.
+///         Ok(options
+///             .and_then(|o| o.column_by_name("transactional"))
+///             .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>())
+///             .map(|b| !b.is_null(0) && b.value(0))
+///             .unwrap_or(false))
+///     }
+///     fn commit(&self, _attach: &[u8], tx: &[u8]) -> Result<()> {
+///         // apply the changes staged under `tx` ... or refuse:
+///         if tx.is_empty() {
+///             return Err(vgi::RpcError::runtime_error("nothing to commit"));
+///         }
+///         Ok(())
+///     }
+/// }
+/// let model = vgi::catalog::CatalogModel {
+///     transactions: Some(std::sync::Arc::new(Journal)),
+///     ..Default::default()
+/// };
+/// # let _ = model;
+/// ```
+pub trait CatalogTransactions: Send + Sync {
+    /// Whether this attach supports transactions — the attach result's
+    /// `supports_transactions`, decided per ATTACH. `options` is the request's
+    /// one-row options record (secret options included; `None` when the
+    /// ATTACH named none). Default: `true` (the SDK's behavior without hooks).
+    fn supports_transactions(&self, options: Option<&arrow_array::RecordBatch>) -> Result<bool> {
+        let _ = options;
+        Ok(true)
+    }
+
+    /// `BEGIN`: mint the transaction's opaque id for the attach
+    /// `attach_opaque_data`. Return `Ok(None)` to keep the SDK's default (a
+    /// fresh, unguessable 29-byte id). An error fails the `BEGIN`.
+    fn begin(&self, attach_opaque_data: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _ = attach_opaque_data;
+        Ok(None)
+    }
+
+    /// `COMMIT` of `transaction_opaque_data`. An error fails the `COMMIT`
+    /// (DuckDB reports it and the transaction is over — the worker should
+    /// discard what it staged before failing).
+    fn commit(&self, attach_opaque_data: &[u8], transaction_opaque_data: &[u8]) -> Result<()> {
+        let _ = (attach_opaque_data, transaction_opaque_data);
+        Ok(())
+    }
+
+    /// `ROLLBACK` of `transaction_opaque_data`: discard what it staged.
+    fn rollback(&self, attach_opaque_data: &[u8], transaction_opaque_data: &[u8]) -> Result<()> {
+        let _ = (attach_opaque_data, transaction_opaque_data);
+        Ok(())
+    }
+}
+
 /// See [`CatalogModel::attach_payload`].
 pub type AttachPayloadHook =
     std::sync::Arc<dyn Fn(Option<&arrow_array::RecordBatch>) -> Result<Vec<u8>> + Send + Sync>;
@@ -972,13 +1060,38 @@ pub struct CatalogModel {
     /// When set, `catalog_attach` merges the user `options` over it and encodes
     /// the result into `attach_opaque_data` (`<16-byte id>\0<ipc>`).
     pub attach_options_default_batch: Option<Vec<u8>>,
-    /// Secondary catalogs only ([`crate::Worker::register_secondary_catalog`]):
-    /// called at attach, after required-option validation, with the request's
-    /// one-row options record (`None` when there are none). The bytes it
-    /// returns ride in this attach's `attach_opaque_data`, and functions read
-    /// them back with [`secondary_attach_payload`]. `None` (the default): the
-    /// attach carries no payload.
+    /// The main-catalog and secondary-catalog attach hook: called at attach,
+    /// after required-option validation, with the request's one-row options
+    /// record (`None` when there are none). The record holds every option the
+    /// ATTACH named, **secret options included** (DuckDB redacts those from
+    /// `duckdb_databases()`, but sends them to the worker). The bytes it returns
+    /// ride in this attach's `attach_opaque_data`, which DuckDB sends back on
+    /// every bind/init of the attach, and functions read them back with
+    /// [`attach_payload`] (on [`BindParams`](crate::BindParams) and
+    /// [`ProcessParams`](crate::ProcessParams) alike, and in the
+    /// [`CatalogTransactions`] hooks). `None` (the default): the attach carries
+    /// no payload.
+    ///
+    /// This is how a secret option (an API key, a token) reaches a function.
+    /// Over HTTP the SDK seals `attach_opaque_data` (XChaCha20-Poly1305 under the
+    /// signing key, bound to the caller — see [`crate::opaque`]), so the
+    /// payload is never readable or forgeable off the worker. On the OS-owned
+    /// transports (stdio, the launcher's unix socket) it travels in plaintext
+    /// over the pipe between DuckDB and its own worker process. Either way the
+    /// worker also replays the attach value into its shared storage for
+    /// table-buffering functions, so return only what functions need.
+    ///
+    /// On the primary catalog the hook replaces the declarative option
+    /// encoding: it cannot be combined with
+    /// [`attach_options_default_batch`](Self::attach_options_default_batch) or
+    /// [`version_schemas`](Self::version_schemas) (the attach is refused) —
+    /// pack whatever options functions need into the payload instead.
     pub attach_payload: Option<AttachPayloadHook>,
+    /// Transaction hooks and the per-attach `supports_transactions` decision
+    /// (see [`CatalogTransactions`]). `None` (the default): every attach
+    /// reports `supports_transactions = true`, `BEGIN` mints an SDK id, and
+    /// `COMMIT` / `ROLLBACK` succeed without doing anything.
+    pub transactions: Option<Arc<dyn CatalogTransactions>>,
     /// Registered function names this catalog additionally asks the client to
     /// publish into its *global* (catalog-independent) namespace, prefixed with
     /// [`global_function_prefix`](Self::global_function_prefix). Advertised via
@@ -1084,9 +1197,30 @@ impl CatalogModel {
             .transpose()?;
         crate::constraints::agree_capabilities(
             &crate::constraints::read_profiles_for(self.has_constraint_records()),
+            &crate::constraints::write_profiles_for(self.has_writable_constrained_tables()),
             hook,
             client_capabilities,
         )
+    }
+
+    /// Whether any table this catalog serves carries constraint records AND
+    /// declares a write function ([`CatTable::writes`]). When true,
+    /// `catalog_attach` also advertises
+    /// [`CONSTRAINT_ENFORCE`](crate::constraints::CONSTRAINT_ENFORCE) and selects
+    /// it when the client offers it with the records read — the promise DuckDB
+    /// needs before it writes to a constrained table. Such a table's write
+    /// functions must then reject rows that would violate its constraints (for
+    /// instance by refusing to change key columns).
+    pub fn has_writable_constrained_tables(&self) -> bool {
+        self.schemas
+            .iter()
+            .chain(self.version_schemas.values().flatten())
+            .flat_map(|schema| &schema.tables)
+            .any(|t| {
+                !t.writes.is_empty()
+                    && (!t.constraints.is_empty()
+                        || t.constraint_versions.values().any(|(c, _)| !c.is_empty()))
+            })
     }
 }
 
@@ -1317,6 +1451,152 @@ pub struct CatTable {
     /// `register_table` call — mirroring the Go `CatalogTable.Function`
     /// ergonomics. Not serialized; only the `scan_function` name reaches the wire.
     pub scan_function_impl: Option<std::sync::Arc<dyn crate::table_function::TableFunction>>,
+    /// The table's INSERT / UPDATE / DELETE functions and the richest result
+    /// mode each produces. Empty (the default): the table is read-only and
+    /// DuckDB answers `Table '<name>' does not support UPDATE` (etc.). See
+    /// [`TableWrites`] and [`crate::write_results`].
+    pub writes: TableWrites,
+}
+
+/// A table-in-out function backing one DML operation of a [`CatTable`].
+#[derive(Clone)]
+pub struct WriteFunction {
+    /// The registered table-in-out function's name.
+    pub function: String,
+    /// The schema the function is registered in. `None`: resolved from the
+    /// worker's registrations (the table's own schema when it is registered
+    /// there), like a scan function.
+    pub schema_path: Option<Vec<String>>,
+    /// The richest result mode it produces (`count < rows < changes`; a mode
+    /// promises every lower one). DuckDB asks for `count` for plain DML and
+    /// `rows` for `RETURNING`.
+    pub max_result_mode: crate::write_results::WriteResultMode,
+    /// The function itself, auto-registered by [`crate::Worker::set_catalog`]
+    /// (deduplicated by name) so it needs no separate
+    /// [`register_table_in_out`](crate::Worker::register_table_in_out). Not
+    /// serialized.
+    pub function_impl: Option<Arc<dyn crate::table_in_out::TableInOutFunction>>,
+}
+
+impl WriteFunction {
+    /// A write function by registered name, producing up to `max_result_mode`.
+    pub fn named(function: &str, max_result_mode: crate::write_results::WriteResultMode) -> Self {
+        WriteFunction {
+            function: function.to_string(),
+            schema_path: None,
+            max_result_mode,
+            function_impl: None,
+        }
+    }
+
+    /// A write function from its implementation (auto-registered by
+    /// [`crate::Worker::set_catalog`]).
+    pub fn from_impl(
+        function: Arc<dyn crate::table_in_out::TableInOutFunction>,
+        max_result_mode: crate::write_results::WriteResultMode,
+    ) -> Self {
+        WriteFunction {
+            function: function.name().to_string(),
+            schema_path: None,
+            max_result_mode,
+            function_impl: Some(function),
+        }
+    }
+}
+
+/// The DML functions of a writable [`CatTable`] (the TypeScript SDK's
+/// `insertFunction` / `updateFunction` / `deleteFunction` +
+/// `writeResultModes`).
+///
+/// Each is a table-in-out function that receives the affected rows and the
+/// `write_options` named argument, and returns a
+/// [`write_result_schema`](crate::write_results::write_result_schema) batch for
+/// the requested mode (see [`crate::write_results`]). UPDATE and DELETE
+/// identify rows by the table's row-id column, so they require a scan function
+/// that emits one ([`row_id_field`](crate::write_results::row_id_field)) and
+/// supports projection pushdown.
+///
+/// The functions are inlined into `TableInfo` (so DuckDB skips the
+/// `catalog_table_*_function_get` round trip) and also served by those RPCs.
+/// A table with constraint records and any write function makes its catalog
+/// negotiate [`CONSTRAINT_ENFORCE`](crate::constraints::CONSTRAINT_ENFORCE).
+#[derive(Clone, Default)]
+pub struct TableWrites {
+    pub insert: Option<WriteFunction>,
+    pub update: Option<WriteFunction>,
+    pub delete: Option<WriteFunction>,
+}
+
+impl TableWrites {
+    /// Whether no operation has a write function (a read-only table).
+    pub fn is_empty(&self) -> bool {
+        self.insert.is_none() && self.update.is_none() && self.delete.is_none()
+    }
+
+    /// The write function for `op`, if declared.
+    pub fn get(&self, op: crate::write_results::WriteOperation) -> Option<&WriteFunction> {
+        use crate::write_results::WriteOperation::*;
+        match op {
+            Insert => self.insert.as_ref(),
+            Update => self.update.as_ref(),
+            Delete => self.delete.as_ref(),
+        }
+    }
+
+    /// Every declared `(operation, function)` pair, in wire order.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (crate::write_results::WriteOperation, &WriteFunction)> {
+        crate::write_results::WriteOperation::ALL
+            .into_iter()
+            .filter_map(move |op| self.get(op).map(|f| (op, f)))
+    }
+
+    /// `TableInfo.write_result_modes`: each declared operation's maximum mode.
+    pub fn result_modes(&self) -> Vec<(String, String)> {
+        self.iter()
+            .map(|(op, f)| {
+                (
+                    op.as_str().to_string(),
+                    f.max_result_mode.as_str().to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+impl CatTable {
+    /// Make the table accept `INSERT` through `function` (builder style).
+    pub fn with_insert_function(
+        mut self,
+        function: Arc<dyn crate::table_in_out::TableInOutFunction>,
+        max_result_mode: crate::write_results::WriteResultMode,
+    ) -> Self {
+        self.writes.insert = Some(WriteFunction::from_impl(function, max_result_mode));
+        self
+    }
+
+    /// Make the table accept `UPDATE` through `function` (builder style).
+    /// Requires a scan function that emits the row-id column.
+    pub fn with_update_function(
+        mut self,
+        function: Arc<dyn crate::table_in_out::TableInOutFunction>,
+        max_result_mode: crate::write_results::WriteResultMode,
+    ) -> Self {
+        self.writes.update = Some(WriteFunction::from_impl(function, max_result_mode));
+        self
+    }
+
+    /// Make the table accept `DELETE` through `function` (builder style).
+    /// Requires a scan function that emits the row-id column.
+    pub fn with_delete_function(
+        mut self,
+        function: Arc<dyn crate::table_in_out::TableInOutFunction>,
+        max_result_mode: crate::write_results::WriteResultMode,
+    ) -> Self {
+        self.writes.delete = Some(WriteFunction::from_impl(function, max_result_mode));
+        self
+    }
 }
 
 /// `columns` is the one field with no sensible zero — a table with no columns
@@ -1350,6 +1630,7 @@ impl Default for CatTable {
             required_filters: Vec::new(),
             supports_time_travel: false,
             scan_function_impl: None,
+            writes: TableWrites::default(),
         }
     }
 }
@@ -1536,6 +1817,7 @@ impl CatTable {
             required_filters: Vec::new(),
             supports_time_travel: false,
             scan_function_impl: None,
+            writes: TableWrites::default(),
         }
     }
 
@@ -1730,7 +2012,81 @@ pub fn table_info(
     t: &CatTable,
     scan_function_schema: Option<&[String]>,
 ) -> Result<crate::protocol::dtos::TableInfo> {
+    table_info_resolved(schema_path, t, scan_function_schema, &|_| None)
+}
+
+/// The `ScanFunctionResult` naming `t`'s write function for `op` (the bytes
+/// inlined in `TableInfo.{insert,update,delete}_function`, and the answer to
+/// `catalog_table_{insert,update,delete}_function_get`), or `None` when the
+/// table does not accept `op`. `resolved_schema` is the function's real home
+/// when the caller can resolve it; otherwise the [`WriteFunction::schema_path`]
+/// or the table's own schema.
+pub fn write_function_result(
+    schema_path: &[String],
+    t: &CatTable,
+    op: crate::write_results::WriteOperation,
+    resolved_schema: Option<&[String]>,
+) -> Option<crate::protocol::dtos::ScanFunctionResult> {
+    let f = t.writes.get(op)?;
+    let home = f
+        .schema_path
+        .as_deref()
+        .or(resolved_schema)
+        .unwrap_or(schema_path);
+    Some(crate::protocol::dtos::ScanFunctionResult {
+        function_name: f.function.clone(),
+        arguments: Bytes::from(Vec::new()),
+        required_extensions: Vec::new(),
+        schema_path: Some(home.to_vec()),
+    })
+}
+
+/// Reject a write declaration DuckDB could not use.
+fn validate_writes(t: &CatTable) -> Result<()> {
+    use crate::write_results::WriteOperation;
+    for (op, f) in t.writes.iter() {
+        if f.function.is_empty() {
+            return Err(vgi_rpc::RpcError::value_error(format!(
+                "Table '{}': the {op} write function has no name",
+                t.name
+            )));
+        }
+        if matches!(op, WriteOperation::Update | WriteOperation::Delete)
+            && t.scan_function.is_empty()
+        {
+            return Err(vgi_rpc::RpcError::value_error(format!(
+                "Table '{}': {op} requires a scan function that emits the row-id column \
+                 (vgi::write_results::row_id_field)",
+                t.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`table_info`] with the schema of each write function resolved by
+/// `write_function_schema(name)` (the dispatcher passes its registrations).
+pub fn table_info_resolved(
+    schema_path: &[String],
+    t: &CatTable,
+    scan_function_schema: Option<&[String]>,
+    write_function_schema: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Result<crate::protocol::dtos::TableInfo> {
     use crate::protocol::dtos::TableInfo;
+    use crate::write_results::WriteOperation;
+    validate_writes(t)?;
+    let write_fn = |op: WriteOperation| -> Result<Option<Bytes>> {
+        let resolved = t
+            .writes
+            .get(op)
+            .and_then(|f| write_function_schema(&f.function));
+        match write_function_result(schema_path, t, op, resolved.as_deref()) {
+            Some(r) => Ok(Some(Bytes::from(ipc::write_batch(
+                &crate::wire::to_batch(r)?,
+            )?))),
+            None => Ok(Some(Bytes::from(Vec::new()))),
+        }
+    };
     let columns = served_table_columns(schema_path, t)?;
     // Inline the scan function only for tables that opt in; otherwise the C++
     // extension resolves it lazily via `catalog_table_scan_function_get`.
@@ -1759,12 +2115,12 @@ pub fn table_info(
         columns: Bytes::from(ipc::write_schema(&columns)?),
         constraints: t.constraints.clone(),
         definition_revision: t.definition_revision.clone(),
-        write_result_modes: Vec::new(),
+        write_result_modes: t.writes.result_modes(),
         supports_column_statistics: !t.statistics.is_empty(),
         scan_function: Some(Bytes::from(scan)),
-        insert_function: Some(Bytes::from(Vec::new())),
-        update_function: Some(Bytes::from(Vec::new())),
-        delete_function: Some(Bytes::from(Vec::new())),
+        insert_function: write_fn(WriteOperation::Insert)?,
+        update_function: write_fn(WriteOperation::Update)?,
+        delete_function: write_fn(WriteOperation::Delete)?,
         cardinality_estimate: t.cardinality.into(),
         cardinality_max: t.cardinality.into(),
         required_filters: t.required_filters.clone(),

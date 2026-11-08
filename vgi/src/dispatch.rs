@@ -716,6 +716,15 @@ impl Dispatcher {
         }
     }
 
+    /// Register `f` unless a table-in-out function of the same name already
+    /// is (how a [`catalog::WriteFunction`]'s embedded implementation is
+    /// auto-registered).
+    pub fn register_table_in_out_if_absent(&mut self, f: Arc<dyn TableInOutFunction>) {
+        if !self.tableinouts.contains_key(f.name()) {
+            self.register_table_in_out(f);
+        }
+    }
+
     pub fn register_table_in_out(&mut self, f: Arc<dyn TableInOutFunction>) {
         // Blended ("UNNEST-style") foot-gun guards, mirroring the Python
         // resolve_metadata checks. Registration happens at worker startup, so
@@ -1417,6 +1426,10 @@ impl Dispatcher {
                 tablesample_percentage: dto.tablesample_percentage,
                 tablesample_seed: dto.tablesample_seed,
                 attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
+                transaction_opaque_data: bind_call
+                    .transaction_opaque_data
+                    .clone()
+                    .map(|b| b.into()),
                 at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
                 at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
                 copy_from: copy_from.clone(),
@@ -1986,6 +1999,11 @@ impl Dispatcher {
             filter_deltas: Vec::new(),
             filter_predicate_order: Vec::new(),
             continuation: TioContinuation::default(),
+            transaction_opaque_data: bind_call
+                .transaction_opaque_data
+                .clone()
+                .map(|b| b.0)
+                .unwrap_or_default(),
         };
         vgi_rpc::stream_codec::bincode_encode(&blob)
     }
@@ -2060,6 +2078,8 @@ impl Dispatcher {
             tablesample_percentage: None,
             tablesample_seed: None,
             attach_opaque_data: Some(blob.attach_opaque_data.clone()).filter(|v| !v.is_empty()),
+            transaction_opaque_data: Some(blob.transaction_opaque_data.clone())
+                .filter(|v| !v.is_empty()),
             at_unit: Some(blob.at_unit.clone()).filter(|s| !s.is_empty()),
             at_value: Some(blob.at_value.clone()).filter(|s| !s.is_empty()),
             // COPY-FROM producers drain fully (no HTTP continuation token is
@@ -2411,21 +2431,17 @@ impl Dispatcher {
             )?;
             let mut scope = self.next_execution_id();
             debug_assert_eq!(scope.len(), EXECUTION_ID_LEN);
+            let options = attach_options_record(&dto)?;
             if let Some(hook) = &sec.attach_payload {
-                let options = dto
-                    .options
-                    .as_ref()
-                    .filter(|b| !b.0.is_empty())
-                    .map(|b| ipc::read_batch(&b.0))
-                    .transpose()?;
                 scope.extend_from_slice(&hook(options.as_ref())?);
             }
+            let supports_transactions = supports_transactions_for(sec, options.as_ref())?;
             let result = CatalogAttachResult {
                 catalog_capabilities: agreement.as_ref().map(|value| value.0.clone()),
                 selected_capabilities: agreement.map(|value| value.1),
                 query_pushdown: None,
                 attach_opaque_data: Bytes::from(encode_secondary_opaque(&sec.name, &scope)),
-                supports_transactions: true,
+                supports_transactions,
                 supports_time_travel: sec.supports_time_travel,
                 catalog_version_frozen: sec.catalog_version_frozen,
                 catalog_version: 1,
@@ -2454,73 +2470,89 @@ impl Dispatcher {
         // Version-shaped catalogs encode the resolved data version into the
         // attach_opaque_data (`<version>\0<id>`) so per-request catalog handlers
         // can select the right object set without server-side session state.
-        let attach_opaque_data =
-            if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
-                // Merge the user-supplied options over the declared defaults and
-                // encode the one-row result as `<16-byte id>\0<ipc batch>`.
-                let default_batch = ipc::read_batch(default_bytes)?;
-                let options = dto
-                    .options
-                    .as_ref()
-                    .map(|b| ipc::read_batch(&b.0))
-                    .transpose()?;
-                // Secret options never enter the value, sealed or not: it is
-                // also persisted server-side (`bufattach`) and, on an OS-owned
-                // transport, travels in plaintext.
-                let secret = catalog::secret_attach_option_names(&self.catalog.attach_option_specs);
-                let is_secret = |name: &str| secret.iter().any(|s| s.eq_ignore_ascii_case(name));
-                let default_batch = {
-                    let schema = default_batch.schema();
-                    let keep: Vec<usize> = (0..schema.fields().len())
-                        .filter(|&i| !is_secret(schema.field(i).name()))
-                        .collect();
-                    default_batch
-                        .project(&keep)
-                        .map_err(|e| RpcError::runtime_error(e.to_string()))?
-                };
-                let cols: Vec<arrow_array::ArrayRef> = default_batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| -> Result<arrow_array::ArrayRef> {
-                        match options.as_ref().and_then(|o| o.column_by_name(f.name())) {
-                            // Cast to the declared type to normalize nested field
-                            // names (DuckDB's list/struct field names differ).
-                            Some(c) => arrow_cast::cast(c, f.data_type())
-                                .map_err(|e| RpcError::runtime_error(e.to_string())),
-                            None => Ok(default_batch.column(i).clone()),
-                        }
-                    })
-                    .collect::<Result<_>>()?;
-                let merged = RecordBatch::try_new(default_batch.schema(), cols)
-                    .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-                let id = self.attach_bytes();
-                let mut v: Vec<u8> = id
-                    .iter()
-                    .copied()
-                    .chain(std::iter::repeat(0))
-                    .take(16)
+        let options_record = attach_options_record(&dto)?;
+        let attach_opaque_data = if let Some(hook) = &self.catalog.attach_payload {
+            // The main-catalog attach hook: the payload rides the same
+            // `<marker><name>\0<session id><payload>` encoding a secondary
+            // catalog's does, so `attach_payload()` reads both.
+            if self.catalog.attach_options_default_batch.is_some()
+                || !self.catalog.version_schemas.is_empty()
+            {
+                return Err(RpcError::value_error(format!(
+                    "catalog '{}': attach_payload cannot be combined with \
+                     attach_options_default_batch or version_schemas",
+                    dto.name
+                )));
+            }
+            let mut scope = self.next_execution_id();
+            scope.extend_from_slice(&hook(options_record.as_ref())?);
+            encode_secondary_opaque(self.primary_catalog_name(), &scope)
+        } else if let Some(default_bytes) = &self.catalog.attach_options_default_batch {
+            // Merge the user-supplied options over the declared defaults and
+            // encode the one-row result as `<16-byte id>\0<ipc batch>`.
+            let default_batch = ipc::read_batch(default_bytes)?;
+            let options = dto
+                .options
+                .as_ref()
+                .map(|b| ipc::read_batch(&b.0))
+                .transpose()?;
+            // Secret options never enter the value, sealed or not: it is
+            // also persisted server-side (`bufattach`) and, on an OS-owned
+            // transport, travels in plaintext.
+            let secret = catalog::secret_attach_option_names(&self.catalog.attach_option_specs);
+            let is_secret = |name: &str| secret.iter().any(|s| s.eq_ignore_ascii_case(name));
+            let default_batch = {
+                let schema = default_batch.schema();
+                let keep: Vec<usize> = (0..schema.fields().len())
+                    .filter(|&i| !is_secret(schema.field(i).name()))
                     .collect();
-                v.push(0);
-                v.extend_from_slice(&ipc::write_batch(&merged)?);
-                v
-            } else if !self.catalog.version_schemas.is_empty() {
-                let mut v = resolved_data_version
-                    .clone()
-                    .unwrap_or_default()
-                    .into_bytes();
-                v.push(0);
-                v.extend_from_slice(&self.attach_bytes());
-                v
-            } else if dto.name == PROJ_REPRO_APP {
-                // The `projection_repro` reproducer is a distinct "app" served by the
-                // same binary, selected by ATTACH name. Echo it back so function
-                // advertisement (which is otherwise global) can scope to it.
-                PROJ_REPRO_APP.as_bytes().to_vec()
-            } else {
-                self.attach_bytes()
+                default_batch
+                    .project(&keep)
+                    .map_err(|e| RpcError::runtime_error(e.to_string()))?
             };
+            let cols: Vec<arrow_array::ArrayRef> = default_batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| -> Result<arrow_array::ArrayRef> {
+                    match options.as_ref().and_then(|o| o.column_by_name(f.name())) {
+                        // Cast to the declared type to normalize nested field
+                        // names (DuckDB's list/struct field names differ).
+                        Some(c) => arrow_cast::cast(c, f.data_type())
+                            .map_err(|e| RpcError::runtime_error(e.to_string())),
+                        None => Ok(default_batch.column(i).clone()),
+                    }
+                })
+                .collect::<Result<_>>()?;
+            let merged = RecordBatch::try_new(default_batch.schema(), cols)
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+            let id = self.attach_bytes();
+            let mut v: Vec<u8> = id
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0))
+                .take(16)
+                .collect();
+            v.push(0);
+            v.extend_from_slice(&ipc::write_batch(&merged)?);
+            v
+        } else if !self.catalog.version_schemas.is_empty() {
+            let mut v = resolved_data_version
+                .clone()
+                .unwrap_or_default()
+                .into_bytes();
+            v.push(0);
+            v.extend_from_slice(&self.attach_bytes());
+            v
+        } else if dto.name == PROJ_REPRO_APP {
+            // The `projection_repro` reproducer is a distinct "app" served by the
+            // same binary, selected by ATTACH name. Echo it back so function
+            // advertisement (which is otherwise global) can scope to it.
+            PROJ_REPRO_APP.as_bytes().to_vec()
+        } else {
+            self.attach_bytes()
+        };
         let agreement = self.catalog.capability_agreement_for(
             dto.client_capabilities
                 .as_ref()
@@ -2531,7 +2563,10 @@ impl Dispatcher {
             selected_capabilities: agreement.map(|value| value.1),
             query_pushdown: None,
             attach_opaque_data: Bytes::from(attach_opaque_data),
-            supports_transactions: true,
+            supports_transactions: supports_transactions_for(
+                &self.catalog,
+                options_record.as_ref(),
+            )?,
             supports_time_travel: self.catalog.supports_time_travel,
             catalog_version_frozen: self.catalog.catalog_version_frozen,
             catalog_version: 1,
@@ -2808,14 +2843,60 @@ impl Dispatcher {
         crate::split_token::split_anchor(Self::CATALOG_VERSION)
     }
 
-    pub fn handle_transaction_begin(&self, _req: &Request) -> Result<Option<RecordBatch>> {
-        // A fresh id per BEGIN so transaction-scoped caches (tx_cached_value)
-        // don't leak across transactions; in autocommit DuckDB passes None.
+    /// `catalog_transaction_begin`: the catalog's
+    /// [`CatalogTransactions::begin`](catalog::CatalogTransactions::begin)
+    /// hook mints the id, or the SDK does (a fresh id per BEGIN, so
+    /// transaction-scoped caches such as `tx_cached_value` don't leak across
+    /// transactions).
+    ///
+    /// DuckDB begins a transaction for EVERY statement on an attach that
+    /// reports `supports_transactions` -- an autocommit statement is a
+    /// one-statement transaction, begun at bind and committed after it runs --
+    /// so functions see a transaction id in autocommit too. Only an attach
+    /// that reports `supports_transactions = false` gets no BEGIN, and its
+    /// functions see `transaction_opaque_data = None`.
+    pub fn handle_transaction_begin(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        let minted = match &self.active_catalog(req).transactions {
+            Some(hooks) => {
+                let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+                hooks.begin(&attach)?
+            }
+            None => None,
+        };
         Ok(Some(wire::to_result_batch(
             CatalogTransactionBeginResult {
-                transaction_opaque_data: Some(Bytes::from(self.next_execution_id())),
+                transaction_opaque_data: Some(Bytes::from(
+                    minted.unwrap_or_else(|| self.next_execution_id()),
+                )),
             },
         )?))
+    }
+
+    /// `catalog_transaction_commit`: the catalog's
+    /// [`CatalogTransactions::commit`](catalog::CatalogTransactions::commit)
+    /// hook, with the plaintext attach and transaction values. A hook error
+    /// fails the COMMIT. No hooks (or no transaction value): nothing to do.
+    pub fn handle_transaction_commit(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        if let Some(hooks) = &self.active_catalog(req).transactions {
+            if let Some(tx) = read_binary_col(req, "transaction_opaque_data") {
+                let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+                hooks.commit(&attach, &tx)?;
+            }
+        }
+        Ok(None)
+    }
+
+    /// `catalog_transaction_rollback`: the catalog's
+    /// [`CatalogTransactions::rollback`](catalog::CatalogTransactions::rollback)
+    /// hook. See [`Self::handle_transaction_commit`].
+    pub fn handle_transaction_rollback(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        if let Some(hooks) = &self.active_catalog(req).transactions {
+            if let Some(tx) = read_binary_col(req, "transaction_opaque_data") {
+                let attach = read_binary_col(req, "attach_opaque_data").unwrap_or_default();
+                hooks.rollback(&attach, &tx)?;
+            }
+        }
+        Ok(None)
     }
 
     fn schema_info_for(&self, cat: &catalog::CatalogModel, path: &[String]) -> SchemaInfo {
@@ -2966,7 +3047,9 @@ impl Dispatcher {
                     .map(|t| {
                         let scan_schema =
                             self.resolve_table_function_schema(req, &t.scan_function, path);
-                        catalog::table_info(path, t, scan_schema.as_deref())
+                        catalog::table_info_resolved(path, t, scan_schema.as_deref(), &|name| {
+                            self.resolve_function_schema(req, FnKind::TableInOut, name, path)
+                        })
                     })
                     .collect::<Result<_>>()?
             }
@@ -3145,7 +3228,9 @@ impl Dispatcher {
                 let tt = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
                 let scan_schema =
                     self.resolve_table_function_schema(req, &tt.scan_function, &schema_path);
-                catalog::table_info(&schema_path, &tt, scan_schema.as_deref())
+                catalog::table_info_resolved(&schema_path, &tt, scan_schema.as_deref(), &|name| {
+                    self.resolve_function_schema(req, FnKind::TableInOut, name, &schema_path)
+                })
             })
             .transpose()?
             .into_iter()
@@ -3180,8 +3265,20 @@ impl Dispatcher {
         function_name: &str,
         table_schema_path: &[String],
     ) -> Option<Vec<String>> {
+        self.resolve_function_schema(req, FnKind::Table, function_name, table_schema_path)
+    }
+
+    /// [`Self::resolve_table_function_schema`] for a function of any `kind`
+    /// (a table's write functions are table-in-out functions).
+    fn resolve_function_schema(
+        &self,
+        req: &Request,
+        kind: FnKind,
+        function_name: &str,
+        table_schema_path: &[String],
+    ) -> Option<Vec<String>> {
         let catalog = self.catalog_identity(self.active_catalog(req));
-        let all = self.homes_of(FnKind::Table, function_name);
+        let all = self.homes_of(kind, function_name);
         let mine: Vec<&FunctionScope> = all.iter().filter(|h| h.in_catalog(catalog)).collect();
         let homes: Vec<&FunctionScope> = if mine.is_empty() {
             all.iter().collect()
@@ -3224,6 +3321,52 @@ impl Dispatcher {
             &resolved_schema,
             &t,
         )?)?))
+    }
+
+    /// `catalog_table_{insert,update,delete}_function_get`: the table-in-out
+    /// function backing `op` on a table (a FLAT `ScanFunctionResult` batch, as
+    /// the scan getter answers). Only asked when the client skipped the value
+    /// inlined in `TableInfo`. A table with no function for `op` is
+    /// `NOT_FOUND`, naming the operation.
+    pub fn handle_table_write_function_get(
+        &self,
+        req: &Request,
+        op: crate::write_results::WriteOperation,
+    ) -> Result<Option<RecordBatch>> {
+        let schema_path = read_string_list_col(req, "schema_path")?;
+        let table_name = read_string_col(req, "name")?;
+        let t = self
+            .schema_for_req(req, &schema_path)
+            .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
+            .ok_or_else(|| {
+                crate::errors::not_found(format!(
+                    "Unknown table: '{}.{table_name}'",
+                    schema_path.join(".")
+                ))
+            })?;
+        let resolved = t.writes.get(op).and_then(|f| {
+            self.resolve_function_schema(req, FnKind::TableInOut, &f.function, &schema_path)
+        });
+        let result = catalog::write_function_result(&schema_path, t, op, resolved.as_deref())
+            .ok_or_else(|| {
+                crate::errors::not_found(format!(
+                    "Table '{table_name}' does not support {}",
+                    op.as_str().to_uppercase()
+                ))
+            })?;
+        Ok(Some(wire::to_result_batch(result)?))
+    }
+
+    pub fn handle_table_insert_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        self.handle_table_write_function_get(req, crate::write_results::WriteOperation::Insert)
+    }
+
+    pub fn handle_table_update_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        self.handle_table_write_function_get(req, crate::write_results::WriteOperation::Update)
+    }
+
+    pub fn handle_table_delete_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
+        self.handle_table_write_function_get(req, crate::write_results::WriteOperation::Delete)
     }
 
     /// Return the table view for a requested time-travel `AT` clause (the
@@ -4975,6 +5118,12 @@ pub struct ExchangeBlob {
     /// rebuilt on any worker can resume it. See [`TioContinuation`].
     #[serde(default)]
     pub continuation: TioContinuation,
+    /// The plaintext transaction the original bind carried (empty = none), so
+    /// a resumed HTTP tick keeps [`ProcessParams::transaction_opaque_data`].
+    /// Like `attach_opaque_data` above, safe in the blob because the blob is
+    /// itself AEAD-sealed into the continuation token.
+    #[serde(default)]
+    pub transaction_opaque_data: Vec<u8>,
 }
 
 /// A table-in-out exchange's continued-output position (see
@@ -5710,6 +5859,44 @@ const EXECUTION_ID_LEN: usize = 9 + 4 + 8 + 8;
 pub fn secondary_attach_payload(attach_opaque_data: &[u8]) -> Option<Vec<u8>> {
     let (_, scope) = decode_secondary_opaque(attach_opaque_data)?;
     scope.get(EXECUTION_ID_LEN..).map(<[u8]>::to_vec)
+}
+
+/// The bytes a catalog's
+/// [`attach_payload`](crate::catalog::CatalogModel::attach_payload) hook
+/// returned for the attach `attach_opaque_data` belongs to — the primary
+/// catalog's or a secondary's — or `None` when the attach carries no payload
+/// (no hook, or a value this SDK did not mint).
+///
+/// Pass it the plaintext value a function or hook receives:
+/// [`BindParams::attach_opaque_data`](crate::BindParams::attach_opaque_data),
+/// [`ProcessParams::attach_opaque_data`](crate::ProcessParams::attach_opaque_data),
+/// or the `attach_opaque_data` argument of a
+/// [`CatalogTransactions`](crate::catalog::CatalogTransactions) hook. (On HTTP
+/// the SDK has already opened the sealed value.)
+pub fn attach_payload(attach_opaque_data: &[u8]) -> Option<Vec<u8>> {
+    secondary_attach_payload(attach_opaque_data)
+}
+
+/// The attach request's one-row options record (`None` when it named none).
+fn attach_options_record(dto: &CatalogAttachRequest) -> Result<Option<RecordBatch>> {
+    dto.options
+        .as_ref()
+        .filter(|b| !b.0.is_empty())
+        .map(|b| ipc::read_batch(&b.0))
+        .transpose()
+}
+
+/// The attach result's `supports_transactions` for `model`: its
+/// [`CatalogTransactions::supports_transactions`](catalog::CatalogTransactions::supports_transactions)
+/// decision for these options, or `true` without hooks.
+fn supports_transactions_for(
+    model: &catalog::CatalogModel,
+    options: Option<&RecordBatch>,
+) -> Result<bool> {
+    match &model.transactions {
+        Some(hooks) => hooks.supports_transactions(options),
+        None => Ok(true),
+    }
 }
 
 fn encode_secondary_opaque(name: &str, scope: &[u8]) -> Vec<u8> {

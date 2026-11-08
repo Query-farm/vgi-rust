@@ -322,7 +322,9 @@ impl Worker {
     /// carries an embedded scan function; these are auto-registered into the
     /// dispatch table here (deduped by name), so a function-backed table needs no
     /// separate [`Worker::register_table`] call — parity with the Go
-    /// `CatalogTable.Function` ergonomics.
+    /// `CatalogTable.Function` ergonomics. Write functions embedded in
+    /// [`CatTable::writes`](crate::catalog::CatTable::writes) are registered the
+    /// same way (as table-in-out functions).
     pub fn set_catalog(&mut self, model: crate::catalog::CatalogModel) {
         let base = model.schemas.iter();
         let versioned = model.version_schemas.values().flatten();
@@ -330,6 +332,11 @@ impl Worker {
             for table in &schema.tables {
                 if let Some(f) = &table.scan_function_impl {
                     self.disp.register_table_if_absent(f.clone());
+                }
+                for (_, w) in table.writes.iter() {
+                    if let Some(f) = &w.function_impl {
+                        self.disp.register_table_in_out_if_absent(f.clone());
+                    }
                 }
             }
         }
@@ -1396,5 +1403,43 @@ mod hosting_tests {
             resolve_introspect_principals(Some(vec![" proxy ".into()])).unwrap(),
             ["proxy"]
         );
+    }
+
+    /// A write function embedded in `CatTable::writes` is registered by
+    /// `set_catalog`, like an embedded scan function.
+    #[test]
+    fn set_catalog_registers_embedded_write_functions() {
+        struct Upd;
+        impl crate::table_in_out::TableInOutFunction for Upd {
+            fn name(&self) -> &str {
+                "t_update"
+            }
+            fn metadata(&self) -> crate::function::FunctionMetadata {
+                Default::default()
+            }
+            fn argument_specs(&self) -> Vec<crate::function::ArgSpec> {
+                crate::write_results::write_function_arg_specs("rows")
+            }
+        }
+        let table = crate::catalog::CatTable::new(
+            "t",
+            Arc::new(arrow_schema::Schema::empty()),
+            "t_scan",
+            Vec::new(),
+            None,
+            None,
+        )
+        .with_update_function(Arc::new(Upd), crate::write_results::WriteResultMode::Count);
+        let mut w = Worker::new();
+        assert!(!w.disp.tableinouts.contains_key("t_update"));
+        w.set_catalog(crate::catalog::CatalogModel {
+            schemas: vec![crate::catalog::CatSchema {
+                name: "main".into(),
+                tables: vec![table],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(w.disp.tableinouts.contains_key("t_update"));
     }
 }

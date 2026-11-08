@@ -33,15 +33,12 @@ pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
 /// answer every call with `UNIMPLEMENTED` / `method_not_implemented` -- never
 /// a silent success.
 ///
-/// The DML getters resolve the INSERT/UPDATE/DELETE function of a writable
-/// table; this port's catalogs are read-only for DML.
+/// (The DML getters `catalog_table_{insert,update,delete}_function_get` are
+/// served: see [`crate::catalog::TableWrites`].)
 pub const UNIMPLEMENTED_METHODS: &[&str] = &[
     "catalog_dependencies",
     "catalog_index_option_definitions",
     "catalog_table_constraints_apply",
-    "catalog_table_insert_function_get",
-    "catalog_table_update_function_get",
-    "catalog_table_delete_function_get",
 ];
 
 type Answer = Result<Option<RecordBatch>>;
@@ -118,8 +115,8 @@ impl VgiService for Dispatcher {
 
     catalog_rpcs! {
         catalog_version => handle_catalog_version,
-        catalog_transaction_commit => handle_void,
-        catalog_transaction_rollback => handle_void,
+        catalog_transaction_commit => handle_transaction_commit,
+        catalog_transaction_rollback => handle_transaction_rollback,
         catalog_detach => handle_void,
     }
 
@@ -265,6 +262,9 @@ impl VgiService for Dispatcher {
         catalog_schema_contents_tables => handle_contents_tables,
         catalog_table_get => handle_table_get,
         catalog_table_scan_function_get => handle_table_scan_function_get,
+        catalog_table_insert_function_get => handle_table_insert_function_get,
+        catalog_table_update_function_get => handle_table_update_function_get,
+        catalog_table_delete_function_get => handle_table_delete_function_get,
         catalog_table_scan_branches_get => handle_table_scan_branches_get,
         catalog_table_column_statistics_get => handle_table_column_statistics_get,
         catalog_copy_from_formats => handle_catalog_copy_from_formats,

@@ -255,6 +255,31 @@ SELECT * FROM external_db.analytics.daily_view;  -- a view
 SELECT external_db.main.transform(col) FROM t;   -- a function
 ```
 
+### Writable tables, transactions and attach secrets
+
+A catalog table accepts `INSERT` / `UPDATE` / `DELETE` when it names a
+table-in-out function per operation in `CatTable::writes` (or with
+`CatTable::with_update_function` and friends). DuckDB streams the affected rows
+into that function with a `write_options` argument; `vgi::write_results` decodes
+it (`WriteOptions::from_arguments`), gives the output schema for the requested
+mode (`write_result_schema`: `count`, `rows` for `RETURNING`, `changes`) and
+builds the answer (`write_result_batch`). UPDATE and DELETE identify rows by a
+row-id column (`row_id_field`) emitted by a scan with projection pushdown. A
+writable table with constraint records makes the catalog negotiate
+`vgi.constraint.enforce.v1` automatically.
+
+`CatalogModel::transactions` takes a `CatalogTransactions` implementation:
+`supports_transactions` per ATTACH (from its options), and `begin` / `commit` /
+`rollback` hooks that see the same plaintext transaction id functions get in
+`BindParams::transaction_opaque_data` and `ProcessParams::transaction_opaque_data`
+— on every transport, including HTTP where the SDK seals it on the wire.
+
+`CatalogModel::attach_payload` (main or secondary catalog) turns the ATTACH
+options — secret ones included — into bytes that ride in `attach_opaque_data`
+(sealed over HTTP); functions and hooks read them with
+`vgi::catalog::attach_payload`. See `vgi-example-worker/src/txfix.rs` for all
+three together.
+
 ## Transports
 
 `Worker::run` picks the transport from argv: **stdio** (default), **Unix socket**
