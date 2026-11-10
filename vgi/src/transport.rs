@@ -33,6 +33,27 @@ impl IrohBridgeOptions {
 
 use vgi_rpc::{RpcServer, TransportCapabilities, TransportKind};
 
+/// Join every per-connection thread that has already returned.
+///
+/// The unix/tcp accept loops keep a `JoinHandle` per connection so shutdown
+/// can wait for in-flight calls. A thread that has exited but was neither
+/// joined nor detached keeps its stack mapping (and guard page) until it is,
+/// so without reaping a long-lived pooled worker leaks two memory mappings
+/// per connection it ever served. After ~32k connections that reaches Linux's
+/// default `vm.max_map_count` (65530): the next `thread::spawn` cannot map its
+/// signal-stack guard page, the Rust runtime aborts, and the client blocks on
+/// the socket until the core dump of the bloated process finishes.
+fn reap_finished(threads: &mut Vec<std::thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < threads.len() {
+        if threads[index].is_finished() {
+            let _ = threads.swap_remove(index).join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
 /// Serve a single sequential Arrow-IPC stream over stdin/stdout until EOF.
 pub fn serve_stdio(server: Arc<RpcServer>) {
     server.notify_transport(TransportKind::Pipe, TransportCapabilities::none());
@@ -88,6 +109,7 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
                 last_activity = std::time::Instant::now();
                 conn.set_nonblocking(false).ok();
                 let srv = server.clone();
+                reap_finished(&mut threads);
                 threads.push(std::thread::spawn(move || {
                     let Ok(mut reader) = conn.try_clone() else {
                         return;
@@ -174,6 +196,7 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
                 // delayed waiting to coalesce writes.
                 conn.set_nodelay(true).ok();
                 let srv = server.clone();
+                reap_finished(&mut threads);
                 threads.push(std::thread::spawn(move || {
                     let Ok(mut reader) = conn.try_clone() else {
                         return;
@@ -423,4 +446,66 @@ fn serve_http_inner(
             .await
             .expect("axum serve");
     });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn mapping_count() -> usize {
+        std::fs::read_to_string("/proc/self/maps")
+            .expect("read /proc/self/maps")
+            .lines()
+            .count()
+    }
+
+    /// A long-lived launcher worker must not accumulate per-connection thread
+    /// stacks. Unreaped, every short connection left two mappings behind
+    /// (stack + guard page), so a pooled worker serving the whole integration
+    /// suite hit `vm.max_map_count` and aborted mid-suite.
+    #[test]
+    fn serve_unix_releases_finished_connection_threads() {
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("vgi-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.sock");
+        let path_str = path.to_str().unwrap().to_string();
+        let server = Arc::new(crate::Worker::new().build_server());
+        let serve_path = path_str.clone();
+        let serving = std::thread::spawn(move || serve_unix(server, &serve_path, 3.0));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while UnixStream::connect(&path).is_err() {
+            assert!(std::time::Instant::now() < deadline, "worker never bound");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Let the probe connection's thread spawn and finish before measuring.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = mapping_count();
+
+        const CONNECTIONS: usize = 2000;
+        for _ in 0..CONNECTIONS {
+            // Connect and hang up: the server's serve() sees EOF and returns.
+            drop(UnixStream::connect(&path).expect("connect"));
+            // Pace a little so threads finish and are reaped as we go.
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // One more accept runs the reaper over everything that has finished.
+        drop(UnixStream::connect(&path).expect("connect"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after = mapping_count();
+
+        // Unreaped this grows by ~2 * CONNECTIONS; allow generous slack for
+        // other tests' threads and allocator arenas in the same process.
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth < CONNECTIONS / 2,
+            "serve_unix leaked {growth} mappings over {CONNECTIONS} connections"
+        );
+
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
