@@ -54,6 +54,87 @@ fn reap_finished(threads: &mut Vec<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Idle self-shutdown bookkeeping shared by the unix/tcp accept loops.
+///
+/// The worker is idle only while no connection is open, and the timeout runs
+/// from the moment it last *became* idle (startup, or its last connection
+/// closing) — not from the last accept, which would cut off a call that
+/// outlives the timeout. Mirrors vgi-rpc's `serve_unix`/`serve_tcp`, including
+/// the `max(idle_timeout, 60s)` grace before the first client connects.
+#[cfg(any(unix, not(target_arch = "wasm32")))]
+struct IdleClock {
+    timeout: Option<std::time::Duration>,
+    state: Arc<std::sync::Mutex<IdleState>>,
+}
+
+#[cfg(any(unix, not(target_arch = "wasm32")))]
+struct IdleState {
+    active: usize,
+    /// When the worker may exit; `None` while a connection is open.
+    deadline: Option<std::time::Instant>,
+}
+
+/// Held by a connection thread; marks the worker idle again when the last one
+/// drops (also on panic, so a failed call cannot pin the worker alive).
+#[cfg(any(unix, not(target_arch = "wasm32")))]
+struct ActiveConnection {
+    timeout: Option<std::time::Duration>,
+    state: Arc<std::sync::Mutex<IdleState>>,
+}
+
+#[cfg(any(unix, not(target_arch = "wasm32")))]
+impl IdleClock {
+    /// `idle_timeout` in seconds; `<= 0` disables idle shutdown.
+    fn new(idle_timeout: f64) -> Self {
+        Self::with_startup_grace(idle_timeout, std::time::Duration::from_secs(60))
+    }
+
+    fn with_startup_grace(idle_timeout: f64, grace: std::time::Duration) -> Self {
+        let timeout =
+            (idle_timeout > 0.0).then(|| std::time::Duration::from_secs_f64(idle_timeout));
+        let deadline = timeout.map(|t| std::time::Instant::now() + t.max(grace));
+        Self {
+            timeout,
+            state: Arc::new(std::sync::Mutex::new(IdleState {
+                active: 0,
+                deadline,
+            })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IdleState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register a newly accepted connection; drop the guard when it closes.
+    fn connection(&self) -> ActiveConnection {
+        let mut st = self.lock();
+        st.active += 1;
+        st.deadline = None;
+        ActiveConnection {
+            timeout: self.timeout,
+            state: self.state.clone(),
+        }
+    }
+
+    /// True once no connection is open and the idle deadline has passed.
+    fn expired(&self) -> bool {
+        let st = self.lock();
+        st.active == 0 && st.deadline.is_some_and(|d| std::time::Instant::now() >= d)
+    }
+}
+
+#[cfg(any(unix, not(target_arch = "wasm32")))]
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.active = st.active.saturating_sub(1);
+        if st.active == 0 {
+            st.deadline = self.timeout.map(|t| std::time::Instant::now() + t);
+        }
+    }
+}
+
 /// Serve a single sequential Arrow-IPC stream over stdin/stdout until EOF.
 pub fn serve_stdio(server: Arc<RpcServer>) {
     server.notify_transport(TransportKind::Pipe, TransportCapabilities::none());
@@ -95,22 +176,21 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
         let _ = ctrlc::try_set_handler(move || sd.store(true, Ordering::Relaxed));
     }
 
-    let idle = if idle_timeout > 0.0 {
-        Some(std::time::Duration::from_secs_f64(idle_timeout))
-    } else {
-        None
-    };
-    let mut last_activity = std::time::Instant::now();
+    let idle = IdleClock::new(idle_timeout);
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     while !shutdown.load(Ordering::Relaxed) {
+        if idle.expired() {
+            break;
+        }
         match listener.accept() {
             Ok((mut conn, _)) => {
-                last_activity = std::time::Instant::now();
+                let active = idle.connection();
                 conn.set_nonblocking(false).ok();
                 let srv = server.clone();
                 reap_finished(&mut threads);
                 threads.push(std::thread::spawn(move || {
+                    let _active = active;
                     let Ok(mut reader) = conn.try_clone() else {
                         return;
                     };
@@ -118,11 +198,6 @@ pub fn serve_unix(server: Arc<RpcServer>, path: &str, idle_timeout: f64) {
                 }));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(timeout) = idle {
-                    if last_activity.elapsed() >= timeout {
-                        break;
-                    }
-                }
                 // Poll frequently: a parallel scan opens its secondary worker
                 // connections in a burst shortly after the primary's, and a
                 // long poll here would accept them late — letting the primary
@@ -179,18 +254,16 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
         let _ = ctrlc::try_set_handler(move || sd.store(true, Ordering::Relaxed));
     }
 
-    let idle = if idle_timeout > 0.0 {
-        Some(std::time::Duration::from_secs_f64(idle_timeout))
-    } else {
-        None
-    };
-    let mut last_activity = std::time::Instant::now();
+    let idle = IdleClock::new(idle_timeout);
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     while !shutdown.load(Ordering::Relaxed) {
+        if idle.expired() {
+            break;
+        }
         match listener.accept() {
             Ok((mut conn, _)) => {
-                last_activity = std::time::Instant::now();
+                let active = idle.connection();
                 conn.set_nonblocking(false).ok();
                 // Disable Nagle so the lockstep request/response framing is not
                 // delayed waiting to coalesce writes.
@@ -198,6 +271,7 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
                 let srv = server.clone();
                 reap_finished(&mut threads);
                 threads.push(std::thread::spawn(move || {
+                    let _active = active;
                     let Ok(mut reader) = conn.try_clone() else {
                         return;
                     };
@@ -205,11 +279,6 @@ pub fn serve_tcp(server: Arc<RpcServer>, host: &str, port: u16, idle_timeout: f6
                 }));
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(timeout) = idle {
-                    if last_activity.elapsed() >= timeout {
-                        break;
-                    }
-                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(_) => break,
@@ -507,5 +576,106 @@ mod tests {
 
         serving.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_clock_waits_for_open_connections() {
+        use std::time::Duration;
+        let clock = IdleClock::with_startup_grace(0.05, Duration::ZERO);
+        let conn = clock.connection();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!clock.expired(), "an open connection must hold the worker");
+        drop(conn);
+        assert!(
+            !clock.expired(),
+            "the timeout restarts when the last connection closes"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(clock.expired(), "idle after the last connection closed");
+        assert!(!IdleClock::new(0.0).expired(), "0 disables idle shutdown");
+    }
+
+    /// A call that runs longer than `--idle-timeout` must not be cut off, and
+    /// the worker must still exit once it has been idle that long afterwards.
+    /// Previously the timeout ran from the last *accept*, so the worker shut
+    /// down underneath a connection that was still open.
+    fn assert_long_connection_survives_idle<C, R>(connect: C, serving: std::thread::JoinHandle<R>)
+    where
+        C: Fn() -> Option<Box<dyn std::io::Write>>,
+    {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut conn = loop {
+            if let Some(c) = connect() {
+                break c;
+            }
+            assert!(Instant::now() < deadline, "worker never bound");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Hold the connection open for 3x the 0.5 s idle timeout.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !serving.is_finished(),
+            "worker exited while a connection was open"
+        );
+        assert!(
+            connect().is_some(),
+            "worker stopped accepting while a connection was open"
+        );
+        let _ = conn.flush();
+        drop(conn);
+        let closed = Instant::now();
+        while !serving.is_finished() {
+            assert!(
+                closed.elapsed() < Duration::from_secs(10),
+                "worker did not exit after going idle"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            closed.elapsed() >= Duration::from_millis(400),
+            "exited before the idle timeout"
+        );
+        serving.join().ok();
+    }
+
+    #[test]
+    fn serve_unix_idle_timeout_counts_from_last_close() {
+        use std::os::unix::net::UnixStream;
+        let dir = std::env::temp_dir().join(format!("vgi-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("w.sock");
+        let serve_path = path.to_str().unwrap().to_string();
+        let server = Arc::new(crate::Worker::new().build_server());
+        let serving = std::thread::spawn(move || serve_unix(server, &serve_path, 0.5));
+        assert_long_connection_survives_idle(
+            || {
+                UnixStream::connect(&path)
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn std::io::Write>)
+            },
+            serving,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_tcp_idle_timeout_counts_from_last_close() {
+        use std::net::{TcpListener, TcpStream};
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let server = Arc::new(crate::Worker::new().build_server());
+        let serving = std::thread::spawn(move || serve_tcp(server, "127.0.0.1", port, 0.5));
+        assert_long_connection_survives_idle(
+            || {
+                TcpStream::connect(("127.0.0.1", port))
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn std::io::Write>)
+            },
+            serving,
+        );
     }
 }
