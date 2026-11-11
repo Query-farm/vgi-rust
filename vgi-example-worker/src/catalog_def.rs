@@ -24,7 +24,7 @@ fn ttv(version: i64, cols: Vec<Field>, scan_fn: &str, year: i32) -> TimeTravelVe
 }
 
 /// A time-travel table: its current (highest-version) columns are the base
-/// schema; `catalog_table_get`/`scan_function_get`/`scan_branches_get` select
+/// schema; `catalog_table_get`/`scan_branches_get` select
 /// per `at_value`. The scan is NOT inlined — the C++ re-invokes the legacy scan
 /// path per query (carrying the AT clause), so each version resolves its own
 /// scan arguments without colliding in the inlined-scan bind cache.
@@ -211,7 +211,7 @@ fn fbbox() -> Field {
 }
 
 /// A `required_filters` table that delegates its scan to a NATIVE
-/// DuckDB function (e.g. `read_parquet`) — `scan_function_get` returns it so the
+/// DuckDB function (e.g. `read_parquet`) — `scan_branches_get` returns it so the
 /// C++ binds the built-in reader directly.
 fn rff_native(
     name: &str,
@@ -494,7 +494,7 @@ fn data_tables() -> Vec<CatTable> {
             "A large sequence of integers from 0 to 1,000,000",
         )),
         // Inlined scan_function (inlined_scan_function.test wants the scan
-        // trace + no scan_function_get RPC) but NO inlined cardinality: with
+        // trace + no scan_branches_get RPC) but NO inlined cardinality: with
         // cardinality=None the wire value is NULL, so the C++ still fires the
         // per-bind table_function_cardinality RPC (ten_thousand returns 10000)
         // and emits no cardinality-inlined trace (inlined_cardinality.test).
@@ -895,7 +895,7 @@ fn data_tables() -> Vec<CatTable> {
         },
     ];
 
-    // Columns-based time-travel + filter pushdown: the scan_function_get path
+    // Columns-based time-travel + filter pushdown: the scan_branches_get path
     // resolves AT → version and passes it as `tt_pushdown_cols_scan(version)`.
     {
         let tt_cols = || {

@@ -1478,7 +1478,7 @@ pub struct CatTable {
     )]
     pub foreign_keys: Vec<ForeignKey>,
     /// When true, the scan function is inlined in `TableInfo.scan_function` and
-    /// the C++ extension skips `catalog_table_scan_function_get`. When false
+    /// the C++ extension skips `catalog_table_scan_branches_get`. When false
     /// (default), the scan is resolved lazily via that RPC.
     pub inline_scan: bool,
     /// Multi-branch sources. `Some` (even empty) overrides the single-branch
@@ -1492,7 +1492,7 @@ pub struct CatTable {
     /// `catalog_table_column_statistics_get`).
     pub statistics: Vec<crate::statistics::CatColStat>,
     /// Time-travel versions (schema evolution). Empty = not time-travel.
-    /// `catalog_table_get` / `catalog_table_scan_function_get` select the entry
+    /// `catalog_table_get` / `catalog_table_scan_branches_get` select the entry
     /// matching the request's `at_value` (or the highest version when absent).
     pub time_travel: Vec<TimeTravelVersion>,
     /// AND-of-OR groups of raw component paths (`list<list<list<utf8>>>`).
@@ -2056,10 +2056,10 @@ pub fn view_info(schema_path: &[String], v: &CatView) -> crate::protocol::dtos::
 }
 
 /// Build a `TableInfo` DTO for a function-backed catalog table, inlining the
-/// scan function so DuckDB needn't call `catalog_table_scan_function_get`.
-/// The flat `ScanFunctionResult` batch for a function-backed table (used both
-/// for the inlined `TableInfo.scan_function` and the lazy
-/// `catalog_table_scan_function_get` RPC response).
+/// scan function so DuckDB needn't call `catalog_table_scan_branches_get`.
+/// The flat `ScanFunctionResult` batch for a function-backed table (the
+/// inlined `TableInfo.scan_function`; the lazy path answers
+/// `catalog_table_scan_branches_get` with the same function as one branch).
 ///
 /// `schema` is the table's own containing schema — a best-effort default,
 /// not a guaranteed-correct resolution: this level has no cross-schema
@@ -2245,7 +2245,7 @@ pub fn table_info_resolved(
     };
     let columns = served_table_columns(schema_path, t)?;
     // Inline the scan function only for tables that opt in; otherwise the C++
-    // extension resolves it lazily via `catalog_table_scan_function_get`.
+    // extension resolves it lazily via `catalog_table_scan_branches_get`.
     //
     // `scan_function_schema` is the caller's real-registry resolution of which
     // schema `t.scan_function` actually lives in (see

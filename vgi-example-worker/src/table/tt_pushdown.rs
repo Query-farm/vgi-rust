@@ -11,7 +11,7 @@
 //!   `example.data.tt_pushdown_fn`.
 //! - `tt_pushdown_cols_scan` — **columns-based**: gets the resolved version as a
 //!   scan-function argument (the worker resolves `AT` → version in
-//!   `catalog_table_scan_function_get`, the native columns-based mechanism).
+//!   `catalog_table_scan_branches_get`, the native columns-based mechanism).
 //!   Backs `example.data.tt_pushdown_cols`.
 
 use std::sync::Arc;
@@ -175,7 +175,7 @@ impl TableFunction for TimeTravelPushdownFunction {
 }
 
 /// `tt_pushdown_cols_scan(version)` — columns-based: the worker resolves AT →
-/// version in `catalog_table_scan_function_get` and passes it as argument 0.
+/// version in `catalog_table_scan_branches_get` and passes it as argument 0.
 pub struct TtPushdownColsScanFunction;
 impl TableFunction for TtPushdownColsScanFunction {
     fn name(&self) -> &str {

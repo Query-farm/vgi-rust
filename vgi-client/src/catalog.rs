@@ -2,11 +2,6 @@
 
 //! Attaching a catalog and discovering what it holds.
 
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
-
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
 use vgi_protocol::constraints::{
@@ -420,16 +415,14 @@ pub struct At {
 
 /// How [`VgiClient::table_scan_branches`] resolved a table's physical sources.
 ///
-/// Consumers can use this to distinguish a genuine one-branch response from a
-/// legacy worker that only implements `catalog_table_scan_function_get`.
+/// Protocol 3.3 removed `catalog_table_scan_function_get`: every worker
+/// answers `catalog_table_scan_branches_get`, so the only resolution left is
+/// [`BranchesRpc`](Self::BranchesRpc). The enum stays so consumers matching on
+/// it keep compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanBranchesResolution {
     /// The worker answered `catalog_table_scan_branches_get`.
     BranchesRpc,
-    /// The branches RPC was unavailable, so this call probed and fell back.
-    LegacyFallbackAfterProbe,
-    /// A previous call already established that this attach needs fallback.
-    LegacyCached,
 }
 
 /// Decoded physical sources backing a catalog table.
@@ -604,10 +597,6 @@ impl OnConflict {
     }
 }
 
-const BRANCHES_CAPABILITY_UNKNOWN: u8 = 0;
-const BRANCHES_CAPABILITY_SUPPORTED: u8 = 1;
-const BRANCHES_CAPABILITY_UNSUPPORTED: u8 = 2;
-
 /// A live attach handle.
 ///
 /// The `attach_opaque_data` blob is the worker's session token: every later
@@ -619,9 +608,6 @@ pub struct AttachedCatalog {
     handle: Bytes,
     info: CatalogAttachResult,
     transaction: Option<Bytes>,
-    // Shared by clones because capability belongs to the remote attach, not a
-    // particular Rust handle value.
-    scan_branches_capability: Arc<AtomicU8>,
 }
 
 impl AttachedCatalog {
@@ -807,7 +793,6 @@ impl VgiClient {
             handle: info.attach_opaque_data.clone(),
             info,
             transaction: None,
-            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
         })
     }
 
@@ -1372,7 +1357,8 @@ impl VgiClient {
         Ok(items.into_iter().next())
     }
 
-    /// How to scan a catalog table: which function to bind, with what arguments.
+    /// The scan function a worker inlined on [`TableInfo::scan_function`]:
+    /// which function to bind, with what arguments.
     ///
     /// A VGI catalog table is not storage the client reads directly — it is a
     /// *function call the worker chose*, so scanning one means binding that
@@ -1381,47 +1367,34 @@ impl VgiClient {
     /// ([`BindSpec::with_raw_arguments`](crate::BindSpec::with_raw_arguments)) rather than decoded and rebuilt,
     /// since they may carry types this client does not model.
     ///
-    /// The worker may **inline** the answer on [`TableInfo::scan_function`] to
-    /// save a round trip, or leave it empty, in which case this fires
-    /// `catalog_table_scan_function_get`. Both are normal; inlining is an
-    /// optimisation, not a different kind of table.
+    /// Protocol 3.3 removed `catalog_table_scan_function_get`, so a table that
+    /// does not inline its scan is resolved only through
+    /// [`table_scan_branches`](Self::table_scan_branches); this returns an
+    /// error for it.
     pub fn table_scan_function(
         &mut self,
-        cat: &AttachedCatalog,
+        _cat: &AttachedCatalog,
         table: &TableInfo,
-        at: Option<&At>,
+        _at: Option<&At>,
     ) -> Result<ScanFunctionResult> {
         // Nullable on the wire: absent OR empty both mean "not inlined".
-        if let Some(inlined) = table.scan_function.as_ref().filter(|b| !b.0.is_empty()) {
-            let batch = vgi_protocol::ipc::read_batch(&inlined.0)?;
-            return vgi_protocol::wire::from_batch(&batch);
-        }
-        call(
-            self.transport_mut(),
-            "catalog_table_scan_function_get",
-            p::CatalogTableScanFunctionGetParams {
-                attach_opaque_data: cat.handle.clone(),
-                schema_path: table.schema_path.clone(),
-                name: table.name.clone(),
-                at_unit: at.map(|a| a.unit.clone()),
-                at_value: at.map(|a| a.value.clone()),
-                transaction_opaque_data: cat.txn(),
-            },
-        )
+        let Some(inlined) = table.scan_function.as_ref().filter(|b| !b.0.is_empty()) else {
+            return Err(RpcError::value_error(format!(
+                "table '{}' does not inline its scan function; resolve it with \
+                 table_scan_branches (catalog_table_scan_branches_get)",
+                table.name
+            )));
+        };
+        let batch = vgi_protocol::ipc::read_batch(&inlined.0)?;
+        vgi_protocol::wire::from_batch(&batch)
     }
 
     /// Resolve every physical source backing a catalog table.
     ///
-    /// New workers answer `catalog_table_scan_branches_get`; each nested IPC
-    /// branch is decoded before it reaches the caller. For compatibility, a
-    /// worker that reports `MethodNotImplementedError` is retried through the
-    /// legacy single-function RPC and that answer is represented as one
-    /// unconstrained function branch. The unsupported capability is cached on
-    /// the attach so later tables avoid the doomed probe.
-    ///
-    /// The fallback is deliberately narrow: transport failures and all other
-    /// worker errors are returned unchanged rather than being hidden behind a
-    /// second RPC.
+    /// Calls `catalog_table_scan_branches_get`, which every protocol 3.3
+    /// worker answers; each nested IPC branch is decoded before it reaches the
+    /// caller. There is no fallback: a worker answering
+    /// `MethodNotImplementedError` is a protocol error, returned unchanged.
     ///
     /// Sends no `pushdown_filters` (bind-time planning, always permitted, even
     /// for a `scan_planning = "filtered"` table); see
@@ -1455,13 +1428,7 @@ impl VgiClient {
         pushdown_filters: Option<Bytes>,
     ) -> Result<CatalogScanBranches> {
         table.validate_scan_planning()?;
-        if cat.scan_branches_capability.load(Ordering::Acquire) == BRANCHES_CAPABILITY_UNSUPPORTED {
-            return self.table_scan_function(cat, table, at).map(|legacy| {
-                scan_branches_from_legacy(legacy, ScanBranchesResolution::LegacyCached)
-            });
-        }
-
-        let response: Result<ScanBranchesResult> = call(
+        let response: ScanBranchesResult = call(
             self.transport_mut(),
             "catalog_table_scan_branches_get",
             p::CatalogTableScanBranchesGetParams {
@@ -1473,28 +1440,8 @@ impl VgiClient {
                 transaction_opaque_data: cat.txn(),
                 pushdown_filters,
             },
-        );
-
-        match response {
-            Ok(response) => {
-                let decoded =
-                    decode_scan_branches(response, ScanBranchesResolution::BranchesRpc, table)?;
-                cat.scan_branches_capability
-                    .store(BRANCHES_CAPABILITY_SUPPORTED, Ordering::Release);
-                Ok(decoded)
-            }
-            Err(error) if error.error_type == "MethodNotImplementedError" => {
-                cat.scan_branches_capability
-                    .store(BRANCHES_CAPABILITY_UNSUPPORTED, Ordering::Release);
-                self.table_scan_function(cat, table, at).map(|legacy| {
-                    scan_branches_from_legacy(
-                        legacy,
-                        ScanBranchesResolution::LegacyFallbackAfterProbe,
-                    )
-                })
-            }
-            Err(error) => Err(error),
-        }
+        )?;
+        decode_scan_branches(response, ScanBranchesResolution::BranchesRpc, table)
     }
 
     /// Fetch the worker's optimizer statistics for one catalog table.
@@ -1569,32 +1516,6 @@ impl VgiClient {
                 transaction_opaque_data: txn,
             },
         )
-    }
-}
-
-fn scan_branches_from_legacy(
-    legacy: ScanFunctionResult,
-    resolution: ScanBranchesResolution,
-) -> CatalogScanBranches {
-    CatalogScanBranches {
-        branches: vec![ScanBranch {
-            function_name: legacy.function_name,
-            arguments: legacy.arguments,
-            branch_filter: None,
-            writable: false,
-            schema_path: legacy.schema_path,
-            source_catalog: None,
-            source_schema_path: None,
-            source_table: None,
-            format_name: None,
-            format_locations: None,
-            format_options: None,
-            row_count: None,
-            column_statistics: None,
-        }],
-        required_extensions: legacy.required_extensions,
-        resolution,
-        column_statistics: vec![None],
     }
 }
 
@@ -1775,7 +1696,7 @@ mod attach_option_tests {
 
     use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use vgi_protocol::{ipc, wire};
+    use vgi_protocol::ipc;
 
     use crate::transport::{ExchangeStream, ProducerStream, VgiTransport};
 
@@ -1905,20 +1826,6 @@ mod attach_option_tests {
                 "catalog_table_scan_branches_get" => {
                     Err(RpcError::new("MethodNotImplementedError", "old worker"))
                 }
-                "catalog_table_scan_function_get" => {
-                    let inner = wire::to_batch(ScanFunctionResult {
-                        function_name: "legacy_sequence".to_string(),
-                        arguments: Bytes(vec![42]),
-                        required_extensions: vec!["legacy_ext".to_string()],
-                        schema_path: Some(vec!["legacy_schema".to_string()]),
-                    })?;
-                    let encoded = ipc::write_batch(&inner)?;
-                    RecordBatch::try_from_iter(vec![(
-                        "result",
-                        Arc::new(BinaryArray::from(vec![encoded.as_slice()])) as ArrayRef,
-                    )])
-                    .map_err(|error| RpcError::runtime_error(error.to_string()))
-                }
                 _ => Err(RpcError::runtime_error(format!("unexpected call {method}"))),
             }
         }
@@ -1985,7 +1892,6 @@ mod attach_option_tests {
             handle: info.attach_opaque_data.clone(),
             info,
             transaction: None,
-            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
         }
     }
 
@@ -2016,8 +1922,12 @@ mod attach_option_tests {
         }
     }
 
+    /// Protocol 3.3: `catalog_table_scan_branches_get` is required. A worker
+    /// answering `MethodNotImplementedError` is a protocol error, returned as
+    /// is, with no second RPC (the legacy `catalog_table_scan_function_get`
+    /// fallback is gone).
     #[test]
-    fn legacy_branches_fallback_is_narrow_and_cached_per_attach() {
+    fn branches_not_implemented_is_an_error_without_fallback() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut client = VgiClient::new(Box::new(LegacyCatalogTransport {
             calls: Arc::clone(&calls),
@@ -2025,30 +1935,29 @@ mod attach_option_tests {
         let cat = attached_catalog_for_test();
         let table = table_for_test();
 
-        let first = client.table_scan_branches(&cat, &table, None).unwrap();
-        assert_eq!(
-            first.resolution,
-            ScanBranchesResolution::LegacyFallbackAfterProbe
-        );
-        assert_eq!(first.branches.len(), 1);
-        assert_eq!(first.branches[0].function_name, "legacy_sequence");
-        assert_eq!(
-            first.branches[0].schema_path.as_deref(),
-            Some(["legacy_schema".to_string()].as_slice()),
-            "scan_branches_from_legacy must carry the legacy response's schema_path through, not drop it"
-        );
-        assert_eq!(first.required_extensions, ["legacy_ext"]);
-
-        let second = client.table_scan_branches(&cat, &table, None).unwrap();
-        assert_eq!(second.resolution, ScanBranchesResolution::LegacyCached);
+        for _ in 0..2 {
+            let err = client.table_scan_branches(&cat, &table, None).unwrap_err();
+            assert_eq!(err.error_type, "MethodNotImplementedError");
+        }
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [
                 "catalog_table_scan_branches_get",
-                "catalog_table_scan_function_get",
-                "catalog_table_scan_function_get"
+                "catalog_table_scan_branches_get"
             ],
-            "the second scan must skip the known-unsupported branches RPC"
+            "every scan asks the branches RPC, and only it"
+        );
+        // A table without an inlined scan has no other resolution.
+        let err = client.table_scan_function(&cat, &table, None).unwrap_err();
+        assert!(
+            err.message.contains("table_scan_branches"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "no RPC for table_scan_function"
         );
     }
 
@@ -2173,6 +2082,7 @@ mod macro_default_tests {
     use super::*;
     use arrow_array::{Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
     use vgi_protocol::generated::protocol_types::{
         MacroOverload, MacroParameter, QueryEvaluationContext,
     };
@@ -2381,7 +2291,6 @@ mod load_catalog_tests {
             handle: info.attach_opaque_data.clone(),
             info,
             transaction: None,
-            scan_branches_capability: Arc::new(AtomicU8::new(BRANCHES_CAPABILITY_UNKNOWN)),
         }
     }
 

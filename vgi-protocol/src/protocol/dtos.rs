@@ -1355,6 +1355,15 @@ pub struct IndexInfo {
     pub options: Bytes,
 }
 
+/// Flat result: `catalog_table_create` (protocol 3.3). `created` is true when
+/// this call created the table, false when `IF NOT EXISTS`
+/// (`on_conflict = IGNORE`) found an existing one and left it unchanged, so
+/// `CREATE TABLE IF NOT EXISTS ... AS SELECT` does not append into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VgiArrow)]
+pub struct CatalogTableCreateResult {
+    pub created: bool,
+}
+
 /// Boxed request of `catalog_table_create` (`CREATE TABLE` on a DDL-capable
 /// catalog). `columns` is the IPC-serialized Arrow schema of the new table.
 #[derive(Debug, Clone, VgiArrow)]

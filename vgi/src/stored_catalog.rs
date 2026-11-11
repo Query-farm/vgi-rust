@@ -60,7 +60,7 @@ use crate::catalog_contents::{
     finish, CatalogContentsEtag, CatalogContentsProvider, CatalogContentsRequest,
 };
 use crate::protocol::dtos::{
-    CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse,
+    CatalogAttachRequest, CatalogAttachResult, CatalogContentsResponse, CatalogTableCreateResult,
     CatalogTransactionBeginResult, CatalogVersionResult, ItemsResult, SchemaContents, SchemaInfo,
     TableCreateRequest, TableInfo, ViewInfo,
 };
@@ -234,13 +234,15 @@ impl StoredCatalog {
     }
 
     /// Validate `event` against the current state and, when it changes
-    /// anything, append it.
-    fn mutate(&self, store: &dyn FunctionStorage, session: &[u8], event: Event) -> Result<()> {
+    /// anything, append it. `Ok(false)`: a no-op (`IF NOT EXISTS` on an
+    /// existing object, `IF EXISTS` on nothing).
+    fn mutate(&self, store: &dyn FunctionStorage, session: &[u8], event: Event) -> Result<bool> {
         let mut state = self.load(store, session)?;
-        if state.apply(&event)? {
+        let changed = state.apply(&event)?;
+        if changed {
             self.append(store, session, &event)?;
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn reported_version(&self, state: &State) -> i64 {
@@ -379,13 +381,11 @@ impl StoredCatalog {
             "catalog_table_column_statistics_get" => Ok(Some(wire::result_batch_from_bytes(
                 &crate::statistics::serialize_column_statistics(&[])?,
             )?)),
-            "catalog_table_scan_function_get" | "catalog_table_scan_branches_get" => {
-                Err(RpcError::value_error(format!(
-                    "catalog '{}' stores table metadata only; its tables have no rows to scan",
-                    self.name
-                ))
-                .with_code(crate::errors::Code::Unimplemented))
-            }
+            "catalog_table_scan_branches_get" => Err(RpcError::value_error(format!(
+                "catalog '{}' stores table metadata only; its tables have no rows to scan",
+                self.name
+            ))
+            .with_code(crate::errors::Code::Unimplemented)),
             "catalog_contents" => {
                 let params: p::CatalogContentsParams = wire::from_batch(&req.batch)?;
                 let response =
@@ -453,7 +453,10 @@ impl StoredCatalog {
                 )?;
                 // Reject malformed or unauthorized NOT NULL claims before effects.
                 require_unconstrained_columns(crate::ipc::read_schema(&q.columns.0)?.as_ref())?;
-                self.mutate(
+                // Protocol 3.3: say whether this call created the table. Only
+                // `IF NOT EXISTS` on an existing table is a no-op (`OR REPLACE`
+                // creates a new one).
+                let created = self.mutate(
                     store,
                     session,
                     Event::TableCreate {
@@ -467,7 +470,9 @@ impl StoredCatalog {
                         on_conflict: OnConflict::parse(&q.on_conflict)?,
                     },
                 )?;
-                Ok(None)
+                Ok(Some(wire::to_result_batch(CatalogTableCreateResult {
+                    created,
+                })?))
             }
             "catalog_table_drop" => {
                 let q: p::CatalogTableDropParams = wire::from_batch(&req.batch)?;
@@ -1285,6 +1290,15 @@ mod tests {
         }
 
         fn create_table(&self, schema: &[&str], name: &str) -> Result<Option<RecordBatch>> {
+            self.create_table_on_conflict(schema, name, "ERROR")
+        }
+
+        fn create_table_on_conflict(
+            &self,
+            schema: &[&str],
+            name: &str,
+            on_conflict: &str,
+        ) -> Result<Option<RecordBatch>> {
             let columns = Schema::new(vec![
                 Field::new("a", DataType::Int32, true),
                 Field::new("b", DataType::Utf8, true),
@@ -1294,7 +1308,7 @@ mod tests {
                 schema_path: path(schema),
                 name: name.to_string(),
                 columns: Bytes::from(crate::ipc::write_schema(&columns).unwrap()),
-                on_conflict: DictString("ERROR".to_string()),
+                on_conflict: DictString(on_conflict.to_string()),
                 constraint_definitions: Vec::new(),
                 transaction_opaque_data: None,
 
@@ -1355,6 +1369,42 @@ mod tests {
             implementation_version: None,
             client_capabilities: None,
         }
+    }
+
+    /// Protocol 3.3: `catalog_table_create` answers `created` — true when this
+    /// call created the table (also `OR REPLACE`), false when `IF NOT EXISTS`
+    /// found it, which leaves the table and the catalog version unchanged.
+    #[test]
+    fn table_create_reports_whether_it_created_the_table() {
+        let created = |r: Result<Option<RecordBatch>>| -> bool {
+            let r: CatalogTableCreateResult =
+                wire::from_batch(&inner(r.unwrap().unwrap())).unwrap();
+            r.created
+        };
+        let s = Session::new(StoredCatalog::new("mem"));
+        assert!(created(s.create_table(&["main"], "t")));
+        let before = s.version();
+        assert!(!created(s.create_table_on_conflict(
+            &["main"],
+            "t",
+            "IGNORE"
+        )));
+        assert_eq!(
+            s.version(),
+            before,
+            "IF NOT EXISTS on an existing table is a no-op"
+        );
+        assert!(s.create_table(&["main"], "t").is_err());
+        assert!(created(s.create_table_on_conflict(
+            &["main"],
+            "t",
+            "REPLACE"
+        )));
+        assert!(created(s.create_table_on_conflict(
+            &["main"],
+            "fresh",
+            "IGNORE"
+        )));
     }
 
     fn inner(result: RecordBatch) -> RecordBatch {

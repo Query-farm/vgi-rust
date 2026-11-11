@@ -128,7 +128,7 @@ impl TableFunction for WideScan {
 }
 
 /// A function-backed table advertising the 2-column schema, scanned lazily by
-/// `scan_fn(3)` (resolution via `catalog_table_scan_function_get`).
+/// `scan_fn(3)` (resolution via `catalog_table_scan_branches_get`).
 fn cat_table(name: &str, scan_fn: &str) -> CatTable {
     let scan_arguments =
         Arguments::serialize_scan_args(&[Arc::new(Int64Array::from(vec![3i64])) as ArrayRef])

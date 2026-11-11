@@ -261,7 +261,6 @@ impl VgiService for Dispatcher {
         catalog_schema_contents_macros => handle_contents_macros,
         catalog_schema_contents_tables => handle_contents_tables,
         catalog_table_get => handle_table_get,
-        catalog_table_scan_function_get => handle_table_scan_function_get,
         catalog_table_insert_function_get => handle_table_insert_function_get,
         catalog_table_update_function_get => handle_table_update_function_get,
         catalog_table_delete_function_get => handle_table_delete_function_get,

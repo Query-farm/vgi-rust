@@ -982,17 +982,16 @@ impl ScalarFunction for ReturnSecretValueFunction {
         "return_secret_value"
     }
     fn metadata(&self) -> FunctionMetadata {
-        meta_ret("Return a secret's value", DataType::Utf8)
+        FunctionMetadata {
+            // Declared statically (not requested mid-bind), so the listing's
+            // `required_secrets` names it and `vgi_secret_types().required_by`
+            // includes it; the extension resolves it before bind.
+            required_secrets: vec![SecretLookup::of_type("vgi_example")],
+            ..meta_ret("Return a secret's value", DataType::Utf8)
+        }
     }
     fn argument_specs(&self) -> Vec<ArgSpec> {
         vec![]
-    }
-    fn secret_lookups(&self, _params: &BindParams) -> Vec<SecretLookup> {
-        vec![SecretLookup {
-            secret_type: "vgi_example".to_string(),
-            scope: None,
-            name: None,
-        }]
     }
     fn cache_control(&self) -> Option<CacheControl> {
         // Deliberately advertises caching so clients prove secret-dependent

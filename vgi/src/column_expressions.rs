@@ -24,6 +24,9 @@ use vgi_rpc::{Result, RpcError};
 
 pub const GENERATED: &str = "vgi.column.generated.v1";
 pub const GENERATION: &str = "vgi.column.generation.v1";
+/// Canonical column DEFAULT: base64 of one `SqlExpression` IPC record (see
+/// [`default_metadata`]). DuckDB applies it to an INSERT that omits the column.
+pub const DEFAULT: &str = "vgi.column.default.v1";
 const PROFILE: &str = "vgi.expression.duckdb.scalar.v1";
 const MAXIMUM: usize = 8 * 1024 * 1024;
 fn invalid(message: &str) -> RpcError {
@@ -114,6 +117,30 @@ pub(crate) fn encoded(value: &str, owner: &[String]) -> Result<SqlExpression> {
 }
 /// Translate the convenience SQL value using an explicit owner and default context.
 pub fn generated_metadata(sql: &str, owner: &[String]) -> Result<String> {
+    expression_metadata(sql, owner)
+}
+
+/// Encode `sql` as canonical [`DEFAULT`] metadata owned by the table's schema
+/// `owner`, in the default evaluation context. The SQL must be a constant
+/// expression (no column references); DuckDB binds and folds it, for boolean,
+/// signed-integer, float, decimal and utf8 columns.
+///
+/// ```
+/// use arrow_schema::{DataType, Field};
+/// use std::collections::HashMap;
+/// use vgi::column_expressions::{default_metadata, DEFAULT};
+///
+/// let qty = Field::new("qty", DataType::Int64, true).with_metadata(HashMap::from([(
+///     DEFAULT.to_string(),
+///     default_metadata("0", &["main".to_string()]).unwrap(),
+/// )]));
+/// assert!(qty.metadata().contains_key(DEFAULT));
+/// ```
+pub fn default_metadata(sql: &str, owner: &[String]) -> Result<String> {
+    expression_metadata(sql, owner)
+}
+
+fn expression_metadata(sql: &str, owner: &[String]) -> Result<String> {
     let value = SqlExpression {
         sql: sql.into(),
         profile: PROFILE.into(),
@@ -226,11 +253,16 @@ pub fn validate(schema: &Schema, owner: &[String], allow_generated: bool) -> Res
                 "generated expression and category must occur together",
             ));
         }
+        if !values.contains_key(GENERATED) {
+            if let Some(value) = values.get(DEFAULT) {
+                encoded(value, owner)?;
+            }
+        }
         if let Some(value) = values.get(GENERATED) {
             if values[GENERATION] != "virtual" {
                 return Err(invalid("only VIRTUAL generated columns are supported"));
             }
-            if values.contains_key("default") || values.contains_key("vgi.column.default.v1") {
+            if values.contains_key("default") || values.contains_key(DEFAULT) {
                 return Err(invalid("generated column cannot have a default"));
             }
             encoded(value, owner)?;

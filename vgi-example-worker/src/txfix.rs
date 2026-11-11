@@ -11,11 +11,14 @@
 //!   [`vgi::attach_options::attach_options`] — the SDK encrypts the secret
 //!   `token` inside `attach_opaque_data`, so it is never there in plaintext
 //!   (`whoami().token_in_attach_data` checks that);
-//! - `main.items` declares an UPDATE function and its result mode through
+//! - `main.items` declares INSERT, UPDATE and DELETE functions (`items_insert`,
+//!   `items_update`, `items_delete`, all `table_only` and with a finalize
+//!   phase) and their result modes through
 //!   [`CatTable::writes`](vgi::catalog::CatTable::writes); its scan emits the
 //!   row id ([`vgi::write_results::row_id_field`]) with projection pushdown;
-//!   its constraint records make the catalog negotiate
-//!   `vgi.constraint.enforce.v1`;
+//!   `qty` carries a canonical column default
+//!   ([`vgi::column_expressions::default_metadata`]); its constraint records
+//!   make the catalog negotiate `vgi.constraint.enforce.v1`;
 //! - `main.labels` is read-only (constrained, no write function);
 //! - [`CatalogTransactions`] decides `supports_transactions` per attach and
 //!   implements begin / commit / rollback.
@@ -25,16 +28,17 @@
 //! ATTACH 'txfix' AS ttx (TYPE vgi, LOCATION '...', token 'tok-123', transactional true);
 //! ```
 //!
-//! On a transactional attach UPDATE stages its changes under the plaintext
-//! transaction id the function sees; scans on that attach read their own
-//! writes; the commit hook applies them (or refuses a negative qty) and the
-//! rollback hook discards them. State lives in one SQLite file under
+//! On a transactional attach INSERT, UPDATE and DELETE stage their changes
+//! under the plaintext transaction id the function sees; scans on that attach
+//! read their own writes; the commit hook applies them (or refuses a negative
+//! qty, discarding them) and the rollback hook discards them. Every write call
+//! is logged (`writes()`), and its finalize phase marks the entry finalized. State lives in one SQLite file under
 //! `$VGI_TXFIX_STATE_DIR` (default `<tmpdir>/vgi-txfix`), partitioned by the
 //! `token` option, because the extension routes the statements of one
 //! transaction to different worker processes (a SQLite `BEGIN IMMEDIATE` is
 //! the cross-process lock). Mirrors the TypeScript reference fixture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -49,7 +53,7 @@ use vgi::table_function::{TableFunction, TableProducer};
 use vgi::table_in_out::TableInOutFunction;
 use vgi::write_results::{
     project_to_output, row_id_field, write_function_arg_specs, write_result_batch,
-    write_result_schema, WriteOptions, WriteResultMode,
+    write_result_schema, WriteOperation, WriteOptions, WriteResultMode,
 };
 use vgi_rpc::{Result, RpcError};
 
@@ -148,16 +152,22 @@ fn open_state() -> Result<Connection> {
     let db = Connection::open(dir.join("txfix.db")).map_err(err)?;
     db.busy_timeout(std::time::Duration::from_secs(10))
         .map_err(err)?;
+    db.execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(err)?;
+    init_schema(&db)?;
+    Ok(db)
+}
+
+fn init_schema(db: &Connection) -> Result<()> {
     db.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS parts (part TEXT PRIMARY KEY);
+        "CREATE TABLE IF NOT EXISTS parts (part TEXT PRIMARY KEY);
          CREATE TABLE IF NOT EXISTS items (part TEXT NOT NULL, id INTEGER NOT NULL, name TEXT, qty INTEGER, PRIMARY KEY (part, id));
          CREATE TABLE IF NOT EXISTS labels (part TEXT NOT NULL, id INTEGER NOT NULL, label TEXT, PRIMARY KEY (part, id));
-         CREATE TABLE IF NOT EXISTS staged (part TEXT NOT NULL, tx TEXT NOT NULL, id INTEGER NOT NULL, name TEXT, qty INTEGER, PRIMARY KEY (part, tx, id));
-         CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, part TEXT NOT NULL, kind TEXT NOT NULL, tx TEXT, ok INTEGER NOT NULL);",
+         CREATE TABLE IF NOT EXISTS pending (part TEXT NOT NULL, tx TEXT NOT NULL, id INTEGER NOT NULL, name TEXT, qty INTEGER, deleted INTEGER NOT NULL, PRIMARY KEY (part, tx, id));
+         CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, part TEXT NOT NULL, kind TEXT NOT NULL, tx TEXT, ok INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS writes (seq INTEGER PRIMARY KEY AUTOINCREMENT, part TEXT NOT NULL, call TEXT NOT NULL, op TEXT NOT NULL, tx TEXT, rows INTEGER NOT NULL, finalized INTEGER NOT NULL, UNIQUE (part, call));",
     )
-    .map_err(err)?;
-    Ok(db)
+    .map_err(err)
 }
 
 /// Run `f` in one SQLite write transaction (`BEGIN IMMEDIATE`: the
@@ -173,7 +183,7 @@ fn with_state<T>(f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>) -> Res
 }
 
 /// Seed `part` with the initial rows the first time it is seen (or always,
-/// clearing its staged changes and events, when `force`).
+/// clearing its staged changes, events and write log, when `force`).
 fn seed(db: &Connection, part: &str, force: bool) -> Result<()> {
     let fresh = db
         .execute("INSERT OR IGNORE INTO parts (part) VALUES (?1)", [part])
@@ -182,7 +192,7 @@ fn seed(db: &Connection, part: &str, force: bool) -> Result<()> {
     if !fresh && !force {
         return Ok(());
     }
-    for table in ["items", "labels", "staged", "events"] {
+    for table in ["items", "labels", "pending", "events", "writes"] {
         db.execute(&format!("DELETE FROM {table} WHERE part = ?1"), [part])
             .map_err(err)?;
     }
@@ -225,7 +235,54 @@ fn items_of(db: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result
         .map_err(err)
 }
 
-/// The rows `part` sees: committed, with transaction `tx`'s staged rows on top.
+/// One staged change of a transaction: the row's new image, or its deletion.
+#[derive(Clone, Debug, PartialEq)]
+enum Staged {
+    Put(Item),
+    Delete(i32),
+}
+
+/// Transaction `tx`'s staged changes in `part`, ordered by id.
+fn staged_of(db: &Connection, part: &str, tx: &str) -> Result<Vec<Staged>> {
+    let mut stmt = db
+        .prepare(
+            "SELECT id, name, qty, deleted FROM pending WHERE part = ?1 AND tx = ?2 ORDER BY id",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![part, tx], |r| {
+            let id: i32 = r.get(0)?;
+            Ok(if r.get::<_, i64>(3)? != 0 {
+                Staged::Delete(id)
+            } else {
+                Staged::Put(Item {
+                    id,
+                    name: r.get(1)?,
+                    qty: r.get(2)?,
+                })
+            })
+        })
+        .map_err(err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(err)
+}
+
+/// Stage `change` under `tx`, replacing any earlier staged change of that id.
+fn stage(db: &Connection, part: &str, tx: &str, change: &Staged) -> Result<()> {
+    let (id, name, qty, deleted) = match change {
+        Staged::Put(r) => (r.id, r.name.clone(), r.qty, 0),
+        Staged::Delete(id) => (*id, None, None, 1),
+    };
+    db.execute(
+        "INSERT OR REPLACE INTO pending (part, tx, id, name, qty, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![part, tx, id, name, qty, deleted],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// The rows `part` sees: committed, with transaction `tx`'s staged changes on
+/// top (staged inserts and updates replace, staged deletes remove).
 fn visible_items(db: &Connection, part: &str, tx: Option<&str>) -> Result<BTreeMap<i32, Item>> {
     seed(db, part, false)?;
     let mut rows: BTreeMap<i32, Item> = items_of(
@@ -237,15 +294,93 @@ fn visible_items(db: &Connection, part: &str, tx: Option<&str>) -> Result<BTreeM
     .map(|i| (i.id, i))
     .collect();
     if let Some(tx) = tx {
-        for i in items_of(
-            db,
-            "SELECT id, name, qty FROM staged WHERE part = ?1 AND tx = ?2",
-            &[&part, &tx],
-        )? {
-            rows.insert(i.id, i);
+        for change in staged_of(db, part, tx)? {
+            match change {
+                Staged::Put(i) => {
+                    rows.insert(i.id, i);
+                }
+                Staged::Delete(id) => {
+                    rows.remove(&id);
+                }
+            }
         }
     }
     Ok(rows)
+}
+
+/// Apply one change to the committed rows of `part`.
+fn apply(db: &Connection, part: &str, change: &Staged) -> Result<()> {
+    match change {
+        Staged::Put(r) => db.execute(
+            "INSERT OR REPLACE INTO items (part, id, name, qty) VALUES (?1, ?2, ?3, ?4)",
+            params![part, r.id, r.name, r.qty],
+        ),
+        Staged::Delete(id) => db.execute(
+            "DELETE FROM items WHERE part = ?1 AND id = ?2",
+            params![part, id],
+        ),
+    }
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Write `changes` for one write call: staged under `tx` on a transactional
+/// attach, applied to the committed rows otherwise.
+fn write_changes(db: &Connection, part: &str, tx: Option<&str>, changes: &[Staged]) -> Result<()> {
+    for change in changes {
+        match tx {
+            Some(tx) => stage(db, part, tx, change)?,
+            None => apply(db, part, change)?,
+        }
+    }
+    Ok(())
+}
+
+// --------------------------------------------------------------- write log
+
+/// The write call a `process` / `finish` belongs to: its execution id (one per
+/// write call, carried by every batch and by the finalize).
+fn call_of(p: &ProcessParams) -> String {
+    hex(&p.execution_id)
+}
+
+/// Add `rows` written rows (applied on a plain attach, staged on a
+/// transactional one: what the call reports) to write call `call`'s
+/// `writes()` entry, creating it on first sight. `tx` is the transaction the
+/// changes are staged under (NULL on a plain attach). Runs in the same SQLite
+/// transaction as the write, so a refused batch logs nothing.
+fn log_write(
+    db: &Connection,
+    part: &str,
+    call: &str,
+    op: WriteOperation,
+    tx: Option<&str>,
+    rows: usize,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO writes (part, call, op, tx, rows, finalized) VALUES (?1, ?2, ?3, ?4, ?5, 0)
+         ON CONFLICT (part, call) DO UPDATE SET rows = rows + excluded.rows",
+        params![part, call, op.as_str(), tx, rows as i64],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// The finalize phase of write call `call`: mark its `writes()` entry.
+fn finalize_write(p: &ProcessParams, op: WriteOperation) -> Result<Vec<RecordBatch>> {
+    let WriteTarget { part, tx } = write_target(p)?;
+    let call = call_of(p);
+    with_state(|db| {
+        // A call no row reached (e.g. an empty MERGE action) is listed too.
+        log_write(db, &part, &call, op, tx.as_deref(), 0)?;
+        db.execute(
+            "UPDATE writes SET finalized = 1 WHERE part = ?1 AND call = ?2",
+            params![part, call],
+        )
+        .map_err(err)?;
+        Ok(())
+    })?;
+    Ok(Vec::new())
 }
 
 fn log_event(db: &Connection, part: &str, kind: &str, tx: Option<&str>, ok: bool) -> Result<()> {
@@ -276,6 +411,30 @@ fn items_table_columns() -> SchemaRef {
         .map(|f| f.as_ref().clone())
         .collect();
     fields.push(row_id_field("rowid"));
+    Arc::new(Schema::new(fields))
+}
+
+/// `items`' columns as the catalog declares them: [`items_table_columns`] with
+/// `qty BIGINT DEFAULT 0` (canonical `vgi.column.default.v1` metadata, which
+/// DuckDB applies to an INSERT that omits `qty`).
+fn items_declared_columns() -> SchemaRef {
+    let qty_default = vgi::column_expressions::default_metadata("0", &["main".to_string()])
+        .expect("valid qty default");
+    let fields: Vec<Field> = items_table_columns()
+        .fields()
+        .iter()
+        .map(|f| {
+            let f = f.as_ref().clone();
+            if f.name() == "qty" {
+                f.with_metadata(HashMap::from([(
+                    vgi::column_expressions::DEFAULT.to_string(),
+                    qty_default.clone(),
+                )]))
+            } else {
+                f
+            }
+        })
+        .collect();
     Arc::new(Schema::new(fields))
 }
 
@@ -406,9 +565,41 @@ fn labels_scan_rows(p: &ProcessParams) -> Result<RecordBatch> {
     .map_err(err)
 }
 
-/// `items_update`: backs `UPDATE main.items`. Applies the new values, or, in
-/// a transaction on a transactional attach, stages them under its id.
-struct ItemsUpdate;
+/// What a write call works on: the attach's partition and, on a transactional
+/// attach, the transaction its changes are staged under.
+struct WriteTarget {
+    part: String,
+    tx: Option<String>,
+}
+
+fn write_target(p: &ProcessParams) -> Result<WriteTarget> {
+    let attach = decode_attach(p.attach_opaque_data.as_deref())?;
+    Ok(WriteTarget {
+        part: part_of(&attach),
+        tx: if attach.transactional {
+            tx_of(p.transaction_opaque_data.as_deref())
+        } else {
+            None
+        },
+    })
+}
+
+/// The id of the row a `rowid` names (`rowid = id`), if it can be one.
+fn rowid_at(rowids: &ArrayRef, i: usize) -> Result<Option<i32>> {
+    Ok(int_at(rowids, i)?.and_then(|r| i32::try_from(r).ok()))
+}
+
+fn result_mode(p: &ProcessParams) -> Result<WriteResultMode> {
+    Ok(WriteOptions::from_arguments(&p.arguments)?.result_mode)
+}
+
+fn bind_write_result(params: &BindParams) -> Result<BindResponse> {
+    let mode = WriteOptions::from_arguments(&params.arguments)?.result_mode;
+    Ok(BindResponse {
+        output_schema: write_result_schema(mode, &items_table_columns()),
+        opaque_data: Vec::new(),
+    })
+}
 
 /// Row `i` of `col` as an i64 (any integer type), or `None` when NULL.
 fn int_at(col: &ArrayRef, i: usize) -> Result<Option<i64>> {
@@ -438,6 +629,96 @@ fn str_at(col: &ArrayRef, i: usize) -> Result<Option<String>> {
     ))
 }
 
+/// `items_insert`: backs `INSERT INTO main.items`. Inserts the rows, or, in a
+/// transaction on a transactional attach, stages them under its id.
+struct ItemsInsert;
+
+impl TableInOutFunction for ItemsInsert {
+    fn name(&self) -> &str {
+        "items_insert"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        volatile("Backs INSERT INTO main.items: inserts (or, in a transaction, stages) the rows")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        write_function_arg_specs("The new rows, in the user columns of items")
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        bind_write_result(params)
+    }
+    fn process(&self, p: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        let WriteTarget { part, tx } = write_target(p)?;
+        let call = call_of(p);
+        let column = |name: &str| batch.column_by_name(name);
+        let inserted = with_state(|db| {
+            let mut current = visible_items(db, &part, tx.as_deref())?;
+            let mut rows = Vec::with_capacity(batch.num_rows());
+            // Validate every row before applying any.
+            for i in 0..batch.num_rows() {
+                let id = match column("id") {
+                    Some(c) => int_at(c, i)?,
+                    None => None,
+                }
+                .ok_or_else(|| err("txfix: id required"))?;
+                let id =
+                    i32::try_from(id).map_err(|_| err(format!("txfix: id {id} out of range")))?;
+                // Committed, staged by this transaction, or earlier in this statement.
+                if current.contains_key(&id) {
+                    return Err(err(format!("txfix: duplicate id {id}")));
+                }
+                let name = match column("name") {
+                    Some(c) => str_at(c, i)?,
+                    None => None,
+                }
+                .ok_or_else(|| err("txfix: name required"))?;
+                let qty = match column("qty") {
+                    Some(c) => int_at(c, i)?,
+                    None => Some(0),
+                };
+                // Like UPDATE: refused now on a plain attach, at commit when staged.
+                if tx.is_none() && qty.is_some_and(|q| q < 0) {
+                    return Err(err("txfix: qty must be >= 0"));
+                }
+                let row = Item {
+                    id,
+                    name: Some(name),
+                    qty,
+                };
+                current.insert(id, row.clone());
+                rows.push(row);
+            }
+            let changes: Vec<Staged> = rows.iter().cloned().map(Staged::Put).collect();
+            write_changes(db, &part, tx.as_deref(), &changes)?;
+            log_write(
+                db,
+                &part,
+                &call,
+                WriteOperation::Insert,
+                tx.as_deref(),
+                rows.len(),
+            )?;
+            Ok(rows)
+        })?;
+        Ok(vec![write_result_batch(
+            result_mode(p)?,
+            &items_table_columns(),
+            None,
+            Some(&items_batch(&inserted, false)?),
+        )?])
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn finish(&self, p: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        finalize_write(p, WriteOperation::Insert)
+    }
+}
+
+/// `items_update`: backs `UPDATE main.items`. Applies the new values, or, in
+/// a transaction on a transactional attach, stages them under its id (a
+/// staged insert is updated in its staged state).
+struct ItemsUpdate;
+
 impl TableInOutFunction for ItemsUpdate {
     fn name(&self) -> &str {
         "items_update"
@@ -449,20 +730,11 @@ impl TableInOutFunction for ItemsUpdate {
         write_function_arg_specs("The SET columns plus rowid of each row to update")
     }
     fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
-        let mode = WriteOptions::from_arguments(&params.arguments)?.result_mode;
-        Ok(BindResponse {
-            output_schema: write_result_schema(mode, &items_table_columns()),
-            opaque_data: Vec::new(),
-        })
+        bind_write_result(params)
     }
     fn process(&self, p: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
-        let attach = decode_attach(p.attach_opaque_data.as_deref())?;
-        let part = part_of(&attach);
-        let tx = if attach.transactional {
-            tx_of(p.transaction_opaque_data.as_deref())
-        } else {
-            None
-        };
+        let WriteTarget { part, tx } = write_target(p)?;
+        let call = call_of(p);
         let rowids = batch
             .column_by_name("rowid")
             .ok_or_else(|| RpcError::value_error("txfix: update input has no rowid"))?;
@@ -472,12 +744,15 @@ impl TableInOutFunction for ItemsUpdate {
             let mut after = Vec::new();
             // Validate every row before applying any.
             for i in 0..batch.num_rows() {
-                let rowid = int_at(rowids, i)?.unwrap_or(-1);
-                let old = i32::try_from(rowid)
-                    .ok()
+                let old = rowid_at(rowids, i)?
                     .and_then(|id| current.get(&id))
                     .cloned()
-                    .ok_or_else(|| err(format!("txfix: no row with rowid {rowid}")))?;
+                    .ok_or_else(|| {
+                        err(format!(
+                            "txfix: no row with rowid {}",
+                            int_at(rowids, i).ok().flatten().unwrap_or(-1)
+                        ))
+                    })?;
                 let mut next = old.clone();
                 for (f, col) in batch.schema().fields().iter().zip(batch.columns()) {
                     match f.name().as_str() {
@@ -506,28 +781,91 @@ impl TableInOutFunction for ItemsUpdate {
                 before.push(old);
                 after.push(next);
             }
-            for r in &after {
-                match &tx {
-                    Some(tx) => db.execute(
-                        "INSERT OR REPLACE INTO staged (part, tx, id, name, qty) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![part, tx, r.id, r.name, r.qty],
-                    ),
-                    None => db.execute(
-                        "UPDATE items SET name = ?1, qty = ?2 WHERE part = ?3 AND id = ?4",
-                        params![r.name, r.qty, part, r.id],
-                    ),
-                }
-                .map_err(err)?;
-            }
+            let changes: Vec<Staged> = after.iter().cloned().map(Staged::Put).collect();
+            write_changes(db, &part, tx.as_deref(), &changes)?;
+            log_write(
+                db,
+                &part,
+                &call,
+                WriteOperation::Update,
+                tx.as_deref(),
+                after.len(),
+            )?;
             Ok((before, after))
         })?;
-        let mode = WriteOptions::from_arguments(&p.arguments)?.result_mode;
         Ok(vec![write_result_batch(
-            mode,
+            result_mode(p)?,
             &items_table_columns(),
             Some(&items_batch(&before, false)?),
             Some(&items_batch(&after, false)?),
         )?])
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn finish(&self, p: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        finalize_write(p, WriteOperation::Update)
+    }
+}
+
+/// `items_delete`: backs `DELETE FROM main.items`. Deletes the rows its
+/// `rowid`s name (`rowid = id`), or, in a transaction on a transactional
+/// attach, stages the deletions under its id. A rowid naming no row is a
+/// no-op, not counted.
+struct ItemsDelete;
+
+impl TableInOutFunction for ItemsDelete {
+    fn name(&self) -> &str {
+        "items_delete"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        volatile("Backs DELETE FROM main.items: deletes (or, in a transaction, stages deleting) the rows")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        write_function_arg_specs("The rowid of each row to delete")
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        bind_write_result(params)
+    }
+    fn process(&self, p: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        let WriteTarget { part, tx } = write_target(p)?;
+        let call = call_of(p);
+        let rowids = batch
+            .column_by_name("rowid")
+            .ok_or_else(|| RpcError::value_error("txfix: delete input has no rowid"))?;
+        let deleted = with_state(|db| {
+            let mut current = visible_items(db, &part, tx.as_deref())?;
+            let mut deleted = Vec::new();
+            for i in 0..batch.num_rows() {
+                // Missing (or already deleted in this call): a no-op.
+                if let Some(old) = rowid_at(rowids, i)?.and_then(|id| current.remove(&id)) {
+                    deleted.push(old);
+                }
+            }
+            let changes: Vec<Staged> = deleted.iter().map(|r| Staged::Delete(r.id)).collect();
+            write_changes(db, &part, tx.as_deref(), &changes)?;
+            log_write(
+                db,
+                &part,
+                &call,
+                WriteOperation::Delete,
+                tx.as_deref(),
+                deleted.len(),
+            )?;
+            Ok(deleted)
+        })?;
+        Ok(vec![write_result_batch(
+            result_mode(p)?,
+            &items_table_columns(),
+            Some(&items_batch(&deleted, false)?),
+            None,
+        )?])
+    }
+    fn has_finish(&self) -> bool {
+        true
+    }
+    fn finish(&self, p: &ProcessParams) -> Result<Vec<RecordBatch>> {
+        finalize_write(p, WriteOperation::Delete)
     }
 }
 
@@ -678,6 +1016,58 @@ fn events_rows(p: &ProcessParams) -> Result<RecordBatch> {
     .map_err(err)
 }
 
+fn writes_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, true),
+        Field::new("op", DataType::Utf8, true),
+        Field::new("tx_id", DataType::Utf8, true),
+        Field::new("rows", DataType::Int64, true),
+        Field::new("finalized", DataType::Boolean, true),
+    ]))
+}
+
+type WriteRow = (i64, String, Option<String>, i64, i64);
+
+/// `writes()`: one row per write call of the partition, in order: its
+/// operation, its transaction id (NULL on a plain attach), the rows it
+/// reported (applied or staged), and whether its finalize phase ran.
+fn writes_rows(p: &ProcessParams) -> Result<RecordBatch> {
+    let part = part_of(&decode_attach(p.attach_opaque_data.as_deref())?);
+    let rows: Vec<WriteRow> = with_state(|db| {
+        let mut stmt = db
+            .prepare("SELECT seq, op, tx, rows, finalized FROM writes WHERE part = ?1 ORDER BY seq")
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([&part], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(err)
+    })?;
+    RecordBatch::try_new(
+        writes_schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.2.clone()).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.4 != 0).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .map_err(err)
+}
+
 // ------------------------------------------------------------ transactions
 
 /// The catalog's transaction hooks.
@@ -703,17 +1093,19 @@ impl CatalogTransactions for TxfixTransactions {
         let part = part_of(&decode_attach(Some(attach_opaque_data))?);
         let tx = hex(transaction_opaque_data);
         let refusal = with_state(|db| {
-            let rows = items_of(
-                db,
-                "SELECT id, name, qty FROM staged WHERE part = ?1 AND tx = ?2 ORDER BY id",
-                &[&part, &tx],
-            )?;
+            let changes = staged_of(db, &part, &tx)?;
             db.execute(
-                "DELETE FROM staged WHERE part = ?1 AND tx = ?2",
+                "DELETE FROM pending WHERE part = ?1 AND tx = ?2",
                 params![part, tx],
             )
             .map_err(err)?;
-            if let Some(bad) = rows.iter().find(|r| r.qty.is_some_and(|q| q < 0)) {
+            // A refused commit discards every staged change (inserts and
+            // deletes included).
+            let bad = changes.iter().find_map(|c| match c {
+                Staged::Put(r) if r.qty.is_some_and(|q| q < 0) => Some(r),
+                _ => None,
+            });
+            if let Some(bad) = bad {
                 log_event(db, &part, "commit", Some(&tx), false)?;
                 return Ok(Some(format!(
                     "txfix: commit refused: qty {} for id {}",
@@ -721,12 +1113,8 @@ impl CatalogTransactions for TxfixTransactions {
                     bad.id
                 )));
             }
-            for r in &rows {
-                db.execute(
-                    "UPDATE items SET name = ?1, qty = ?2 WHERE part = ?3 AND id = ?4",
-                    params![r.name, r.qty, part, r.id],
-                )
-                .map_err(err)?;
+            for change in &changes {
+                apply(db, &part, change)?;
             }
             log_event(db, &part, "commit", Some(&tx), true)?;
             Ok(None)
@@ -742,7 +1130,7 @@ impl CatalogTransactions for TxfixTransactions {
         let tx = hex(transaction_opaque_data);
         with_state(|db| {
             db.execute(
-                "DELETE FROM staged WHERE part = ?1 AND tx = ?2",
+                "DELETE FROM pending WHERE part = ?1 AND tx = ?2",
                 params![part, tx],
             )
             .map_err(err)?;
@@ -783,7 +1171,7 @@ pub fn catalog() -> CatalogModel {
     let transactional_default: ArrayRef = Arc::new(BooleanArray::from(vec![false]));
     let transactional = vgi::catalog::serialize_attach_option_spec_with_flags(
         "transactional",
-        "Stage UPDATEs in DuckDB transactions (supports_transactions for this attach)",
+        "Stage writes in DuckDB transactions (supports_transactions for this attach)",
         &DataType::Boolean,
         Some(&transactional_default),
         AttachOptionFlags::default(),
@@ -803,7 +1191,7 @@ pub fn catalog() -> CatalogModel {
 
     let mut items = CatTable::with_function(
         "items",
-        items_table_columns(),
+        items_declared_columns(),
         Arc::new(OneShotFn {
             name: "items_scan",
             description:
@@ -813,10 +1201,15 @@ pub fn catalog() -> CatalogModel {
             projection_pushdown: true,
             rows: items_scan_rows,
         }),
-        Some("Writable: UPDATE name/qty (staged per transaction on a transactional attach)".into()),
+        Some(
+            "Writable: INSERT, UPDATE name/qty, DELETE (staged per transaction on a transactional attach)"
+                .into(),
+        ),
         None,
     )
-    .with_update_function(Arc::new(ItemsUpdate), WriteResultMode::Changes);
+    .with_insert_function(Arc::new(ItemsInsert), WriteResultMode::Changes)
+    .with_update_function(Arc::new(ItemsUpdate), WriteResultMode::Changes)
+    .with_delete_function(Arc::new(ItemsDelete), WriteResultMode::Changes);
     items.constraints = table_constraints("items", &["id", "name"], "id");
 
     let mut labels = CatTable::with_function(
@@ -834,7 +1227,7 @@ pub fn catalog() -> CatalogModel {
     );
     labels.constraints = table_constraints("labels", &["id"], "id");
     // Fixture contract: `labels_scan` is an ordinary SQL callable; `items_scan`
-    // and `items_update` stay `table_only` (the default).
+    // and the write functions stay `table_only` (the default).
     labels.expose_scan = true;
 
     CatalogModel {
@@ -866,7 +1259,7 @@ pub fn register(w: &mut vgi::Worker) {
     };
     w.register_table(one_shot(
         "reset",
-        "Restore this token's initial rows; clear its staged changes and events",
+        "Restore this token's initial rows; clear its staged changes, events and write log",
         ok_schema,
         reset_rows,
     ));
@@ -887,6 +1280,12 @@ pub fn register(w: &mut vgi::Worker) {
         "This token's transaction-hook event log",
         events_schema,
         events_rows,
+    ));
+    w.register_table(one_shot(
+        "writes",
+        "This token's write-call log: one row per write call (op, tx id, rows written, finalized)",
+        writes_schema,
+        writes_rows,
     ));
     w.register_table_in_out(TagTx);
 }
@@ -918,13 +1317,149 @@ mod tests {
     }
 
     /// Fixture contract (vgi docs/writable_tx_fixtures.md): `items_scan` and
-    /// `items_update` are listed `table_only`, `labels_scan` is public.
+    /// the write functions are listed `table_only`, `labels_scan` is public.
     #[test]
     fn items_functions_are_table_only_and_labels_scan_is_exposed() {
         let table_only = catalog().table_only_function_names();
-        assert!(table_only.contains("items_scan"));
-        assert!(table_only.contains("items_update"));
+        for f in ["items_scan", "items_insert", "items_update", "items_delete"] {
+            assert!(table_only.contains(f), "{f}");
+        }
         assert!(!table_only.contains("labels_scan"));
+    }
+
+    /// `items` takes INSERT, UPDATE and DELETE, each with a finalize phase and
+    /// up to `changes`; `labels` takes none.
+    #[test]
+    fn items_writes_have_finalize_and_labels_is_read_only() {
+        let model = catalog();
+        let tables = &model.schemas[0].tables;
+        let items = tables.iter().find(|t| t.name == "items").unwrap();
+        for op in WriteOperation::ALL {
+            let f = items
+                .writes
+                .get(op)
+                .unwrap_or_else(|| panic!("no {op} function"));
+            assert_eq!(f.max_result_mode, WriteResultMode::Changes);
+            let info = vgi::catalog::table_in_out_function_info(
+                f.function_impl.as_ref().unwrap().as_ref(),
+            )
+            .unwrap();
+            assert!(info.has_finalize, "{op}");
+            assert_eq!(info.name, format!("items_{op}"));
+        }
+        let labels = tables.iter().find(|t| t.name == "labels").unwrap();
+        assert!(labels.writes.is_empty());
+    }
+
+    /// `qty` is declared `BIGINT DEFAULT 0` with canonical default metadata.
+    #[test]
+    fn qty_declares_a_canonical_default() {
+        let columns = items_declared_columns();
+        let qty = columns.field_with_name("qty").unwrap();
+        assert_eq!(qty.data_type(), &DataType::Int64);
+        assert!(qty
+            .metadata()
+            .contains_key(vgi::column_expressions::DEFAULT));
+        vgi::column_expressions::validate(&columns, &["main".to_string()], false).unwrap();
+        // Only the declared columns carry it.
+        assert!(items_table_columns()
+            .field_with_name("qty")
+            .unwrap()
+            .metadata()
+            .is_empty());
+    }
+
+    fn memory_state() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+        db
+    }
+
+    fn item(id: i32, name: &str, qty: i64) -> Item {
+        Item {
+            id,
+            name: Some(name.to_string()),
+            qty: Some(qty),
+        }
+    }
+
+    /// Staged inserts, updates and deletes are visible to their own
+    /// transaction only, an update of a staged insert edits the staged row,
+    /// and applying them reaches the committed rows.
+    #[test]
+    fn staged_changes_are_read_your_writes_and_apply_in_order() {
+        let db = memory_state();
+        let part = "token:unit";
+        seed(&db, part, false).unwrap();
+        write_changes(
+            &db,
+            part,
+            Some("tx1"),
+            &[Staged::Put(item(4, "d", 40)), Staged::Delete(1)],
+        )
+        .unwrap();
+        // Update the staged insert.
+        write_changes(&db, part, Some("tx1"), &[Staged::Put(item(4, "d", 41))]).unwrap();
+        let mine = visible_items(&db, part, Some("tx1")).unwrap();
+        assert_eq!(mine.keys().copied().collect::<Vec<_>>(), [2, 3, 4]);
+        assert_eq!(mine[&4].qty, Some(41));
+        let others = visible_items(&db, part, None).unwrap();
+        assert_eq!(others.keys().copied().collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(visible_items(&db, part, Some("tx2")).unwrap(), others);
+        // Delete of a staged insert, then re-insert under the same id.
+        write_changes(&db, part, Some("tx1"), &[Staged::Delete(4)]).unwrap();
+        assert!(!visible_items(&db, part, Some("tx1"))
+            .unwrap()
+            .contains_key(&4));
+        write_changes(&db, part, Some("tx1"), &[Staged::Put(item(4, "e", 5))]).unwrap();
+        // Commit = apply the staged changes in id order.
+        for change in staged_of(&db, part, "tx1").unwrap() {
+            apply(&db, part, &change).unwrap();
+        }
+        let committed = visible_items(&db, part, None).unwrap();
+        assert_eq!(committed.keys().copied().collect::<Vec<_>>(), [2, 3, 4]);
+        assert_eq!(committed[&4], item(4, "e", 5));
+        // Without a transaction, changes apply at once.
+        write_changes(&db, part, None, &[Staged::Delete(2)]).unwrap();
+        assert!(!visible_items(&db, part, None).unwrap().contains_key(&2));
+    }
+
+    /// One `writes()` entry per write call: its batches add up, finalize marks
+    /// it, and `reset()` (a forced seed) clears the log.
+    #[test]
+    fn the_write_log_has_one_entry_per_call() {
+        let db = memory_state();
+        let part = "token:log";
+        seed(&db, part, false).unwrap();
+        log_write(&db, part, "c1", WriteOperation::Insert, None, 2048).unwrap();
+        log_write(&db, part, "c1", WriteOperation::Insert, None, 952).unwrap();
+        log_write(&db, part, "c2", WriteOperation::Delete, Some("ab"), 1).unwrap();
+        db.execute(
+            "UPDATE writes SET finalized = 1 WHERE part = ?1 AND call = 'c1'",
+            [part],
+        )
+        .unwrap();
+        let rows: Vec<(String, Option<String>, i64, i64)> = db
+            .prepare("SELECT op, tx, rows, finalized FROM writes WHERE part = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([part], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("insert".to_string(), None, 3000, 1),
+                ("delete".to_string(), Some("ab".to_string()), 1, 0)
+            ]
+        );
+        seed(&db, part, true).unwrap();
+        let n: i64 = db
+            .query_row("SELECT count(*) FROM writes WHERE part = ?1", [part], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

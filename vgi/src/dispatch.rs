@@ -3378,32 +3378,6 @@ impl Dispatcher {
         }
     }
 
-    /// Lazy scan-function resolution for non-inlined function-backed tables.
-    /// Returns a FLAT `ScanFunctionResult` batch (no `{result}` envelope).
-    pub fn handle_table_scan_function_get(&self, req: &Request) -> Result<Option<RecordBatch>> {
-        let schema_path = read_string_list_col(req, "schema_path")?;
-        let table_name = read_string_col(req, "name")?;
-        let at_unit = read_opt_string_col(req, "at_unit");
-        let at_value = read_opt_string_col(req, "at_value");
-        let t = self
-            .schema_for_req(req, &schema_path)
-            .and_then(|s| s.tables.iter().find(|t| t.name == table_name))
-            .ok_or_else(|| {
-                crate::errors::not_found(format!(
-                    "Unknown table: '{}.{table_name}'",
-                    schema_path.join(".")
-                ))
-            })?;
-        let t = Self::at_version(t, at_unit.as_deref(), at_value.as_deref())?;
-        let resolved_schema = self
-            .resolve_table_function_schema(req, &t.scan_function, &schema_path)
-            .unwrap_or_else(|| schema_path.clone());
-        Ok(Some(wire::to_result_batch(catalog::scan_function_result(
-            &resolved_schema,
-            &t,
-        )?)?))
-    }
-
     /// `catalog_table_{insert,update,delete}_function_get`: the table-in-out
     /// function backing `op` on a table (a FLAT `ScanFunctionResult` batch, as
     /// the scan getter answers). Only asked when the client skipped the value
@@ -8175,25 +8149,29 @@ mod catalog_contents_tests {
     #[test]
     fn scan_function_schema_ignores_homes_in_other_catalogs() {
         let scan_schema = |d: &Dispatcher| {
-            let batch = wire::to_batch(p::CatalogTableScanFunctionGetParams {
+            let batch = wire::to_batch(p::CatalogTableScanBranchesGetParams {
                 attach_opaque_data: Bytes::from(d.attach_bytes()),
                 schema_path: path(&["data"]),
                 name: "t".to_string(),
                 at_unit: None,
                 at_value: None,
                 transaction_opaque_data: None,
+                pushdown_filters: None,
             })
             .unwrap();
-            let r: ScanFunctionResult = wire::from_batch(&inner(
-                d.handle_table_scan_function_get(&request(
-                    "catalog_table_scan_function_get",
+            let r: crate::protocol::dtos::ScanBranchesResult = wire::from_batch(&inner(
+                d.handle_table_scan_branches_get(&request(
+                    "catalog_table_scan_branches_get",
                     batch,
                 ))
                 .unwrap()
                 .unwrap(),
             ))
             .unwrap();
-            r.schema_path
+            assert_eq!(r.branches.len(), 1);
+            let branch: crate::protocol::dtos::ScanBranch =
+                wire::from_batch(&ipc::read_batch(&r.branches[0].0).unwrap()).unwrap();
+            branch.schema_path
         };
         let mut d = dispatcher();
         d.register_table(Arc::new(NoRows("t_scan")));

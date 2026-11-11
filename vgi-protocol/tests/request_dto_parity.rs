@@ -68,6 +68,7 @@ parity! {
     aggregate_streaming_chunk_response: AggregateStreamingChunkResponse => aggregate_streaming_chunk_result_schema,
     catalog_transaction_begin_result: CatalogTransactionBeginResult => catalog_transaction_begin_result_schema,
     catalog_version_result: CatalogVersionResult => catalog_version_result_schema,
+    catalog_table_create_result: CatalogTableCreateResult => catalog_table_create_result_schema,
 }
 
 /// The worker still decodes requests from peers that omit the optional

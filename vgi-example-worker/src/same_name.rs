@@ -454,10 +454,9 @@ impl TableProducer for CachedTagRow {
 /// test_same_name_table_scan() -- backs the declarative test_same_name_table
 /// (see catalog_def.rs), registered under one name in BOTH schemas. Unlike the
 /// four pairs above (each reached by calling the function directly), this one
-/// is reached only via catalog_table_scan_function_get /
-/// catalog_table_scan_branches_get -- the RPC pair that tells a client which
-/// function backs a declarative table, and the end-to-end regression guard
-/// for protocol 1.5.0's ScanFunctionResult.schema_path /
+/// is reached only via catalog_table_scan_branches_get -- the RPC that tells
+/// a client which function backs a declarative table, and the end-to-end
+/// regression guard for protocol 1.5.0's ScanFunctionResult.schema_path /
 /// ScanBranch.schema_path. Driven by
 /// test/sql/integration/table/same_name_schemas.test.
 pub struct SameNameTableScan {

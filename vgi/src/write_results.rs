@@ -422,17 +422,31 @@ pub fn project_to_output(
 
 /// What DuckDB asked a write function for, decoded from its `write_options`
 /// named argument.
+///
+/// Protocol 3.3: the `write_options` batch carries only `result_mode`. The
+/// `on_conflict` / `on_conflict_columns` fields it used to carry are gone from
+/// the wire: DuckDB's binder rewrites every `INSERT ... ON CONFLICT` and
+/// `INSERT OR REPLACE` into `MERGE` before any catalog hook runs, so they were
+/// always `"throw"` / empty. The struct fields remain, deprecated, with those
+/// values, so code that reads them keeps compiling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteOptions {
     /// The result the statement needs.
     pub result_mode: WriteResultMode,
-    /// `throw` (the default), or the `INSERT ... ON CONFLICT` action DuckDB
-    /// requested (`nothing`).
+    /// Always `"throw"`.
+    #[deprecated(
+        note = "protocol 3.3 removed on_conflict from write_options; DuckDB rewrites \
+                INSERT ... ON CONFLICT into MERGE (one write call per action). Always \"throw\"."
+    )]
     pub on_conflict: String,
-    /// The `ON CONFLICT (<columns>)` target, when one was named.
+    /// Always empty.
+    #[deprecated(
+        note = "protocol 3.3 removed on_conflict_columns from write_options. Always empty."
+    )]
     pub on_conflict_columns: Vec<String>,
 }
 
+#[allow(deprecated)] // initializes the removed on_conflict fields to their only values
 impl Default for WriteOptions {
     fn default() -> Self {
         WriteOptions {
@@ -473,6 +487,8 @@ impl WriteOptions {
     }
 
     /// Decode the one-row IPC batch DuckDB serializes into `write_options`.
+    /// Columns other than `result_mode` are ignored (an older extension's
+    /// `on_conflict` / `on_conflict_columns` included).
     pub fn decode(ipc_bytes: &[u8]) -> Result<Self> {
         let mut out = Self::default();
         if ipc_bytes.is_empty() {
@@ -500,30 +516,6 @@ impl WriteOptions {
         if let Some(mode) = string_at("result_mode")? {
             out.result_mode = mode.parse()?;
         }
-        if let Some(action) = string_at("on_conflict")? {
-            out.on_conflict = action;
-        }
-        if let Some(col) = batch.column_by_name("on_conflict_columns") {
-            if !col.is_null(0) {
-                let list = arrow_cast::cast(
-                    col,
-                    &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                )
-                .map_err(|e| {
-                    RpcError::value_error(format!("write_options.on_conflict_columns: {e}"))
-                })?;
-                let list = list
-                    .as_any()
-                    .downcast_ref::<arrow_array::ListArray>()
-                    .expect("cast to List<Utf8>");
-                let values = list.value(0);
-                let values = values
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .expect("List<Utf8> values");
-                out.on_conflict_columns = values.iter().flatten().map(str::to_string).collect();
-            }
-        }
         Ok(out)
     }
 }
@@ -545,7 +537,7 @@ pub fn write_options_arg_spec() -> crate::ArgSpec {
         WRITE_OPTIONS_ARG,
         -1,
         "binary",
-        "Write options supplied by DuckDB (result mode, ON CONFLICT action).",
+        "Write options supplied by DuckDB (the result mode).",
     )
     .with_default(serde_json::Value::Null)
 }
@@ -681,8 +673,40 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // asserts the removed on_conflict fields keep their only values
     fn write_options_decode() {
         assert_eq!(WriteOptions::decode(&[]).unwrap(), WriteOptions::default());
+        // Protocol 3.3: only `result_mode`.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "result_mode",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["rows"]))]).unwrap();
+        let bytes = crate::ipc::write_batch(&batch).unwrap();
+        let opts = WriteOptions::decode(&bytes).unwrap();
+        assert_eq!(opts.result_mode, WriteResultMode::Rows);
+        assert_eq!(opts.on_conflict, "throw");
+        assert!(opts.on_conflict_columns.is_empty());
+        // Through the named argument, as a function sees it.
+        let mut args = crate::arguments::Arguments::default();
+        args.named.insert(
+            WRITE_OPTIONS_ARG.to_string(),
+            Arc::new(arrow_array::BinaryArray::from(vec![bytes.as_slice()])),
+        );
+        assert_eq!(WriteOptions::from_arguments(&args).unwrap(), opts);
+        // Absent: a plain count write.
+        assert_eq!(
+            WriteOptions::from_arguments(&crate::arguments::Arguments::default()).unwrap(),
+            WriteOptions::default()
+        );
+    }
+
+    /// A pre-3.3 extension's `on_conflict` columns are ignored, not decoded.
+    #[test]
+    #[allow(deprecated)]
+    fn write_options_ignore_the_removed_on_conflict_columns() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("result_mode", DataType::Utf8, false),
             Field::new("on_conflict", DataType::Utf8, true),
@@ -699,28 +723,15 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["rows"])),
+                Arc::new(StringArray::from(vec!["count"])),
                 Arc::new(StringArray::from(vec!["nothing"])),
                 Arc::new(list.finish()),
             ],
         )
         .unwrap();
-        let bytes = crate::ipc::write_batch(&batch).unwrap();
-        let opts = WriteOptions::decode(&bytes).unwrap();
-        assert_eq!(opts.result_mode, WriteResultMode::Rows);
-        assert_eq!(opts.on_conflict, "nothing");
-        assert_eq!(opts.on_conflict_columns, vec!["id".to_string()]);
-        // Through the named argument, as a function sees it.
-        let mut args = crate::arguments::Arguments::default();
-        args.named.insert(
-            WRITE_OPTIONS_ARG.to_string(),
-            Arc::new(arrow_array::BinaryArray::from(vec![bytes.as_slice()])),
-        );
-        assert_eq!(WriteOptions::from_arguments(&args).unwrap(), opts);
-        // Absent: a plain count write.
-        assert_eq!(
-            WriteOptions::from_arguments(&crate::arguments::Arguments::default()).unwrap(),
-            WriteOptions::default()
-        );
+        let opts = WriteOptions::decode(&crate::ipc::write_batch(&batch).unwrap()).unwrap();
+        assert_eq!(opts, WriteOptions::default());
+        assert_eq!(opts.on_conflict, "throw");
+        assert!(opts.on_conflict_columns.is_empty());
     }
 }

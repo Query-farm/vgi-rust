@@ -26,15 +26,15 @@ use vgi_rpc::wire::{StreamReader, StreamWriter};
 
 /// The combined successor `vgi.v3` protocol hash, including scalar projection.
 ///
-/// Changes only with `vgi.v3`'s protocol version (currently 3.2.0, see
+/// Changes only with `vgi.v3`'s protocol (currently 3.3.0, see
 /// `VGI_PROTOCOL_VERSION`). If this fails, this port's surface drifted from
 /// the reference -- fix the registration, do not update the constant, unless
 /// the protocol version itself moved.
 const REFERENCE_VGI_V3_HASH: &str =
-    "171ac8263bf22ffdd5dd4ac2c3d3c4e1dc186a7ceba45d386f324af8c9c6fced";
+    "ad10c6b137db8cd0054c8c3d80b0f50946382d52bbd549beaad209e00c180f08";
 
 /// The reference's method count, for a readable failure before the hash.
-const REFERENCE_VGI_V3_METHODS: usize = 85;
+const REFERENCE_VGI_V3_METHODS: usize = 84;
 
 #[test]
 fn vgi_v3_hash_equals_the_reference() {

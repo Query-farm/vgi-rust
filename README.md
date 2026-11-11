@@ -285,6 +285,15 @@ row-id column (`row_id_field`) emitted by a scan with projection pushdown. A
 writable table with constraint records makes the catalog negotiate
 `vgi.constraint.enforce.v1` automatically.
 
+`MERGE INTO` and `INSERT ... ON CONFLICT` / `INSERT OR REPLACE` (which DuckDB
+rewrites into `MERGE`) need no extra function: the extension emulates them
+with one call of the table's insert / update / delete function per MERGE
+action. They are atomic only on an attach whose catalog supports transactions,
+and they require the table's row-id column. Declare `has_finish` on a write
+function to get one finalize call per write call (never after a failed
+statement). A column default is declared with
+`vgi::column_expressions::default_metadata` on the table's column.
+
 `CatalogModel::transactions` takes a `CatalogTransactions` implementation:
 `supports_transactions` per ATTACH (from its options), and `begin` / `commit` /
 `rollback` hooks that see the same plaintext transaction id functions get in
