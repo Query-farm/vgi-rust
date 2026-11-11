@@ -185,11 +185,13 @@ impl Worker {
         );
     }
 
-    /// Hide an already-registered function from the catalog's advertised
-    /// function list. It stays bindable, so a function-backed catalog table can
-    /// still resolve it as a scan function, but the client creates no SQL
-    /// callable for it — use this when the table is the only intended entry
-    /// point.
+    /// List an already-registered function as `table_only` (protocol 3.3). It
+    /// stays bindable and the client keeps its capabilities, so a catalog table
+    /// can still resolve it, but the client creates no SQL callable for it.
+    ///
+    /// Superseded for table functions: a catalog table's embedded scan and its
+    /// write functions are `table_only` automatically unless the table sets
+    /// [`CatTable::expose_scan`](crate::catalog::CatTable::expose_scan).
     pub fn hide_function(&mut self, name: impl Into<String>) {
         self.disp.hide_function(name);
     }
@@ -328,6 +330,12 @@ impl Worker {
     /// `CatalogTable.Function` ergonomics. Write functions embedded in
     /// [`CatTable::writes`](crate::catalog::CatTable::writes) are registered the
     /// same way (as table-in-out functions).
+    ///
+    /// Protocol 3.3: these auto-registered functions are listed `table_only`
+    /// (no SQL callable) unless the table sets
+    /// [`CatTable::expose_scan`](crate::catalog::CatTable::expose_scan); a scan
+    /// the author registers explicitly with [`Worker::register_table`] stays
+    /// public. Write functions are always `table_only`.
     pub fn set_catalog(&mut self, model: crate::catalog::CatalogModel) {
         let base = model.schemas.iter();
         let versioned = model.version_schemas.values().flatten();

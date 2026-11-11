@@ -833,6 +833,9 @@ pub fn catalog() -> CatalogModel {
         None,
     );
     labels.constraints = table_constraints("labels", &["id"], "id");
+    // Fixture contract: `labels_scan` is an ordinary SQL callable; `items_scan`
+    // and `items_update` stay `table_only` (the default).
+    labels.expose_scan = true;
 
     CatalogModel {
         name: CATALOG_NAME.to_string(),
@@ -912,6 +915,16 @@ mod tests {
         model.validate_tables().unwrap();
         assert!(model.has_constraint_records());
         assert!(model.has_writable_constrained_tables());
+    }
+
+    /// Fixture contract (vgi docs/writable_tx_fixtures.md): `items_scan` and
+    /// `items_update` are listed `table_only`, `labels_scan` is public.
+    #[test]
+    fn items_functions_are_table_only_and_labels_scan_is_exposed() {
+        let table_only = catalog().table_only_function_names();
+        assert!(table_only.contains("items_scan"));
+        assert!(table_only.contains("items_update"));
+        assert!(!table_only.contains("labels_scan"));
     }
 
     #[test]

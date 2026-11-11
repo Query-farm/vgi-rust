@@ -620,6 +620,9 @@ pub fn default_function_info(name: &str, function_type: &str) -> FunctionInfo {
         input_rows_per_call: None,
         required_settings: Vec::new(),
         required_secrets: Vec::new(),
+        // Public; the listing marks a table's functions `table_only`
+        // (`Dispatcher::build_function_listing`).
+        visibility: None,
     }
 }
 
@@ -1137,6 +1140,65 @@ pub struct CatalogModel {
 }
 
 impl CatalogModel {
+    /// Protocol 3.3: the (lower-cased) names of the functions this catalog's
+    /// tables name that its function listing marks `table_only`, judged from
+    /// the catalog alone — every write function, and every scan function
+    /// (`scan_function`, time-travel versions' and branches' functions) that no
+    /// table naming it exposes with [`CatTable::expose_scan`]. A function named
+    /// both as a write function and as an exposed scan stays `table_only`.
+    ///
+    /// The worker's listing additionally keeps a scan public when the author
+    /// registered it explicitly (`Worker::register_table` and friends) rather
+    /// than letting [`crate::Worker::set_catalog`] auto-register a table's
+    /// embedded implementation; write functions are `table_only` regardless.
+    pub fn table_only_function_names(&self) -> std::collections::HashSet<String> {
+        let (mut writes, scans) = self.table_function_names();
+        writes.extend(scans);
+        writes
+    }
+
+    /// `(write functions, unexposed scan functions)` named by this catalog's
+    /// tables, lower-cased; see [`Self::table_only_function_names`].
+    pub(crate) fn table_function_names(
+        &self,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut writes = std::collections::HashSet::new();
+        let mut scans = std::collections::HashSet::new();
+        let mut exposed = std::collections::HashSet::new();
+        let schemas = self
+            .schemas
+            .iter()
+            .chain(self.version_schemas.values().flatten());
+        for table in schemas.flat_map(|s| s.tables.iter()) {
+            for (_, w) in table.writes.iter() {
+                writes.insert(w.function.to_ascii_lowercase());
+            }
+            let named = std::iter::once(table.scan_function.as_str())
+                .chain(table.time_travel.iter().map(|v| v.scan_function.as_str()))
+                .chain(
+                    table
+                        .branches
+                        .iter()
+                        .flatten()
+                        .map(|b| b.function_name.as_str()),
+                )
+                .filter(|n| !n.is_empty());
+            for name in named {
+                let name = name.to_ascii_lowercase();
+                if table.expose_scan {
+                    exposed.insert(name);
+                } else {
+                    scans.insert(name);
+                }
+            }
+        }
+        scans.retain(|n| !exposed.contains(n));
+        (writes, scans)
+    }
+
     /// The schema set visible for a given resolved data `version` (or the base
     /// schemas when the catalog is not version-shaped / the version is unknown).
     pub fn schemas_for(&self, version: Option<&str>) -> &[CatSchema] {
@@ -1466,6 +1528,16 @@ pub struct CatTable {
     /// [`branches`](Self::branches), or one branch wrapping the scan function
     /// (see [`crate::scan_planning::ScanPlanRequest::default_plan`]).
     pub scan_planner: Option<crate::scan_planning::SharedScanBranchPlanner>,
+    /// Protocol 3.3: also make this table's scan function an ordinary SQL
+    /// callable. Every function a table names is listed so the client has its
+    /// capabilities, but the scan (`scan_function`, each time-travel version's
+    /// and each branch's function) is listed `table_only` — absent from
+    /// `duckdb_functions()`, not callable from SQL — unless a table naming it
+    /// sets this or the author also registers it as an ordinary function
+    /// (`Worker::register_table` and friends, as opposed to the auto-registered
+    /// [`scan_function_impl`](Self::scan_function_impl)). Write functions are
+    /// always `table_only`. Default `false`.
+    pub expose_scan: bool,
 }
 
 /// Protocol 3.2 `TableInfo.scan_planning`: when the client resolves a table's
@@ -1678,6 +1750,7 @@ impl Default for CatTable {
             writes: TableWrites::default(),
             scan_planning: ScanPlanning::Bind,
             scan_planner: None,
+            expose_scan: false,
         }
     }
 }
@@ -1877,6 +1950,7 @@ impl CatTable {
             writes: TableWrites::default(),
             scan_planning: ScanPlanning::Bind,
             scan_planner: None,
+            expose_scan: false,
         }
     }
 
@@ -1905,6 +1979,14 @@ impl CatTable {
         t.inline_scan = true;
         t.scan_function_impl = Some(function);
         t
+    }
+
+    /// Also expose the table's scan function as an ordinary SQL callable
+    /// (builder style; sets [`expose_scan`](Self::expose_scan)). Without it the
+    /// scan is listed `table_only`: only the table can use it.
+    pub fn with_expose_scan(mut self, expose: bool) -> Self {
+        self.expose_scan = expose;
+        self
     }
 
     /// Make this a protocol 3.2 [`ScanPlanning::Filtered`] table planned by

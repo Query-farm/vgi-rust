@@ -255,6 +255,23 @@ SELECT * FROM external_db.analytics.daily_view;  -- a view
 SELECT external_db.main.transform(col) FROM t;   -- a function
 ```
 
+### Table functions and visibility (protocol 3.3)
+
+Every function a table names — its scan (`scan_function`, time-travel versions'
+and branches' functions) and its INSERT / UPDATE / DELETE functions — is always
+sent in the schema's function listing, so DuckDB has its capabilities
+(projection / filter pushdown, required secrets, `has_finalize`, ...). The SDK
+marks them `FunctionInfo.visibility = "table_only"`: they are absent from
+`duckdb_functions()` and cannot be called from SQL, only through the table.
+Write functions are always `table_only`. A scan is `table_only` when it rides
+in the table (`CatTable::with_function`, auto-registered by
+`Worker::set_catalog`); to also make it an ordinary SQL callable, set
+`CatTable::expose_scan` (or `CatTable::with_expose_scan(true)`), or register the
+function yourself with `Worker::register_table`, which keeps it public. Functions
+no table names stay public. `Worker::hide_function` still
+works and now lists the function as `table_only`; for table functions it is no
+longer needed.
+
 ### Writable tables, transactions and attach secrets
 
 A catalog table accepts `INSERT` / `UPDATE` / `DELETE` when it names a

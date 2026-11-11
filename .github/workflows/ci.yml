@@ -16,7 +16,7 @@ permissions:
   actions: read
 
 env:
-  VGI_REF: 2df81a5e75fd2d1f436526906cf5f868522c6655
+  VGI_REF: 423f76fde64d95b10ae83c60835e729bcf7d772c
   VGI_NATIVE_RUNNER_BRANCH: v2.0
   CARGO_TERM_COLOR: always
 

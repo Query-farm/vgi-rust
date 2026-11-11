@@ -38,6 +38,29 @@ pub mod scan_planning {
     }
 }
 
+/// `FunctionInfo.visibility` (protocol 3.3.0) — who can see a listed function.
+/// A plain nullable `utf8` column like [`scan_planning`], not a dictionary;
+/// null means [`PUBLIC`](function_visibility::PUBLIC).
+pub mod function_visibility {
+    /// An ordinary catalog entry: in `duckdb_functions()`, callable from SQL.
+    pub const PUBLIC: &str = "public";
+    /// Listed only so the client has the function's capabilities when it
+    /// resolves a table's scan or write function; absent from
+    /// `duckdb_functions()` and not callable from SQL.
+    pub const TABLE_ONLY: &str = "table_only";
+
+    /// Reject any value other than [`PUBLIC`] and [`TABLE_ONLY`] (`None` is
+    /// public).
+    pub fn validate(value: Option<&str>) -> vgi_rpc::Result<()> {
+        match value {
+            None | Some(PUBLIC) | Some(TABLE_ONLY) => Ok(()),
+            Some(other) => Err(vgi_rpc::RpcError::value_error(format!(
+                "visibility must be '{PUBLIC}' or '{TABLE_ONLY}', got {other:?}"
+            ))),
+        }
+    }
+}
+
 /// `FunctionType` — which registry a function lives in (`FunctionInfo` and
 /// `BindRequest.function_type`).
 ///
@@ -158,6 +181,16 @@ pub mod phase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_visibility_accepts_only_public_and_table_only() {
+        assert!(function_visibility::validate(None).is_ok());
+        assert!(function_visibility::validate(Some("public")).is_ok());
+        assert!(function_visibility::validate(Some("table_only")).is_ok());
+        for bad in ["", "hidden", "TABLE_ONLY", "Public"] {
+            assert!(function_visibility::validate(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     /// Each constant set is exactly the member names of its vgi-python enum, in
     /// upper case — what `vgi_rpc` writes for an `Enum` field and what the

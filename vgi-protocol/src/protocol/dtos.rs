@@ -1475,7 +1475,22 @@ pub struct FunctionInfo {
     pub input_rows_per_call: Option<i64>,
     pub required_settings: Vec<String>,
     pub required_secrets: Vec<RequiredSecret>,
+    /// Who can see the function (protocol 3.3.0): a plain nullable `utf8`,
+    /// one of [`function_visibility::PUBLIC`](crate::protocol::enums::function_visibility::PUBLIC)
+    /// (also what `None` means) or
+    /// [`function_visibility::TABLE_ONLY`](crate::protocol::enums::function_visibility::TABLE_ONLY):
+    /// the client keeps the function's description to resolve the tables that
+    /// name it, but creates no SQL callable for it.
+    pub visibility: Option<String>,
 }
+}
+
+impl FunctionInfo {
+    /// Whether this function is `table_only`: listed only so the client can
+    /// resolve the tables that name it, never callable from SQL.
+    pub fn is_table_only(&self) -> bool {
+        self.visibility.as_deref() == Some(crate::protocol::enums::function_visibility::TABLE_ONLY)
+    }
 }
 
 /// `CopyFromFormatInfo` item — a custom `COPY ... FROM` format advertised by a

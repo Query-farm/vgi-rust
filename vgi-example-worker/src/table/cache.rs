@@ -68,8 +68,10 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_table(CachePartitionMultiColFunction);
     w.register_table(CachePartitionProjFunction);
     // `cache_multicol` backs only the `ex.data.cache_multicol` table — it stays
-    // bindable for that scan but is not advertised as a SQL callable, matching
-    // the Python fixture worker (which lists it under `tables`, not `functions`).
+    // bindable for that scan but is listed `table_only`, not as a SQL callable,
+    // matching the Python fixture worker (which lists it under `tables`, not
+    // `functions`). Since protocol 3.3 a table's scan is `table_only` anyway;
+    // this keeps `hide_function` exercised.
     w.hide_function("cache_multicol");
 }
 

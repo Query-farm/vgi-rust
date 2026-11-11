@@ -170,24 +170,16 @@ pub(crate) enum ScopeKind<'a> {
     /// catalog; where the schema *was* recorded at bind, the caller replays it
     /// as [`ScopeKind::Schema`] instead.
     Bound,
-    /// A bind for a function this worker deliberately hid from its catalog
-    /// listing ([`Dispatcher::hide_function`]).
+    /// A schema-less bind for a function this worker hid with
+    /// [`Dispatcher::hide_function`].
     ///
-    /// The extension derives a scan's owning schema by looking the backing
-    /// function up as a `TableFunctionCatalogEntry`
-    /// (`VgiTableEntry::GetScanFunctionImpl`, around
-    /// `src/storage/vgi_table_entry.cpp:666`). A hidden function is by
-    /// definition never advertised, so no such entry exists in the table's
-    /// schema or in the catalog default, and `scan_function_schema` stays
-    /// empty. That is inherent to hiding a function rather than a defect: the
-    /// worker asked for it to be unlistable, and an unlisted function has
-    /// nothing for the extension to read a schema from.
-    ///
-    /// The worker knows which of its own functions are hidden, so this is
-    /// recognised exactly — not inferred from the function's kind. Resolution
-    /// stays catalog-scoped and still raises on cross-schema ambiguity, so it
-    /// cannot route `data.f` to `main.f`. Every other schema-less bind is
-    /// refused.
+    /// Since protocol 3.3 hidden functions are listed `table_only`, so the
+    /// extension knows their schema and sends it; this allowance remains for a
+    /// peer that resolved the function without one. The worker knows which of
+    /// its own functions are hidden, so this is recognised exactly — not
+    /// inferred from the function's kind. Resolution stays catalog-scoped and
+    /// still raises on cross-schema ambiguity, so it cannot route `data.f` to
+    /// `main.f`. Every other schema-less bind is refused.
     UnlistedScanFunction,
     /// The peer predates protocol 1.1.0 and omits the `schema_path` column
     /// entirely, so *no* bind it sends can name a schema. That is a statement
@@ -298,12 +290,22 @@ pub struct Dispatcher {
     /// names a catalog's `catalog_schema_contents_functions` advertises: a
     /// secondary shows only its own, and the primary hides every secondary's.
     pub(crate) secondary_functions: Vec<Vec<String>>,
-    /// Function names registered for binding but hidden from
-    /// `catalog_schema_contents_functions`. A function-backed catalog table
-    /// needs its backing function resolvable at scan time, but the table may be
-    /// the only intended entry point — advertising the function too would create
-    /// a redundant SQL callable. See [`Dispatcher::hide_function`].
+    /// Function names [`Dispatcher::hide_function`] marked: listed in
+    /// `catalog_schema_contents_functions` as `table_only` (protocol 3.3), so
+    /// the client can resolve a table's function without creating a SQL
+    /// callable for it. Functions the catalog's tables name are `table_only`
+    /// without being in this set (see
+    /// [`CatalogModel::table_only_function_names`](catalog::CatalogModel::table_only_function_names)).
     pub(crate) hidden_functions: std::collections::HashSet<String>,
+    /// Lower-cased names registered through an ordinary `register_*` call, as
+    /// opposed to the `*_if_absent` auto-registration of a catalog table's
+    /// embedded implementation. A table scan registered this way stays a
+    /// public function (protocol 3.3); write functions are `table_only`
+    /// regardless.
+    explicitly_registered: std::collections::HashSet<String>,
+    /// Set while a `*_if_absent` call registers, so [`Self::note_scope`] does
+    /// not count that registration as explicit.
+    auto_registering: bool,
     /// Declaration home per registered *instance*, parallel to the by-name
     /// registry vectors: `scopes[&(kind, name)][i]` is where the i-th overload
     /// registered under `name` lives. Every instance has one — see
@@ -404,6 +406,8 @@ impl Dispatcher {
             secondary: Vec::new(),
             secondary_functions: Vec::new(),
             hidden_functions: std::collections::HashSet::new(),
+            explicitly_registered: std::collections::HashSet::new(),
+            auto_registering: false,
             scopes: HashMap::new(),
             secret_types: Vec::new(),
             settings: Vec::new(),
@@ -596,6 +600,9 @@ impl Dispatcher {
     /// registry vector for `(kind, name)`. Kept parallel to that vector, so
     /// every `register_*` must call this exactly once per push.
     fn note_scope(&mut self, kind: FnKind, name: &str, scope: FunctionScope) {
+        if !self.auto_registering {
+            self.explicitly_registered.insert(name.to_ascii_lowercase());
+        }
         self.scopes
             .entry((kind, name.to_string()))
             .or_default()
@@ -702,10 +709,14 @@ impl Dispatcher {
         self.note_scope(FnKind::Table, &name, scope);
     }
 
-    /// Hide `name` from `catalog_schema_contents_functions` without
-    /// unregistering it. The function stays bindable — a function-backed catalog
-    /// table still resolves its scan — but DuckDB never creates a SQL callable
-    /// for it, so the table is the only entry point.
+    /// List `name` as `table_only` (protocol 3.3): the function stays bindable
+    /// and the client keeps its capabilities to resolve the tables that name it,
+    /// but DuckDB never creates a SQL callable for it.
+    ///
+    /// Superseded for table functions: a table's scan and write functions are
+    /// `table_only` automatically unless the table sets
+    /// [`CatTable::expose_scan`](catalog::CatTable::expose_scan). Still useful
+    /// to hide a function no catalog table names.
     pub fn hide_function(&mut self, name: impl Into<String>) {
         self.hidden_functions.insert(name.into());
         self.function_listings_changed();
@@ -717,7 +728,9 @@ impl Dispatcher {
     pub fn register_table_if_absent(&mut self, f: Arc<dyn TableFunction>) {
         if !self.tables.contains_key(f.name()) {
             let home = self.default_home();
+            self.auto_registering = true;
             self.register_table_scoped(f, home);
+            self.auto_registering = false;
         }
     }
 
@@ -726,7 +739,9 @@ impl Dispatcher {
     /// auto-registered).
     pub fn register_table_in_out_if_absent(&mut self, f: Arc<dyn TableInOutFunction>) {
         if !self.tableinouts.contains_key(f.name()) {
+            self.auto_registering = true;
             self.register_table_in_out(f);
+            self.auto_registering = false;
         }
     }
 
@@ -4125,10 +4140,16 @@ impl Dispatcher {
             .flatten()
             .map(|s| s.as_str())
             .collect();
+        // Protocol 3.3: every registered function is listed — a table's scan and
+        // write functions included, so the client has their capabilities — and
+        // the ones only tables may use are marked `table_only` below.
+        // Write functions always; a scan unless a table exposes it or the
+        // author registered it explicitly; and whatever `hide_function` named.
+        let (mut table_only, mut scans) = active.table_function_names();
+        scans.retain(|n| !self.explicitly_registered.contains(n));
+        table_only.extend(scans);
+        table_only.extend(self.hidden_functions.iter().map(|n| n.to_ascii_lowercase()));
         let visible = |name: &str| {
-            if self.hidden_functions.contains(name) {
-                return false;
-            }
             if name.starts_with(PROJ_REPRO_PREFIX) != key.proj_repro {
                 return false;
             }
@@ -4220,6 +4241,12 @@ impl Dispatcher {
                         }
                     }
                 }
+            }
+        }
+        for info in &mut infos {
+            if table_only.contains(&info.name.to_ascii_lowercase()) {
+                info.visibility =
+                    Some(crate::protocol::enums::function_visibility::TABLE_ONLY.to_string());
             }
         }
         Ok(infos)
@@ -7056,10 +7083,187 @@ mod scope_tests {
             listed_names(&list_functions(&d, "main", "SCALAR_FUNCTION")),
             ["alpha", "beta"]
         );
+        // Hiding no longer drops a function from the listing (protocol 3.3):
+        // it is listed `table_only`, and the listing is rebuilt to say so.
         d.hide_function("alpha");
         assert_eq!(
-            listed_names(&list_functions(&d, "main", "SCALAR_FUNCTION")),
-            ["beta"]
+            listed_visibility(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            [
+                ("alpha".to_string(), Some(TABLE_ONLY.to_string())),
+                ("beta".to_string(), None),
+            ]
+        );
+    }
+
+    const TABLE_ONLY: &str = crate::protocol::enums::function_visibility::TABLE_ONLY;
+
+    fn listed_visibility(items: &[Bytes]) -> Vec<(String, Option<String>)> {
+        items
+            .iter()
+            .map(|item| {
+                let info: FunctionInfo =
+                    wire::from_batch(&ipc::read_batch(&item.0).unwrap()).unwrap();
+                (info.name, info.visibility)
+            })
+            .collect()
+    }
+
+    fn table(name: &str, scan: &str) -> catalog::CatTable {
+        let columns = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "x",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        catalog::CatTable::new(name, columns, scan, Vec::new(), None, None)
+    }
+
+    /// Register `name` the way `Worker::set_catalog` auto-registers a table's
+    /// embedded implementation (not an explicit registration). Visibility is
+    /// decided by name, so a scalar probe stands in for the table function.
+    fn auto_register(d: &mut Dispatcher, name: &'static str) {
+        d.auto_registering = true;
+        d.register_scalar(Arc::new(Probe(name)));
+        d.auto_registering = false;
+    }
+
+    /// Protocol 3.3: every function a table names is listed (so the client has
+    /// its capabilities), write functions and unexposed scans as `table_only`;
+    /// `expose_scan` makes a scan public, and ordinary functions stay public.
+    #[test]
+    fn table_functions_are_listed_table_only_unless_the_scan_is_exposed() {
+        let mut d = Dispatcher::new("cat");
+        d.register_scalar(Arc::new(Probe("plain")));
+        for name in [
+            "items_scan",
+            "items_update",
+            "items_insert",
+            "items_delete",
+            "items_v1_scan",
+            "items_branch",
+            "labels_scan",
+        ] {
+            auto_register(&mut d, name);
+        }
+        let mut items = table("items", "items_scan");
+        items.writes.update = Some(catalog::WriteFunction::named(
+            "items_update",
+            crate::write_results::WriteResultMode::Changes,
+        ));
+        items.writes.insert = Some(catalog::WriteFunction::named(
+            "items_insert",
+            crate::write_results::WriteResultMode::Rows,
+        ));
+        items.writes.delete = Some(catalog::WriteFunction::named(
+            "items_delete",
+            crate::write_results::WriteResultMode::Count,
+        ));
+        items.time_travel = vec![catalog::TimeTravelVersion {
+            version: 1,
+            columns: items.columns.clone(),
+            scan_function: "items_v1_scan".to_string(),
+            scan_arguments: Vec::new(),
+            timestamp_year: None,
+        }];
+        items.branches = Some(vec![catalog::CatBranch {
+            function_name: "items_branch".to_string(),
+            ..Default::default()
+        }]);
+        let labels = table("labels", "labels_scan").with_expose_scan(true);
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".to_string(),
+            schemas: vec![catalog::CatSchema {
+                name: "main".to_string(),
+                tables: vec![items, labels],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let t = || Some(TABLE_ONLY.to_string());
+        assert_eq!(
+            listed_visibility(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            [
+                ("items_branch".to_string(), t()),
+                ("items_delete".to_string(), t()),
+                ("items_insert".to_string(), t()),
+                ("items_scan".to_string(), t()),
+                ("items_update".to_string(), t()),
+                ("items_v1_scan".to_string(), t()),
+                ("labels_scan".to_string(), None),
+                ("plain".to_string(), None),
+            ]
+        );
+    }
+
+    /// A scan the author also registers as an ordinary function is public; a
+    /// write function is `table_only` even when registered explicitly. Only
+    /// the `*_if_absent` auto-registration is not explicit.
+    #[test]
+    fn an_explicitly_registered_scan_is_public_but_a_write_function_is_not() {
+        let mut d = Dispatcher::new("cat");
+        d.register_scalar(Arc::new(Probe("named_scan")));
+        d.register_scalar(Arc::new(Probe("explicit_writer")));
+        auto_register(&mut d, "embedded_scan");
+        let mut t = table("t", "named_scan");
+        t.writes.update = Some(catalog::WriteFunction::named(
+            "explicit_writer",
+            crate::write_results::WriteResultMode::Count,
+        ));
+        let e = table("e", "embedded_scan");
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".to_string(),
+            schemas: vec![catalog::CatSchema {
+                name: "main".to_string(),
+                tables: vec![t, e],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(d.explicitly_registered.contains("named_scan"));
+        assert!(!d.explicitly_registered.contains("embedded_scan"));
+        assert_eq!(
+            listed_visibility(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            [
+                ("embedded_scan".to_string(), Some(TABLE_ONLY.to_string())),
+                ("explicit_writer".to_string(), Some(TABLE_ONLY.to_string())),
+                ("named_scan".to_string(), None),
+            ]
+        );
+    }
+
+    /// A scan any table naming it exposes is public (case-insensitively); a
+    /// write function is `table_only` even when another table exposes it as its
+    /// scan; `hide_function` always wins.
+    #[test]
+    fn exposure_is_per_function_and_never_exposes_a_write_function() {
+        let mut d = Dispatcher::new("cat");
+        for name in ["shared_scan", "writer", "hidden_scan"] {
+            auto_register(&mut d, name);
+        }
+        let mut a = table("a", "SHARED_SCAN");
+        a.writes.insert = Some(catalog::WriteFunction::named(
+            "writer",
+            crate::write_results::WriteResultMode::Count,
+        ));
+        let b = table("b", "shared_scan").with_expose_scan(true);
+        let c = table("c", "writer").with_expose_scan(true);
+        let e = table("e", "hidden_scan").with_expose_scan(true);
+        d.set_catalog(catalog::CatalogModel {
+            name: "cat".to_string(),
+            schemas: vec![catalog::CatSchema {
+                name: "main".to_string(),
+                tables: vec![a, b, c, e],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        d.hide_function("hidden_scan");
+        assert_eq!(
+            listed_visibility(&list_functions(&d, "main", "SCALAR_FUNCTION")),
+            [
+                ("hidden_scan".to_string(), Some(TABLE_ONLY.to_string())),
+                ("shared_scan".to_string(), None),
+                ("writer".to_string(), Some(TABLE_ONLY.to_string())),
+            ]
         );
     }
 

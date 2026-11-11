@@ -47,8 +47,10 @@
 /// breaking catalog/query successor, routed as `vgi.v3`. Protocol 3.2 adds
 /// filtered scan planning: `TableInfo.scan_planning`, the
 /// `pushdown_filters` parameter of `catalog_table_scan_branches_get`, and
-/// `ScanBranch.row_count` / `ScanBranch.column_statistics`.
-pub const VGI_PROTOCOL_VERSION: &str = "3.2.0";
+/// `ScanBranch.row_count` / `ScanBranch.column_statistics`. Protocol 3.3 adds
+/// `FunctionInfo.visibility` (`public` / `table_only`): every function a table
+/// names is listed, and the ones only tables may use are `table_only`.
+pub const VGI_PROTOCOL_VERSION: &str = "3.3.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///
