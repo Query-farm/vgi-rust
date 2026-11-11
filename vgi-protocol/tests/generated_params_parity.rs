@@ -22,7 +22,8 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_protocol::wire::{params_schema_for, request_binary_schema};
 
-/// The table exactly as it stood before code generation (renamed only).
+/// The table as it stood before code generation (renamed only; protocol 3.3
+/// removed `catalog_table_scan_function_get`, so its entry is gone too).
 #[rustfmt::skip]
 fn legacy_params_schema_for(method: &str) -> SchemaRef {
     match method {
@@ -74,14 +75,6 @@ fn legacy_params_schema_for(method: &str) -> SchemaRef {
             Field::new("transaction_opaque_data", DataType::Binary, true),
         ])),
         "catalog_table_scan_branches_get" => Arc::new(Schema::new(vec![
-            Field::new("attach_opaque_data", DataType::Binary, false),
-            Field::new("schema_path", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("at_unit", DataType::Utf8, true),
-            Field::new("at_value", DataType::Utf8, true),
-            Field::new("transaction_opaque_data", DataType::Binary, true),
-        ])),
-        "catalog_table_scan_function_get" => Arc::new(Schema::new(vec![
             Field::new("attach_opaque_data", DataType::Binary, false),
             Field::new("schema_path", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
