@@ -39,8 +39,22 @@ static NONCE_COUNTER: AtomicI64 = AtomicI64::new(0);
 static REVALIDATION_POLICY_CALLS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Makes nonces unique ACROSS worker processes, not just within one. The
+/// client's subprocess pool holds several worker processes and hands a scan
+/// whichever it pops (most recently released first), so two cache MISSes can
+/// land in two different processes. With a bare per-process counter both could
+/// mint the same value and a MISS would read as a HIT (that is how
+/// `cache/transaction_scope.test` "t2 nonce <> t1a nonce" can fail on the stdio
+/// lane once earlier tests have left more than one process in the pool).
+/// Folding the pid into the high 32 bits keeps the nonces of every live process
+/// disjoint, while the low 32 bits stay a plain per-process count
+/// (`pid = nonce >> 32`, which also makes a nonce self-describing when
+/// debugging the cache). Mirrors vgi-go fc71b1c.
+static NONCE_BASE: LazyLock<i64> = LazyLock::new(|| i64::from(std::process::id()) << 32);
+
+/// Mints the next nonce: this process's base plus a counter starting at 0.
 fn next_nonce() -> i64 {
-    NONCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    *NONCE_BASE + NONCE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn register(w: &mut vgi::Worker) {
@@ -2184,5 +2198,28 @@ impl TableFunction for CachePartitionProjFunction {
             country_idx: 0,
             meta: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::next_nonce;
+
+    /// The nonce fixtures must mint values unique across worker processes, not
+    /// just within one: the client's subprocess pool may serve two cache MISSes
+    /// from two different processes (`cache/transaction_scope.test` asserts
+    /// their nonces differ). The pid lives in the high 32 bits.
+    #[test]
+    fn nonce_is_process_unique() {
+        let a = next_nonce();
+        let b = next_nonce();
+        assert!(b > a, "nonce not increasing within a process: {a} then {b}");
+        for n in [a, b] {
+            assert_eq!(
+                n >> 32,
+                i64::from(std::process::id()),
+                "nonce {n} does not carry this process's pid"
+            );
+        }
     }
 }
