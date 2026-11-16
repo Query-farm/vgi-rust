@@ -1864,5 +1864,9 @@ pub fn build() -> CatalogModel {
     };
     crate::canonical_constraints::qualify_catalog(&mut model)
         .expect("immutable constraint fixture qualification");
+    // The cross-SDK table-contract fixtures (table_only scans, an INSERT
+    // reported from finalize, decimal widths). Added after qualification,
+    // which accepts constraint fixtures only in the `data` schema.
+    model.schemas.push(crate::contract::schema());
     model
 }

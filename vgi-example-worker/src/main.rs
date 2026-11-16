@@ -18,6 +18,7 @@ mod canonical_constraints;
 mod catalog_def;
 mod contents_fixtures;
 mod contents_reval;
+mod contract;
 mod copy_from;
 mod copy_to;
 #[cfg(feature = "coverage")]
