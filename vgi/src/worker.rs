@@ -340,13 +340,21 @@ impl Worker {
         let base = model.schemas.iter();
         let versioned = model.version_schemas.values().flatten();
         for schema in base.chain(versioned) {
+            // A table's embedded functions live in the table's own schema, so
+            // they are listed there and nowhere else: homing them in `main`
+            // would make a `main` macro's bare call of a same-named host
+            // function (e.g. `range`) resolve to the worker.
+            let home = (!model.name.is_empty()).then(|| {
+                crate::dispatch::FunctionScope::new_path(&model.name, schema.effective_path())
+            });
             for table in &schema.tables {
                 if let Some(f) = &table.scan_function_impl {
-                    self.disp.register_table_if_absent(f.clone());
+                    self.disp.register_table_if_absent(f.clone(), home.clone());
                 }
                 for (_, w) in table.writes.iter() {
                     if let Some(f) = &w.function_impl {
-                        self.disp.register_table_in_out_if_absent(f.clone());
+                        self.disp
+                            .register_table_in_out_if_absent(f.clone(), home.clone());
                     }
                 }
             }
@@ -1468,5 +1476,88 @@ mod hosting_tests {
             ..Default::default()
         });
         assert!(w.disp.tableinouts.contains_key("t_update"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_home_tests {
+    use super::*;
+    use crate::catalog::{CatSchema, CatTable, CatalogModel};
+    use crate::dispatch::{FnKind, FunctionScope};
+    use crate::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
+    use crate::table_function::{TableFunction, TableProducer};
+    use crate::table_in_out::TableInOutFunction;
+    use crate::write_results::WriteResultMode;
+    use arrow_schema::{DataType, Field, Schema};
+
+    struct Scan(&'static str);
+
+    impl TableFunction for Scan {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            Vec::new()
+        }
+        fn on_bind(&self, _p: &BindParams) -> vgi_rpc::Result<BindResponse> {
+            Ok(BindResponse::result(DataType::Int64))
+        }
+        fn producer(&self, _p: &ProcessParams) -> vgi_rpc::Result<Box<dyn TableProducer>> {
+            unreachable!("never run")
+        }
+    }
+
+    struct Writer;
+
+    impl TableInOutFunction for Writer {
+        fn name(&self) -> &str {
+            "t_insert"
+        }
+        fn metadata(&self) -> FunctionMetadata {
+            FunctionMetadata::default()
+        }
+        fn argument_specs(&self) -> Vec<ArgSpec> {
+            crate::write_results::write_function_arg_specs("rows")
+        }
+    }
+
+    /// A table's embedded scan and write functions are homed in the table's
+    /// own schema, not the catalog's default `main`: listed in `main`, a
+    /// `range` scan would capture a `main` macro's bare `range(...)` call.
+    #[test]
+    fn embedded_table_functions_are_homed_in_the_tables_schema() {
+        let columns = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let in_side =
+            CatTable::with_function("t", columns.clone(), Arc::new(Scan("range")), None, None)
+                .with_insert_function(Arc::new(Writer), WriteResultMode::Count);
+        let in_main = CatTable::with_function("m", columns, Arc::new(Scan("m_scan")), None, None);
+        let mut worker = Worker::new();
+        worker.set_catalog(CatalogModel {
+            name: "cat".to_string(),
+            schemas: vec![
+                CatSchema {
+                    name: "main".to_string(),
+                    tables: vec![in_main],
+                    ..Default::default()
+                },
+                CatSchema {
+                    name: "side".to_string(),
+                    tables: vec![in_side],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let home = |kind, name: &str| worker.disp.scopes[&(kind, name.to_string())].clone();
+        let side = [FunctionScope::new("cat", "side")];
+        assert_eq!(home(FnKind::Table, "range"), side);
+        assert_eq!(home(FnKind::TableInOut, "t_insert"), side);
+        assert_eq!(
+            home(FnKind::Table, "m_scan"),
+            [FunctionScope::new("cat", "main")]
+        );
     }
 }

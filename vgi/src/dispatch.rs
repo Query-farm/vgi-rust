@@ -725,9 +725,14 @@ impl Dispatcher {
     /// Register `f` only if no table function with its name is registered yet.
     /// Used by `Worker::set_catalog` to auto-register catalog tables' embedded
     /// `scan_function_impl` without clobbering an explicit `register_table`.
-    pub fn register_table_if_absent(&mut self, f: Arc<dyn TableFunction>) {
+    /// `home` is the declaring table's schema (`None`: the default home).
+    pub fn register_table_if_absent(
+        &mut self,
+        f: Arc<dyn TableFunction>,
+        home: Option<FunctionScope>,
+    ) {
         if !self.tables.contains_key(f.name()) {
-            let home = self.default_home();
+            let home = home.unwrap_or_else(|| self.default_home());
             self.auto_registering = true;
             self.register_table_scoped(f, home);
             self.auto_registering = false;
@@ -736,11 +741,19 @@ impl Dispatcher {
 
     /// Register `f` unless a table-in-out function of the same name already
     /// is (how a [`catalog::WriteFunction`]'s embedded implementation is
-    /// auto-registered).
-    pub fn register_table_in_out_if_absent(&mut self, f: Arc<dyn TableInOutFunction>) {
+    /// auto-registered). `home` is the declaring table's schema (`None`: the
+    /// default home).
+    pub fn register_table_in_out_if_absent(
+        &mut self,
+        f: Arc<dyn TableInOutFunction>,
+        home: Option<FunctionScope>,
+    ) {
         if !self.tableinouts.contains_key(f.name()) {
             self.auto_registering = true;
-            self.register_table_in_out(f);
+            match home {
+                Some(home) => self.register_table_in_out_scoped(f, home),
+                None => self.register_table_in_out(f),
+            }
             self.auto_registering = false;
         }
     }
