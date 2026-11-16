@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.51.1 (2026-11-16)
+
+- **A catalog table's embedded functions live in the table's own schema.**
+  `Worker::set_catalog` registered every table's scan and write functions in
+  `main`, whatever schema the table was in, so a `table_only` scan in another
+  schema was listed in `main` (a hidden scan named `range` then shadowed
+  DuckDB's `range()` in `main`'s macros).
+- The example worker serves the `contract` schema for the vgi extension's
+  cross-SDK conformance files.
+
+## 0.51.0 (2026-11-12)
 
 - **Protocol 3.3.0** (`VGI_PROTOCOL_VERSION`). Requires the matching VGI
   extension (peers must agree on major + minor); upgrade workers and the
