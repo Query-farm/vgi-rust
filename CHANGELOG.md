@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Cloudflare Durable Object storage backend** (feature `cloudflare-do`).
+  `VGI_WORKER_SHARED_STORAGE=cloudflare-do` with `VGI_CF_DO_URL` and
+  `VGI_CF_DO_TOKEN` stores worker state in the
+  `vgi-cloudflare-durable-object-storage` service the other SDKs use, so Rust
+  workers on several hosts share state with no storage server to run.
+  `vgi::storage::CfDoStorage` shards by storage scope and retries with a stable
+  `attempt_id`. Selecting `cloudflare-do` in a build without the feature now
+  fails at startup instead of falling back to per-machine storage.
+
 ## 0.51.1 (2026-11-16)
 
 - **A catalog table's embedded functions live in the table's own schema.**

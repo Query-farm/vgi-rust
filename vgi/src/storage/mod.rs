@@ -18,6 +18,9 @@
 //! - `HttpStorage` — a client to a remote storage service, so stateless
 //!   workers (e.g. several fly.io instances) share one durable store
 //!   (feature `http-storage`).
+//! - `CfDoStorage` — a client to the Cloudflare Durable Object storage service
+//!   the other VGI SDKs use, for multi-host deployments with no storage server
+//!   of their own to run (feature `cloudflare-do`).
 //!
 //! The method surface is intentionally **infallible**: a backend that can't
 //! complete an operation logs and degrades (reads → empty, writes → dropped),
@@ -122,8 +125,8 @@ pub fn orphan_ttl() -> Duration {
 }
 
 /// Construct the worker's storage backend from `VGI_WORKER_SHARED_STORAGE`
-/// (`memory` | `fs` | `sqlite` | `http`). Unset selects `sqlite` when compiled
-/// in, else `fs`. Runs an orphan GC pass on construction.
+/// (`memory` | `fs` | `sqlite` | `http` | `cloudflare-do`). Unset selects
+/// `sqlite` when compiled in, else `fs`. Runs an orphan GC pass on construction.
 pub fn default_storage() -> Arc<dyn FunctionStorage> {
     let choice = std::env::var("VGI_WORKER_SHARED_STORAGE").unwrap_or_default();
     let store: Arc<dyn FunctionStorage> = match choice.as_str() {
@@ -133,6 +136,15 @@ pub fn default_storage() -> Arc<dyn FunctionStorage> {
         "sqlite" => Arc::new(SqliteStorage::new()),
         #[cfg(feature = "http-storage")]
         "http" => Arc::new(http::HttpStorage::from_env()),
+        #[cfg(feature = "cloudflare-do")]
+        "cloudflare-do" => Arc::new(cfdo::CfDoStorage::from_env()),
+        // Falling back to a per-machine store would silently split state across
+        // hosts, so a deployment asking for the shared backend must get it.
+        #[cfg(not(feature = "cloudflare-do"))]
+        "cloudflare-do" => panic!(
+            "VGI_WORKER_SHARED_STORAGE=cloudflare-do requires building vgi with \
+             the `cloudflare-do` cargo feature"
+        ),
         "" => {
             #[cfg(feature = "sqlite")]
             {
@@ -156,6 +168,11 @@ pub fn default_storage() -> Arc<dyn FunctionStorage> {
 pub mod http;
 #[cfg(feature = "http-storage")]
 pub use http::HttpStorage;
+
+#[cfg(feature = "cloudflare-do")]
+pub mod cfdo;
+#[cfg(feature = "cloudflare-do")]
+pub use cfdo::CfDoStorage;
 
 /// Owner of the store, used to namespace per-user base dirs/paths. On unix this
 /// is the real uid; elsewhere temp dirs are already per-user.

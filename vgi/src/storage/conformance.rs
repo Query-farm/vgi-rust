@@ -146,3 +146,230 @@ fn sqlite_backend_conforms() {
     run_all(&store);
     let _ = std::fs::remove_file(&p);
 }
+
+/// Live checks against a running `vgi-cloudflare-durable-object-storage`
+/// Worker. Opt-in: they run only when `VGI_CF_DO_TEST_URL` (and, for the
+/// multi-tenant service, `VGI_CF_DO_TEST_TOKEN`) are set, e.g. against a local
+/// `npx wrangler dev`; otherwise each test returns early.
+#[cfg(feature = "cloudflare-do")]
+mod cloudflare_do_live {
+    use super::*;
+    use crate::storage::cfdo::{build_body, new_attempt_id, shard_key_for_scope, CfDoStorage};
+    use serde_json::json;
+
+    fn live() -> Option<CfDoStorage> {
+        let url = std::env::var("VGI_CF_DO_TEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())?;
+        let token = std::env::var("VGI_CF_DO_TEST_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        Some(CfDoStorage::new(url, token))
+    }
+
+    /// The Durable Object outlives a test run, so every scope is prefixed with
+    /// a per-run nonce: the suite's fixed scopes (`e1`, `q`, ...) start empty.
+    struct Fresh<S> {
+        prefix: Vec<u8>,
+        inner: S,
+    }
+
+    impl<S> Fresh<S> {
+        fn new(inner: S) -> Self {
+            Fresh {
+                prefix: format!("run-{}/", new_attempt_id()).into_bytes(),
+                inner,
+            }
+        }
+        fn s(&self, scope: &[u8]) -> Vec<u8> {
+            [&self.prefix[..], scope].concat()
+        }
+    }
+
+    impl<S: FunctionStorage> FunctionStorage for Fresh<S> {
+        fn kv_get(&self, scope: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+            self.inner.kv_get(&self.s(scope), key)
+        }
+        fn kv_put(&self, scope: &[u8], key: &[u8], value: &[u8]) {
+            self.inner.kv_put(&self.s(scope), key, value)
+        }
+        fn kv_del(&self, scope: &[u8], key: &[u8]) {
+            self.inner.kv_del(&self.s(scope), key)
+        }
+        fn append(&self, scope: &[u8], ns: &[u8], key: &[u8], value: Vec<u8>) -> i64 {
+            self.inner.append(&self.s(scope), ns, key, value)
+        }
+        fn scan(
+            &self,
+            scope: &[u8],
+            ns: &[u8],
+            key: &[u8],
+            after_id: i64,
+            limit: usize,
+        ) -> Vec<(i64, Vec<u8>)> {
+            self.inner.scan(&self.s(scope), ns, key, after_id, limit)
+        }
+        fn queue_push(&self, scope: &[u8], items: &[Vec<u8>]) {
+            self.inner.queue_push(&self.s(scope), items)
+        }
+        fn queue_pop(&self, scope: &[u8]) -> Option<Vec<u8>> {
+            self.inner.queue_pop(&self.s(scope))
+        }
+        fn clear(&self, scope: &[u8]) {
+            self.inner.clear(&self.s(scope))
+        }
+    }
+
+    #[test]
+    fn cloudflare_do_backend_conforms() {
+        let Some(store) = live() else {
+            eprintln!("skipped: set VGI_CF_DO_TEST_URL to run");
+            return;
+        };
+        run_all(&Fresh::new(store));
+    }
+
+    #[test]
+    fn cloudflare_do_replays_a_retried_append_and_pop() {
+        let Some(store) = live() else { return };
+        let scope = format!("replay-{}", new_attempt_id()).into_bytes();
+        let shard = shard_key_for_scope(&scope);
+        let attempt = new_attempt_id();
+        let append = || {
+            let body = build_body(
+                json!({
+                    "scope_id": B64.encode(&scope),
+                    "ns": B64.encode(b"ns"),
+                    "key": B64.encode(b"k"),
+                    "item": B64.encode(b"once"),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                &shard,
+                Some(&attempt),
+            );
+            store.post_body("state_append", &body).unwrap()["ordinal"]
+                .as_i64()
+                .unwrap()
+        };
+        // A lost-response retry (same attempt_id) returns the first ordinal and
+        // writes no second row.
+        let first = append();
+        assert_eq!(append(), first);
+        assert_eq!(store.scan(&scope, b"ns", b"k", -1, usize::MAX).len(), 1);
+
+        store.queue_push(&scope, &[b"a".to_vec(), b"b".to_vec()]);
+        let pop_attempt = new_attempt_id();
+        let pop = || {
+            let body = build_body(
+                json!({ "execution_id": B64.encode(&scope) })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                &shard,
+                Some(&pop_attempt),
+            );
+            store.post_body("queue_pop", &body).unwrap()["item"].clone()
+        };
+        let item = pop();
+        assert_eq!(pop(), item, "a replayed pop returns the same item");
+        assert_eq!(store.queue_pop(&scope).as_deref(), Some(&b"b"[..]));
+        assert_eq!(store.queue_pop(&scope), None);
+        store.clear(&scope);
+        assert!(store.scan(&scope, b"ns", b"k", -1, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn cloudflare_do_concurrent_poppers_claim_each_item_once() {
+        let Some(store) = live() else { return };
+        let store = std::sync::Arc::new(store);
+        let scope = format!("pop-{}", new_attempt_id()).into_bytes();
+        let items: Vec<Vec<u8>> = (0..40).map(|i| format!("{i}").into_bytes()).collect();
+        store.queue_push(&scope, &items);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, scope) = (store.clone(), scope.clone());
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    while let Some(i) = store.queue_pop(&scope) {
+                        got.push(i);
+                    }
+                    got
+                })
+            })
+            .collect();
+        let mut all: Vec<Vec<u8>> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort();
+        let mut want = items;
+        want.sort();
+        assert_eq!(all, want);
+        store.clear(&scope);
+    }
+
+    #[test]
+    fn cloudflare_do_large_values_round_trip_and_oversize_is_refused() {
+        let Some(store) = live() else { return };
+        let scope = format!("big-{}", new_attempt_id()).into_bytes();
+        let big: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        store.kv_put(&scope, b"k", &big);
+        assert_eq!(store.kv_get(&scope, b"k").as_deref(), Some(&big[..]));
+        let too_big = vec![0u8; 1024 * 1024 + 1];
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.kv_put(&scope, b"k2", &too_big)
+        }))
+        .expect_err("a value over 1 MiB is refused");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("413"), "{msg}");
+        store.clear(&scope);
+        assert_eq!(store.kv_get(&scope, b"k"), None);
+    }
+
+    #[test]
+    fn cloudflare_do_bad_token_is_a_definitive_error() {
+        let Ok(url) = std::env::var("VGI_CF_DO_TEST_URL") else {
+            return;
+        };
+        let store = CfDoStorage::new(url, Some("vgi_nobody_not-a-real-key".into()));
+        let err =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.kv_get(b"s", b"k")))
+                .expect_err("an unknown key is refused");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("authentication failed"), "{msg}");
+        assert!(
+            !msg.contains("not-a-real-key"),
+            "the token never leaks: {msg}"
+        );
+    }
+
+    /// Cross-SDK check, driven by an external harness:
+    /// with `VGI_CF_DO_XSDK_SCOPE` set, read what another SDK wrote under that
+    /// scope's shard (`kv` = `py-value`, a two-entry log, a queue item), then
+    /// write Rust's own values for the other SDK to read back.
+    #[test]
+    fn cloudflare_do_cross_sdk_exchange() {
+        let (Some(store), Ok(scope)) = (live(), std::env::var("VGI_CF_DO_XSDK_SCOPE")) else {
+            return;
+        };
+        let scope = scope.into_bytes();
+        assert_eq!(
+            store.kv_get(&scope, b"from-py").as_deref(),
+            Some(&b"py-value"[..])
+        );
+        let log = store.scan(&scope, b"log", b"k", -1, usize::MAX);
+        assert_eq!(
+            log.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+            vec![b"py-1".to_vec(), b"py-2".to_vec()]
+        );
+        assert_eq!(store.queue_pop(&scope).as_deref(), Some(&b"py-item"[..]));
+        store.kv_put(&scope, b"from-rust", b"rust-value");
+        store.append(&scope, b"log", b"k", b"rust-3".to_vec());
+        store.queue_push(&scope, &[b"rust-item".to_vec()]);
+    }
+
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+}

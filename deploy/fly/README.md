@@ -82,6 +82,49 @@ you outgrow it (both deferred — the protocol already carries a `shard_key` hoo
   machine with its own volume, requests routed with `fly-replay`. Mirrors
   Cloudflare Durable Objects' `idFromName`; scales **writes** horizontally.
 
+## Alternative: Cloudflare Durable Object storage (no storage app to run)
+
+Instead of running `vgi-storage` yourself, workers can share state through the
+Cloudflare Durable Object storage service
+([`vgi-cloudflare-durable-object-storage`](https://github.com/Query-farm/vgi-cloudflare-durable-object-storage)),
+the same multi-tenant service the Python, Go, Java and TypeScript SDKs use.
+Build the worker with the `vgi` crate's `cloudflare-do` feature and set:
+
+```sh
+fly secrets set \
+  VGI_WORKER_SHARED_STORAGE=cloudflare-do \
+  VGI_CF_DO_URL=https://vgi-storage.<account>.workers.dev \
+  VGI_CF_DO_TOKEN=<api key from `npm run keys -- mint --tenant <svc-env>`> \
+  -a vgi-worker
+```
+
+| Variable | Meaning |
+|---|---|
+| `VGI_WORKER_SHARED_STORAGE=cloudflare-do` | Select the backend. A worker built without the `cloudflare-do` feature refuses to start rather than fall back to per-machine storage. |
+| `VGI_CF_DO_URL` | Base URL of the storage Worker (required). |
+| `VGI_CF_DO_TOKEN` | The worker's API key, sent as `Authorization: Bearer`; it resolves server-side to a tenant that isolates this worker's data. Required by the multi-tenant deployment. Never logged. |
+
+Which to use:
+
+- **`http`** (`vgi-storage` + `SqliteStorage` on a fly volume): state lives in
+  your own infrastructure, on a volume you back up, and stays until cleared.
+  You run and scale the single-writer storage app, and workers reach it over
+  the fly private network.
+- **`cloudflare-do`**: nothing to operate, and storage shards across Durable
+  Objects instead of one writer. Every request crosses the public internet to
+  Cloudflare, and state is **transient**: a Durable Object deletes itself after
+  12 h untouched, or 5 min after its scope is cleared. That suits execution
+  state (buffering, aggregates, work queues), but not data that must outlive an
+  idle period, such as a stored catalog's tables. A single stored value is
+  capped at 1 MiB (a larger write fails with 413).
+
+The Rust client shards by storage scope: each execution or transaction id maps
+to its own Durable Object (`shard_key = "exe-" + hex(sha256(scope)[..16])`), so
+every machine that serves the execution reaches the same state. Destructive
+calls carry an `attempt_id` that is reused across retries, so a retried write
+whose response was lost is replayed by the server, not applied twice. See
+`vgi::storage::cfdo` for the endpoint mapping.
+
 ## Notes / current limitations
 
 - The storage server's idempotency cache is in-memory — sufficient for a single

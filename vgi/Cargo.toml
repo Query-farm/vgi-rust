@@ -22,6 +22,10 @@ sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
 # deployments (e.g. fly.io) where workers share one durable store.
 http-storage = ["dep:ureq", "dep:bincode"]
+# Cloudflare Durable Object storage client (talks to the
+# vgi-cloudflare-durable-object-storage Worker, shared with the Python, Go, Java
+# and TypeScript SDKs). HTTPS via ureq + rustls (ring, webpki roots).
+cloudflare-do = ["dep:ureq", "ureq/rustls"]
 # HTTP *worker* transport (`--http`, axum/tokio). Pulls the tokio runtime and the
 # vgi-rpc http stack. Off for wasm builds (tokio/mio/zstd don't compile to wasm);
 # the wasm worker serves over stdio (and, on wasip2, raw TCP).
