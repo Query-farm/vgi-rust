@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.52.0 (2026-11-19)
 
 - **Cloudflare Durable Object storage backend** (feature `cloudflare-do`).
   `VGI_WORKER_SHARED_STORAGE=cloudflare-do` with `VGI_CF_DO_URL` and
