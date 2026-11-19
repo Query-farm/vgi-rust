@@ -157,7 +157,7 @@ fn check_clear(store: &dyn FunctionStorage) {
     assert_eq!(store.queue_pop(b"c"), None);
 }
 
-fn run_all(store: &dyn FunctionStorage) {
+pub(super) fn run_all(store: &dyn FunctionStorage) {
     check_kv(store);
     check_kv_many(store);
     check_log(store);

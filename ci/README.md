@@ -6,7 +6,7 @@ The documentation job also uses the matching `HAYBARN_CLI`; local documentation 
 
 `.github/workflows/integration.yml` runs the **canonical `Query-farm/vgi`
 integration sqllogictest suite** against the Rust example worker on every push /
-PR, across all three public transports on Linux.
+PR, across all three public transports on Linux, plus a fourth `vendor` lane.
 
 ## How it works
 
@@ -29,9 +29,21 @@ community-extension preprocessing path.
 
 ## Matrix
 
-| OS | stdio (subprocess) | launch (AF_UNIX) | http |
-|----|:------------------:|:----------------:|:----:|
-| Linux | ✅ | ✅ | ✅ |
+| OS | stdio (subprocess) | launch (AF_UNIX) | http | vendor |
+|----|:------------------:|:----------------:|:----:|:------:|
+| Linux | ✅ | ✅ | ✅ | ✅ |
+
+The **vendor** lane is the http lane with everything externalized through
+vgi-rpc's fake blob vendor, which the VGI checkout's
+`test/start_fake_blob_vendor.sh` starts with `uvx` before any worker boots.
+Every worker inherits its environment: results over 4 KiB come back as vendor
+pointers, requests over 32 KiB go up through vendor upload URLs, and storage
+values of 4 KiB or more live in the vendor (`VGI_STORAGE_EXTERNALIZE=1`). It
+then runs `test/sql/external_storage/*` against the example worker's
+`blob_test` catalog (the contract is the VGI checkout's
+`docs/testing/blob-test-catalog.md`). The `fetch_*.test` files there test only
+the extension's download client and skip without `VGI_EXTERNAL_PROBE_WORKER`,
+which this lane leaves unset.
 
 Platform packaging remains covered by VGI's extension-distribution pipeline;
 this workflow owns Rust worker protocol/integration compatibility across the

@@ -440,6 +440,69 @@ fn format_http_bind(host: &str, port: u16) -> String {
     }
 }
 
+/// The request-size knobs an HTTP worker reads from the environment.
+///
+/// - `VGI_RPC_MAX_REQUEST_BYTES`: advertised (`VGI-Max-Request-Bytes`) and
+///   enforced (413) inline-request cap.
+/// - With the blob vendor (`VGI_BLOB_VENDOR_URL`, feature `blob-vendor`):
+///   `VGI-Upload-URL-Support` with upload URLs vended by the vendor, so a
+///   client sends a larger request as an upload pointer, and
+///   `VGI_RPC_MAX_UPLOAD_BYTES` advertised as `VGI-Max-Upload-Bytes`.
+///
+/// Read before the tokio runtime starts: the vendor's blocking HTTP client
+/// must not be built inside it.
+#[cfg(feature = "transport-http")]
+struct HttpRequestCaps {
+    max_request_bytes: Option<usize>,
+    max_upload_bytes: Option<usize>,
+    upload_url_provider: Option<Arc<dyn vgi_rpc::external::UploadUrlProvider>>,
+}
+
+#[cfg(feature = "transport-http")]
+impl HttpRequestCaps {
+    fn from_env() -> Self {
+        let max_request_bytes = std::env::var("VGI_RPC_MAX_REQUEST_BYTES")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(|v| match v.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => panic!("VGI_RPC_MAX_REQUEST_BYTES must be a positive integer, got {v:?}"),
+            });
+        #[cfg(feature = "blob-vendor")]
+        {
+            if let Some((_, storage)) = crate::blob_vendor::http_vendor() {
+                return HttpRequestCaps {
+                    max_request_bytes,
+                    max_upload_bytes: crate::blob_vendor::max_upload_bytes(),
+                    upload_url_provider: Some(storage.clone()),
+                };
+            }
+        }
+        HttpRequestCaps {
+            max_request_bytes,
+            max_upload_bytes: None,
+            upload_url_provider: None,
+        }
+    }
+
+    fn apply(
+        self,
+        mut builder: vgi_rpc::http::HttpStateBuilder,
+    ) -> vgi_rpc::http::HttpStateBuilder {
+        if let Some(n) = self.max_request_bytes {
+            builder = builder.max_request_bytes(n);
+        }
+        if let Some(n) = self.max_upload_bytes {
+            builder = builder.max_upload_bytes(n);
+        }
+        if let Some(provider) = self.upload_url_provider {
+            builder = builder.upload_url_provider(provider);
+        }
+        builder
+    }
+}
+
 #[cfg(feature = "transport-http")]
 fn serve_http_inner(
     server: Arc<RpcServer>,
@@ -456,6 +519,7 @@ fn serve_http_inner(
         }));
     }
     server.notify_transport(TransportKind::Http, TransportCapabilities::none());
+    let request_caps = HttpRequestCaps::from_env();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -475,6 +539,7 @@ fn serve_http_inner(
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
         }
+        builder = request_caps.apply(builder);
         if let Some(bridge) = bridge {
             let provider = vgi_rpc::iroh_forwarded_header_provider(
                 vgi_rpc::IrohForwardedHeaderConfig::new(

@@ -13,6 +13,7 @@
 mod accumulate;
 mod aggregate;
 mod attach_options;
+mod blob_catalog;
 mod buffering;
 mod canonical_constraints;
 mod catalog_def;
@@ -125,6 +126,10 @@ fn main() {
         // one secret attach option whose effect a table reveals. Served by
         // every SDK's fixture worker; see ticket_probe.rs.
         ticket_probe::register(&mut worker);
+        // blob_test: the blob-vendor externalization fixture catalog the
+        // extension's external_storage/*.test files attach (vgi
+        // docs/testing/blob-test-catalog.md). See blob_catalog.rs.
+        blob_catalog::register(&mut worker);
         // The six catalog_contents fixture catalogs (contents_probe / _broken /
         // _legacy / _memory / _reval / _hash) the cross-SDK
         // catalog_contents*.test files attach. See contents_fixtures.rs.

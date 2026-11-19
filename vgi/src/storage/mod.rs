@@ -37,6 +37,10 @@
 //! The framework's own context (buffered-function init records, aggregate
 //! arguments, streaming-aggregate sessions) is written **sealed**; see
 //! [`seal`].
+//!
+//! [`default_storage`] wraps the backend in [`blobs::ExternalizingStorage`]
+//! (a value envelope that keeps large values in the blob vendor) on
+//! `cloudflare-do`, and on any backend with `VGI_STORAGE_EXTERNALIZE=1`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,6 +59,8 @@ pub use memory::MemoryStorage;
 pub use sqlite::SqliteStorage;
 
 pub mod seal;
+
+pub mod blobs;
 
 #[cfg(test)]
 mod conformance;
@@ -213,7 +219,11 @@ pub fn default_storage() -> Arc<dyn FunctionStorage> {
         }
     };
     store.gc(orphan_ttl());
-    store
+    // Value envelope + blob-vendor externalization (see `blobs`): always on
+    // `cloudflare-do` (1 MiB per value), opt-in elsewhere with
+    // VGI_STORAGE_EXTERNALIZE=1.
+    let max_value_bytes = (choice == "cloudflare-do").then_some(blobs::CF_DO_MAX_VALUE_BYTES);
+    blobs::wrap_storage_from_env(store, max_value_bytes)
 }
 
 #[cfg(feature = "http-storage")]

@@ -692,6 +692,14 @@ impl Worker {
         if let Some(identity) = identity {
             builder = builder.identity(identity);
         }
+        // HTTP + VGI_BLOB_VENDOR_URL: results over the threshold go to the blob
+        // vendor, and inbound upload pointers resolve from its hosts.
+        #[cfg(feature = "blob-vendor")]
+        if transport == ServeTransport::Http {
+            if let Some((cfg, _)) = crate::blob_vendor::http_vendor() {
+                builder = builder.with_external_location(cfg.clone());
+            }
+        }
         let mut srv = builder
             .try_build()
             .unwrap_or_else(|err| panic!("{HOOK_NAME}: {}", err.message));

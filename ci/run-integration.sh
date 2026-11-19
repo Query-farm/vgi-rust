@@ -16,7 +16,11 @@
 #   HAYBARN_UNITTEST path to the haybarn-unittest binary
 #   VGI_WORKER_BIN   path to the built vgi-example-worker
 # Optional:
-#   TRANSPORT        stdio | launch | http   (default stdio)
+#   TRANSPORT        stdio | launch | http | vendor   (default stdio)
+#                    vendor = the http lane with everything externalized through
+#                    a fake blob vendor (started by the VGI checkout's
+#                    test/start_fake_blob_vendor.sh, which needs `uvx`), plus
+#                    test/sql/external_storage/* (docs/testing/blob-test-catalog.md).
 #   STAGE            scratch dir for the preprocessed test tree (default: mktemp)
 set -uo pipefail  # not -e: the suite exit code is managed explicitly (`|| rc=$?`)
 
@@ -71,7 +75,7 @@ fi
 # ---------------------------------------------------------------------------
 AWK_HTTP=0
 HTTP_SKIP=()
-if [ "$TRANSPORT" = "http" ]; then
+if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
   AWK_HTTP=1
   # dynamic_filter.test used to be dropped here too, blamed on the prebuilt
   # binary. That was wrong: this SDK's HTTP server discarded a continuation
@@ -125,9 +129,29 @@ mkdir -p "$STAGE/test/support" || exit 1
 install -m 0755 "$DATABASE_WORKER_FIXTURE" \
   "$STAGE/test/support/database_worker_fixture.sh" || exit 1
 
+# The vendor lane also runs the blob-vendor externalization files. Their
+# fetch_*.test files test only the extension's own download client and skip
+# without VGI_EXTERNAL_PROBE_WORKER, which this lane leaves unset.
+if [ "$TRANSPORT" = "vendor" ]; then
+  EXTERNAL_STORAGE="$VGI_SRC/test/sql/external_storage"
+  [ -d "$EXTERNAL_STORAGE" ] || { echo "::error::no test/sql/external_storage under VGI_SRC=$VGI_SRC"; exit 1; }
+  mkdir -p "$STAGE/test/sql/external_storage" || exit 1
+  for f in "$EXTERNAL_STORAGE"/*.test; do
+    if [ "$RUNNER_LINKS_EXTENSIONS" = "1" ]; then
+      cp "$f" "$STAGE/test/sql/external_storage/" || exit 1
+    else
+      awk -v http=1 -f "$HERE/preprocess-require.awk" "$f" \
+          > "$STAGE/test/sql/external_storage/$(basename "$f")" || exit 1
+    fi
+  done
+fi
+
 # Background worker processes (http servers) tracked here and killed on exit.
 BG_PIDS=()
-cleanup() { for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
+cleanup() {
+  for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+  if declare -F stop_fake_blob_vendor >/dev/null; then stop_fake_blob_vendor; fi
+}
 trap cleanup EXIT
 
 # boot_http_worker <executable> [env=val ...] — start it as an HTTP server on an
@@ -241,7 +265,16 @@ case "$TRANSPORT" in
     export VGI_WRITABLE_TX_WORKER="launch:${WTX}"
     boot_versioned_http
     ;;
-  http)
+  http | vendor)
+    if [ "$TRANSPORT" = "vendor" ]; then
+      # Start the fake blob vendor before any worker boots, so every worker
+      # inherits VGI_BLOB_VENDOR_URL and the lane's small thresholds: results
+      # over 4 KiB are vendor pointers, requests over 32 KiB go up through
+      # vendor upload URLs, and storage values over 4 KiB live in the vendor.
+      # shellcheck source=/dev/null
+      source "$VGI_SRC/test/start_fake_blob_vendor.sh" || {
+        echo "::error::the fake blob vendor did not start"; exit 1; }
+    fi
     # Whole-suite-over-HTTP. Every ATTACH goes over http://, so staging injected
     # `LOAD httpfs`. VGI_REQUIRE_LAUNCHER_TRANSPORT is deliberately unset (the
     # launcher-only tests must skip here). bearer_auth runs separately below.
@@ -271,7 +304,7 @@ case "$TRANSPORT" in
       && export VGI_WRITABLE_TX_WORKER="http://localhost:${BOOTED_PORT}"
     ;;
   *)
-    echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http)"; exit 1 ;;
+    echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http|vendor)"; exit 1 ;;
 esac
 
 cd "$STAGE" || {
@@ -340,6 +373,8 @@ case "$TRANSPORT" in
   stdio)  MIN_EXECUTED="${MIN_EXECUTED:-263}" ;;
   launch) MIN_EXECUTED="${MIN_EXECUTED:-268}" ;;
   http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-255}"; else MIN_EXECUTED="${MIN_EXECUTED:-260}"; fi ;;
+  # The http suite plus the seven blob_test contract files.
+  vendor) MIN_EXECUTED="${MIN_EXECUTED:-267}" ;;
 esac
 
 # run_unittest — invoke haybarn-unittest, streaming its output, and additionally
@@ -398,8 +433,15 @@ run_unittest() {
   return "$unittest_rc"
 }
 
-if [ "$TRANSPORT" = "http" ]; then
+if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
   run_unittest "test/sql/integration/*" "~test/sql/integration/bearer_auth/*" || rc=$?
+  if [ "$TRANSPORT" = "vendor" ]; then
+    # One file at a time (the runner is serial): the files compare the
+    # vendor's lane-wide counters and arm faults for the next download.
+    echo "Running external_storage/* against the fake blob vendor ..."
+    run_unittest "test/sql/external_storage/*" || rc=$?
+    echo "fake blob vendor counters: $(curl -fsS "$VGI_BLOB_VENDOR_URL/__stats__" 2>&1 | tr -s ' ')"
+  fi
   echo "Running bearer_auth/* against a bearer-protected http worker ..."
   boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=example" "VGI_BEARER_TOKENS=test-secret-token=test-principal"
   # Subshell so the override doesn't outlive the call: a `VAR=v func` prefix

@@ -1,7 +1,8 @@
 # Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #
 # Runs the canonical Query-farm/vgi integration sqllogictest suite against the
-# Rust example worker across all three transports (subprocess / launcher / http).
+# Rust example worker across all three transports (subprocess / launcher / http),
+# plus the http transport against a fake blob vendor (vendor).
 # The framework builds its Rust worker and downloads a native runner linked
 # with VGI from the same revision as the test suite.
 # See ci/README.md.
@@ -24,7 +25,9 @@ concurrency:
 
 env:
   # Match the test suite to the native runner built from this exact revision.
-  VGI_REF: 9dae8d55c9692cbd8b69d021c28b20a09aeee438
+  # f9e5df3 adds the blob-vendor lane's contract (test/sql/external_storage,
+  # test/start_fake_blob_vendor.sh, docs/testing/blob-test-catalog.md).
+  VGI_REF: f9e5df356dcc8fd18f545a3a348ca364ae58fe0e
   VGI_NATIVE_RUNNER_BRANCH: v2.0
 
 jobs:
@@ -33,10 +36,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      # All three transports execute the pinned suite and matching native extension.
+      # Every lane executes the pinned suite and matching native extension.
       fail-fast: true
       matrix:
-        transport: [stdio, launch, http]
+        # vendor = the http suite with everything externalized through vgi-rpc's
+        # fake blob vendor, plus test/sql/external_storage/*.
+        transport: [stdio, launch, http, vendor]
     steps:
       - name: Checkout vgi-rust
         uses: actions/checkout@v5
@@ -52,6 +57,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install uv (the vendor lane runs the fake blob vendor with uvx)
+        if: matrix.transport == 'vendor'
+        uses: astral-sh/setup-uv@v6
 
       - name: Build example worker
         run: cargo build --release -p vgi-example-worker

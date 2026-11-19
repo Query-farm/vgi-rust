@@ -152,6 +152,8 @@ pub mod aggregate;
 pub mod arguments;
 pub mod attach_options;
 pub mod attach_ticket;
+#[cfg(feature = "blob-vendor")]
+mod blob_vendor;
 pub mod buffering;
 
 pub mod catalog;

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Blob-vendor externalization** (feature `blob-vendor`; the example worker
+  enables it). Port of vgi-python's `function_storage_blobs` and serve wiring:
+  - `storage::blobs::ExternalizingStorage` wraps any backend in the v1 value
+    envelope (`0x00||raw` / `0x01||u64be size||sha256||object_id`, byte-identical
+    to Python and checked against the vgi extension's
+    `test/vectors/storage_envelope_v1.json`). Values of at least
+    `VGI_STORAGE_EXTERNALIZE_BYTES` (default 512 KiB) go to the blob vendor and
+    are verified on read. `cloudflare-do` storage is always wrapped (1 MiB per
+    value); other backends opt in with `VGI_STORAGE_EXTERNALIZE=1`. An unreadable
+    blob fails the query with `storage blob <id> failed its integrity check: ...`
+    / `storage blob <id> is missing: ...`.
+  - `--http` with `VGI_BLOB_VENDOR_URL` externalizes results over
+    `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES`, vends upload URLs, and advertises
+    `VGI_RPC_MAX_UPLOAD_BYTES`. `VGI_RPC_MAX_REQUEST_BYTES` is now honoured on
+    every HTTP worker.
+  - The example worker serves the cross-SDK `blob_test` catalog
+    (`docs/testing/blob-test-catalog.md`), and the integration workflow has a
+    `vendor` lane: the http suite plus `test/sql/external_storage/*` against the
+    fake blob vendor.
+
 ## 0.52.0 (2026-11-19)
 
 - **Cloudflare Durable Object storage backend** (feature `cloudflare-do`).

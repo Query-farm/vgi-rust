@@ -24,7 +24,7 @@ coverage = []
 [dependencies]
 # `http-storage` lets the worker use the remote storage backend
 # (VGI_WORKER_SHARED_STORAGE=http) for multi-instance deployments.
-vgi = { path = "../vgi", features = ["http-storage"] }
+vgi = { path = "../vgi", features = ["http-storage", "blob-vendor"] }
 vgi-protocol = { path = "../vgi-protocol" }
 vgi-rpc = { workspace = true }
 arrow-array = { workspace = true }
