@@ -57,6 +57,20 @@ impl FunctionStorage for MemoryStorage {
         g.kv.remove(&(scope.to_vec(), key.to_vec()));
     }
 
+    fn kv_get_many(&self, scope: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let g = self.inner.lock().unwrap();
+        keys.iter()
+            .map(|k| g.kv.get(&(scope.to_vec(), k.clone())).cloned())
+            .collect()
+    }
+
+    fn kv_put_many(&self, scope: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
+        let mut g = self.inner.lock().unwrap();
+        for (k, v) in items {
+            g.kv.insert((scope.to_vec(), k.clone()), v.clone());
+        }
+    }
+
     fn append(&self, scope: &[u8], ns: &[u8], key: &[u8], value: Vec<u8>) -> i64 {
         let mut g = self.inner.lock().unwrap();
         let id = g.next_id;

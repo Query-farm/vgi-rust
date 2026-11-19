@@ -168,6 +168,7 @@ pub mod copy_to;
 pub mod diagnostics;
 pub mod dispatch;
 pub mod errors;
+mod framework_state;
 pub mod function;
 pub mod numeric;
 pub mod opaque;

@@ -373,6 +373,14 @@ pub struct Dispatcher {
     /// ([`crate::attach_options`]): the explicitly configured key, else the
     /// HTTP signing key. `None`: the host-local key file.
     pub(crate) secret_root: Option<Vec<u8>>,
+    /// The key material framework payloads in storage are sealed under
+    /// ([`crate::storage::seal`]): the worker's signing key as it resolved it
+    /// (HTTP). `None`: the host-local key file.
+    pub(crate) storage_seal_root: Option<Vec<u8>>,
+    /// The derived seal key, computed on first use.
+    storage_seal_key: std::sync::OnceLock<[u8; 32]>,
+    /// Decoded buffered-function init records, per execution.
+    buffering_inits: crate::framework_state::BufferingInitCache,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -423,6 +431,9 @@ impl Dispatcher {
             opaque: None,
             ticket_key: None,
             secret_root: None,
+            storage_seal_root: None,
+            storage_seal_key: std::sync::OnceLock::new(),
+            buffering_inits: Default::default(),
         }
     }
 
@@ -1558,65 +1569,34 @@ impl Dispatcher {
                 );
             }
             // Sink phase: emit nothing; data arrives via process RPCs.
-            // The process/combine RPCs carry no schema and may run in a
-            // different pooled worker, so persist the bound output schema
-            // (which may differ from the input, e.g. sum_all_columns) to the
-            // file-backed store keyed by execution_id for them to read. Also
-            // persist the input schema so they can re-derive the output schema
-            // via on_bind should the stored copy be unreadable (see
-            // buffering_output_schema).
-            self.store.kv_put(
+            // The process/combine RPCs carry no bind_call and no schemas, and
+            // may run in a different pooled worker, so persist what they need
+            // as ONE sealed record keyed by execution_id: the bound output
+            // schema (which may differ from the input, e.g. sum_all_columns),
+            // the input schema, the call arguments, the `logging` flag, the
+            // COPY ... TO destination, the resolved secrets (forwarded via the
+            // two-phase secret bind -- what lets a COPY-TO writer's write() /
+            // close() read the caller's CREATE SECRET credentials), and the
+            // attach scope and owning schema as fallbacks for a peer whose
+            // process/combine request omits them. Sealed (see
+            // `storage::seal`): it holds secrets, and a rewritten COPY-TO path
+            // would redirect the writer's output.
+            self.persist_buffering_init(
                 &execution_id,
-                b"outsc",
-                &ipc::write_schema_ref(&output_schema)?,
-            );
-            if let Some(insc) = input_schema.as_ref() {
-                self.store
-                    .kv_put(&execution_id, b"insc", &ipc::write_schema_ref(insc)?);
-            }
-            // COPY ... TO context (destination format + path): the process /
-            // combine RPCs carry no bind_call, so persist it keyed by
-            // execution_id for them to replay. See `handle_buffering_*`.
-            if let Some(ct) = copy_to.as_ref() {
-                self.store
-                    .kv_put(&execution_id, b"copytofmt", ct.format.as_bytes());
-                self.store
-                    .kv_put(&execution_id, b"copytopath", ct.file_path.as_bytes());
-            }
-            // Resolved secrets (forwarded via the two-phase secret bind): the
-            // process/combine RPCs carry no bind_call, so persist the secrets IPC
-            // blob keyed by execution_id for them to replay onto BufferingParams.
-            // This is what lets a COPY-TO writer's write()/close() read the
-            // caller's CREATE SECRET credentials. See `handle_buffering_*`.
-            if let Some(s) = bind_call.secrets.as_ref() {
-                self.store.kv_put(&execution_id, b"bufsecrets", &s.0);
-            }
-            // Persist named flags the process/combine RPCs need (e.g. `logging`),
-            // since those RPCs carry no arguments and may run in another worker.
-            self.store.kv_put(
-                &execution_id,
-                b"bufflags",
-                &[bp.arguments.named_bool("logging").unwrap_or(false) as u8],
-            );
-            // Replay the call arguments + attach scope to the process/combine
-            // RPCs (they carry neither and may run in another pooled worker).
-            // Stateful buffering functions (e.g. `accumulate`) read these.
-            self.store
-                .kv_put(&execution_id, b"bufargs", &bind_call.arguments.0);
-            if let Some(a) = bind_call.attach_opaque_data.as_ref() {
-                self.store.kv_put(&execution_id, b"bufattach", &a.0);
-            }
-            // Replay the owning schema too. process/combine carry no bind_call,
-            // so without this they could only resolve the bare name — which is
-            // exactly the ambiguity the schema-keyed registry exists to remove.
-            if let Some(path) = bind_call
-                .schema_path
-                .as_deref()
-                .filter(|path| !path.is_empty())
-            {
-                self.store
-                    .kv_put(&execution_id, b"bufschema", path.join("\0").as_bytes());
-            }
+                crate::framework_state::BufferingInit {
+                    output_schema: output_schema.clone(),
+                    input_schema: input_schema.clone(),
+                    arguments: bind_call.arguments.0.clone(),
+                    secrets: bind_call.secrets.as_ref().map(|s| s.0.clone()),
+                    logging: bp.arguments.named_bool("logging").unwrap_or(false),
+                    copy_to: copy_to.clone(),
+                    attach_opaque_data: bind_call.attach_opaque_data.as_ref().map(|a| a.0.clone()),
+                    schema_path: bind_call
+                        .schema_path
+                        .clone()
+                        .filter(|path| !path.is_empty()),
+                },
+            )?;
             let state = TableProducerState {
                 inner: Box::new(EmptyProducer),
                 filters: None,
@@ -2143,6 +2123,7 @@ impl Dispatcher {
             // combine RPCs use — those RPCs already rebuild this context from
             // scratch on a worker that never saw the bind, so reusing them
             // keeps one replay path instead of a second that can drift.
+            let init = self.buffering_init(&blob.execution_id)?;
             let bparams = BufferingParams {
                 execution_id: blob.execution_id.clone(),
                 storage: self.store.clone(),
@@ -2152,12 +2133,10 @@ impl Dispatcher {
                 secrets,
                 attach_opaque_data: Some(blob.attach_opaque_data.clone())
                     .filter(|v| !v.is_empty())
-                    .or_else(|| self.store.kv_get(&blob.execution_id, b"bufattach")),
+                    .or_else(|| init.attach_opaque_data.clone()),
                 batch_index: None,
-                copy_to: self.buffering_copy_to(&blob.execution_id),
-                input_schema: input_schema
-                    .clone()
-                    .or_else(|| self.buffering_input_schema(&blob.execution_id)),
+                copy_to: init.copy_to.clone(),
+                input_schema: input_schema.clone().or_else(|| init.input_schema.clone()),
                 logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             let mut producer = f.finalize_producer(&bparams, blob.finalize_state_id.clone())?;
@@ -2544,7 +2523,7 @@ impl Dispatcher {
                 .transpose()?;
             // Secret options never enter this record, sealed or not (they
             // travel encrypted in the options trailer instead): it is
-            // also persisted server-side (`bufattach`) and, on an OS-owned
+            // also persisted server-side (in the buffering init record) and, on an OS-owned
             // transport, travels in plaintext.
             let secret = catalog::secret_attach_option_names(&self.catalog.attach_option_specs);
             let is_secret = |name: &str| secret.iter().any(|s| s.eq_ignore_ascii_case(name));
@@ -4352,108 +4331,137 @@ impl Dispatcher {
 
     // -- table buffering RPCs ----------------------------------------------
 
-    /// The bound output schema for a buffering execution, persisted by the
-    /// sink init to the file-backed store (process/combine carry no schema and
-    /// may run in a different pooled worker). Falls back to `default` when no
-    /// schema was persisted (e.g. echo-style functions where it is unused).
-    /// Resolve the bound output schema for a buffering process/combine RPC.
-    ///
-    /// Persisted at sink-init under `outsc`, but a process/combine RPC may land
-    /// on a different pooled worker that never wrote it (launcher transport).
-    /// On a store miss, recompute it deterministically by re-running the
-    /// function's `on_bind` with the same arguments and input schema sink-init
-    /// saw — the process batch's schema, or the persisted `insc` for combine.
-    ///
-    /// This never silently substitutes a possibly-wrong schema: the previous
-    /// behaviour fell back to the raw input schema, which is correct only when a
-    /// function's output type matches its input and silently breaks otherwise
-    /// (e.g. sum_all_columns, whose DECIMAL inputs map to FLOAT64 output —
-    /// `sum_column` then rejected the unexpected DECIMAL type). If no input
-    /// schema is available to rebind from, fail loudly rather than guess.
-    fn buffering_output_schema(
-        &self,
-        execution_id: &[u8],
-        f: &dyn TableBufferingFunction,
-        input_schema: Option<arrow_schema::SchemaRef>,
-    ) -> Result<arrow_schema::SchemaRef> {
-        if let Some(s) = self
-            .store
-            .kv_get(execution_id, b"outsc")
-            .and_then(|b| ipc::read_schema(&b).ok())
-        {
-            return Ok(s);
+    /// The storage-seal key ([`crate::storage::seal`]): derived from the
+    /// worker's signing key, else from the host-local key file every VGI
+    /// worker process of this user shares.
+    fn storage_seal_key(&self) -> Result<[u8; 32]> {
+        if let Some(k) = self.storage_seal_key.get() {
+            return Ok(*k);
         }
-        let input_schema = input_schema.or_else(|| {
-            self.store
-                .kv_get(execution_id, b"insc")
-                .and_then(|b| ipc::read_schema(&b).ok())
-        });
-        let Some(input_schema) = input_schema else {
-            return Err(RpcError::runtime_error(
-                "table-buffering: bound output schema unavailable (sink-init state \
-                 not found on this worker and no input schema to rebind from)"
-                    .to_string(),
-            ));
+        let ikm = match &self.storage_seal_root {
+            Some(root) => root.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            None => crate::attach_options::host_local_root()?,
+            // A wasm worker is one process (see `next_execution_id`), so a
+            // sandbox without a usable key file can seal under a per-process
+            // key instead of refusing every buffered function.
+            #[cfg(target_arch = "wasm32")]
+            None => crate::attach_options::host_local_root().unwrap_or_else(|e| {
+                log::warn!("storage seal: {}; using a per-process key", e.message);
+                rand::random::<[u8; 32]>().to_vec()
+            }),
         };
-        let bind = f.on_bind(&BindParams {
-            input_schema: Some(input_schema),
-            arguments: self.buffering_arguments(execution_id, f),
-            attach_opaque_data: self.store.kv_get(execution_id, b"bufattach"),
-            storage: Some(self.store.clone()),
-            ..Default::default()
-        })?;
-        Ok(bind.output_schema)
+        Ok(*self
+            .storage_seal_key
+            .get_or_init(|| crate::storage::seal::derive_key(&ikm)))
     }
 
-    /// Replay the buffering call arguments persisted by the sink init (the
-    /// process/combine RPCs carry none). Remapped onto the function's declared
-    /// positions, matching what `on_bind` saw. Empty when none were persisted.
-    fn buffering_arguments(
+    /// Seal `plaintext` and store it at `(scope, key)`.
+    fn put_sealed(&self, scope: &[u8], key: &[u8], plaintext: &[u8]) -> Result<()> {
+        let k = self.storage_seal_key()?;
+        crate::storage::seal::sealed_kv_put(self.store.as_ref(), &k, scope, key, plaintext);
+        Ok(())
+    }
+
+    /// Read and open the sealed `(scope, key)`; `Ok(None)` when absent, an
+    /// error when present but not authentic.
+    fn get_sealed(&self, scope: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let k = self.storage_seal_key()?;
+        Ok(crate::storage::seal::sealed_kv_get(
+            self.store.as_ref(),
+            &k,
+            scope,
+            key,
+        )?)
+    }
+
+    /// Persist a buffered execution's init record (one sealed write) and
+    /// cache it for this process's own process/combine calls.
+    pub(crate) fn persist_buffering_init(
         &self,
         execution_id: &[u8],
+        record: crate::framework_state::BufferingInit,
+    ) -> Result<()> {
+        self.put_sealed(
+            execution_id,
+            crate::framework_state::BUFFERING_INIT_KEY,
+            &record.encode()?,
+        )?;
+        self.buffering_inits.insert(execution_id, Arc::new(record));
+        Ok(())
+    }
+
+    /// The init record the sink init persisted for `execution_id`: from this
+    /// process's cache, else one sealed storage read (then cached).
+    ///
+    /// Absent is an error, not a default: without it the call would run with
+    /// no arguments, no secrets and a guessed output schema.
+    pub(crate) fn buffering_init(
+        &self,
+        execution_id: &[u8],
+    ) -> Result<Arc<crate::framework_state::BufferingInit>> {
+        if let Some(r) = self.buffering_inits.get(execution_id) {
+            return Ok(r);
+        }
+        let bytes = self
+            .get_sealed(execution_id, crate::framework_state::BUFFERING_INIT_KEY)?
+            .ok_or_else(|| {
+                RpcError::runtime_error(
+                    "table-buffering: no init record for this execution in function storage \
+                     (the sink init never ran against this storage backend, or the execution \
+                     was already destroyed)"
+                        .to_string(),
+                )
+            })?;
+        let record = Arc::new(crate::framework_state::BufferingInit::decode(&bytes)?);
+        self.buffering_inits.insert(execution_id, record.clone());
+        Ok(record)
+    }
+
+    /// The call arguments the sink init recorded, remapped onto the
+    /// function's declared positions (matching what `on_bind` saw).
+    fn buffering_arguments(
+        init: &crate::framework_state::BufferingInit,
         f: &dyn TableBufferingFunction,
-    ) -> crate::arguments::Arguments {
-        let mut args = self
-            .store
-            .kv_get(execution_id, b"bufargs")
-            .and_then(|b| crate::arguments::Arguments::parse(&b).ok())
-            .unwrap_or_default();
+    ) -> Result<crate::arguments::Arguments> {
+        let mut args = crate::arguments::Arguments::parse(&init.arguments)?;
         args.remap_positional(&f.argument_specs());
-        args
+        Ok(args)
     }
 
-    /// Replay the `COPY ... TO` context persisted by the sink-init (process /
-    /// combine carry no bind_call). `None` for ordinary buffered functions.
-    fn buffering_copy_to(&self, execution_id: &[u8]) -> Option<CopyToContext> {
-        let path = self.store.kv_get(execution_id, b"copytopath")?;
-        let format = self
-            .store
-            .kv_get(execution_id, b"copytofmt")
-            .unwrap_or_default();
-        Some(CopyToContext {
-            format: String::from_utf8_lossy(&format).into_owned(),
-            file_path: String::from_utf8_lossy(&path).into_owned(),
-        })
+    /// The resolved secrets the sink init recorded (empty when none were
+    /// forwarded). This is what surfaces CREATE SECRET credentials on a
+    /// COPY-TO writer's write()/close() params.
+    fn buffering_secrets(
+        init: &crate::framework_state::BufferingInit,
+    ) -> Result<crate::secrets::Secrets> {
+        match &init.secrets {
+            Some(b) => crate::secrets::Secrets::parse(b),
+            None => Ok(crate::secrets::Secrets::default()),
+        }
     }
 
-    /// Replay the source (input) schema persisted by the sink-init.
-    fn buffering_input_schema(&self, execution_id: &[u8]) -> Option<arrow_schema::SchemaRef> {
-        self.store
-            .kv_get(execution_id, b"insc")
-            .and_then(|b| ipc::read_schema(&b).ok())
-    }
-
-    /// Replay the resolved secrets persisted by the sink-init (process / combine
-    /// carry no bind_call). Empty when none were forwarded. This is what surfaces
-    /// CREATE SECRET credentials on a COPY-TO writer's write()/close() params.
-    /// The owning schema the sink-init recorded for `execution_id`, if any.
-    /// Absent only when the bind itself named none (a COPY-TO handler).
-    fn buffering_schema(&self, execution_id: &[u8]) -> Option<Vec<String>> {
-        self.store
-            .kv_get(execution_id, b"bufschema")
-            .and_then(|b| String::from_utf8(b).ok())
+    /// The declaring schema of a process/combine call: the request's
+    /// (protocol >= 1.2.0), else the one the sink init recorded. Only a
+    /// schema-less bind (a COPY-TO handler) leaves both unset.
+    fn buffering_call_schema<'a>(
+        request: Option<&'a [String]>,
+        init: &'a crate::framework_state::BufferingInit,
+    ) -> Option<&'a [String]> {
+        request
             .filter(|s| !s.is_empty())
-            .map(|s| s.split('\0').map(str::to_string).collect())
+            .or(init.schema_path.as_deref())
+    }
+
+    /// The attach scope of a process/combine call: the request's, else the
+    /// one the sink init recorded.
+    fn buffering_attach(
+        request: Option<&Bytes>,
+        init: &crate::framework_state::BufferingInit,
+    ) -> Option<Vec<u8>> {
+        request
+            .map(|b| b.0.clone())
+            .or_else(|| init.attach_opaque_data.clone())
     }
 
     /// Scope a non-bind RPC against an already-resolved execution: exact when
@@ -4483,59 +4491,62 @@ impl Dispatcher {
         Self::bound_scope(self.call_catalog(attach), schema_path)
     }
 
-    fn buffering_secrets(&self, execution_id: &[u8]) -> crate::secrets::Secrets {
-        self.store
-            .kv_get(execution_id, b"bufsecrets")
-            .and_then(|b| crate::secrets::Secrets::parse(&b).ok())
-            .unwrap_or_default()
-    }
-
     pub fn handle_buffering_process(
         &self,
         req: &Request,
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
-        // The request names the declaring schema as of protocol 1.2.0. These two
-        // RPCs ride a bound connection whose init already carried it, so they
-        // also have the copy the sink-init persisted under `bufschema` — prefer
-        // the request, fall back to the persisted one for an older peer. Only a
-        // schema-less bind (a COPY-TO handler) leaves both unset.
-        let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
-        let persisted = self.buffering_schema(&dto.execution_id.0);
-        let schema = dto
-            .schema_path
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or(persisted.as_deref());
-        let call = Self::bound_scope(catalog, schema);
+        let (response, logs) = self.buffering_process(dto)?;
+        Self::drain_buffering_logs(&logs, ctx);
+        Ok(Some(wire::to_result_batch(response)?))
+    }
+
+    /// The transport-free core of `table_buffering_process`.
+    ///
+    /// Every piece of bind context comes from the execution's init record
+    /// ([`Self::buffering_init`]): zero storage reads once this process has
+    /// seen the execution, one otherwise. The request's own
+    /// `attach_opaque_data` and `schema_path` win over the recorded copies.
+    pub(crate) fn buffering_process(
+        &self,
+        dto: TableBufferingProcessRequest,
+    ) -> Result<(
+        TableBufferingProcessResponse,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    )> {
+        let init = self.buffering_init(&dto.execution_id.0)?;
+        let attach = Self::buffering_attach(dto.attach_opaque_data.as_ref(), &init);
+        let catalog = self.call_catalog(attach.as_deref());
+        let call = Self::bound_scope(
+            catalog,
+            Self::buffering_call_schema(dto.schema_path.as_deref(), &init),
+        );
         let f = self.resolve_buffering(&dto.function_name, call)?;
         let batch = ipc::read_batch(&dto.input_batch.0)?;
-        let output_schema =
-            self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), Some(batch.schema()))?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
-            output_schema,
-            arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
+            output_schema: init.output_schema.clone(),
+            arguments: Self::buffering_arguments(&init, f.as_ref())?,
             settings: crate::settings::Settings::default(),
             // Resolved secrets replayed from the sink-init (the process RPC carries
             // no bind_call) — lets a COPY-TO writer read CREATE SECRET creds.
-            secrets: self.buffering_secrets(&dto.execution_id.0),
-            attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
+            secrets: Self::buffering_secrets(&init)?,
+            attach_opaque_data: attach,
             batch_index: dto.batch_index,
-            copy_to: self.buffering_copy_to(&dto.execution_id.0),
-            input_schema: self.buffering_input_schema(&dto.execution_id.0),
+            copy_to: init.copy_to.clone(),
+            input_schema: init.input_schema.clone(),
             logs: logs.clone(),
         };
         let state_id = f.process(&params, &batch)?;
-        Self::drain_buffering_logs(&logs, ctx);
-        Ok(Some(wire::to_result_batch(
+        Ok((
             TableBufferingProcessResponse {
                 state_id: Bytes::from(state_id),
             },
-        )?))
+            logs,
+        ))
     }
 
     /// Forward queued buffering INFO logs to the call context (→ duckdb_logs()).
@@ -4575,30 +4586,28 @@ impl Dispatcher {
         TableBufferingCombineResponse,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     )> {
-        let catalog = self.call_catalog(dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()));
-        let persisted = self.buffering_schema(&dto.execution_id.0);
-        let schema = dto
-            .schema_path
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or(persisted.as_deref());
-        let call = Self::bound_scope(catalog, schema);
+        let init = self.buffering_init(&dto.execution_id.0)?;
+        let attach = Self::buffering_attach(dto.attach_opaque_data.as_ref(), &init);
+        let catalog = self.call_catalog(attach.as_deref());
+        let call = Self::bound_scope(
+            catalog,
+            Self::buffering_call_schema(dto.schema_path.as_deref(), &init),
+        );
         let f = self.resolve_buffering(&dto.function_name, call)?;
-        let output_schema = self.buffering_output_schema(&dto.execution_id.0, f.as_ref(), None)?;
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let params = BufferingParams {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
-            output_schema,
-            arguments: self.buffering_arguments(&dto.execution_id.0, f.as_ref()),
+            output_schema: init.output_schema.clone(),
+            arguments: Self::buffering_arguments(&init, f.as_ref())?,
             settings: crate::settings::Settings::default(),
             // Resolved secrets replayed from the sink-init (the combine RPC carries
             // no bind_call) — lets a COPY-TO writer's close() read CREATE SECRET creds.
-            secrets: self.buffering_secrets(&dto.execution_id.0),
-            attach_opaque_data: self.store.kv_get(&dto.execution_id.0, b"bufattach"),
+            secrets: Self::buffering_secrets(&init)?,
+            attach_opaque_data: attach,
             batch_index: None,
-            copy_to: self.buffering_copy_to(&dto.execution_id.0),
-            input_schema: self.buffering_input_schema(&dto.execution_id.0),
+            copy_to: init.copy_to.clone(),
+            input_schema: init.input_schema.clone(),
             logs: logs.clone(),
         };
         let state_ids: Vec<Vec<u8>> = dto.state_ids.into_iter().map(|b| b.0).collect();
@@ -4613,6 +4622,7 @@ impl Dispatcher {
 
     pub fn handle_buffering_destructor(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingDestructorRequest = boxed(req)?;
+        self.buffering_inits.remove(&dto.execution_id.0);
         self.store.clear(&dto.execution_id.0);
         // An empty `TableBufferingDestructorResponse`, in the `{result:
         // binary}` envelope the reference declares (not a void method).
@@ -4660,8 +4670,12 @@ impl Dispatcher {
         // Stash the raw bind-time arguments so `finalize` can rebuild const
         // params (e.g. `vgi_percentile`'s percentile) — update/finalize RPCs
         // don't resend arguments and may run in a different pooled worker.
-        self.store
-            .kv_put(&execution_id, b"aggargs", &dto.arguments.0);
+        // Sealed like every framework payload (see `storage::seal`).
+        self.put_sealed(
+            &execution_id,
+            crate::framework_state::AGGREGATE_ARGS_KEY,
+            &dto.arguments.0,
+        )?;
         Ok(Some(wire::to_result_batch(AggregateBindResponse {
             output_schema: Bytes::from(ipc::write_schema_ref(&bind.output_schema)?),
             execution_id: Bytes::from(execution_id),
@@ -4685,20 +4699,32 @@ impl Dispatcher {
         // actually folds in a value — so a group that received only NULLs
         // (DEFAULT null handling) leaves no state and finalizes to NULL
         // rather than a seeded 0.
-        let mut states: HashMap<i64, Vec<u8>> = HashMap::new();
-        for i in 0..gids.len() {
-            let gid = gids.value(i);
-            if let std::collections::hash_map::Entry::Vacant(e) = states.entry(gid) {
-                if let Some(s) = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(gid)) {
-                    e.insert(s);
-                }
+        //
+        // One batched read of every distinct group and one batched write of
+        // the results: two storage calls per batch, whatever the group count.
+        let mut seen = std::collections::HashSet::new();
+        let distinct: Vec<i64> = gids
+            .values()
+            .iter()
+            .copied()
+            .filter(|g| seen.insert(*g))
+            .collect();
+        let keys: Vec<Vec<u8>> = distinct.iter().map(|g| Self::agg_key(*g)).collect();
+        let mut states: HashMap<i64, Vec<u8>> = HashMap::with_capacity(distinct.len());
+        for (gid, state) in distinct
+            .iter()
+            .zip(self.store.kv_get_many(&dto.execution_id.0, &keys))
+        {
+            if let Some(state) = state {
+                states.insert(*gid, state);
             }
         }
         f.update(&mut states, &gids, &columns)?;
-        for (gid, state) in states {
-            self.store
-                .kv_put(&dto.execution_id.0, &Self::agg_key(gid), &state);
-        }
+        let items: Vec<(Vec<u8>, Vec<u8>)> = states
+            .into_iter()
+            .map(|(gid, state)| (Self::agg_key(gid), state))
+            .collect();
+        self.store.kv_put_many(&dto.execution_id.0, &items);
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -4724,11 +4750,35 @@ impl Dispatcher {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .ok_or_else(|| RpcError::type_error("combine: target_group_id"))?
             .clone();
+        // Read every group the merge batch names once, merge in memory in
+        // batch order (a later pair sees an earlier pair's result, exactly as
+        // the per-pair storage round trips did), and write the changed
+        // targets back once: two storage calls per combine.
+        let mut seen = std::collections::HashSet::new();
+        let groups: Vec<i64> = src
+            .values()
+            .iter()
+            .chain(tgt.values().iter())
+            .copied()
+            .filter(|g| seen.insert(*g))
+            .collect();
+        let keys: Vec<Vec<u8>> = groups.iter().map(|g| Self::agg_key(*g)).collect();
+        let mut states: HashMap<i64, Vec<u8>> = HashMap::with_capacity(groups.len());
+        for (gid, state) in groups
+            .iter()
+            .zip(self.store.kv_get_many(&dto.execution_id.0, &keys))
+        {
+            if let Some(state) = state {
+                states.insert(*gid, state);
+            }
+        }
+        let mut written: Vec<i64> = Vec::new();
+        let mut dirty = std::collections::HashSet::new();
         for i in 0..src.len() {
             let s = src.value(i);
             let t = tgt.value(i);
-            let source = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(s));
-            let target = self.store.kv_get(&dto.execution_id.0, &Self::agg_key(t));
+            let source = states.get(&s).cloned();
+            let target = states.remove(&t);
             // Both absent (e.g. an all-NULL group under DEFAULT null handling):
             // leave the target stateless so finalize yields NULL, not a seeded 0.
             let merged = match (target, source) {
@@ -4737,9 +4787,16 @@ impl Dispatcher {
                 (None, Some(s)) => s,
                 (Some(t), Some(s)) => f.combine(t, s)?,
             };
-            self.store
-                .kv_put(&dto.execution_id.0, &Self::agg_key(t), &merged);
+            states.insert(t, merged);
+            if dirty.insert(t) {
+                written.push(t);
+            }
         }
+        let items: Vec<(Vec<u8>, Vec<u8>)> = written
+            .into_iter()
+            .filter_map(|g| states.get(&g).map(|st| (Self::agg_key(g), st.clone())))
+            .collect();
+        self.store.kv_put_many(&dto.execution_id.0, &items);
         Ok(Some(wire::empty_result_batch()?))
     }
 
@@ -4760,19 +4817,25 @@ impl Dispatcher {
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| RpcError::type_error("finalize: group_ids not int64"))?
             .clone();
-        let states: Vec<Option<Vec<u8>>> = (0..gids.len())
-            .map(|i| {
-                self.store
-                    .kv_get(&dto.execution_id.0, &Self::agg_key(gids.value(i)))
-            })
-            .collect();
+        let keys: Vec<Vec<u8>> = gids.values().iter().map(|g| Self::agg_key(*g)).collect();
+        let states: Vec<Option<Vec<u8>>> = self.store.kv_get_many(&dto.execution_id.0, &keys);
         // Reload the bind-time arguments stashed at aggregate_bind, remapped
         // to the function's declared positions, for ConstParam finalize.
-        let mut agg_args = self
-            .store
-            .kv_get(&dto.execution_id.0, b"aggargs")
-            .and_then(|b| crate::arguments::Arguments::parse(&b).ok())
-            .unwrap_or_default();
+        // Absent or unopenable is an error: finalizing with no arguments
+        // would silently answer with the wrong constants.
+        let raw_args = self
+            .get_sealed(
+                &dto.execution_id.0,
+                crate::framework_state::AGGREGATE_ARGS_KEY,
+            )?
+            .ok_or_else(|| {
+                RpcError::runtime_error(
+                    "aggregate finalize: no bind-time arguments for this execution in function \
+                     storage (aggregate_bind never ran against this storage backend)"
+                        .to_string(),
+                )
+            })?;
+        let mut agg_args = crate::arguments::Arguments::parse(&raw_args)?;
         agg_args.remap_positional(&f.argument_specs());
         let result = f.finalize_with_args(&output_schema, &gids, &states, &agg_args)?;
         Ok(Some(wire::to_result_batch(AggregateFinalizeResponse {
@@ -5043,18 +5106,17 @@ impl Dispatcher {
             ),
         )?;
         let execution_id = self.next_execution_id();
-        self.store.kv_put(
+        // One sealed session record (framework context), not three keys.
+        self.put_sealed(
             &execution_id,
-            b"strm_pkc",
-            &dto.partition_key_count.to_le_bytes(),
-        );
-        self.store.kv_put(
-            &execution_id,
-            b"strm_okc",
-            &dto.order_key_count.to_le_bytes(),
-        );
-        self.store
-            .kv_put(&execution_id, b"strm_sos", &dto.output_schema.0);
+            crate::framework_state::STREAMING_SESSION_KEY,
+            &crate::framework_state::StreamingSession {
+                partition_key_count: dto.partition_key_count,
+                order_key_count: dto.order_key_count,
+                output_schema: dto.output_schema.0.clone(),
+            }
+            .encode(),
+        )?;
         Ok(Some(wire::to_result_batch(
             AggregateStreamingOpenResponse {
                 execution_id: Bytes::from(execution_id),
@@ -5072,20 +5134,31 @@ impl Dispatcher {
             ),
         )?;
         let chunk = ipc::read_batch(&dto.input_batch.0)?;
-        let pkc = self
-            .store
-            .kv_get(&dto.execution_id.0, b"strm_pkc")
-            .and_then(|b| read_le_i64(&b))
-            .unwrap_or(0) as usize;
-        let okc = self
-            .store
-            .kv_get(&dto.execution_id.0, b"strm_okc")
-            .and_then(|b| read_le_i64(&b))
-            .unwrap_or(0) as usize;
-        let output_schema = self
-            .store
-            .kv_get(&dto.execution_id.0, b"strm_sos")
-            .and_then(|b| ipc::read_schema(&b).ok());
+        let session = self
+            .get_sealed(
+                &dto.execution_id.0,
+                crate::framework_state::STREAMING_SESSION_KEY,
+            )?
+            .ok_or_else(|| {
+                RpcError::runtime_error(
+                    "streaming aggregate: no session for this execution in function storage \
+                     (aggregate_streaming_open never ran against this storage backend)"
+                        .to_string(),
+                )
+            })?;
+        let session = crate::framework_state::StreamingSession::decode(&session)?;
+        let count = |n: i64, what: &str| {
+            usize::try_from(n).map_err(|_| {
+                RpcError::runtime_error(format!("streaming aggregate: negative {what} {n}"))
+            })
+        };
+        let pkc = count(session.partition_key_count, "partition key count")?;
+        let okc = count(session.order_key_count, "order key count")?;
+        let output_schema = if session.output_schema.is_empty() {
+            None
+        } else {
+            Some(ipc::read_schema(&session.output_schema)?)
+        };
         let mut states = self
             .store
             .kv_get(&dto.execution_id.0, b"strm_state")
@@ -5116,10 +5189,8 @@ impl Dispatcher {
     pub fn handle_aggregate_streaming_close(&self, req: &Request) -> Result<Option<RecordBatch>> {
         let dto: AggregateStreamingCloseRequest = boxed(req)?;
         for k in [
-            b"strm_pkc".as_slice(),
-            b"strm_okc",
-            b"strm_sos",
-            b"strm_state",
+            crate::framework_state::STREAMING_SESSION_KEY,
+            b"strm_state".as_slice(),
         ] {
             self.store.kv_del(&dto.execution_id.0, k);
         }
@@ -5863,14 +5934,6 @@ impl vgi_rpc::ProducerState for TableProducerState {
 // ---------------------------------------------------------------------------
 
 /// Read a "boxed" DTO from the `request` binary column (IPC stream).
-/// Read a little-endian `i64` from the first 8 bytes of a store value, or
-/// `None` if the buffer is shorter. Store blobs come off disk and could be
-/// truncated/corrupt, so slicing `b[..8]` directly would risk a panic.
-fn read_le_i64(b: &[u8]) -> Option<i64> {
-    let arr: [u8; 8] = b.get(..8)?.try_into().ok()?;
-    Some(i64::from_le_bytes(arr))
-}
-
 /// Decode the IPC batch carried in the request's `request` binary column.
 fn request_inner_batch(req: &Request) -> Result<RecordBatch> {
     let col = req
@@ -6205,6 +6268,10 @@ mod canonical_constraint_version_tests {
 mod window_partition_tests;
 
 #[cfg(test)]
+#[path = "storage_calls_tests.rs"]
+mod storage_calls_tests;
+
+#[cfg(test)]
 mod buffering_schema_tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
@@ -6256,23 +6323,32 @@ mod buffering_schema_tests {
         }
     }
 
-    // On a store miss the output schema must be recomputed via on_bind from the
-    // input schema (FLOAT64 `s`), NOT fall back to the raw DECIMAL input.
+    // With no init record, process fails loudly rather than guessing an
+    // output schema from the input (the old fallback silently broke
+    // functions whose output type differs, e.g. sum_all_columns) or running
+    // with no arguments and no secrets.
     #[test]
-    fn output_schema_recomputed_on_store_miss() {
-        let d = Dispatcher::new("test");
-        let exec = format!("test-recompute-{}", std::process::id()).into_bytes();
-        d.store.clear(&exec); // ensure no `outsc`/`insc` from a prior run
-        let decimal_input = Arc::new(Schema::new(vec![Field::new(
+    fn process_without_an_init_record_is_an_error() {
+        let mut d = Dispatcher::new("test");
+        d.store = Arc::new(crate::storage::MemoryStorage::new());
+        d.register_buffering(Arc::new(FixedOutput));
+        let batch = arrow_array::RecordBatch::try_from_iter([(
             "a",
-            DataType::Decimal128(10, 2),
-            true,
-        )]));
-        let out = d
-            .buffering_output_schema(&exec, &FixedOutput, Some(decimal_input))
-            .expect("recompute via on_bind");
-        assert_eq!(out.fields().len(), 1);
-        assert_eq!(out.field(0).data_type(), &DataType::Float64);
+            Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap();
+        let err = d
+            .buffering_process(TableBufferingProcessRequest {
+                function_name: FixedOutput.name().to_string(),
+                execution_id: Bytes::from(b"no-init".to_vec()),
+                input_batch: Bytes::from(ipc::write_batch(&batch).unwrap()),
+                batch_index: None,
+                attach_opaque_data: None,
+                transaction_id: None,
+                schema_path: None,
+            })
+            .unwrap_err();
+        assert!(err.message.contains("no init record"), "{}", err.message);
     }
 
     /// Empty input at runtime (vgi 63eb257): the extension inits the
@@ -6323,12 +6399,24 @@ mod buffering_schema_tests {
         let f = Arc::new(CountingCombine(std::sync::Mutex::new(None)));
         let mut d = Dispatcher::new("test");
         d.register_buffering(f.clone());
-        let exec = format!("test-empty-combine-{}", std::process::id()).into_bytes();
-        d.store.clear(&exec);
+        d.store = Arc::new(crate::storage::MemoryStorage::new());
+        let exec = b"test-empty-combine".to_vec();
         // What the buffering-phase init persists before combine.
         let out = Arc::new(Schema::new(vec![Field::new("s", DataType::Int64, true)]));
-        d.store
-            .kv_put(&exec, b"outsc", &ipc::write_schema_ref(&out).unwrap());
+        d.persist_buffering_init(
+            &exec,
+            crate::framework_state::BufferingInit {
+                output_schema: out,
+                input_schema: None,
+                arguments: Vec::new(),
+                secrets: None,
+                logging: false,
+                copy_to: None,
+                attach_opaque_data: None,
+                schema_path: None,
+            },
+        )
+        .unwrap();
 
         let (response, logs) = d
             .buffering_combine(TableBufferingCombineRequest {
@@ -6345,23 +6433,8 @@ mod buffering_schema_tests {
         assert_eq!(logs.lock().unwrap().as_slice(), ["combined".to_string()]);
         d.store.clear(&exec);
     }
-
-    // No stored schema and no input to rebind from → fail loudly, never guess.
-    #[test]
-    fn output_schema_errors_without_any_input() {
-        let d = Dispatcher::new("test");
-        let exec = format!("test-error-{}", std::process::id()).into_bytes();
-        d.store.clear(&exec);
-        assert!(d
-            .buffering_output_schema(&exec, &FixedOutput, None)
-            .is_err());
-    }
 }
 
-// Defensive-decoding tests: the streaming state blob and the small int store
-// values live in the on-disk cross-process store, so a truncated write or a
-// corrupt file must degrade to a default — never panic (which on stdio becomes
-// an opaque "handler panicked" error, and over HTTP a bare 500).
 #[cfg(test)]
 mod malformed_input_tests {
     use super::*;
@@ -6409,21 +6482,6 @@ mod malformed_input_tests {
             let buf: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
             let _ = Dispatcher::de_state_map(&buf);
         }
-    }
-
-    #[test]
-    fn read_le_i64_is_bounds_safe() {
-        assert_eq!(read_le_i64(&7i64.to_le_bytes()), Some(7));
-        assert_eq!(read_le_i64(&(-1i64).to_le_bytes()), Some(-1));
-        // A value longer than 8 bytes reads the first 8.
-        let mut long = 42i64.to_le_bytes().to_vec();
-        long.extend_from_slice(b"trailing");
-        assert_eq!(read_le_i64(&long), Some(42));
-        // Anything shorter than 8 bytes is None, not a panic.
-        for n in 0..8usize {
-            assert_eq!(read_le_i64(&vec![0u8; n]), None);
-        }
-        assert_eq!(read_le_i64(&[]), None);
     }
 }
 
@@ -7784,7 +7842,7 @@ mod catalog_contents_tests {
 
     /// Rule 5: a `secret` attach option never lands in `attach_opaque_data`
     /// -- not on an OS-owned transport where the value is plaintext, and so
-    /// not in the persisted `bufattach` copy either -- even with a declared
+    /// not in the persisted buffering-init copy either -- even with a declared
     /// default and a supplied value. Non-secret options still round-trip.
     #[test]
     fn secret_attach_options_never_enter_the_opaque_value() {

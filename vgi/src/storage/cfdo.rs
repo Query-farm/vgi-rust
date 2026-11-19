@@ -20,14 +20,24 @@
 //! | trait method   | endpoint(s)                                        |
 //! |----------------|----------------------------------------------------|
 //! | `kv_get`       | `state_get_many` (`ns = "kv"`, one key)            |
+//! | `kv_get_many`  | `state_get_many` (`ns = "kv"`, up to 1,000 keys)   |
 //! | `kv_put`       | `state_put_many` (`ns = "kv"`, one item)           |
+//! | `kv_put_many`  | `state_put_many` (`ns = "kv"`, ≤ 4 MiB per call)   |
 //! | `kv_del`       | `state_delete` (`ns = "kv"`, one key)              |
 //! | `append`       | `state_append` (`item` = value → `ordinal`)        |
+//! | `append_many`  | one `state_append` per value (see below)           |
 //! | `scan`         | `state_log_scan` (`after_id`, optional `limit`)    |
 //! | `queue_push`   | `queue_push` (`execution_id` = scope)              |
 //! | `queue_pop`    | `queue_pop`                                        |
 //! | `clear`        | `execution_clear` then `queue_clear`               |
 //! | `gc`           | no-op: each DO evicts itself through an idle alarm |
+//!
+//! `append_many` is the trait's default loop: the server has no batched log
+//! append (`state_append` takes one `item`, and its replay detection is one
+//! row per `attempt_id`), so a table-in-out FINALIZE flush over HTTP still
+//! costs one round trip per batch on this backend. A `state_append_many`
+//! endpoint (`items: [b64]` → `ordinals: [int]`, one transaction, replayed by
+//! `attempt_id`) would make it one call.
 //!
 //! # Sharding
 //!
@@ -61,7 +71,6 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
 use super::FunctionStorage;
 
@@ -75,30 +84,36 @@ const POST_ATTEMPTS: u32 = 3;
 /// Largest integer a JSON number carries exactly into the JavaScript server.
 const MAX_SAFE_JSON_INT: u64 = (1 << 53) - 1;
 
-/// The Durable Object routing key for a storage scope:
-/// `"exe-"` + the first 16 bytes of `sha256(scope)` in lowercase hex.
-///
-/// 36 characters, inside the server's `^[A-Za-z0-9._-]{1,128}$`, whatever the
-/// scope's length or bytes.
-pub fn shard_key_for_scope(scope: &[u8]) -> String {
-    let digest = Sha256::digest(scope);
-    format!("exe-{}", hex(&digest[..16]))
+/// Keys per `state_get_many` call from [`FunctionStorage::kv_get_many`]. The
+/// server chunks its own `IN` clause; this bounds the request, and a reply
+/// over the server's 8 MiB read budget (a 413) is retried in halves.
+const GET_MANY_KEYS: usize = 1000;
+
+/// Items per `state_put_many` call from [`FunctionStorage::kv_put_many`], and
+/// the raw key + value bytes per call (base64 grows it by a third).
+const PUT_MANY_ITEMS: usize = 1000;
+const PUT_MANY_BYTES: usize = 4 * 1024 * 1024;
+
+/// A failed logical call: the last HTTP status seen (if any) and why.
+#[derive(Debug)]
+pub(crate) struct PostError {
+    pub status: Option<u16>,
+    pub message: String,
 }
+
+impl fmt::Display for PostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+use super::hex;
+pub use super::shard_key_for_scope;
 
 /// A fresh idempotency token: 16 random bytes as 32 lowercase hex characters,
 /// the shape the server's `ATTEMPT_ID_RE` requires.
 pub fn new_attempt_id() -> String {
     hex(&rand::random::<[u8; 16]>())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(DIGITS[(b >> 4) as usize] as char);
-        s.push(DIGITS[(b & 0xf) as usize] as char);
-    }
-    s
 }
 
 fn b64(bytes: &[u8]) -> Value {
@@ -224,17 +239,29 @@ impl CfDoStorage {
         scope: &[u8],
         attempt_id: Option<&str>,
     ) -> Value {
-        let body = build_body(fields, &shard_key_for_scope(scope), attempt_id);
-        match self.post_body(endpoint, &body) {
+        match self.try_post(endpoint, fields, scope, attempt_id) {
             Ok(v) => v,
             Err(e) => panic!("vgi cloudflare-do storage: {e}"),
         }
     }
 
+    /// [`post`](Self::post) without the panic.
+    fn try_post(
+        &self,
+        endpoint: &str,
+        fields: Map<String, Value>,
+        scope: &[u8],
+        attempt_id: Option<&str>,
+    ) -> Result<Value, PostError> {
+        let body = build_body(fields, &shard_key_for_scope(scope), attempt_id);
+        self.post_body(endpoint, &body)
+    }
+
     /// The retry loop over a prepared body.
-    pub(crate) fn post_body(&self, endpoint: &str, body: &[u8]) -> Result<Value, String> {
+    pub(crate) fn post_body(&self, endpoint: &str, body: &[u8]) -> Result<Value, PostError> {
         let target = format!("{}/{endpoint}", self.url);
         let mut last_err = String::new();
+        let mut last_status = None;
         for attempt in 0..POST_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
@@ -255,6 +282,7 @@ impl CfDoStorage {
                 }
             };
             let status = resp.status().as_u16();
+            last_status = Some(status);
             // `state_log_scan` replies are unbounded by the server, so lift
             // ureq's 10 MB default rather than truncate into a decode error.
             let bytes = match resp.body_mut().with_config().limit(u64::MAX).read_to_vec() {
@@ -267,16 +295,54 @@ impl CfDoStorage {
             };
             match classify(endpoint, status, &bytes) {
                 Outcome::Done(v) => return Ok(v),
-                Outcome::Fatal(e) => return Err(e),
+                Outcome::Fatal(e) => {
+                    return Err(PostError {
+                        status: Some(status),
+                        message: e,
+                    })
+                }
                 Outcome::Retry(e) => {
                     log::debug!("cf-do {endpoint} attempt={attempt} retrying: {e}");
                     last_err = e;
                 }
             }
         }
-        Err(format!(
-            "{last_err} (gave up after {POST_ATTEMPTS} attempts)"
-        ))
+        Err(PostError {
+            status: last_status,
+            message: format!("{last_err} (gave up after {POST_ATTEMPTS} attempts)"),
+        })
+    }
+
+    /// One `state_get_many` over `keys`, halving on a 413 (the reply would
+    /// exceed the server's read budget).
+    fn get_many_chunk(&self, scope: &[u8], keys: &[Vec<u8>], out: &mut Vec<Option<Vec<u8>>>) {
+        let mut f = Self::scoped(scope, KV_NS);
+        f.insert(
+            "keys".into(),
+            Value::Array(keys.iter().map(|k| b64(k)).collect()),
+        );
+        match self.try_post("state_get_many", f, scope, None) {
+            Ok(data) => {
+                let rows = rows(&data, "state_get_many");
+                assert!(
+                    rows.len() == keys.len(),
+                    "vgi cloudflare-do storage: state_get_many returned {} rows for {} keys",
+                    rows.len(),
+                    keys.len()
+                );
+                out.extend(
+                    rows.iter().map(|r| {
+                        (!r.is_null()).then(|| decode(&r["value"], "state_get_many value"))
+                    }),
+                );
+            }
+            Err(e) if e.status == Some(413) && keys.len() > 1 => {
+                let (a, b) = keys.split_at(keys.len() / 2);
+                self.get_many_chunk(scope, a, out);
+                self.get_many_chunk(scope, b, out);
+            }
+            Err(e) => panic!("vgi cloudflare-do storage: {e}"),
+        }
     }
 
     fn scoped(scope: &[u8], ns: &[u8]) -> Map<String, Value> {
@@ -330,6 +396,46 @@ impl FunctionStorage for CfDoStorage {
             json!([{ "key": B64.encode(key), "value": B64.encode(value) }]),
         );
         self.post("state_put_many", f, scope, Some(&new_attempt_id()));
+    }
+
+    fn kv_get_many(&self, scope: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(GET_MANY_KEYS) {
+            self.get_many_chunk(scope, chunk, &mut out);
+        }
+        out
+    }
+
+    /// One `state_put_many` per chunk of at most `PUT_MANY_ITEMS` items and
+    /// `PUT_MANY_BYTES` of keys and values, each atomic on the server and
+    /// each with its own `attempt_id` (the server's replay check looks at a
+    /// call's first item).
+    fn kv_put_many(&self, scope: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
+        let mut start = 0;
+        while start < items.len() {
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < items.len()
+                && end - start < PUT_MANY_ITEMS
+                && (end == start
+                    || bytes + items[end].0.len() + items[end].1.len() <= PUT_MANY_BYTES)
+            {
+                bytes += items[end].0.len() + items[end].1.len();
+                end += 1;
+            }
+            let mut f = Self::scoped(scope, KV_NS);
+            f.insert(
+                "items".into(),
+                Value::Array(
+                    items[start..end]
+                        .iter()
+                        .map(|(k, v)| json!({ "key": B64.encode(k), "value": B64.encode(v) }))
+                        .collect(),
+                ),
+            );
+            self.post("state_put_many", f, scope, Some(&new_attempt_id()));
+            start = end;
+        }
     }
 
     fn kv_del(&self, scope: &[u8], key: &[u8]) {
@@ -596,7 +702,7 @@ mod tests {
     fn definitive_errors_do_not_retry_and_never_leak_the_token() {
         let (url, seen) = mock(vec![(401, r#"{"error":"unauthorized"}"#)]);
         let s = CfDoStorage::new(url, Some("tok-secret-xyz".into()));
-        let err = s.post_body("queue_pop", b"{}").unwrap_err();
+        let err = s.post_body("queue_pop", b"{}").unwrap_err().to_string();
         assert!(err.contains("authentication failed"), "{err}");
         assert!(!err.contains("tok-secret-xyz"));
         assert_eq!(seen.lock().unwrap().len(), 1);
@@ -606,7 +712,7 @@ mod tests {
     fn exhausted_retries_report_the_last_error() {
         let (url, seen) = mock(vec![(500, r#"{"error":"a"}"#); 3]);
         let s = CfDoStorage::new(url, None);
-        let err = s.post_body("queue_pop", b"{}").unwrap_err();
+        let err = s.post_body("queue_pop", b"{}").unwrap_err().to_string();
         assert!(err.contains("gave up after 3 attempts"), "{err}");
         assert_eq!(seen.lock().unwrap().len(), 3);
         // No token configured → no Authorization header.
@@ -614,6 +720,51 @@ mod tests {
             .0
             .to_ascii_lowercase()
             .contains("authorization"));
+    }
+
+    #[test]
+    fn get_many_batches_and_halves_on_413() {
+        let (url, seen) = mock(vec![
+            (413, r#"{"error":"payload_too_large"}"#),
+            (200, r#"{"rows":[{"value":"YQ=="},null]}"#),
+            (200, r#"{"rows":[{"value":"Yw=="},{"value":"ZA=="}]}"#),
+        ]);
+        let s = CfDoStorage::new(url, None);
+        let keys: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
+        assert_eq!(
+            s.kv_get_many(b"s", &keys),
+            vec![
+                Some(b"a".to_vec()),
+                None,
+                Some(b"c".to_vec()),
+                Some(b"d".to_vec())
+            ]
+        );
+        let seen = seen.lock().unwrap();
+        let first: Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(first["keys"].as_array().unwrap().len(), 4);
+        let half: Value = serde_json::from_str(&seen[1].1).unwrap();
+        assert_eq!(half["keys"], json!(["YQ==", "Yg=="]));
+        assert!(seen[0].0.starts_with("POST /state_get_many "));
+    }
+
+    #[test]
+    fn put_many_is_one_call_with_one_attempt_id() {
+        let (url, seen) = mock(vec![(200, "{}")]);
+        let s = CfDoStorage::new(url, None);
+        s.kv_put_many(
+            b"s",
+            &[
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ],
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let body: Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        assert_eq!(body["ns"], "a3Y=");
+        assert_eq!(body["attempt_id"].as_str().unwrap().len(), 32);
     }
 
     #[test]

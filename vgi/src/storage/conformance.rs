@@ -92,6 +92,50 @@ fn check_append_many(store: &dyn FunctionStorage) {
     store.clear(b"am");
 }
 
+/// `kv_get_many` / `kv_put_many` must be indistinguishable from the same
+/// single calls: order kept, absent keys `None`, a repeated key ends with its
+/// last value, scopes isolated, and an empty batch is a no-op.
+fn check_kv_many(store: &dyn FunctionStorage) {
+    let keys: Vec<Vec<u8>> = (0u8..40).map(|i| vec![b'g', i]).collect();
+    assert!(store.kv_get_many(b"km", &keys).iter().all(Option::is_none));
+    let items: Vec<(Vec<u8>, Vec<u8>)> = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 != 0)
+        .map(|(i, k)| (k.clone(), vec![i as u8; i + 1]))
+        .collect();
+    store.kv_put_many(b"km", &items);
+    store.kv_put_many(b"km", &[]);
+    let got = store.kv_get_many(b"km", &keys);
+    assert_eq!(got.len(), keys.len());
+    for (i, (k, v)) in keys.iter().zip(&got).enumerate() {
+        let want = (i % 3 != 0).then(|| vec![i as u8; i + 1]);
+        assert_eq!(v, &want, "key {i}");
+        assert_eq!(store.kv_get(b"km", k), want, "single read of key {i}");
+    }
+    // Overwrite through the batch; a key repeated in one batch keeps its last value.
+    store.kv_put_many(
+        b"km",
+        &[
+            (keys[1].clone(), b"x".to_vec()),
+            (keys[1].clone(), b"y".to_vec()),
+        ],
+    );
+    assert_eq!(store.kv_get(b"km", &keys[1]).as_deref(), Some(&b"y"[..]));
+    // A key may repeat in a read too.
+    assert_eq!(
+        store.kv_get_many(b"km", &[keys[1].clone(), keys[0].clone(), keys[1].clone()]),
+        vec![Some(b"y".to_vec()), None, Some(b"y".to_vec())]
+    );
+    assert!(store.kv_get_many(b"km", &[]).is_empty());
+    assert!(store
+        .kv_get_many(b"km-other", &keys[..2])
+        .iter()
+        .all(Option::is_none));
+    store.clear(b"km");
+    assert!(store.kv_get_many(b"km", &keys).iter().all(Option::is_none));
+}
+
 fn check_queue(store: &dyn FunctionStorage) {
     store.queue_push(b"q", &[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
     // FIFO order, each item claimed exactly once.
@@ -115,6 +159,7 @@ fn check_clear(store: &dyn FunctionStorage) {
 
 fn run_all(store: &dyn FunctionStorage) {
     check_kv(store);
+    check_kv_many(store);
     check_log(store);
     check_append_many(store);
     check_queue(store);
@@ -196,8 +241,23 @@ mod cloudflare_do_live {
         fn kv_del(&self, scope: &[u8], key: &[u8]) {
             self.inner.kv_del(&self.s(scope), key)
         }
+        fn kv_get_many(&self, scope: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+            self.inner.kv_get_many(&self.s(scope), keys)
+        }
+        fn kv_put_many(&self, scope: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
+            self.inner.kv_put_many(&self.s(scope), items)
+        }
         fn append(&self, scope: &[u8], ns: &[u8], key: &[u8], value: Vec<u8>) -> i64 {
             self.inner.append(&self.s(scope), ns, key, value)
+        }
+        fn append_many(
+            &self,
+            scope: &[u8],
+            ns: &[u8],
+            key: &[u8],
+            values: Vec<Vec<u8>>,
+        ) -> Vec<i64> {
+            self.inner.append_many(&self.s(scope), ns, key, values)
         }
         fn scan(
             &self,
@@ -326,6 +386,57 @@ mod cloudflare_do_live {
         assert!(msg.contains("413"), "{msg}");
         store.clear(&scope);
         assert_eq!(store.kv_get(&scope, b"k"), None);
+    }
+
+    /// Batches past one request's bounds: more keys than one
+    /// `state_get_many` / `state_put_many` carries, and values whose total
+    /// exceeds the server's 8 MiB read budget (the 413 is retried in halves).
+    #[test]
+    fn cloudflare_do_kv_many_chunks_and_bisects() {
+        let Some(store) = live() else { return };
+        let store = Fresh::new(store);
+        let keys: Vec<Vec<u8>> = (0u32..2500).map(|i| i.to_be_bytes().to_vec()).collect();
+        let items: Vec<(Vec<u8>, Vec<u8>)> = keys
+            .iter()
+            .map(|k| (k.clone(), [k.as_slice(), b"-v"].concat()))
+            .collect();
+        store.kv_put_many(b"many", &items);
+        let got = store.kv_get_many(b"many", &keys);
+        assert_eq!(got.len(), keys.len());
+        for ((_, v), g) in items.iter().zip(&got) {
+            assert_eq!(g.as_ref(), Some(v));
+        }
+
+        let big: Vec<(Vec<u8>, Vec<u8>)> = (0u8..12)
+            .map(|i| (vec![b'b', i], vec![i; 900 * 1024]))
+            .collect();
+        store.kv_put_many(b"big", &big);
+        let bk: Vec<Vec<u8>> = big.iter().map(|(k, _)| k.clone()).collect();
+        let got = store.kv_get_many(b"big", &bk);
+        for ((_, v), g) in big.iter().zip(&got) {
+            assert_eq!(g.as_ref(), Some(v));
+        }
+        store.clear(b"many");
+        store.clear(b"big");
+    }
+
+    /// A sealed framework record round-trips through the service and does not
+    /// open once moved to another execution's slot.
+    #[test]
+    fn cloudflare_do_sealed_record_round_trips() {
+        let Some(store) = live() else { return };
+        let store = Fresh::new(store);
+        let k = crate::storage::seal::derive_key(b"live-test-key");
+        crate::storage::seal::sealed_kv_put(&store, &k, b"exec-a", b"_vgi/x", b"context");
+        assert_eq!(
+            crate::storage::seal::sealed_kv_get(&store, &k, b"exec-a", b"_vgi/x").unwrap(),
+            Some(b"context".to_vec())
+        );
+        let blob = store.kv_get(b"exec-a", b"_vgi/x").unwrap();
+        store.kv_put(b"exec-b", b"_vgi/x", &blob);
+        assert!(crate::storage::seal::sealed_kv_get(&store, &k, b"exec-b", b"_vgi/x").is_err());
+        store.clear(b"exec-a");
+        store.clear(b"exec-b");
     }
 
     #[test]

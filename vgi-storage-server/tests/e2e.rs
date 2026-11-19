@@ -111,6 +111,36 @@ fn http_backend_conforms_end_to_end() {
 }
 
 #[test]
+fn batched_ops_round_trip_end_to_end() {
+    let server = start_server(None);
+    let store = client(&server, None);
+    let keys: Vec<Vec<u8>> = (0u8..5).map(|i| vec![i]).collect();
+    store.kv_put_many(
+        b"bm",
+        &[
+            (keys[0].clone(), b"a".to_vec()),
+            (keys[3].clone(), b"d".to_vec()),
+        ],
+    );
+    assert_eq!(
+        store.kv_get_many(b"bm", &keys),
+        vec![Some(b"a".to_vec()), None, None, Some(b"d".to_vec()), None]
+    );
+    let first = store.append(b"bm", b"ns", b"k", b"0".to_vec());
+    let ids = store.append_many(b"bm", b"ns", b"k", vec![b"1".to_vec(), b"2".to_vec()]);
+    assert_eq!(ids.len(), 2);
+    assert!(ids[0] > first && ids[1] > ids[0]);
+    assert_eq!(
+        store
+            .scan(b"bm", b"ns", b"k", -1, usize::MAX)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<_>>(),
+        vec![b"0".to_vec(), b"1".to_vec(), b"2".to_vec()]
+    );
+}
+
+#[test]
 fn bearer_auth_is_enforced() {
     let server = start_server(Some("s3cret"));
     // Correct token works.

@@ -701,13 +701,10 @@ impl SumAllColumnsFunction {
             _ => BufferedCacheBehavior::None,
         }
     }
-    /// Whether the `logging` flag (persisted at sink init) is set for this run.
+    /// Whether the `logging` named argument is set for this run (the
+    /// framework replays the bind's arguments onto every process / combine).
     fn logging_enabled(params: &BufferingParams) -> bool {
-        params
-            .storage
-            .kv_get(&params.execution_id, b"bufflags")
-            .map(|b| b.first() == Some(&1))
-            .unwrap_or(false)
+        params.arguments.named_bool("logging").unwrap_or(false)
     }
     /// Sum one (already int64/float64-typed) column to a 1-element array.
     fn sum_column(field_type: &DataType, col: &ArrayRef) -> Result<ArrayRef> {

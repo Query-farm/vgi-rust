@@ -22,13 +22,21 @@
 //!   the other VGI SDKs use, for multi-host deployments with no storage server
 //!   of their own to run (feature `cloudflare-do`).
 //!
-//! The method surface is intentionally **infallible**: a backend that can't
-//! complete an operation logs and degrades (reads → empty, writes → dropped),
-//! matching the original filesystem store's best-effort contract.
-//! The remote `HttpStorage` retries internally and, on an unrecoverable error, panics —
-//! which the RPC layer's panic isolation converts into a clean per-call error
-//! rather than taking down the worker. (Surfacing storage errors as `Result`
-//! to callers is a planned refinement.)
+//! The method surface is intentionally **infallible**: a local backend that
+//! can't complete an operation logs and degrades (reads → empty, writes →
+//! dropped), matching the original filesystem store's best-effort contract.
+//! The remote backends (`HttpStorage`, `CfDoStorage`) retry internally and, on
+//! an unrecoverable error or a reply they cannot decode, panic. That is
+//! deliberate: vgi-rpc runs every handler under panic isolation, so the panic
+//! becomes a clean per-call error for the one RPC (never a crashed worker),
+//! and an infallible trait leaves no way to report the failure that would not
+//! silently hand the caller an empty value. (Surfacing storage errors as
+//! `Result` would change the trait every user function sees, and is left for
+//! a breaking release.)
+//!
+//! The framework's own context (buffered-function init records, aggregate
+//! arguments, streaming-aggregate sessions) is written **sealed**; see
+//! [`seal`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,8 +54,33 @@ pub use memory::MemoryStorage;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStorage;
 
+pub mod seal;
+
 #[cfg(test)]
 mod conformance;
+
+/// The Durable Object routing key for a storage scope:
+/// `"exe-"` + the first 16 bytes of `sha256(scope)` in lowercase hex.
+///
+/// 36 characters, inside the `cloudflare-do` server's
+/// `^[A-Za-z0-9._-]{1,128}$`, whatever the scope's length or bytes. Also the
+/// `shard_key` a [`seal`]ed payload's AAD binds, on every backend.
+pub fn shard_key_for_scope(scope: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(scope);
+    format!("exe-{}", hex(&digest[..16]))
+}
+
+/// Lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(DIGITS[(b >> 4) as usize] as char);
+        s.push(DIGITS[(b & 0xf) as usize] as char);
+    }
+    s
+}
 
 /// Backend contract for cross-process worker state. Keys are opaque byte
 /// strings; `scope` is the execution id (or a transaction id). Implementations
@@ -61,6 +94,25 @@ pub trait FunctionStorage: Send + Sync {
     fn kv_put(&self, scope: &[u8], key: &[u8], value: &[u8]);
     /// Delete `(scope, key)` if present.
     fn kv_del(&self, scope: &[u8], key: &[u8]);
+
+    /// Read several keys of one scope, in order: one entry per key, `None`
+    /// where absent. Defaults to one [`kv_get`](Self::kv_get) per key.
+    ///
+    /// Worth overriding wherever a call carries fixed cost (a network round
+    /// trip, a lock, a statement): an aggregate `update` reads every group of
+    /// a batch through this, once per batch.
+    fn kv_get_many(&self, scope: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        keys.iter().map(|k| self.kv_get(scope, k)).collect()
+    }
+
+    /// Overwrite several `(key, value)` pairs of one scope. Defaults to one
+    /// [`kv_put`](Self::kv_put) per pair. A key that repeats ends with its
+    /// last value.
+    fn kv_put_many(&self, scope: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
+        for (k, v) in items {
+            self.kv_put(scope, k, v);
+        }
+    }
 
     // --- append-only log, keyed by (scope, ns, key) ---
 

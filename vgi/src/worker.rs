@@ -97,6 +97,14 @@ impl ServeTransport {
 /// [`Worker::signing_key`]).
 pub const SIGNING_KEY_ENV: &str = "VGI_SIGNING_KEY";
 
+/// The key bytes a configured `VGI_SIGNING_KEY` value stands for: its UTF-8
+/// bytes exactly as configured, never hex- or base64-decoded (the cross-SDK
+/// rule: the sealed-storage, opaque-value and ticket keys derive from these
+/// bytes in every SDK). Empty counts as unset.
+pub(crate) fn signing_key_bytes(value: Option<String>) -> Option<Vec<u8>> {
+    value.filter(|v| !v.is_empty()).map(String::into_bytes)
+}
+
 /// Environment variable naming the principals allowed to call
 /// `vgi_rpc.Identity.v2`'s `introspect_token`, comma-separated.
 pub const INTROSPECT_PRINCIPALS_ENV: &str = "VGI_INTROSPECT_PRINCIPALS";
@@ -603,18 +611,17 @@ impl Worker {
             let key = self
                 .signing_key
                 .clone()
-                .or_else(|| {
-                    std::env::var(SIGNING_KEY_ENV)
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .map(String::into_bytes)
-                })
+                .or_else(|| signing_key_bytes(std::env::var(SIGNING_KEY_ENV).ok()))
                 .unwrap_or_else(|| {
                     let mut key = vec![0u8; 32];
                     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
                     key
                 });
             disp.opaque = Some(crate::opaque::OpaqueSealer::new(key.clone()));
+            // Framework payloads in shared storage are sealed under the
+            // signing key exactly as resolved (see `storage::seal`); the
+            // OS-owned transports fall back to the host-local key file.
+            disp.storage_seal_root = Some(key.clone());
             disp.secret_root = Some(key);
         }
         if let Some(root) = &self.attach_secret_key {
@@ -636,10 +643,7 @@ impl Worker {
             // Attach tickets: the key is configured, never generated (this SDK
             // has no generated key), so every ticket survives a restart.
             let signing_key = self.signing_key.clone().or_else(|| {
-                std::env::var(crate::attach_ticket::SIGNING_KEY_ENV)
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .map(String::into_bytes)
+                signing_key_bytes(std::env::var(crate::attach_ticket::SIGNING_KEY_ENV).ok())
             });
             if let Some(key) = signing_key {
                 disp.ticket_key = Some(key.clone());

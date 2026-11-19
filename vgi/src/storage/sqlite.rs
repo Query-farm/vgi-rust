@@ -123,6 +123,66 @@ impl FunctionStorage for SqliteStorage {
         Self::touch(&conn, scope);
     }
 
+    /// One prepared statement under one lock for the whole batch.
+    fn kv_get_many(&self, scope: &[u8], keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare_cached("SELECT value FROM function_state WHERE scope = ?1 AND key = ?2")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("vgi sqlite kv_get_many prepare: {e}");
+                return vec![None; keys.len()];
+            }
+        };
+        keys.iter()
+            .map(|k| {
+                stmt.query_row(params![scope, k], |row| row.get::<_, Vec<u8>>(0))
+                    .optional()
+                    .unwrap_or_else(|e| {
+                        log::warn!("vgi sqlite kv_get_many: {e}");
+                        None
+                    })
+            })
+            .collect()
+    }
+
+    /// One transaction for the whole batch (one WAL commit, not one per key).
+    fn kv_put_many(&self, scope: &[u8], items: &[(Vec<u8>, Vec<u8>)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("vgi sqlite kv_put_many tx: {e}");
+                return;
+            }
+        };
+        {
+            let mut stmt = match tx.prepare(
+                "INSERT INTO function_state (scope, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("vgi sqlite kv_put_many prepare: {e}");
+                    return;
+                }
+            };
+            for (k, v) in items {
+                if let Err(e) = stmt.execute(params![scope, k, v]) {
+                    log::warn!("vgi sqlite kv_put_many: {e}");
+                }
+            }
+        }
+        Self::touch(&tx, scope);
+        if let Err(e) = tx.commit() {
+            log::warn!("vgi sqlite kv_put_many commit: {e}");
+        }
+    }
+
     fn kv_del(&self, scope: &[u8], key: &[u8]) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(

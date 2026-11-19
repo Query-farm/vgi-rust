@@ -10,6 +10,41 @@
   `vgi::storage::CfDoStorage` shards by storage scope and retries with a stable
   `attempt_id`. Selecting `cloudflare-do` in a build without the feature now
   fails at startup instead of falling back to per-machine storage.
+- **Framework state in storage is sealed** (sealed framework payload v1, the
+  cross-SDK format: HKDF-SHA256 of the signing key, or of the host-local key
+  file on stdio/unix/TCP, then AES-256-GCM with the storage slot as AAD; see
+  `vgi::storage::seal`). A buffered function's init context (schemas,
+  arguments, resolved secrets, `COPY ... TO` path, attach scope), an
+  aggregate's bind-time arguments and a streaming aggregate's session no
+  longer sit in shared storage in plaintext, and a tampered, moved or unsealed
+  record is an error instead of being trusted (a rewritten `COPY ... TO` path
+  could previously redirect a writer's output with the caller's secrets).
+  Executions are short-lived, so state written by an older release mid-query
+  is not migrated: such a query fails and is re-run.
+- **Fewer storage round trips.** The buffered init is one record (one write,
+  was up to nine), read once per worker process and then served from a
+  process-local cache: a buffered `process` / `combine` makes no framework
+  reads after the first (was seven per batch, eight for `COPY ... TO`). The
+  request's own `attach_opaque_data` and `schema_path` are used directly.
+  Aggregate `update` / `combine` / `finalize` make two storage calls each
+  (were two per group, three per merged pair, and one per group plus one).
+- **`FunctionStorage::kv_get_many` / `kv_put_many`** (default: a loop of the
+  single-key calls). Batched in the memory and SQLite backends (one lock / one
+  transaction), `cloudflare-do` (`state_get_many` / `state_put_many`) and
+  `http`, where new `KvGetMany` / `KvPutMany` / `AppendMany` ops (appended to
+  `StorageOp`, so old tags are unchanged) make `append_many` one round trip
+  too. `vgi-storage-server` serves them; a client talking to an older server
+  falls back to single ops after the first 400.
+- **Breaking (internal storage keys):** the framework no longer writes the
+  `outsc` / `insc` / `bufargs` / `bufflags` / `bufattach` / `bufschema` /
+  `bufsecrets` / `copytofmt` / `copytopath` / `aggargs` / `strm_pkc` /
+  `strm_okc` / `strm_sos` keys. A function that read one directly from
+  `params.storage` must use `BufferingParams` instead (e.g.
+  `params.arguments.named_bool("logging")` for the old `bufflags`, as the
+  example worker now does).
+- Missing or undecodable framework state is an error, not a silent default
+  (empty arguments, empty secrets, a guessed output schema). The `http`
+  backend no longer turns a reply of the wrong shape into an empty value.
 
 ## 0.51.1 (2026-11-16)
 

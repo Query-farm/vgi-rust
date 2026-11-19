@@ -316,7 +316,7 @@ fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
 }
 
 /// HKDF-SHA256 with an empty salt and `L = 32` (one block).
-fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
+pub(crate) fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
     let prk = hmac_sha256(&[0u8; 32], &[ikm]);
     hmac_sha256(&prk, &[info, &[1u8]])
 }
@@ -372,7 +372,7 @@ fn key_for_id(id: &[u8]) -> Option<[u8; KEY_LEN]> {
 }
 
 /// The host-local root key, read (or created) once per process.
-fn host_local_root() -> Result<Vec<u8>> {
+pub(crate) fn host_local_root() -> Result<Vec<u8>> {
     static ROOT: OnceLock<Vec<u8>> = OnceLock::new();
     if let Some(r) = ROOT.get() {
         return Ok(r.clone());
