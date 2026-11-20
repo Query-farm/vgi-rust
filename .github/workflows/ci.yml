@@ -17,7 +17,7 @@ permissions:
 
 env:
   # vgi protocol-3.4 (upload URLs v2, protocol 3.4.0). TODO(release-wave).
-  VGI_REF: 865022e2557c6942187a659e2a9bd4fa68253d4e
+  VGI_REF: 653b879c1131a18594918874e8f670d274a37ccb
   VGI_NATIVE_RUNNER_BRANCH: v2.0
   CARGO_TERM_COLOR: always
 

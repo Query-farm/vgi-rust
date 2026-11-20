@@ -53,9 +53,9 @@ opt-level = 2
 # pointer digests), which builds on the blob-vendor client; patching them all
 # keeps one copy of each.
 [patch.crates-io]
-vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
-vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
-vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
-vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
-vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
-vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
+vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
+vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
+vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
+vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
+vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d9106ab0e4aad52f52c2c38901eaf8f9b0e62ead" }
