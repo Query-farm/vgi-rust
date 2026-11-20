@@ -28,7 +28,8 @@ env:
   # f9e5df3 adds the blob-vendor lane's contract (test/sql/external_storage,
   # test/start_fake_blob_vendor.sh, docs/testing/blob-test-catalog.md).
   # 865022e is vgi protocol-3.4: protocol 3.4.0, upload URLs v2 and
-  # external_storage/upload_integrity.test. TODO(release-wave).
+  # external_storage/upload_integrity.test, and includes 91f8d63
+  # (scan_planning_predicates*.test over data.planned_events). TODO(release-wave).
   VGI_REF: 865022e2557c6942187a659e2a9bd4fa68253d4e
   # The fake blob vendor with sized-PUT verification and the upload fault
   # (vgi-rpc-python protocol-3.4); overrides start_fake_blob_vendor.sh's pin.
