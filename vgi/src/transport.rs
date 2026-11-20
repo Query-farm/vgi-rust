@@ -445,8 +445,9 @@ fn format_http_bind(host: &str, port: u16) -> String {
 /// - `VGI_RPC_MAX_REQUEST_BYTES`: advertised (`VGI-Max-Request-Bytes`) and
 ///   enforced (413) inline-request cap.
 /// - With the blob vendor (`VGI_BLOB_VENDOR_URL`, feature `blob-vendor`):
-///   `VGI-Upload-URL-Support` with upload URLs vended by the vendor, so a
-///   client sends a larger request as an upload pointer, and
+///   `VGI-Upload-URL-Support: 2` with sized, checksummed upload URLs vended by
+///   the vendor (`/v1/blobs/put`, purpose `rpc`), so a client sends a larger
+///   request as an upload pointer carrying `vgi_rpc.location.sha256`, and
 ///   `VGI_RPC_MAX_UPLOAD_BYTES` advertised as `VGI-Max-Upload-Bytes`.
 ///
 /// Read before the tokio runtime starts: the vendor's blocking HTTP client

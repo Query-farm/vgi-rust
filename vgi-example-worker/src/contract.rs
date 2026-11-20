@@ -1,7 +1,7 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
 //! `example.contract`: the cross-SDK table-contract fixtures (protocol
-//! `vgi.v3` / 3.3), served by every SDK's standard example worker and driven by
+//! `vgi.v3` / 3.4), served by every SDK's standard example worker and driven by
 //! vgi's `visibility/example_table_only.test`,
 //! `write_contract/example_insert_finalize.test` and
 //! `write_contract/example_decimal_width.test`.

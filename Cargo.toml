@@ -47,14 +47,15 @@ env_logger = "0.11"
 [profile.release]
 opt-level = 2
 
-# TODO(release-wave): switch to vgi-rpc 0.32.5 (or whatever the wave cuts) and
-# drop this section. Until then every vgi-rpc-rust crate comes from the commit
-# that adds the blob-vendor client (`vgi_rpc_s3::vendor`) and lets a handler
-# panic with an `RpcError` payload; patching them all keeps one copy of each.
+# TODO(release-wave): switch to the vgi-rpc release the wave cuts and drop this
+# section. Until then every vgi-rpc-rust crate comes from the `protocol-3.4`
+# branch commit (upload URLs v2, `VGI-Upload-URL-Support: 2`, mandatory request
+# pointer digests), which builds on the blob-vendor client; patching them all
+# keeps one copy of each.
 [patch.crates-io]
-vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
-vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
-vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
-vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
-vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
-vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "951c287ea0c49b07d061003f269244c35804ccb8" }
+vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }
+vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "b2f0bccb4afd758ea42c5b5d7a2db024122e221a" }

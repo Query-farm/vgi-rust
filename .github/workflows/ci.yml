@@ -16,7 +16,8 @@ permissions:
   actions: read
 
 env:
-  VGI_REF: 9dae8d55c9692cbd8b69d021c28b20a09aeee438
+  # vgi protocol-3.4 (upload URLs v2, protocol 3.4.0). TODO(release-wave).
+  VGI_REF: 865022e2557c6942187a659e2a9bd4fa68253d4e
   VGI_NATIVE_RUNNER_BRANCH: v2.0
   CARGO_TERM_COLOR: always
 

@@ -50,7 +50,11 @@
 /// `ScanBranch.row_count` / `ScanBranch.column_statistics`. Protocol 3.3 adds
 /// `FunctionInfo.visibility` (`public` / `table_only`): every function a table
 /// names is listed, and the ones only tables may use are `table_only`.
-pub const VGI_PROTOCOL_VERSION: &str = "3.3.0";
+/// Protocol 3.4 changes no `vgi.v3` message: it marks the move to sized,
+/// checksummed client uploads (vgi-rpc `VGI-Upload-URL-Support: 2`) and makes
+/// `vgi_rpc.location.sha256` mandatory on every external-location pointer, so
+/// every peer moves together.
+pub const VGI_PROTOCOL_VERSION: &str = "3.4.0";
 /// RPC protocol name — the `vgi_rpc.protocol` routing key every VGI request
 /// carries, and the name this worker advertises as hosting.
 ///

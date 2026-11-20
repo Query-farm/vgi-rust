@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **vgi protocol 3.4.0** (breaking: exact major+minor match, so it pairs only
+  with a 3.4 extension). No `vgi.v3` message changes; 3.4 marks the move to
+  vgi-rpc's upload-URL protocol v2 and mandatory pointer digests:
+  - `--http` with the blob vendor advertises `VGI-Upload-URL-Support: 2`. Each
+    `__upload_url__/init` entry carries the body's size and SHA-256, and the
+    vendor's sized `/v1/blobs/put` (purpose `rpc`) signs the PUT for exactly
+    that body, so storage refuses anything else. The retired `count` request is
+    refused with a 400.
+  - A request pointer must carry `vgi_rpc.location.sha256`; the worker verifies
+    the fetched bytes against it before decoding.
+  - Requires the unreleased vgi-rpc-rust `protocol-3.4` branch (pinned with
+    `[patch.crates-io]`, `TODO(release-wave)`).
+
 - **Blob-vendor externalization** (feature `blob-vendor`; the example worker
   enables it). Port of vgi-python's `function_storage_blobs` and serve wiring:
   - `storage::blobs::ExternalizingStorage` wraps any backend in the v1 value

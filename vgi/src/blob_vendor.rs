@@ -9,9 +9,11 @@
 //!   `VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` (default 1 MiB) to the vendor,
 //!   replacing them with pointers that carry `vgi_rpc.location.sha256`, and
 //!   compresses them per `VGI_RPC_EXTERNAL_COMPRESSION`;
-//! - vends client upload URLs (`__upload_url__/init`) from the vendor and
-//!   accepts requests sent as upload pointers, fetching only from the vendor's
-//!   storage hosts;
+//! - vends client upload URLs (`__upload_url__/init`, `VGI-Upload-URL-Support:
+//!   2`) from the vendor, each signed for the client's declared size and
+//!   SHA-256 so the storage refuses any other body, and accepts requests sent
+//!   as upload pointers (which must carry `vgi_rpc.location.sha256`, verified
+//!   before decoding), fetching only from the vendor's storage hosts;
 //! - advertises `VGI_RPC_MAX_UPLOAD_BYTES`.
 //!
 //! `VGI_RPC_MAX_REQUEST_BYTES` is honoured on every HTTP worker (see
