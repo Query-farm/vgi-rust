@@ -493,6 +493,154 @@ fn filtered_scan_planning_round_trips() {
     client.detach(&cat).expect("detach");
 }
 
+/// A VGI Filter Encoding v2 snapshot over `data.planned_events` with one
+/// advisory `<column> <op> <literal>` predicate per entry.
+fn planned_events_filter(
+    predicates: &[(&str, usize, &str, arrow_array::ArrayRef)],
+) -> vgi_client::Bytes {
+    use std::sync::Arc;
+    let expressions: Vec<String> = predicates
+        .iter()
+        .enumerate()
+        .map(|(i, (column, index, op, _))| {
+            format!(
+                r#"{{"id":"query:{i}","revision":0,"mode":"advisory","source":"query","expression":{{"node":"comparison","op":"{op}","left":{{"node":"column_ref","column_index":{index},"column_name":"{column}"}},"right":{{"node":"literal","value_ref":{i}}}}}}}"#
+            )
+        })
+        .collect();
+    let document = format!(
+        r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{}]}}"#,
+        expressions.join(",")
+    );
+    let mut fields = vec![arrow_schema::Field::new(
+        "filter_spec",
+        DataType::Utf8,
+        false,
+    )];
+    let mut arrays: Vec<arrow_array::ArrayRef> =
+        vec![Arc::new(arrow_array::StringArray::from(vec![document]))];
+    for (i, (_, _, _, value)) in predicates.iter().enumerate() {
+        fields.push(arrow_schema::Field::new(
+            format!("value_{i}"),
+            value.data_type().clone(),
+            true,
+        ));
+        arrays.push(value.clone());
+    }
+    let schema = arrow_schema::Schema::new_with_metadata(
+        fields,
+        std::collections::HashMap::from([
+            (
+                "vgi_filter_encoding".to_string(),
+                "vgi.filters.v2".to_string(),
+            ),
+            ("vgi_filter_version".to_string(), "2".to_string()),
+            (
+                "vgi_evaluation_context".to_string(),
+                "vgi.none.v1".to_string(),
+            ),
+        ]),
+    );
+    let batch = arrow_array::RecordBatch::try_new(Arc::new(schema), arrays).unwrap();
+    vgi_client::Bytes::from(vgi::ipc::write_batch(&batch).unwrap())
+}
+
+/// `data.planned_events`: a filtered mixed-type table that prunes days on
+/// `event_date` / `ts` statistics and records every planning call (planned
+/// days and described filters, `null` when none arrived) in
+/// `planned_events_last_plan.json`, as vgi-python's fixture does.
+#[test]
+fn planned_events_records_every_planning_call() {
+    use std::sync::Arc;
+    let _ = worker_or_skip!();
+    let mut client = connect().unwrap();
+    let cat = client
+        .attach("example", AttachOptions::default())
+        .expect("attach");
+    let table = client
+        .table_get(&cat, "data", "planned_events", None)
+        .expect("catalog_table_get(planned_events)")
+        .expect("example worker did not advertise data.planned_events");
+    assert_eq!(table.scan_planning, "filtered");
+    let columns = vgi_protocol::ipc::read_schema(&table.columns.0).expect("decode columns");
+    let names: Vec<&str> = columns.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(
+        names,
+        ["event_date", "ts", "series", "ticker", "n", "price", "flag"]
+    );
+
+    let branch_dir = std::env::var("VGI_TEST_BRANCH_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned())
+        .replace('\\', "/");
+    let record = std::path::Path::new(branch_dir.trim_end_matches('/'))
+        .join("planned_events_last_plan.json");
+    let mut plan = |filters: Option<vgi_client::Bytes>| {
+        let _ = std::fs::remove_file(&record);
+        let result = client
+            .table_scan_branches_with_filters(&cat, &table, None, filters)
+            .expect("planned_events planning");
+        let rows: Vec<i64> = result.branches.iter().filter_map(|b| b.row_count).collect();
+        (rows, std::fs::read_to_string(&record).expect("plan record"))
+    };
+    let days = |list: &[u8]| {
+        list.iter()
+            .map(|d| format!("\"2026-10-0{d}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // 2026-10-04 05:00 UTC, in microseconds.
+    let cutoff = (20_727_i64 + 3) * 86_400_000_000 + 5 * 3_600_000_000;
+    let ts =
+        Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![cutoff]).with_timezone("UTC"));
+    let (rows, recorded) = plan(Some(planned_events_filter(&[("ts", 1, "ge", ts)])));
+    assert_eq!(rows, [20]);
+    assert_eq!(
+        recorded,
+        format!(r#"{{"days": [{}], "filters": ["ts GE"]}}"#, days(&[4, 5]))
+    );
+
+    // A predicate on a column without statistics reaches the worker but prunes nothing.
+    let date = Arc::new(arrow_array::Date32Array::from(vec![20_727 + 1]));
+    let n = Arc::new(arrow_array::Int64Array::from(vec![3]));
+    let (rows, recorded) = plan(Some(planned_events_filter(&[
+        ("n", 4, "lt", n.clone()),
+        ("event_date", 0, "eq", date),
+    ])));
+    assert_eq!(rows, [10]);
+    assert_eq!(
+        recorded,
+        format!(
+            r#"{{"days": [{}], "filters": ["event_date EQ", "n LT"]}}"#,
+            days(&[2])
+        )
+    );
+    let (rows, recorded) = plan(Some(planned_events_filter(&[("n", 4, "lt", n)])));
+    assert_eq!(rows, [50]);
+    assert_eq!(
+        recorded,
+        format!(
+            r#"{{"days": [{}], "filters": ["n LT"]}}"#,
+            days(&[1, 2, 3, 4, 5])
+        )
+    );
+
+    // A planning call without predicates records filters: null.
+    let (rows, recorded) = plan(None);
+    assert_eq!(rows, [50]);
+    assert_eq!(
+        recorded,
+        format!(
+            r#"{{"days": [{}], "filters": null}}"#,
+            days(&[1, 2, 3, 4, 5])
+        )
+    );
+
+    client.detach(&cat).expect("detach");
+}
+
 #[test]
 fn reports_a_catalog_version() {
     let _ = worker_or_skip!();

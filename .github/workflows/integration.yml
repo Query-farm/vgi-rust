@@ -26,8 +26,9 @@ concurrency:
 env:
   # Match the test suite to the native runner built from this exact revision.
   # f9e5df3 adds the blob-vendor lane's contract (test/sql/external_storage,
-  # test/start_fake_blob_vendor.sh, docs/testing/blob-test-catalog.md).
-  VGI_REF: f9e5df356dcc8fd18f545a3a348ca364ae58fe0e
+  # test/start_fake_blob_vendor.sh, docs/testing/blob-test-catalog.md); 91f8d63
+  # adds scan_planning_predicates*.test over the data.planned_events fixture.
+  VGI_REF: 91f8d6355e1d86d2c6168e4c3a93396108a209c0
   VGI_NATIVE_RUNNER_BRANCH: v2.0
 
 jobs:

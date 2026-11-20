@@ -22,6 +22,18 @@
     `vendor` lane: the http suite plus `test/sql/external_storage/*` against the
     fake blob vendor.
 
+- **`PushdownFilters::describe()`**: one stable, sorted line per pushed
+  predicate (`"col OP"`, `"col IsNull"`, `"col In"`, `"And(...)"`, otherwise
+  `"<first column> V2Expression"`), byte-identical to vgi-python's fixture
+  description, for tests and diagnostics that assert what reached the worker.
+- The example worker serves **`data.planned_events`** (vgi-python 3cf1489): a
+  `scan_planning = filtered` table with DATE, TIMESTAMPTZ, VARCHAR, BIGINT,
+  DOUBLE and BOOLEAN columns over `planned_events_<day>.parquet`. It prunes days
+  on `event_date` / `ts` statistics and writes every planning call's days and
+  described filters to `planned_events_last_plan.json`, for vgi's
+  `catalog/scan_planning_predicates*.test` and `table/comments.test`. CI pins
+  the shared suite to vgi 91f8d63.
+
 ## 0.52.0 (2026-11-19)
 
 - **Cloudflare Durable Object storage backend** (feature `cloudflare-do`).

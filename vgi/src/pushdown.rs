@@ -640,6 +640,26 @@ impl PushdownFilters {
             .map(|p| filter_view(&p.expression))
             .collect()
     }
+    /// One stable line per predicate, sorted: what reached the worker, for
+    /// test assertions and diagnostics.
+    ///
+    /// `"col OP"` for a column-first comparison with a literal (`OP` is `EQ`,
+    /// `NE`, `LT`, `LE`, `GT` or `GE`; a bare BOOLEAN column reads as
+    /// `"flag EQ"`), `"col IsNull"` / `"col IsNotNull"` / `"col In"`,
+    /// `"And(...)"` / `"Or(...)"` when every child has one of these forms, and
+    /// `"col V2Expression"` (its first column) for anything else. A predicate
+    /// that names no column is left out. Byte-identical to the description
+    /// vgi-python's fixture worker writes (`_describe_filter` over its filter
+    /// views), so the shared suite can assert it against any SDK.
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .predicates
+            .iter()
+            .filter_map(|p| describe_view(&p.expression).or_else(|| describe_other(&p.expression)))
+            .collect();
+        lines.sort();
+        lines
+    }
     pub fn get_column_filters(&self, column: &str) -> Vec<Filter> {
         self.predicates
             .iter()
@@ -1877,6 +1897,78 @@ fn filter_view(expression: &Expr) -> Filter {
     }
 }
 
+/// [`PushdownFilters::describe`] for the shapes vgi-python projects into its
+/// convenience filter classes; `None` for everything else.
+fn describe_view(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Comparison { op, left, right } => {
+            if let (Expr::Column { name, .. }, Expr::Literal(_)) = (left.as_ref(), right.as_ref()) {
+                if matches!(op.as_str(), "eq" | "ne" | "lt" | "le" | "gt" | "ge") {
+                    return Some(format!("{name} {}", op.to_uppercase()));
+                }
+            }
+        }
+        Expr::IsNull {
+            expression,
+            negated,
+        } => {
+            if let Expr::Column { name, .. } = expression.as_ref() {
+                let kind = if *negated { "IsNotNull" } else { "IsNull" };
+                return Some(format!("{name} {kind}"));
+            }
+        }
+        Expr::In {
+            expression,
+            negated: false,
+            ..
+        } => {
+            if let Expr::Column { name, .. } = expression.as_ref() {
+                return Some(format!("{name} In"));
+            }
+        }
+        Expr::And(children) | Expr::Or(children) => {
+            let kind = if matches!(expression, Expr::And(_)) {
+                "And"
+            } else {
+                "Or"
+            };
+            let described = children
+                .iter()
+                .map(describe_view)
+                .collect::<Option<Vec<_>>>()?;
+            return Some(format!("{kind}({})", described.join(", ")));
+        }
+        _ => {}
+    }
+    boolean_column_leaf(expression).map(|(name, _)| format!("{name} EQ"))
+}
+
+/// [`PushdownFilters::describe`] for an expression with no convenience view:
+/// its first column, in expression order.
+fn describe_other(expression: &Expr) -> Option<String> {
+    fn first_column(expression: &Expr) -> Option<&str> {
+        match expression {
+            Expr::Column { name, .. } => Some(name),
+            Expr::Field { expression, .. }
+            | Expr::Not(expression)
+            | Expr::Negate(expression)
+            | Expr::IsNull { expression, .. }
+            | Expr::In { expression, .. }
+            | Expr::Cast { expression, .. } => first_column(expression),
+            Expr::Comparison { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+                first_column(left).or_else(|| first_column(right))
+            }
+            Expr::And(values)
+            | Expr::Or(values)
+            | Expr::Call {
+                arguments: values, ..
+            } => values.iter().find_map(first_column),
+            Expr::Literal(_) | Expr::RuntimeFilter => None,
+        }
+    }
+    first_column(expression).map(|name| format!("{name} V2Expression"))
+}
+
 fn constant_for(expression: &Expr, column: &str) -> Option<ArrayRef> {
     match expression {
         Expr::Comparison { op, left, right } if op == "eq" && root_column(left) == Some(column) => {
@@ -2440,6 +2532,92 @@ mod tests {
         // must not make it look like one.
         let bytes = bool_predicate(r#"{"node":"column_ref","column_index":1,"column_name":"n"}"#);
         assert!(PushdownFilters::parse_with_schema(&bytes, bool_schema()).is_err());
+    }
+
+    #[test]
+    fn describe_matches_the_python_fixture_description() {
+        // One predicate per shape vgi-python's `_describe_filter` distinguishes:
+        // its convenience views ("col OP", "col IsNull", "col In", And/Or of
+        // views) and everything else as "<first column> V2Expression".
+        const N: &str = r#"{"node":"column_ref","column_index":1,"column_name":"n"}"#;
+        let lit = |i: usize| format!(r#"{{"node":"literal","value_ref":{i}}}"#);
+        let cmp = |op: &str, left: &str, right: &str| {
+            format!(r#"{{"node":"comparison","op":"{op}","left":{left},"right":{right}}}"#)
+        };
+        let list = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0_i32, 2].into()),
+            Arc::new(Int64Array::from(vec![2, 4])) as ArrayRef,
+            None,
+        )) as ArrayRef;
+        let in_set = |negated: bool| {
+            format!(
+                r#"{{"node":"in","expression":{N},"set":{{"kind":"literal","value_ref":6}},"negated":{negated}}}"#
+            )
+        };
+        let expressions = [
+            cmp("ge", N, &lit(0)),
+            cmp("lt", &lit(1), N),
+            cmp("distinct_from", N, &lit(2)),
+            format!(
+                r#"{{"node":"and","children":[{},{}]}}"#,
+                cmp("gt", N, &lit(3)),
+                cmp("le", N, &lit(4))
+            ),
+            format!(
+                r#"{{"node":"or","children":[{},{}]}}"#,
+                cmp("eq", N, &lit(5)),
+                cmp("ne", &lit(5), N)
+            ),
+            FLAG.to_string(),
+            format!(r#"{{"node":"is_null","expression":{N},"negated":true}}"#),
+            in_set(false),
+            in_set(true),
+        ];
+        let predicates: Vec<String> = expressions
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    r#"{{"id":"p{i}","revision":0,"mode":"advisory","source":"query","expression":{e}}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"encoding":"vgi.filters.v2","semantics":"vgi.duckdb.standard.v1","kind":"snapshot","predicates":[{}]}}"#,
+            predicates.join(",")
+        );
+        let (mut fields, mut arrays): (Vec<Arc<Field>>, Vec<ArrayRef>) = (0..6)
+            .map(|i| {
+                (
+                    Arc::new(Field::new(format!("value_{i}"), DataType::Int64, true)),
+                    Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef,
+                )
+            })
+            .unzip();
+        fields.push(Arc::new(Field::new(
+            "value_6",
+            list.data_type().clone(),
+            true,
+        )));
+        arrays.push(list);
+        let state =
+            PushdownFilters::parse_with_schema(&encode(&json, fields, arrays), bool_schema())
+                .unwrap();
+        assert_eq!(
+            state.describe(),
+            [
+                "And(n GT, n LE)",
+                "flag EQ",
+                "n GE",
+                "n In",
+                "n IsNotNull",
+                "n V2Expression",
+                "n V2Expression",
+                "n V2Expression",
+                "n V2Expression",
+            ]
+        );
     }
 
     #[test]

@@ -394,6 +394,114 @@ fn planned_days_tables() -> Vec<CatTable> {
     ]
 }
 
+/// `planned_events` (`test/sql/integration/catalog/scan_planning_predicates*.test`):
+/// a filtered-planning table with the column types real catalogs filter on —
+/// DATE, TIMESTAMPTZ, VARCHAR, BIGINT, DOUBLE, BOOLEAN — over one parquet file
+/// per day, `{branch_dir}/planned_events_<YYYY-MM-DD>.parquet` (written by the
+/// tests), 10 hourly rows each. Statistics cover `event_date` and `ts`, so
+/// predicates on either prune; every other column only reaches DuckDB.
+///
+/// Every planning call writes `planned_events_last_plan.json` with the planned
+/// days and [`PushdownFilters::describe`](vgi::pushdown::PushdownFilters::describe)
+/// of the predicates (`null` when none arrived), so a test can assert what
+/// reached the worker, including that a predicate it cannot use (LIKE, most
+/// functions) stayed with the client. Only the `planned_events` serial group
+/// queries this table, so the record is never overwritten concurrently.
+/// Mirrors vgi-python's `planned_events` fixture, byte for byte.
+fn planned_events_table() -> CatTable {
+    use arrow_schema::TimeUnit;
+    use vgi::scan_planning::{ScanBranchesPlan, ScanPlanRequest};
+    use vgi::statistics::{CatColStat, StatValue};
+
+    const MICROS_PER_HOUR: i64 = 3_600_000_000;
+    let ts_type = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let stats = |day: i32| -> Vec<CatColStat> {
+        let start = i64::from(PLANNED_DAYS_FIRST + day) * 24 * MICROS_PER_HOUR;
+        let ts = |micros: i64| {
+            StatValue::arrow(Arc::new(
+                arrow_array::TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"),
+            ))
+        };
+        let mut stats = planned_day_stats(day);
+        stats.push(CatColStat {
+            column_name: "ts".to_string(),
+            min: ts(start),
+            max: ts(start + 9 * MICROS_PER_HOUR),
+            has_null: false,
+            has_not_null: true,
+            distinct_count: None,
+            contains_unicode: None,
+            max_string_length: None,
+        });
+        stats
+    };
+    let planner = move |request: &ScanPlanRequest<'_>| -> vgi::Result<ScanBranchesPlan> {
+        let mut days = Vec::new();
+        for day in 0..PLANNED_DAYS {
+            let keep = match request.pushdown_filters {
+                Some(filters) => filters.may_match(&stats(day))?,
+                None => true,
+            };
+            if keep {
+                days.push(day);
+            }
+        }
+        // Byte-identical to vgi-python's `json.dump` (key order, separators).
+        let quoted = |items: Vec<String>| {
+            items
+                .iter()
+                .map(|item| format!("\"{}\"", item.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let described = match request.pushdown_filters {
+            Some(filters) => format!("[{}]", quoted(filters.decode()?.describe())),
+            None => "null".to_string(),
+        };
+        let record = format!(
+            r#"{{"days": [{}], "filters": {described}}}"#,
+            quoted(
+                days.iter()
+                    .map(|d| format!("2026-10-{:02}", d + 1))
+                    .collect()
+            )
+        );
+        std::fs::write(branch_path("planned_events_last_plan.json"), record)
+            .map_err(|error| vgi::RpcError::runtime_error(format!("planned_events: {error}")))?;
+        let files: Vec<String> = days
+            .iter()
+            .map(|d| branch_path(&format!("planned_events_2026-10-{:02}.parquet", d + 1)))
+            .collect();
+        let branches = if files.is_empty() {
+            Vec::new()
+        } else {
+            vec![vgi::catalog::CatBranch {
+                row_count: Some(10 * files.len() as i64),
+                ..planned_read_parquet(&files, true)
+            }]
+        };
+        Ok(ScanBranchesPlan {
+            branches,
+            required_extensions: vec!["parquet".to_string()],
+        })
+    };
+    let mut table = dtable(
+        "planned_events",
+        vec![
+            f("event_date", DataType::Date32),
+            f("ts", ts_type()),
+            f("series", DataType::Utf8),
+            f("ticker", DataType::Utf8),
+            f("n", DataType::Int64),
+            f("price", DataType::Float64),
+            f("flag", DataType::Boolean),
+        ],
+        "Protocol 3.2: filtered planning, non-prunable predicates — scan_planning_predicates.test",
+    );
+    table.required_extensions = vec!["parquet".to_string()];
+    table.with_filtered_scan_planning(planner)
+}
+
 /// A path under the shared native-branch scratch dir.
 fn branch_path(name: &str) -> String {
     format!("{}/{name}", branch_dir())
@@ -1051,6 +1159,7 @@ fn data_tables() -> Vec<CatTable> {
         t
     };
     tables.extend(planned_days_tables());
+    tables.push(planned_events_table());
     // Protocol 3.2: branch_filter must be ONE expression. "n < 5, n > 2" parses
     // as two; 3.1 clients silently kept the first, a 3.2 client rejects it.
     tables.push(mb(
