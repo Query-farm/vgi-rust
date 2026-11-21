@@ -329,6 +329,13 @@ included) into a `vgia1.` ticket that a runner holding the user's grant
 redeems with the single attach option `vgi_attach_ticket`. See
 [docs/hosted-protocols.md](docs/hosted-protocols.md).
 
+With `VGI_ORCHARD_HOSTED=1` an HTTP worker runs in **Orchard hosted mode**: it
+accepts only Orchard Passes (ES256 RFC 9068 access tokens verified against the
+Front Desk's JWKS), refuses to start with any other credential or transport
+configured, and hands the Pass's claims to function code through
+`ProcessParams::auth`. No worker code is needed. See
+[docs/orchard-hosted-mode.md](docs/orchard-hosted-mode.md).
+
 Over HTTP the worker seals the `attach_opaque_data` and
 `transaction_opaque_data` values it hands the client (XChaCha20-Poly1305 under
 `VGI_SIGNING_KEY` / `Worker::signing_key`, or a key generated at startup when

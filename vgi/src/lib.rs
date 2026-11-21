@@ -172,6 +172,8 @@ pub mod dispatch;
 pub mod errors;
 mod framework_state;
 pub mod function;
+#[cfg(feature = "transport-http")]
+pub mod hosted;
 pub mod numeric;
 pub mod opaque;
 pub mod overload;

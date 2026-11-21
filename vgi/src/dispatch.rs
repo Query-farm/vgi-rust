@@ -1132,6 +1132,7 @@ impl Dispatcher {
             secrets: parse_secrets(&dto.secrets)?,
             resolved_secrets_provided: dto.resolved_secrets_provided,
             auth_principal: principal(ctx),
+            auth: ctx.auth.clone(),
             attach_opaque_data: dto.attach_opaque_data.clone().map(|b| b.into()),
             transaction_opaque_data: dto.transaction_opaque_data.clone().map(|b| b.into()),
             storage: Some(self.store.clone()),
@@ -1433,56 +1434,57 @@ impl Dispatcher {
         };
         let split_payload_slice: &[Vec<u8>] = split_payloads.as_deref().unwrap_or(&[]);
 
-        let build_params =
-            |args: crate::arguments::Arguments, settings, secrets, auth| ProcessParams {
-                output_schema: output_schema.clone(),
-                bind_output_schema: bind_output_schema.clone(),
-                current_pushdown_filters: None,
-                input_schema: input_schema.clone(),
-                execution_id: execution_id.clone(),
-                substream_id: dto.substream_id.clone().map(|b| b.into()),
-                bind_opaque_data: dto
-                    .bind_opaque_data
-                    .clone()
-                    .map(|b| b.into())
-                    .unwrap_or_default(),
-                init_opaque_data: dto
-                    .init_opaque_data
-                    .clone()
-                    .map(|b| b.into())
-                    .unwrap_or_default(),
-                arguments: args,
-                settings,
-                secrets,
-                auth_principal: auth,
-                projection_ids: dto.projection_ids.clone(),
-                pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0),
-                join_keys: dto
-                    .join_keys
-                    .clone()
-                    .map(|v| v.into_iter().map(|b| b.0).collect())
-                    .unwrap_or_default(),
-                storage: Some(self.store.clone()),
-                order_by_column: dto.order_by_column_name.clone(),
-                order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
-                order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
-                order_by_limit: dto.order_by_limit,
-                tablesample_percentage: dto.tablesample_percentage,
-                tablesample_seed: dto.tablesample_seed,
-                attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
-                transaction_opaque_data: bind_call
-                    .transaction_opaque_data
-                    .clone()
-                    .map(|b| b.into()),
-                at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
-                at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
-                copy_from: copy_from.clone(),
-                // Conditional validators ride per-tick metadata, not the init
-                // request — set per exchange tick (see TableInOutExchangeState).
-                if_none_match: None,
-                if_modified_since: None,
-                split_payloads: split_payloads.clone(),
-            };
+        let build_params = |args: crate::arguments::Arguments,
+                            settings,
+                            secrets,
+                            auth,
+                            auth_ctx| ProcessParams {
+            output_schema: output_schema.clone(),
+            bind_output_schema: bind_output_schema.clone(),
+            current_pushdown_filters: None,
+            input_schema: input_schema.clone(),
+            execution_id: execution_id.clone(),
+            substream_id: dto.substream_id.clone().map(|b| b.into()),
+            bind_opaque_data: dto
+                .bind_opaque_data
+                .clone()
+                .map(|b| b.into())
+                .unwrap_or_default(),
+            init_opaque_data: dto
+                .init_opaque_data
+                .clone()
+                .map(|b| b.into())
+                .unwrap_or_default(),
+            arguments: args,
+            settings,
+            secrets,
+            auth_principal: auth,
+            auth: auth_ctx,
+            projection_ids: dto.projection_ids.clone(),
+            pushdown_filters: dto.pushdown_filters.clone().map(|b| b.0),
+            join_keys: dto
+                .join_keys
+                .clone()
+                .map(|v| v.into_iter().map(|b| b.0).collect())
+                .unwrap_or_default(),
+            storage: Some(self.store.clone()),
+            order_by_column: dto.order_by_column_name.clone(),
+            order_by_direction: dto.order_by_direction.clone().map(|d| d.0),
+            order_by_null_order: dto.order_by_null_order.clone().map(|d| d.0),
+            order_by_limit: dto.order_by_limit,
+            tablesample_percentage: dto.tablesample_percentage,
+            tablesample_seed: dto.tablesample_seed,
+            attach_opaque_data: bind_call.attach_opaque_data.clone().map(|b| b.into()),
+            transaction_opaque_data: bind_call.transaction_opaque_data.clone().map(|b| b.into()),
+            at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
+            at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
+            copy_from: copy_from.clone(),
+            // Conditional validators ride per-tick metadata, not the init
+            // request — set per exchange tick (see TableInOutExchangeState).
+            if_none_match: None,
+            if_modified_since: None,
+            split_payloads: split_payloads.clone(),
+        };
 
         // Table buffering: sink (header-only) or finalize source (producer). As
         // at bind, a COPY-FROM init is the read path and never resolves here —
@@ -1649,7 +1651,13 @@ impl Dispatcher {
             bp.arguments.remap_positional(&f.argument_specs());
             let filter_handling = f.metadata().filter_handling()?;
             let auto_apply = filter_handling == crate::FilterHandling::Sdk;
-            let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let mut params = build_params(
+                bp.arguments,
+                bp.settings,
+                bp.secrets,
+                bp.auth_principal,
+                bp.auth,
+            );
             let parsed_filters = params
                 .pushdown_filters
                 .as_ref()
@@ -1830,7 +1838,13 @@ impl Dispatcher {
             let max_workers = f.max_workers(&bp);
             let filter_handling = f.metadata().filter_handling()?;
             let auto_apply = filter_handling == crate::FilterHandling::Sdk;
-            let mut params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+            let mut params = build_params(
+                bp.arguments,
+                bp.settings,
+                bp.secrets,
+                bp.auth_principal,
+                bp.auth,
+            );
             let parsed_filters = params
                 .pushdown_filters
                 .as_ref()
@@ -1905,7 +1919,13 @@ impl Dispatcher {
             call,
         )?;
         bp.arguments.remap_positional(&f.argument_specs());
-        let params = build_params(bp.arguments, bp.settings, bp.secrets, bp.auth_principal);
+        let params = build_params(
+            bp.arguments,
+            bp.settings,
+            bp.secrets,
+            bp.auth_principal,
+            bp.auth,
+        );
 
         let header = wire::to_batch(GlobalInitResponse {
             execution_id: Bytes::from(execution_id.clone()),
@@ -2076,6 +2096,7 @@ impl Dispatcher {
             settings: settings.clone(),
             secrets: secrets.clone(),
             auth_principal: None,
+            auth: vgi_rpc::AuthContext::anonymous(),
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
             join_keys: blob.join_keys.clone(),
@@ -5342,6 +5363,7 @@ impl ExchangeState for ScalarExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
+        self.params.auth = ctx.auth.clone();
         self.params.if_none_match =
             cond_validator(ctx, crate::cache_control::CACHE_IF_NONE_MATCH_KEY);
         self.params.if_modified_since =
@@ -5551,6 +5573,7 @@ impl ExchangeState for TableInOutExchangeState {
         ctx: &CallContext,
     ) -> Result<()> {
         self.params.auth_principal = principal(ctx);
+        self.params.auth = ctx.auth.clone();
         if let Some(encoded) = ctx.tick_metadata("vgi_pushdown_filters") {
             let current = self
                 .params

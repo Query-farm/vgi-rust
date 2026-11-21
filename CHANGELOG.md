@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Orchard hosted mode** (`VGI_ORCHARD_HOSTED=1`, `vgi::hosted`), ported from
+  vgi-python: an `--http` worker accepts only Orchard Passes (ES256 RFC 9068
+  access tokens checked against `VGI_JWT_ISSUER` / `VGI_JWT_AUDIENCE` /
+  `VGI_JWT_JWKS_URI`, JWKS cached at most 10 minutes and never used stale),
+  on every request except `HEAD /health` and CORS preflights, before the body
+  is read; and refuses to start with any other credential, a short or missing
+  `VGI_SIGNING_KEY`, or a transport other than `--http`. Part of the default
+  `transport-http` feature (adds jsonwebtoken with aws-lc-rs, and ureq with
+  rustls). See `docs/orchard-hosted-mode.md`.
+- `BindParams::auth` / `ProcessParams::auth`: the caller's full
+  `AuthContext` (domain, principal, claims with their JSON types), beside
+  `auth_principal`. Breaking for code that builds `ProcessParams` with a
+  struct literal.
+
 - **vgi protocol 3.4.0** (breaking: exact major+minor match, so it pairs only
   with a 3.4 extension). No `vgi.v3` message changes; 3.4 marks the move to
   vgi-rpc's upload-URL protocol v2 and mandatory pointer digests:

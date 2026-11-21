@@ -209,7 +209,9 @@ as native catalogs.
 - **stdio** (default) — DuckDB spawns the worker per query. Nothing to configure.
 - **Unix socket** (`--unix <path>`) — one long-lived worker (the launcher contract).
 - **HTTP** (`--http`) — Arrow-IPC over HTTP with AEAD-sealed stateless stream
-  tokens and optional bearer auth.
+  tokens and optional bearer auth. With `VGI_ORCHARD_HOSTED=1` it runs in
+  Orchard hosted mode and accepts only Orchard Passes (see the
+  [`hosted`](https://docs.rs/vgi/latest/vgi/hosted/) module).
 
 ## Testing your worker
 

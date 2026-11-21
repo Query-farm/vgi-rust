@@ -723,6 +723,12 @@ pub struct BindParams {
     pub resolved_secrets_provided: bool,
     /// Authenticated principal name, if any.
     pub auth_principal: Option<String>,
+    /// The caller's full authentication: domain, principal and claims.
+    /// Claims an authenticator decoded from JSON (a JWT, an Orchard Pass) keep
+    /// their JSON types; read them with
+    /// [`AuthContext::claim_value`](vgi_rpc::AuthContext::claim_value).
+    /// Anonymous when the transport does not authenticate callers.
+    pub auth: vgi_rpc::AuthContext,
     /// The attach's `attach_opaque_data`, as the worker minted it (plaintext:
     /// on HTTP the SDK opens the sealed wire value before any function runs).
     /// Read a catalog's attach payload from it with
@@ -811,6 +817,12 @@ pub struct ProcessParams {
     pub secrets: crate::secrets::Secrets,
     /// Authenticated principal name, if any.
     pub auth_principal: Option<String>,
+    /// The caller's full authentication: domain, principal and claims.
+    /// Claims an authenticator decoded from JSON (a JWT, an Orchard Pass) keep
+    /// their JSON types; read them with
+    /// [`AuthContext::claim_value`](vgi_rpc::AuthContext::claim_value).
+    /// Anonymous when the transport does not authenticate callers.
+    pub auth: vgi_rpc::AuthContext,
     /// Projection pushdown: output column indices to emit (None = all).
     pub projection_ids: Option<Vec<i64>>,
     /// Original serialized snapshot bytes, retained for transport/debugging.

@@ -85,3 +85,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # HTTP, which needs a concrete backend under `HttpClient`. The library leaves
 # the backend to its consumer; the tests pick reqwest.
 vgi-rpc-client = { workspace = true, features = ["reqwest"] }
+# orchard_hosted: mint ES256 Orchard Passes and send raw HTTP requests to a
+# hosted worker. All already in the build through `vgi`'s `transport-http`.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
+aws-lc-rs = "1"
+base64 = "0.22"
+serde_json = { workspace = true }
+ureq = { version = "3", default-features = false }

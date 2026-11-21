@@ -29,7 +29,12 @@ cloudflare-do = ["dep:ureq", "ureq/rustls"]
 # HTTP *worker* transport (`--http`, axum/tokio). Pulls the tokio runtime and the
 # vgi-rpc http stack. Off for wasm builds (tokio/mio/zstd don't compile to wasm);
 # the wasm worker serves over stdio (and, on wasip2, raw TCP).
-transport-http = ["dep:tokio", "vgi-rpc/http"]
+#
+# It also carries Orchard hosted mode (`VGI_ORCHARD_HOSTED=1`, see
+# `src/hosted.rs`): every HTTP worker image can run hosted, so the Pass
+# verifier is not a separate feature. jsonwebtoken verifies the ES256 Pass;
+# ureq (sync, no runtime of its own, rustls) fetches the JWKS.
+transport-http = ["dep:tokio", "vgi-rpc/http", "dep:jsonwebtoken", "dep:ureq", "ureq/rustls"]
 # Blob-vendor externalization (vgi-rpc-s3's `vendor` client): large storage
 # values kept in the vendor (`storage::blobs`), and over HTTP, with
 # VGI_BLOB_VENDOR_URL set, large results externalized and client upload URLs
@@ -87,6 +92,10 @@ rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 # client — safe to call from a worker served over stdio OR inside a tokio HTTP
 # runtime (no async nesting). `bincode` frames the request/response.
 ureq = { version = "3", default-features = false, optional = true }
+# Orchard hosted mode's Pass verifier (feature `transport-http`). Same version
+# and crypto backend as vgi-rpc's `jwt-jsonwebtoken`, so the two never select
+# different jsonwebtoken providers in one build.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"], optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
 
 # Unix-only: used to namespace the cross-process store base dir by uid (so users
@@ -102,6 +111,9 @@ libc = "0.2"
 ctrlc = "3"
 
 [dev-dependencies]
+# ES256 key generation for the hosted-mode tests' Passes (already in the build
+# through jsonwebtoken's `aws_lc_rs` backend).
+aws-lc-rs = "1"
 # Lightweight blocking HTTP client to drive the loopback HTTP server in the
 # producer-continuation tests (no TLS needed for 127.0.0.1).
 ureq = { version = "3", default-features = false }

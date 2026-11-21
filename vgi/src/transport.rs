@@ -369,7 +369,7 @@ pub fn serve_http(
     authenticate: Option<vgi_rpc::Authenticate>,
     landing_info: Option<vgi_rpc::http::LandingInfo>,
 ) {
-    serve_http_inner(server, authenticate, landing_info, None, None);
+    serve_http_inner(server, authenticate, landing_info, None, None, None);
 }
 
 /// Serve HTTP at an explicit address while preserving the standard HTTP state machine.
@@ -387,6 +387,7 @@ pub fn serve_http_at(
         landing_info,
         None,
         Some(format_http_bind(host, port)),
+        None,
     );
 }
 
@@ -398,7 +399,7 @@ pub fn serve_http_behind_iroh(
     landing_info: Option<vgi_rpc::http::LandingInfo>,
     bridge: IrohBridgeOptions,
 ) {
-    serve_http_inner(server, authenticate, landing_info, Some(bridge), None);
+    serve_http_inner(server, authenticate, landing_info, Some(bridge), None, None);
 }
 
 /// Serve an Iroh bridge's HTTP upstream at an explicit loopback address.
@@ -428,11 +429,12 @@ pub fn serve_http_behind_iroh_at(
         landing_info,
         Some(bridge),
         Some(format_http_bind(host, port)),
+        None,
     );
 }
 
 #[cfg(feature = "transport-http")]
-fn format_http_bind(host: &str, port: u16) -> String {
+pub(crate) fn format_http_bind(host: &str, port: u16) -> String {
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
     } else {
@@ -504,14 +506,74 @@ impl HttpRequestCaps {
     }
 }
 
+/// Orchard hosted mode's HTTP settings (see [`crate::hosted`]).
 #[cfg(feature = "transport-http")]
-fn serve_http_inner(
+struct HostedHttp {
+    authenticate: vgi_rpc::Authenticate,
+    token_key: [u8; 32],
+}
+
+/// With `VGI_ORCHARD_HOSTED=1`, the hosted HTTP settings, or a refusal to
+/// start. `None` when hosted mode is off.
+///
+/// The worker-level checks (transport, `resolve_token`, grant keys, ...) ran
+/// when the server was built; these are the ones only the HTTP layer sees.
+#[cfg(feature = "transport-http")]
+fn hosted_http(
+    authenticate: Option<&vgi_rpc::Authenticate>,
+    bridge: Option<&IrohBridgeOptions>,
+    explicit_signing_key: Option<&[u8]>,
+) -> Option<HostedHttp> {
+    use crate::hosted;
+    if !hosted::hosted_mode_enabled() {
+        return None;
+    }
+    let env = |name: &str| std::env::var(name).ok();
+    if bridge.is_some() {
+        hosted::refuse(
+            "only --http is allowed, without the Iroh bridge: peer identity is not a Pass.",
+        );
+    }
+    let config = hosted::resolve_hosted_config();
+    if let Some(reason) = hosted::environment_conflict(&env) {
+        hosted::refuse(&reason);
+    }
+    if authenticate.is_some() {
+        hosted::refuse(
+            "a custom authenticate callback is configured; hosted workers verify Passes only.",
+        );
+    }
+    let key = match hosted::configured_signing_key(explicit_signing_key, &env) {
+        Some(key) if key.len() >= hosted::MIN_SIGNING_KEY_BYTES => key,
+        Some(_) => hosted::refuse(&format!(
+            "VGI_SIGNING_KEY must be at least {} bytes.",
+            hosted::MIN_SIGNING_KEY_BYTES
+        )),
+        None => hosted::refuse(
+            "VGI_SIGNING_KEY is not set; hosted workers need a stable key shared by every \
+             machine of the deployment, or every restart breaks attached sessions.",
+        ),
+    };
+    Some(HostedHttp {
+        authenticate: hosted::hosted_authenticate(config),
+        token_key: hosted::http_token_key(&key),
+    })
+}
+
+#[cfg(feature = "transport-http")]
+pub(crate) fn serve_http_inner(
     server: Arc<RpcServer>,
     authenticate: Option<vgi_rpc::Authenticate>,
     landing_info: Option<vgi_rpc::http::LandingInfo>,
     bridge: Option<IrohBridgeOptions>,
     explicit_bind: Option<String>,
+    explicit_signing_key: Option<Vec<u8>>,
 ) {
+    let hosted = hosted_http(
+        authenticate.as_ref(),
+        bridge.as_ref(),
+        explicit_signing_key.as_deref(),
+    );
     if std::env::var("VGI_HTTP_PANIC_TRACE").is_ok() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -539,6 +601,17 @@ fn serve_http_inner(
             .producer_batch_limit(1);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
+        }
+        if let Some(hosted) = hosted {
+            // Every request needs a Pass, checked before its body is read;
+            // CORS is open because the only credential is a bearer header.
+            builder = builder
+                .authenticate(hosted.authenticate)
+                .authenticate_every_request(true)
+                .www_authenticate(crate::hosted::HOSTED_CHALLENGE)
+                .cors_origins("*")
+                .cors_credentials(false)
+                .token_key(&hosted.token_key);
         }
         builder = request_caps.apply(builder);
         if let Some(bridge) = bridge {

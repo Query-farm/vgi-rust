@@ -592,6 +592,37 @@ impl Worker {
     /// alongside it. The HTTP transport reuses the dispatcher to serve the
     /// landing contract (`describe.json`) via catalog introspection.
     fn build_parts(self, transport: ServeTransport) -> (RpcServer, Arc<Dispatcher>) {
+        // Orchard hosted mode: refuse, before anything is built or bound, any
+        // configuration that would admit a caller without a Pass.
+        #[cfg(feature = "transport-http")]
+        if crate::hosted::hosted_mode_enabled() {
+            let surface = crate::hosted::WorkerSurface {
+                transport,
+                authenticate: self.authenticate.is_some(),
+                resolve_token: self.resolve_token.is_some(),
+                mint_grant: self.mint_grant.is_some(),
+                grant_keys: self.grant_keys.is_some(),
+                explicit_signing_key: self.signing_key.as_deref(),
+            };
+            if let Some(reason) =
+                crate::hosted::worker_conflict(&surface, &|name| std::env::var(name).ok())
+            {
+                crate::hosted::refuse(&reason);
+            }
+        }
+        #[cfg(not(feature = "transport-http"))]
+        if let Ok(value) = std::env::var("VGI_ORCHARD_HOSTED") {
+            if !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            ) {
+                eprintln!(
+                    "Error: VGI_ORCHARD_HOSTED is set, but this worker was built without \
+                     the `transport-http` feature that Orchard hosted mode needs."
+                );
+                std::process::exit(1);
+            }
+        }
         let server_id = self
             .server_id
             .clone()
@@ -723,7 +754,10 @@ impl Worker {
     ///   `--host` / `--port` select the bind address. Bearer auth is enabled by
     ///   setting `VGI_BEARER_TOKENS` (`token=principal,…`). `--grant-key <base64>`
     ///   (repeatable, first mints; or `VGI_RPC_GRANT_KEYS`) turns on sealed
-    ///   grants -- see [`grant_keys`](Self::grant_keys).
+    ///   grants -- see [`grant_keys`](Self::grant_keys). With
+    ///   `VGI_ORCHARD_HOSTED=1` the worker runs in Orchard hosted mode (see
+    ///   [`crate::hosted`]): it accepts only Orchard Passes, and `--http` is
+    ///   the only transport it starts on.
     /// - `--iroh-raw-upstream [<host>:]<port> --iroh-issuer <namespace>` —
     ///   loopback raw upstream for `vgi-iroh-bridge`. Add `--iroh-observe` to
     ///   expose peer evidence without making it the application principal.
@@ -756,6 +790,8 @@ impl Worker {
         let worker_doc = self.disp.catalog.comment.clone().unwrap_or_default();
         #[cfg(feature = "transport-http")]
         let explicit_authenticate = self.authenticate.clone();
+        #[cfg(feature = "transport-http")]
+        let explicit_signing_key = self.signing_key.clone();
         let (server, disp) = self.build_parts(transport_from_args(&args));
         let server = Arc::new(server);
 
@@ -834,19 +870,16 @@ impl Worker {
                         bridge,
                     );
                 }
-            } else if explicit_bind {
-                crate::transport::serve_http_at(
-                    server,
-                    explicit_authenticate.clone().or_else(build_authenticate),
-                    Some(info),
-                    host,
-                    port,
-                );
             } else {
-                crate::transport::serve_http(
+                // Hosted mode needs the explicit signing key too; in it, the
+                // checks in `build_parts` leave no other authenticator here.
+                crate::transport::serve_http_inner(
                     server,
                     explicit_authenticate.clone().or_else(build_authenticate),
                     Some(info),
+                    None,
+                    explicit_bind.then(|| crate::transport::format_http_bind(host, port)),
+                    explicit_signing_key,
                 );
             }
             return;
@@ -1151,12 +1184,9 @@ fn bearer_token<'a>(req: &'a vgi_rpc::AuthRequest<'a>) -> Option<&'a str> {
 #[cfg(feature = "transport-http")]
 fn build_authenticate() -> Option<vgi_rpc::Authenticate> {
     let principal_of = |tokens: &std::collections::HashMap<String, String>, tok: &str| {
-        tokens.get(tok).map(|principal| vgi_rpc::AuthContext {
-            domain: "bearer".to_string(),
-            authenticated: true,
-            principal: principal.clone(),
-            claims: Default::default(),
-        })
+        tokens
+            .get(tok)
+            .map(|principal| vgi_rpc::AuthContext::for_principal("bearer", principal.clone()))
     };
 
     if let Some(required) = parse_token_map("VGI_BEARER_TOKENS") {

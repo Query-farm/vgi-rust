@@ -69,6 +69,9 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_scalar(ReturnSecretValueFunction);
     w.register_scalar(SecretFieldFunction);
     w.register_scalar(WhoAmIFunction);
+    if vgi::hosted::hosted_mode_enabled() {
+        w.register_scalar(PassClaimsFunction);
+    }
     // type_info overloads
     w.register_scalar(TypeInfo("int32", DataType::Int32));
     w.register_scalar(TypeInfo("int64", DataType::Int64));
@@ -1054,6 +1057,53 @@ impl ScalarFunction for SecretFieldFunction {
         let s = format!("port={port};name={name}");
         let n = output_len(batch);
         let out: StringArray = (0..n).map(|_| Some(s.clone())).collect();
+        result(params, arc(out))
+    }
+}
+
+/// `pass_claims(x)` — the caller's verified Orchard Pass as a JSON object:
+/// `{"claims": {...}, "domain": "orchard", "principal": "<sub>"}`, keys
+/// sorted, `claims` the whole verified claim set (vgi's
+/// `test/hosted/README.md` fixture). Claims keep their JSON types (`email_verified` is a boolean, `exp`
+/// a number), so a test can tell a real boolean from the string `"true"`.
+/// Registered only in Orchard hosted mode (`VGI_ORCHARD_HOSTED=1`), so the
+/// ordinary fixture surface is unchanged.
+pub struct PassClaimsFunction;
+impl ScalarFunction for PassClaimsFunction {
+    fn name(&self) -> &str {
+        "pass_claims"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta_ret(
+            "Return the caller's verified Orchard Pass claims as JSON",
+            DataType::Utf8,
+        )
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("x", 0, "int64", "dummy input")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let auth = &params.auth;
+        // BTreeMaps, so the keys come out sorted whatever serde_json's
+        // `preserve_order` feature says.
+        // Every verified claim, with its JSON type (the whole claim set, as
+        // vgi-python's fixture returns it).
+        let claims: std::collections::BTreeMap<&str, serde_json::Value> = auth
+            .claims
+            .keys()
+            .filter_map(|name| auth.claim_value(name).map(|v| (name.as_str(), v)))
+            .collect();
+        let payload = serde_json::to_string(&std::collections::BTreeMap::from([
+            ("claims", serde_json::to_value(claims).unwrap_or_default()),
+            ("domain", serde_json::Value::from(auth.domain.as_str())),
+            (
+                "principal",
+                serde_json::Value::from(auth.principal.as_str()),
+            ),
+        ]))
+        .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        let n = batch.num_rows();
+        let out: StringArray = (0..n).map(|_| Some(payload.clone())).collect();
         result(params, arc(out))
     }
 }

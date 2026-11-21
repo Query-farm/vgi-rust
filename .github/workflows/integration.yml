@@ -38,8 +38,46 @@ env:
   # TODO(release-wave).
   VGI_RPC_FAKE_VENDOR_REF: f0fb6754ae5b70900ba21629a1e2d48eb2182774
   VGI_NATIVE_RUNNER_BRANCH: protocol-3.4
+  # vgi protocol-3.4 with the Orchard hosted-mode conformance harness
+  # (test/hosted/run_hosted_conformance.py). TODO(release-wave).
+  VGI_HOSTED_REF: fce57984a7e8ea35f9dcd4a034b5ed37c85ca5c5
 
 jobs:
+  # Orchard hosted mode (VGI_ORCHARD_HOSTED=1, vgi::hosted) against vgi's
+  # SDK-neutral harness. Needs no native runner: the harness drives the
+  # worker over raw HTTP and vgi-python's client.
+  orchard-hosted-conformance:
+    name: Linux / Orchard hosted mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout vgi-rust
+        uses: actions/checkout@v5
+
+      - name: Checkout the hosted-mode harness
+        uses: actions/checkout@v5
+        with:
+          repository: Query-farm/vgi
+          ref: ${{ env.VGI_HOSTED_REF }}
+          path: vgi-hosted
+
+      - name: Install Rust toolchain (MSRV 1.97)
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install uv (the harness is a uv script)
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build example worker
+        run: cargo build -p vgi-example-worker
+
+      - name: Run the hosted-mode conformance harness
+        env:
+          VGI_SRC: ${{ github.workspace }}/vgi-hosted
+          VGI_WORKER_BIN: target/debug/vgi-example-worker
+        run: ci/hosted-conformance.sh
+
   integration:
     name: Linux / ${{ matrix.transport }}
     runs-on: ubuntu-latest
