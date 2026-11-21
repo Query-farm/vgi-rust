@@ -17,8 +17,8 @@ permissions:
 
 env:
   # vgi protocol-3.4 (upload URLs v2, protocol 3.4.0). TODO(release-wave).
-  VGI_REF: 653b879c1131a18594918874e8f670d274a37ccb
-  VGI_NATIVE_RUNNER_BRANCH: v2.0
+  VGI_REF: 5b8b7a2a7e4e587e15573ddd62cf1dbcdf6b357e
+  VGI_NATIVE_RUNNER_BRANCH: protocol-3.4
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -99,6 +99,8 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi-rpc-python
+          # TODO(release-wave): back to main (unpinned) once protocol-3.4 is merged.
+          ref: protocol-3.4
           path: vgi-rpc-python
 
       - uses: dtolnay/rust-toolchain@1.97.0
