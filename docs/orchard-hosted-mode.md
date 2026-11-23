@@ -82,6 +82,20 @@ decompressed. CORS is open (`Access-Control-Allow-Origin: *`, no
 `Allow-Credentials`): the only credential is the `Authorization` header a
 caller sets itself. The `Authorization` header is never logged, at any level.
 
+## The blob vendor
+
+Orchard sets `VGI_BLOB_VENDOR_URL` and `VGI_BLOB_VENDOR_TOKEN` for hosted
+workers, and a hosted worker serves with them exactly as any `--http` worker
+does (feature `blob-vendor`, on by default): results over
+`VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES` become vendor pointers, `__upload_url__`
+grants come from the vendor with `VGI-Upload-URL-Support: 2`, and
+`VGI-Arguments-Ref-Bytes` is advertised. Every request has passed the Pass
+check before it reaches a grant, so a grant's `ref` is sealed for the Pass's
+principal (`domain = "orchard"`, the `sub`) and opens for no other caller.
+`VGI_RPC_MAX_REQUEST_BYTES` defaults to 32 MiB in hosted mode. A worker built
+with `default-features = false` and without `blob-vendor` refuses to start in
+hosted mode when `VGI_BLOB_VENDOR_URL` is set.
+
 ## Claims in function code
 
 A Pass authenticates the caller with `domain = "orchard"` and the Pass's `sub`

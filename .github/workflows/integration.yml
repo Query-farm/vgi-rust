@@ -81,6 +81,17 @@ jobs:
           VGI_WORKER_BIN: target/debug/vgi-example-worker
         run: ci/hosted-conformance.sh
 
+      # Hosted mode with the blob vendor (vgi-client/tests/orchard_hosted_vendor.rs):
+      # grants bound to the Pass principal, results externalized, the hosted
+      # capability headers. It skips without the fake vendor, so give it one.
+      - name: Hosted mode against the fake vendor
+        run: |
+          uv venv -q "$RUNNER_TEMP/fake-vendor"
+          uv pip install -q -p "$RUNNER_TEMP/fake-vendor" \
+            "vgi-rpc[http,external] @ git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}"
+          VGI_RPC_FAKE_VENDOR_BIN="$RUNNER_TEMP/fake-vendor/bin/vgi-rpc-fake-vendor" \
+            cargo test -p vgi-client --test orchard_hosted_vendor -- --nocapture
+
   integration:
     name: Linux / ${{ matrix.transport }}
     runs-on: ubuntu-latest

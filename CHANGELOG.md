@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Orchard hosted mode with the blob vendor.** `blob-vendor` is now a default
+  feature of `vgi`, so every HTTP worker image (vgi-starter-rust's included)
+  externalizes results, vends `__upload_url__` grants with `object_id` and a
+  `ref` sealed for the Pass principal, and advertises `VGI-Arguments-Ref-Bytes`
+  when Orchard sets `VGI_BLOB_VENDOR_URL`. A hosted worker built without the
+  feature refuses to start when the vendor is set, instead of serving without
+  it. Hosted mode defaults `VGI_RPC_MAX_REQUEST_BYTES` to 32 MiB (advertised as
+  `VGI-Max-Request-Bytes`), as vgi-python's does. New test
+  `vgi-client/tests/orchard_hosted_vendor.rs` (the port of vgi-csharp's
+  `OrchardHostedVendorTests`), run in CI's hosted-mode job against the fake
+  vendor.
+
 - **Protocol 3.4 large values** (vgi `docs/large-values-3.4.md`):
   - **Generated bind types.** `BindRequest`, `ArgumentsLocation`,
     `CopyFromContext`, `CopyToContext` and the six requests embedding
