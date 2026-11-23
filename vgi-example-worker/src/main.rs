@@ -257,6 +257,8 @@ fn run_worker(worker: Worker) {
         .peer_authentication_policy(vgi_rpc::peer_identity_primary("iroh"))
         .enable_sticky(true)
         .producer_batch_limit(1)
+        .token_ttl(vgi::transport::TOKEN_TTL)
+        .cursor_rule(vgi_rpc::CursorRule::Error)
         .build();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

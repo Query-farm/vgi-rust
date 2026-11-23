@@ -23,6 +23,20 @@
 //! | `blob_buffer_echo(t)` | table-buffering | each input batch as one log value, replayed |
 //! | `blob_tio(t)` | table-in-out | each batch stored, read back and deleted |
 //! | `blob_store_values(t)` | table-in-out | each value of column 0 as its own storage value |
+//! | `blob_param_batches(payload, batches)` | table | large bind parameter over many turns |
+//! | `blob_param_streams(payload, streams)` | table (one split per stream) | large bind parameter, parallel streams |
+//! | `blob_param_scalar(i, payload)` | scalar (constant parameter) | large constant parameter of a scalar |
+//! | `blob_param_table` | catalog table | a scan binding `blob_param_echo`'s twin |
+//!
+//! The four `blob_param_*` fixtures back the extension's protocol 3.4
+//! argument-reference tests (`test/sql/external_storage/arguments_ref*.test`,
+//! "Protocol 3.4 large values" in the catalog document): `blob_param_batches`
+//! emits `batches` one-row batches, one per stream turn; `blob_param_streams`
+//! plans `streams` splits that each emit one row; `blob_param_scalar` returns
+//! `sha256(payload)` for each non-NULL `i` with `payload` a constant
+//! parameter; `blob_param_table` binds `repeat('t', 65536)`, reports
+//! `STABLE_WITHIN_QUERY` and is not inline-bound, so every scan binds over
+//! RPC.
 //!
 //! The checksum columns `payload_len` / `payload_sha256` are the UTF-8 byte
 //! length and lowercase hex SHA-256 of a value as text (DuckDB's `strlen` and
@@ -43,7 +57,10 @@ use vgi::function::{
     ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction,
 };
 use vgi::ipc;
-use vgi::table_function::{resume, TableCardinality, TableFunction, TableProducer};
+use vgi::split_token::{PlanOutcome, PlannedSplit};
+use vgi::table_function::{
+    resume, BindRepeatability, TableCardinality, TableFunction, TableProducer,
+};
 use vgi::table_in_out::TableInOutFunction;
 use vgi_rpc::{Result, RpcError};
 
@@ -53,7 +70,7 @@ const ROWS_PER_BATCH: i64 = 2048;
 const BUFFER_NS: &[u8] = b"blob_buffer";
 const VALUES_NS: &[u8] = b"blob_values";
 
-const FUNCTIONS: [&str; 7] = [
+const FUNCTIONS: [&str; 11] = [
     "blob_repeat",
     "blob_len",
     "blob_rows",
@@ -61,7 +78,14 @@ const FUNCTIONS: [&str; 7] = [
     "blob_buffer_echo",
     "blob_tio",
     "blob_store_values",
+    "blob_param_batches",
+    "blob_param_streams",
+    "blob_param_scalar",
+    "blob_param_table_scan",
 ];
+
+/// The fixed argument `blob_param_table` binds: `repeat('t', 65536)`.
+pub const BLOB_PARAM_TABLE_ARGUMENT_LEN: usize = 65536;
 
 fn err(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
@@ -367,6 +391,292 @@ impl TableProducer for OneBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol 3.4 argument-reference fixtures
+// ---------------------------------------------------------------------------
+
+/// `strlen(payload)` and `sha256(payload)` as one-row columns.
+fn digest_columns(payload: Option<&str>) -> [ArrayRef; 2] {
+    checksum_columns(std::iter::once(payload.map(str::as_bytes)))
+}
+
+fn index_digest_schema(index: &str) -> SchemaRef {
+    let mut fields = vec![Field::new(index, DataType::Int64, true)];
+    fields.extend(checksum_fields());
+    Arc::new(Schema::new(fields))
+}
+
+fn index_digest_batch(index: &str, i: i64, payload: Option<&str>) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![i]))];
+    columns.extend(digest_columns(payload));
+    RecordBatch::try_new(index_digest_schema(index), columns).map_err(err)
+}
+
+/// `blob_param_batches(payload, batches)`: `batches` one-row batches, one per
+/// stream turn. Row `i` is `(i, strlen(payload), sha256(payload))`, so a
+/// 60-batch call is at least 60 continuations, each carrying the stream's
+/// `init` state.
+pub struct BlobParamBatchesFunction;
+impl TableFunction for BlobParamBatchesFunction {
+    fn name(&self) -> &str {
+        "blob_param_batches"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Length and SHA-256 of a parameter, once per batch (argument references over many turns)")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("payload", 0, "varchar", "Parameter to measure"),
+            ArgSpec::const_arg("batches", 1, "int64", "Number of one-row batches").with_ge(0.0),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: index_digest_schema("i"),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let n = params.arguments.const_i64(1)?.max(0);
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(BatchesProducer {
+            payload: params.arguments.const_str(0),
+            batches: params.arguments.const_i64(1).unwrap_or(0).max(0),
+            next: 0,
+        }))
+    }
+}
+
+struct BatchesProducer {
+    payload: Option<String>,
+    batches: i64,
+    next: i64,
+}
+
+impl TableProducer for BatchesProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.next >= self.batches {
+            return Ok(None);
+        }
+        let batch = index_digest_batch("i", self.next, self.payload.as_deref())?;
+        self.next += 1;
+        Ok(Some(batch))
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.next])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.next = v[0];
+        }
+    }
+}
+
+/// `blob_param_streams(payload, streams)`: one bind planned as `streams`
+/// splits, each emitting `(stream index, strlen(payload), sha256(payload))`.
+/// Every split's init embeds the same bind call, so with an argument
+/// reference the worker process fetches the argument once (vgi-rpc's object
+/// cache).
+pub struct BlobParamStreamsFunction;
+impl TableFunction for BlobParamStreamsFunction {
+    fn name(&self) -> &str {
+        "blob_param_streams"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            supports_splits: true,
+            ..meta("Length and SHA-256 of a parameter from parallel streams (argument references)")
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("payload", 0, "varchar", "Parameter to measure"),
+            ArgSpec::const_arg(
+                "streams",
+                1,
+                "int64",
+                "Number of parallel streams (one split each)",
+            )
+            .with_ge(1.0),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: index_digest_schema("stream"),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        let n = params.arguments.const_i64(1)?.max(1);
+        Some(TableCardinality {
+            estimate: Some(n),
+            max: Some(n),
+        })
+    }
+    fn on_plan(
+        &self,
+        params: &BindParams,
+        _request: &vgi::protocol::dtos::TableFunctionPlanRequest,
+    ) -> Result<Option<PlanOutcome>> {
+        let count = params.arguments.const_i64(1).unwrap_or(1).max(1);
+        Ok(Some(PlanOutcome {
+            splits: (0..count)
+                .map(|i| PlannedSplit {
+                    payload: i.to_le_bytes().to_vec(),
+                    estimated_rows: Some(1),
+                    rows_exact: true,
+                    ..Default::default()
+                })
+                .collect(),
+            estimated_total_splits: Some(count),
+            estimated_total_rows: Some(count),
+            ..Default::default()
+        }))
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        let Some(payloads) = params.split_payloads.as_ref() else {
+            return Err(RpcError::runtime_error(
+                "blob_param_streams is split-only; vgi_split_scans is probably off",
+            ));
+        };
+        let streams = payloads
+            .iter()
+            .map(|p| {
+                <[u8; 8]>::try_from(p.as_slice())
+                    .map(i64::from_le_bytes)
+                    .map_err(|_| RpcError::runtime_error("split payload must be 8 bytes"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Box::new(StreamsProducer {
+            payload: params.arguments.const_str(0),
+            streams,
+            next: 0,
+        }))
+    }
+}
+
+struct StreamsProducer {
+    payload: Option<String>,
+    streams: Vec<i64>,
+    next: i64,
+}
+
+impl TableProducer for StreamsProducer {
+    fn next_batch(&mut self, _out: &mut vgi_rpc::OutputCollector) -> Result<Option<RecordBatch>> {
+        let Some(stream) = self.streams.get(self.next as usize).copied() else {
+            return Ok(None);
+        };
+        self.next += 1;
+        index_digest_batch("stream", stream, self.payload.as_deref()).map(Some)
+    }
+    fn resume_supported(&self) -> bool {
+        true
+    }
+    fn encode_resume(&self) -> Vec<u8> {
+        resume::pack(&[self.next])
+    }
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some(v) = resume::unpack(bytes, 1) {
+            self.next = v[0];
+        }
+    }
+}
+
+/// `blob_param_scalar(i, payload)`: `sha256(payload)` for every row whose `i`
+/// is not NULL. `payload` is a constant parameter, so it rides the scalar's
+/// bind (and with it an argument reference), not its input batches.
+pub struct BlobParamScalarFunction;
+impl ScalarFunction for BlobParamScalarFunction {
+    fn name(&self) -> &str {
+        "blob_param_scalar"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata {
+            return_type: Some(DataType::Utf8),
+            ..meta(
+                "SHA-256 of a constant parameter for every row (argument references for scalars)",
+            )
+        }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::column("i", 0, "int64", "Row value; NULL gives NULL"),
+            ArgSpec::const_arg("payload", 1, "varchar", "Constant parameter to hash"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse::result(DataType::Utf8))
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let digest = params
+            .arguments
+            .const_str(1)
+            .map(|p| sha256_hex(p.as_bytes()));
+        let i = batch.column(0);
+        let out: StringArray = (0..batch.num_rows())
+            .map(|row| (!i.is_null(row)).then(|| digest.clone()).flatten())
+            .collect();
+        RecordBatch::try_new(params.output_schema.clone(), vec![Arc::new(out)]).map_err(err)
+    }
+}
+
+/// The scan behind the `blob_param_table` catalog table: `blob_param_echo`
+/// with a fixed argument. It reports `STABLE_WITHIN_QUERY` and is never
+/// inline-bound, so every scan binds over RPC and a serialized-plan rebind
+/// must reproduce the same bind bytes (the extension's per-query
+/// argument-reference memo).
+pub struct BlobParamTableScan;
+impl TableFunction for BlobParamTableScan {
+    fn name(&self) -> &str {
+        "blob_param_table_scan"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        meta("Length and SHA-256 of blob_param_table's fixed parameter (STABLE_WITHIN_QUERY)")
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        BlobParamEchoFunction.argument_specs()
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        BlobParamEchoFunction.on_bind(params)
+    }
+    fn repeatability(&self, _params: &BindParams) -> BindRepeatability {
+        BindRepeatability::StableWithinQuery
+    }
+    fn cardinality(&self, params: &BindParams) -> Option<TableCardinality> {
+        BlobParamEchoFunction.cardinality(params)
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        BlobParamEchoFunction.producer(params)
+    }
+}
+
+/// The `blob_param_table` catalog table: `blob_param_table_scan('t' x 65536)`,
+/// bound over RPC on every scan (not inline).
+fn blob_param_table() -> Result<vgi::catalog::CatTable> {
+    let argument: ArrayRef = Arc::new(StringArray::from(vec![
+        "t".repeat(BLOB_PARAM_TABLE_ARGUMENT_LEN)
+    ]));
+    Ok(vgi::catalog::CatTable::new(
+        "blob_param_table",
+        checksum_only_schema(),
+        "blob_param_table_scan",
+        vgi::arguments::Arguments::serialize_scan_args(&[argument])?,
+        Some(
+            "blob_param_echo(repeat('t', 65536)), STABLE_WITHIN_QUERY, bound over RPC on every scan"
+                .into(),
+        ),
+        Some(1),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Table-buffering and table-in-out
 // ---------------------------------------------------------------------------
 
@@ -567,14 +877,14 @@ pub fn catalog() -> CatalogModel {
             tags: Vec::new(),
             views: Vec::new(),
             macros: Vec::new(),
-            tables: Vec::new(),
+            tables: vec![blob_param_table().expect("blob_param_table scan arguments")],
         }],
         catalog_version_frozen: true,
         ..Default::default()
     }
 }
 
-/// Register the seven functions and the `blob_test` catalog.
+/// Register the functions and the `blob_test` catalog.
 pub fn register(w: &mut vgi::Worker) {
     w.register_scalar_in(CATALOG_NAME, "main", BlobRepeatFunction);
     w.register_scalar_in(CATALOG_NAME, "main", BlobLenFunction);
@@ -583,6 +893,10 @@ pub fn register(w: &mut vgi::Worker) {
     w.register_buffering_in(CATALOG_NAME, "main", BlobBufferEchoFunction);
     w.register_table_in_out_in(CATALOG_NAME, "main", BlobTioFunction);
     w.register_table_in_out_in(CATALOG_NAME, "main", BlobStoreValuesFunction);
+    w.register_table_in(CATALOG_NAME, "main", BlobParamBatchesFunction);
+    w.register_table_in(CATALOG_NAME, "main", BlobParamStreamsFunction);
+    w.register_scalar_in(CATALOG_NAME, "main", BlobParamScalarFunction);
+    w.register_table_in(CATALOG_NAME, "main", BlobParamTableScan);
     w.register_secondary_catalog(catalog(), FUNCTIONS.iter().map(|s| s.to_string()).collect());
 }
 
