@@ -16,7 +16,7 @@ categories = ["database", "api-bindings"]
 all-features = true
 
 [features]
-default = ["sqlite", "transport-http", "catalog-publication"]
+default = ["sqlite", "transport-http", "catalog-publication", "blob-vendor"]
 # Durable single-file SQLite storage backend (bundles libsqlite3 — compiles C).
 sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
@@ -38,7 +38,9 @@ transport-http = ["dep:tokio", "vgi-rpc/http", "dep:jsonwebtoken", "dep:ureq", "
 # Blob-vendor externalization (vgi-rpc-s3's `vendor` client): large storage
 # values kept in the vendor (`storage::blobs`), and over HTTP, with
 # VGI_BLOB_VENDOR_URL set, large results externalized and client upload URLs
-# vended. Pulls reqwest (blocking, rustls).
+# vended. Pulls reqwest (blocking, rustls). A default feature: Orchard hosts
+# every worker image with the vendor set, and a hosted worker built without it
+# refuses to start rather than serve without externalization.
 blob-vendor = ["transport-http", "dep:vgi-rpc-s3"]
 
 catalog-publication = ["vgi-rpc/external", "dep:zstd"]

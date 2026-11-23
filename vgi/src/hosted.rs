@@ -69,6 +69,12 @@ pub const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The shortest `VGI_SIGNING_KEY` a hosted worker accepts.
 pub const MIN_SIGNING_KEY_BYTES: usize = 32;
 
+/// The request cap (`VGI-Max-Request-Bytes`) a hosted worker serves with when
+/// `VGI_RPC_MAX_REQUEST_BYTES` is unset: 32 MiB, vgi-python's
+/// `HOSTED_DEFAULT_MAX_REQUEST_BYTES`. With the blob vendor, a larger request
+/// goes up through an upload URL instead.
+pub const HOSTED_DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 /// Largest JWKS document read.
 const JWKS_MAX_BYTES: u64 = 1 << 20;
 

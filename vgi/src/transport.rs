@@ -466,7 +466,10 @@ struct HttpRequestCaps {
 
 #[cfg(feature = "transport-http")]
 impl HttpRequestCaps {
-    fn from_env() -> Self {
+    /// `hosted`: Orchard hosted mode, where an unset `VGI_RPC_MAX_REQUEST_BYTES`
+    /// means [`crate::hosted::HOSTED_DEFAULT_MAX_REQUEST_BYTES`] rather than no
+    /// cap, as in vgi-python's hosted mode.
+    fn from_env(hosted: bool) -> Self {
         let max_request_bytes = std::env::var("VGI_RPC_MAX_REQUEST_BYTES")
             .ok()
             .map(|v| v.trim().to_string())
@@ -474,7 +477,8 @@ impl HttpRequestCaps {
             .map(|v| match v.parse::<usize>() {
                 Ok(n) if n > 0 => n,
                 _ => panic!("VGI_RPC_MAX_REQUEST_BYTES must be a positive integer, got {v:?}"),
-            });
+            })
+            .or(hosted.then_some(crate::hosted::HOSTED_DEFAULT_MAX_REQUEST_BYTES));
         #[cfg(feature = "blob-vendor")]
         {
             if let Some((cfg, storage)) = crate::blob_vendor::http_vendor() {
@@ -551,6 +555,17 @@ fn hosted_http(
     if let Some(reason) = hosted::environment_conflict(&env) {
         hosted::refuse(&reason);
     }
+    // Orchard sets the vendor for every hosted worker; one built without it
+    // would serve on without externalization, upload grants or argument
+    // references, so it refuses instead.
+    #[cfg(not(feature = "blob-vendor"))]
+    if env("VGI_BLOB_VENDOR_URL").is_some_and(|v| !v.trim().is_empty()) {
+        hosted::refuse(
+            "VGI_BLOB_VENDOR_URL is set but this worker was built without the vgi crate's \
+             `blob-vendor` feature (a default feature); enable it to externalize results and \
+             grant uploads through the vendor.",
+        );
+    }
     if authenticate.is_some() {
         hosted::refuse(
             "a custom authenticate callback is configured; hosted workers verify Passes only.",
@@ -595,7 +610,7 @@ pub(crate) fn serve_http_inner(
         }));
     }
     server.notify_transport(TransportKind::Http, TransportCapabilities::none());
-    let request_caps = HttpRequestCaps::from_env();
+    let request_caps = HttpRequestCaps::from_env(hosted.is_some());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
