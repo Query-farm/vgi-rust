@@ -209,7 +209,7 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
     .unwrap();
     let bind = BindRequest {
         function_name: function.to_string(),
-        arguments: Bytes::from(args),
+        arguments: Some(Bytes::from(args)),
         function_type: DictString("TABLE".to_string()),
         input_schema: input_schema
             .map(|s| Bytes::from(ipc::write_schema(s).unwrap()))
@@ -225,10 +225,11 @@ fn init_body(function: &str, input_schema: Option<&Schema>, phase: Option<&str>)
         copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("value".to_string())]),
+        arguments_location: None,
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
-        bind_call: Bytes::from(bind_bytes),
+        bind_call: crate::protocol::dtos::Nested::from_bytes(bind_bytes),
         output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,

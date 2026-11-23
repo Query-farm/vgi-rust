@@ -1,6 +1,8 @@
 // Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
-//! Hand-written request / response DTOs must match their generated schemas.
+//! Request / response DTOs must match their generated schemas. Most are
+//! hand-written; `BindRequest` and the requests embedding `bind_call` are the
+//! generated records themselves (protocol 3.4), pinned here all the same.
 //!
 //! These are the records a Rust client (`vgi-client`) serializes into a
 //! request, and the records a worker writes back. Their shape — field
@@ -26,6 +28,7 @@ macro_rules! parity {
 parity! {
     copy_from_context: CopyFromContext => copy_from_context_schema,
     copy_to_context: CopyToContext => copy_to_context_schema,
+    arguments_location: ArgumentsLocation => arguments_location_schema,
     bind_request: BindRequest => bind_request_schema,
     init_request: InitRequest => init_request_schema,
     table_function_plan_request: TableFunctionPlanRequest => table_function_plan_request_schema,
@@ -54,6 +57,8 @@ parity! {
     aggregate_streaming_chunk_request: AggregateStreamingChunkRequest => aggregate_streaming_chunk_request_schema,
     aggregate_streaming_close_request: AggregateStreamingCloseRequest => aggregate_streaming_close_request_schema,
     cardinality_request: CardinalityRequest => table_function_cardinality_request_schema,
+    statistics_request: TableFunctionStatisticsRequest => table_function_statistics_request_schema,
+    projection_request: TableFunctionProjectionRequest => table_function_projection_request_schema,
     dynamic_to_string_request: DynamicToStringRequest => table_function_dynamic_to_string_request_schema,
     bind_response: BindResponse => bind_result_schema,
     plan_response: PlanResponse => table_function_plan_result_schema,

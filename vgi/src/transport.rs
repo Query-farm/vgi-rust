@@ -459,6 +459,9 @@ struct HttpRequestCaps {
     max_request_bytes: Option<usize>,
     max_upload_bytes: Option<usize>,
     upload_url_provider: Option<Arc<dyn vgi_rpc::external::UploadUrlProvider>>,
+    /// `VGI-Arguments-Ref-Bytes` (protocol 3.4 argument references): sent
+    /// only with upload URLs whose objects the storage can fetch back by id.
+    arguments_ref_bytes: Option<u64>,
 }
 
 #[cfg(feature = "transport-http")]
@@ -474,11 +477,15 @@ impl HttpRequestCaps {
             });
         #[cfg(feature = "blob-vendor")]
         {
-            if let Some((_, storage)) = crate::blob_vendor::http_vendor() {
+            if let Some((cfg, storage)) = crate::blob_vendor::http_vendor() {
                 return HttpRequestCaps {
                     max_request_bytes,
                     max_upload_bytes: crate::blob_vendor::max_upload_bytes(),
                     upload_url_provider: Some(storage.clone()),
+                    arguments_ref_bytes: crate::arguments_ref::advertised_arguments_ref_bytes(
+                        true,
+                        cfg.storage.object_store().is_some(),
+                    ),
                 };
             }
         }
@@ -486,6 +493,7 @@ impl HttpRequestCaps {
             max_request_bytes,
             max_upload_bytes: None,
             upload_url_provider: None,
+            arguments_ref_bytes: None,
         }
     }
 
@@ -505,6 +513,11 @@ impl HttpRequestCaps {
         builder
     }
 }
+
+/// Maximum stream duration (protocol 3.4): cursor and call tokens and stored
+/// `StateRef` tags expire after 6 h.
+#[cfg(feature = "transport-http")]
+pub const TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(21_600);
 
 /// Orchard hosted mode's HTTP settings (see [`crate::hosted`]).
 #[cfg(feature = "transport-http")]
@@ -598,7 +611,13 @@ pub(crate) fn serve_http_inner(
             // position into the token so the whole result set never has to fit in
             // memory; producers that can't serialize their position drain fully
             // via a per-producer override (see `TableProducerState::batch_limit`).
-            .producer_batch_limit(1);
+            .producer_batch_limit(1)
+            // Protocol 3.4: a stream lives at most 6 h, and VGI keeps a
+            // stream's unchanging state in its `init: StateRef`, so a cursor
+            // over the turn budget is refused (`cursor_too_large`) rather than
+            // only warned about.
+            .token_ttl(TOKEN_TTL)
+            .cursor_rule(vgi_rpc::CursorRule::Error);
         if let Some(auth) = authenticate {
             builder = builder.authenticate(auth);
         }
@@ -613,6 +632,7 @@ pub(crate) fn serve_http_inner(
                 .cors_credentials(false)
                 .token_key(&hosted.token_key);
         }
+        let arguments_ref_bytes = request_caps.arguments_ref_bytes;
         builder = request_caps.apply(builder);
         if let Some(bridge) = bridge {
             let provider = vgi_rpc::iroh_forwarded_header_provider(
@@ -650,9 +670,30 @@ pub(crate) fn serve_http_inner(
         let port = listener.local_addr().unwrap().port();
         println!("PORT:{port}");
         io::stdout().flush().ok();
-        vgi_rpc::http::serve_with_shutdown(state, listener)
-            .await
-            .expect("axum serve");
+        let mut app = vgi_rpc::http::build_router(state);
+        // `VGI-Arguments-Ref-Bytes` on every response, beside vgi-rpc's own
+        // capability headers (capability discovery included).
+        if let Some(n) = arguments_ref_bytes {
+            let value = axum::http::HeaderValue::from(n);
+            app = app.layer(axum::middleware::map_response(
+                move |mut response: axum::response::Response| {
+                    let value = value.clone();
+                    async move {
+                        response
+                            .headers_mut()
+                            .insert(crate::arguments_ref::ARGUMENTS_REF_BYTES_HEADER, value);
+                        response
+                    }
+                },
+            ));
+        }
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(vgi_rpc::http::shutdown_signal())
+        .await
+        .expect("axum serve");
     });
 }
 

@@ -34,7 +34,7 @@ cloudflare-do = ["dep:ureq", "ureq/rustls"]
 # `src/hosted.rs`): every HTTP worker image can run hosted, so the Pass
 # verifier is not a separate feature. jsonwebtoken verifies the ES256 Pass;
 # ureq (sync, no runtime of its own, rustls) fetches the JWKS.
-transport-http = ["dep:tokio", "vgi-rpc/http", "dep:jsonwebtoken", "dep:ureq", "ureq/rustls"]
+transport-http = ["dep:tokio", "vgi-rpc/http", "dep:jsonwebtoken", "dep:ureq", "ureq/rustls", "dep:axum"]
 # Blob-vendor externalization (vgi-rpc-s3's `vendor` client): large storage
 # values kept in the vendor (`storage::blobs`), and over HTTP, with
 # VGI_BLOB_VENDOR_URL set, large results externalized and client upload URLs
@@ -84,6 +84,10 @@ log = { workspace = true }
 # tokio only backs the HTTP worker transport; optional + gated so the crate
 # compiles for wasm (where tokio's rt-multi-thread/net features are unsupported).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"], optional = true }
+# The HTTP worker's router (feature `transport-http`): vgi-rpc builds it, the
+# worker layers `VGI-Arguments-Ref-Bytes` onto every response. Already in the
+# build through vgi-rpc's `http` feature, same major.
+axum = { version = "0.8", optional = true }
 # SQLite storage backend (feature `sqlite`). `bundled` compiles a vendored
 # libsqlite3 so there is no system dependency; this is the one C-compiled dep.
 # 0.41 (libsqlite3-sys 0.39, bundled SQLite 3.53.x) for RUSTSEC-2026-0459; MSRV 1.97 is fine.

@@ -5,15 +5,11 @@ use arrow_schema::{Schema, SchemaRef};
 use base64::Engine;
 use std::sync::Arc;
 use vgi_protocol::generated::protocol_types::SqlExpression;
-use vgi_rpc::{Bytes, LargeBytes, Result, RpcError, VgiArrow};
+use vgi_rpc::{Bytes, Result, RpcError, VgiArrow};
 pub const PROFILE: &str = "vgi.expression.duckdb.scalar.v1";
-#[derive(Clone, Debug, VgiArrow)]
-pub struct ProjectionRequest {
-    pub bind_call: Bytes,
-    pub bind_result: Bytes,
-    pub expressions: Vec<LargeBytes>,
-    pub result_schema: Bytes,
-}
+/// The `table_function_projection` request: the generated record, whose
+/// `bind_call` is a raw-preserving `Nested<BindRequest>`.
+pub type ProjectionRequest = vgi_protocol::protocol::dtos::TableFunctionProjectionRequest;
 #[derive(Clone, Debug, VgiArrow)]
 pub struct ProjectionResponse {
     pub accepted_indices: Vec<i64>,
@@ -102,7 +98,15 @@ pub(crate) fn record(bytes: &[u8], expected: &Schema) -> Result<arrow_array::Rec
 }
 impl ProjectionProposal {
     pub(crate) fn decode(r: ProjectionRequest) -> Result<Self> {
-        if r.bind_call.0.len()
+        // 8 MiB is the projection contract's request bound, the same one the
+        // extension enforces before it sends (`MAX_PROJECTION_BYTES`,
+        // `src/vgi_projection_pushdown.cpp`), and `bind_call` counts towards
+        // it. Since protocol 3.4 a bind whose arguments are large travels by
+        // reference (`arguments_location`), so `bind_call` is small and the
+        // bound is met on HTTP; only inline arguments near the cap (a
+        // byte-stream transport, or `VGI_ARGUMENTS_REF_BYTES` raised above
+        // ~8 MiB) still exceed it, and the extension refuses those itself.
+        if r.bind_call.bytes().len()
             + r.bind_result.0.len()
             + r.result_schema.0.len()
             + r.expressions.iter().map(|v| v.0.len()).sum::<usize>()
@@ -114,7 +118,7 @@ impl ProjectionProposal {
             return Err(invalid("projection exceeds 8MiB"));
         }
         let bind_call: BindRequest = wire::from_batch(&record(
-            &r.bind_call.0,
+            r.bind_call.bytes(),
             &vgi_protocol::generated::protocol_schemas::bind_request_schema(),
         )?)?;
         let bind_result: BindResponse = wire::from_batch(&record(
@@ -239,7 +243,7 @@ mod tests {
         ProjectionProposal {
             bind_call: BindRequest {
                 function_name: "test".into(),
-                arguments: Bytes::from(Vec::new()),
+                arguments: Some(Bytes::from(Vec::new())),
                 function_type: DictString("TABLE".into()),
                 input_schema: None,
                 settings: None,
@@ -253,6 +257,7 @@ mod tests {
                 argument_names: None,
                 copy_to: None,
                 copy_from: None,
+                arguments_location: None,
             },
             bind_result: BindResponse {
                 output_schema: Bytes::from(Vec::new()),

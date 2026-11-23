@@ -24,10 +24,14 @@
 //!   message exactly `<field> not recognized`, code `INVALID_ARGUMENT`, kind
 //!   `opaque_data_not_recognized`, no details. There is no plaintext fallback.
 //!
-//! The dispatcher never sees a sealed value: [`OpaqueSealer::open_batch`] runs
-//! on every request before any handler, opening each value wherever the wire
-//! carries one (top-level columns, the boxed `request`, a nested `bind_call`),
-//! and [`OpaqueSealer::seal_result`] seals the two results that mint one. On
+//! [`OpaqueSealer::open_batch`] runs on every request before any handler,
+//! opening each value the top-level columns and the boxed `request` carry, and
+//! [`OpaqueSealer::seal_result`] seals the two results that mint one. A nested
+//! `bind_call` is **never** rewritten (vgi `docs/large-values-3.4.md` §3.3 rule
+//! 11): it is kept as the bytes the client sent, sealed values included, so it
+//! re-encodes byte for byte (into a state token, a stored init, a split
+//! fingerprint). The handlers open its values with
+//! [`OpaqueSealer::open_values`] into a per-call overlay beside it. On
 //! the OS-owned transports (stdio, unix, TCP launcher) there is no sealer and
 //! values travel as the dispatcher produced them. Secret attach options are
 //! never in them in plaintext on any transport: the SDK encrypts them with a
@@ -52,8 +56,9 @@ const TRANSACTION_AAD_PREFIX: &[u8] = b"vgi.transaction_opaque_data.v1\x00";
 const ATTACH_FIELD: &str = "attach_opaque_data";
 const TRANSACTION_FIELD: &str = "transaction_opaque_data";
 /// Binary columns whose rows are nested IPC request batches that may carry
-/// opaque values of their own.
-const NESTED_FIELDS: [&str; 2] = ["request", "bind_call"];
+/// opaque values of their own, opened in place. `bind_call` is deliberately
+/// absent (rule 11 above): its values are opened beside it, never in it.
+const NESTED_FIELDS: [&str; 1] = ["request"];
 
 /// The uniform rejection for an opaque value that does not open.
 ///
@@ -108,6 +113,9 @@ fn transaction_aad(auth: &AuthContext, attach_envelope: &[u8]) -> Vec<u8> {
     aad.extend_from_slice(attach_envelope);
     aad
 }
+
+/// The plaintexts of a record's attach and transaction values.
+pub type OpenedValues = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Seals and opens opaque values under one signing key.
 #[derive(Clone)]
@@ -175,9 +183,37 @@ impl OpaqueSealer {
         .map_err(|_| opaque_data_rejected(TRANSACTION_FIELD))
     }
 
-    /// Open every opaque value `batch` carries, at any depth the wire nests
-    /// one, returning the batch the dispatcher sees. Unchanged (and not
-    /// copied) when it carries none.
+    /// Open the attach and transaction values of one record (a decoded
+    /// `bind_call`), returning their plaintexts. Absent and empty values stay
+    /// as they are; a transaction opens only beside the record's sealed
+    /// attach, exactly as [`Self::open_batch`] requires.
+    pub fn open_values(
+        &self,
+        attach: Option<&[u8]>,
+        transaction: Option<&[u8]>,
+        auth: &AuthContext,
+    ) -> Result<OpenedValues> {
+        let opened_attach = match attach {
+            None => None,
+            Some([]) => Some(Vec::new()),
+            Some(sealed) => Some(self.open_attach(sealed, auth)?),
+        };
+        let opened_transaction = match transaction {
+            None => None,
+            Some([]) => Some(Vec::new()),
+            Some(sealed) => {
+                let attach = attach.ok_or_else(|| opaque_data_rejected(TRANSACTION_FIELD))?;
+                Some(self.open_transaction(sealed, auth, attach)?)
+            }
+        };
+        Ok((opened_attach, opened_transaction))
+    }
+
+    /// Open every opaque value `batch` carries in its own columns and in a
+    /// boxed `request`, returning the batch the dispatcher sees. Unchanged
+    /// (and not copied) when it carries none. A nested record that carries
+    /// none is kept as its exact bytes, so a `request` holding only a
+    /// `bind_call` passes through untouched.
     ///
     /// A transaction value opens only beside the sealed attach of the same
     /// record; one presented without an attach is rejected.
@@ -207,7 +243,10 @@ impl OpaqueSealer {
                         .ok_or_else(|| opaque_data_rejected(TRANSACTION_FIELD))?;
                     self.open_transaction(sealed, auth, attach)
                 })?
-            } else if NESTED_FIELDS.contains(&name) && is_binary(column.data_type()) {
+            } else if NESTED_FIELDS.contains(&name)
+                && is_binary(column.data_type())
+                && nested_touches(&binary_column(batch, name)?.expect("present"))?
+            {
                 let values = binary_column(batch, name)?.expect("present");
                 map_binary(&values, |_, nested| {
                     rewrite_nested(nested, |inner| self.open_batch(&inner, auth))
@@ -286,6 +325,24 @@ fn rewrite_nested(
     let declared = ipc::read_schema(nested)?;
     let out = f(ipc::read_batch(nested)?)?;
     ipc::write_batch_with_schema(&out, declared.as_ref())
+}
+
+/// Whether any nested record in `values` carries a column [`OpaqueSealer::open_batch`]
+/// opens (read from each record's schema only, without decoding it).
+fn nested_touches(values: &BinaryArray) -> Result<bool> {
+    for row in 0..values.len() {
+        if values.is_null(row) || values.value(row).is_empty() {
+            continue;
+        }
+        let schema = ipc::read_schema(values.value(row))?;
+        if schema.fields().iter().any(|f| {
+            let name = f.name().as_str();
+            name == ATTACH_FIELD || name == TRANSACTION_FIELD || NESTED_FIELDS.contains(&name)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_binary(data_type: &DataType) -> bool {
@@ -478,40 +535,60 @@ mod tests {
         assert_eq!(attach_errors[0].3, tx_errors[0].3);
     }
 
+    /// A boxed `request` is opened in place; a `bind_call` nested in it is
+    /// kept byte for byte, sealed values and all (rule 11), and its values
+    /// open beside it with `open_values`.
     #[test]
-    fn nested_request_and_bind_call_are_opened() {
+    fn nested_request_is_opened_and_bind_call_is_kept() {
         let s = sealer();
         let attach = s.seal_attach(b"cat", &alice());
-        let inner = flat(Some(&attach), None);
-        let bind_call = RecordBatch::try_new(
+        let tx = s.seal_transaction(b"tx", &alice(), &attach);
+        let inner = flat(Some(&attach), Some(&tx));
+        let bind_call_bytes = ipc::write_batch(&inner).unwrap();
+        let init = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "bind_call",
                 DataType::Binary,
                 false,
             )])),
-            vec![Arc::new(BinaryArray::from(vec![ipc::write_batch(&inner)
-                .unwrap()
-                .as_slice()]))],
+            vec![Arc::new(BinaryArray::from(
+                vec![bind_call_bytes.as_slice()],
+            ))],
         )
         .unwrap();
-        let request = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "request",
-                DataType::Binary,
-                true,
-            )])),
-            vec![Arc::new(BinaryArray::from(vec![ipc::write_batch(
-                &bind_call,
+        let init_bytes = ipc::write_batch(&init).unwrap();
+        let request = |payload: &[u8]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "request",
+                    DataType::Binary,
+                    true,
+                )])),
+                vec![Arc::new(BinaryArray::from(vec![payload]))],
             )
             .unwrap()
-            .as_slice()]))],
-        )
-        .unwrap();
-        let out = s.open_batch(&request, &alice()).unwrap();
+        };
+        // A request whose record carries only a bind_call passes through as
+        // its exact bytes: nothing is decoded or re-encoded.
+        let out = s.open_batch(&request(&init_bytes), &alice()).unwrap();
+        assert_eq!(opened(&out, "request"), init_bytes);
         let level1 = ipc::read_batch(&opened(&out, "request")).unwrap();
-        let level2 = ipc::read_batch(&opened(&level1, "bind_call")).unwrap();
-        assert_eq!(opened(&level2, ATTACH_FIELD), b"cat");
-        assert!(s.open_batch(&request, &bob()).is_err());
+        assert_eq!(opened(&level1, "bind_call"), bind_call_bytes);
+        // The overlay opens beside it.
+        let (a, t) = s.open_values(Some(&attach), Some(&tx), &alice()).unwrap();
+        assert_eq!(a.as_deref(), Some(&b"cat"[..]));
+        assert_eq!(t.as_deref(), Some(&b"tx"[..]));
+        assert!(s.open_values(Some(&attach), None, &bob()).is_err());
+        assert!(s.open_values(None, Some(&tx), &alice()).is_err());
+        // A boxed record with its own attach is still opened in place.
+        let out = s
+            .open_batch(&request(&ipc::write_batch(&inner).unwrap()), &alice())
+            .unwrap();
+        let level1 = ipc::read_batch(&opened(&out, "request")).unwrap();
+        assert_eq!(opened(&level1, ATTACH_FIELD), b"cat");
+        assert!(s
+            .open_batch(&request(&ipc::write_batch(&inner).unwrap()), &bob())
+            .is_err());
     }
 
     #[test]

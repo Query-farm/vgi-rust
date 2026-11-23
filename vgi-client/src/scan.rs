@@ -25,9 +25,10 @@ use arrow_schema::{DataType, Schema, SchemaRef, SortOptions};
 use vgi_protocol::cache_control::CacheControl;
 use vgi_protocol::generated::request_params as p;
 use vgi_protocol::protocol::dtos::{
-    BindRequest, BindResponse, CardinalityRequest, DynamicToStringRequest, DynamicToStringResponse,
-    FieldPath, GlobalInitResponse, InitRequest, KeyGrouping, PartitionTransform, PlanResponse,
-    RangeKey, RangePartitioning, ScanSplit, SortField, TableFunctionPlanRequest, TransformSpec,
+    BindRequest, BindResponse, DynamicToStringRequest, DynamicToStringResponse, FieldPath,
+    GlobalInitResponse, InitRequest, KeyGrouping, Nested, PartitionTransform, PlanResponse,
+    RangeKey, RangePartitioning, ScanSplit, SortField, TableFunctionPlanRequest,
+    TableFunctionStatisticsRequest, TransformSpec,
 };
 use vgi_protocol::protocol::enums;
 use vgi_protocol::{ipc, wire};
@@ -216,7 +217,7 @@ impl BoundFunction {
         finalize_state_id: Option<Bytes>,
     ) -> InitRequest {
         InitRequest {
-            bind_call: self.bind_call.clone(),
+            bind_call: Nested::from_bytes(self.bind_call.0.clone()),
             output_schema: self.response.output_schema.clone(),
             bind_opaque_data: self.response.opaque_data.clone(),
             projection_ids: opts.wire_projection(),
@@ -785,8 +786,8 @@ impl VgiClient {
     /// The response is the protocol's canonical sparse-union statistics batch;
     /// an empty-schema batch means the function does not provide statistics.
     pub fn table_function_statistics(&mut self, bound: &BoundFunction) -> Result<RecordBatch> {
-        let request = envelope(CardinalityRequest {
-            bind_call: bound.bind_call.clone(),
+        let request = envelope(TableFunctionStatisticsRequest {
+            bind_call: Nested::from_bytes(bound.bind_call.0.clone()),
             bind_opaque_data: bound.response.opaque_data.clone(),
         })?;
         call_batch(
@@ -808,7 +809,7 @@ impl VgiClient {
         execution_id: Bytes,
     ) -> Result<DynamicToStringResponse> {
         let request = envelope(DynamicToStringRequest {
-            bind_call: bound.bind_call.clone(),
+            bind_call: Nested::from_bytes(bound.bind_call.0.clone()),
             bind_opaque_data: bound.response.opaque_data.clone(),
             global_execution_id: execution_id,
         })?;
@@ -840,10 +841,10 @@ impl VgiClient {
     ) -> Result<BoundFunction> {
         let request = BindRequest {
             function_name: spec.function_name.clone(),
-            arguments: match &spec.raw_arguments {
+            arguments: Some(match &spec.raw_arguments {
                 Some(raw) => raw.clone(),
                 None => spec.arguments.to_ipc()?,
-            },
+            }),
             function_type: DictString(spec.function_type.as_str().to_string()),
             input_schema: None,
             settings: spec.settings.clone(),
@@ -857,6 +858,7 @@ impl VgiClient {
             copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
+            arguments_location: None,
         };
 
         // `init` echoes the whole bind call back, so keep the exact bytes we
@@ -1614,7 +1616,7 @@ impl VgiClient {
             pages += 1;
 
             let request = TableFunctionPlanRequest {
-                bind_call: bound.bind_call.clone(),
+                bind_call: Nested::from_bytes(bound.bind_call.0.clone()),
                 bind_opaque_data: bound.response.opaque_data.clone(),
                 projection_ids: opts.wire_projection(),
                 pushdown_filters: opts.pushdown_filters.clone().map(LargeBytes),
@@ -2282,7 +2284,7 @@ mod tests {
         assert_eq!(response.values, ["42", "7"]);
 
         let request = seen.lock().unwrap().clone().expect("request");
-        assert_eq!(request.bind_call, Bytes(Vec::new()));
+        assert!(request.bind_call.bytes().is_empty());
         assert_eq!(request.bind_opaque_data, Some(Bytes(Vec::new())));
         assert_eq!(
             request.global_execution_id,

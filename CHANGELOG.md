@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **Protocol 3.4 large values** (vgi `docs/large-values-3.4.md`):
+  - **Generated bind types.** `BindRequest`, `ArgumentsLocation`,
+    `CopyFromContext`, `CopyToContext` and the six requests embedding
+    `bind_call` (`InitRequest`, `TableFunctionCardinalityRequest`,
+    `TableFunctionStatisticsRequest`, `TableFunctionDynamicToStringRequest`,
+    `TableFunctionPlanRequest`, `TableFunctionProjectionRequest`) are now the
+    generated records (`vgi_protocol::generated::protocol_types`, re-exported
+    from `protocol::dtos`). `bind_call` is a raw-preserving
+    `Nested<BindRequest>` that re-encodes as the bytes received, and
+    `BindRequest.arguments` is `Option<Bytes>` beside the new
+    `arguments_location`. Breaking for code that builds these structs.
+    `CardinalityRequest` / `DynamicToStringRequest` remain as aliases;
+    statistics now uses its own `TableFunctionStatisticsRequest`.
+  - **Argument references.** A bind whose arguments travelled by reference
+    (`arguments_location`) is resolved at each turn's entry through vgi-rpc
+    (sealed ref, object cache, size and SHA-256 checks); exactly one of
+    `arguments` / `arguments_location` is required (`invalid_bind_request`),
+    and an expired object answers `arguments_ref_missing` with "this prepared
+    statement's large argument has expired; prepare it again". An `--http`
+    worker with the blob vendor sends `VGI-Arguments-Ref-Bytes` (default
+    4 MiB, `VGI_ARGUMENTS_REF_BYTES`; `VGI_TEST_DISABLE_ARGUMENTS_REF=1` turns
+    it off). The split-token fingerprint hashes a location's size and SHA-256,
+    never the value or the sealed ref. Table buffering persists the reference.
+  - **`init: StateRef`.** An HTTP stream's cursor is now `StreamCursor`: the
+    stream's immutable init (`StreamInit`, carrying the `bind_call` exactly as
+    received) as one vgi-rpc `StateRef`, plus the per-turn fields. A
+    continuation resolves it, and the arguments, on its first turn. The
+    former `ExchangeBlob`, which carried the raw arguments in every token, is
+    gone.
+  - **Opaque values beside `bind_call`.** The sealer no longer rewrites a
+    nested `bind_call`; its attach / transaction values are opened into a
+    per-call overlay, so plaintext never reaches a re-encoded request or a
+    state token.
+  - `--http` serves with `token_ttl` 21600 s (was vgi-rpc's 300 s) and the
+    `cursor_too_large` cursor rule.
+  - Example worker: `blob_param_batches`, `blob_param_streams`,
+    `blob_param_scalar` and the `blob_param_table` catalog table.
+
 - **Orchard hosted mode** (`VGI_ORCHARD_HOSTED=1`, `vgi::hosted`), ported from
   vgi-python: an `--http` worker accepts only Orchard Passes (ES256 RFC 9068
   access tokens checked against `VGI_JWT_ISSUER` / `VGI_JWT_AUDIENCE` /

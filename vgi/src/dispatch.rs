@@ -381,6 +381,11 @@ pub struct Dispatcher {
     storage_seal_key: std::sync::OnceLock<[u8; 32]>,
     /// Decoded buffered-function init records, per execution.
     buffering_inits: crate::framework_state::BufferingInitCache,
+    /// This dispatcher, once [`crate::protocol::register::register`] shares
+    /// it. A stream rebuilt from an HTTP continuation resolves its
+    /// `init: StateRef` and its arguments at the turn's entry, where a
+    /// [`CallContext`] exists, so the rebuilt state keeps the dispatcher.
+    pub(crate) self_ref: std::sync::OnceLock<std::sync::Weak<Dispatcher>>,
 }
 
 /// Which cached `catalog_contents` response a call is served: the catalog
@@ -434,6 +439,7 @@ impl Dispatcher {
             storage_seal_root: None,
             storage_seal_key: std::sync::OnceLock::new(),
             buffering_inits: Default::default(),
+            self_ref: std::sync::OnceLock::new(),
         }
     }
 
@@ -1122,11 +1128,66 @@ impl Dispatcher {
         )
     }
 
-    /// Build `BindParams` from a wire `BindRequest` + call context.
+    /// Decode a `bind_call` from the bytes a request embeds, opening its
+    /// sealed values and resolving its arguments into the per-call overlay
+    /// ([`crate::arguments_ref::OpenedBindCall`]); the held bytes are never
+    /// rewritten (large-values spec §3.3 rule 11). `path` names the field in
+    /// decode errors (e.g. `InitRequest.bind_call`).
+    pub(crate) fn open_bind_call(
+        &self,
+        bytes: &[u8],
+        path: &str,
+        ctx: &CallContext,
+    ) -> Result<crate::arguments_ref::OpenedBindCall> {
+        let (dto, legacy_peer) = decode_bind_call(bytes, path)?;
+        self.open_bind_dto(dto, legacy_peer, &ctx.auth, Some(ctx))
+    }
+
+    /// [`Self::open_bind_call`] for an already-decoded bind call. Opens the
+    /// attach / transaction values with the sealer (when this transport has
+    /// one) for `auth`, then validates and resolves the arguments through
+    /// `ctx`. Without a context (dynamic-to-string reads only the name) the
+    /// arguments are validated but not fetched.
+    pub(crate) fn open_bind_dto(
+        &self,
+        mut dto: BindRequest,
+        legacy_peer: bool,
+        auth: &vgi_rpc::AuthContext,
+        ctx: Option<&CallContext>,
+    ) -> Result<crate::arguments_ref::OpenedBindCall> {
+        if let Some(sealer) = &self.opaque {
+            let (attach, transaction) = sealer.open_values(
+                dto.attach_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                dto.transaction_opaque_data.as_ref().map(|b| b.0.as_slice()),
+                auth,
+            )?;
+            dto.attach_opaque_data = attach.map(Bytes);
+            dto.transaction_opaque_data = transaction.map(Bytes);
+        }
+        let location = match ctx {
+            Some(ctx) => crate::arguments_ref::resolve_in_place(&mut dto, ctx)?,
+            None => {
+                dto.validate_arguments()?;
+                dto.arguments_location.clone()
+            }
+        };
+        Ok(crate::arguments_ref::OpenedBindCall {
+            view: dto,
+            legacy_peer,
+            location,
+        })
+    }
+
+    /// Build `BindParams` from an opened bind call + call context.
     fn bind_params(&self, dto: &BindRequest, ctx: &CallContext) -> Result<BindParams> {
         Ok(BindParams {
             input_schema: opt_schema(&dto.input_schema)?,
-            arguments: crate::arguments::Arguments::parse(&dto.arguments.0)?,
+            arguments: crate::arguments::Arguments::parse(
+                dto.arguments
+                    .as_ref()
+                    .map(|b| b.0.as_slice())
+                    .unwrap_or(&[]),
+            )?,
             argument_names: dto.argument_names.clone(),
             settings: parse_settings(&dto.settings)?,
             secrets: parse_secrets(&dto.secrets)?,
@@ -1148,7 +1209,10 @@ impl Dispatcher {
 
     pub fn handle_bind(&self, req: &Request, ctx: &CallContext) -> Result<Option<RecordBatch>> {
         let (inner, legacy_peer) = backfill_bind_request(request_inner_batch(req)?)?;
-        let dto: BindRequest = wire::from_batch(&inner)?;
+        let mut dto: BindRequest = wire::from_batch(&inner)?;
+        // Exactly one of `arguments` / `arguments_location`; a reference is
+        // resolved here (the boxed request's attach was already opened).
+        crate::arguments_ref::resolve_in_place(&mut dto, ctx)?;
         let mut params = self.bind_params(&dto, ctx)?;
         // The COPY ... FROM / ... TO contexts (when present) ride as out-of-band
         // nested-struct columns the C++ extension omits for ordinary binds. A
@@ -1370,17 +1434,20 @@ impl Dispatcher {
 
     pub fn handle_init(&self, req: &Request, ctx: &CallContext) -> Result<StreamResult> {
         let dto: InitRequest = boxed(req)?;
-        // bind_call is an IPC-serialized BindRequest.
-        let (bind_call_batch, legacy_peer) =
-            backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?;
-        let bind_call: BindRequest = wire::from_batch(&bind_call_batch)?;
-        // COPY ... FROM context (out-of-band struct column, absent for ordinary
-        // scans) — threaded onto every ProcessParams built below.
-        let copy_from = read_copy_from(&bind_call_batch)?;
-        // COPY ... TO context (out-of-band struct column, absent for ordinary
-        // scans) — persisted at sink-init for the process/combine RPCs.
-        let copy_to = read_copy_to(&bind_call_batch)?;
-        let mut bp = self.bind_params(&bind_call, ctx)?;
+        // bind_call is an IPC-serialized BindRequest, held as the bytes the
+        // client sent (`Nested`). The handlers read the opened, resolved
+        // overlay; anything that re-encodes the init (the stream's
+        // `init: StateRef`, the buffering record) uses the held bytes.
+        let opened = self.open_bind_call(dto.bind_call.bytes(), "InitRequest.bind_call", ctx)?;
+        let bind_call = &opened.view;
+        let legacy_peer = opened.legacy_peer;
+        // COPY ... FROM context (absent for ordinary scans) — threaded onto
+        // every ProcessParams built below.
+        let copy_from = bind_call.copy_from.clone();
+        // COPY ... TO context (absent for ordinary scans) — persisted at
+        // sink-init for the process/combine RPCs.
+        let copy_to = bind_call.copy_to.clone();
+        let mut bp = self.bind_params(bind_call, ctx)?;
         bp.copy_from = copy_from.clone();
         bp.copy_to = copy_to.clone();
         // Projection pushdown: the C++ sends the full bind output schema plus
@@ -1397,7 +1464,7 @@ impl Dispatcher {
         let ft = normalize_function_type(&bind_call.function_type.0).unwrap_or_default();
         // The embedded bind_call carries the same (catalog, schema) the bind did.
         let call = self.bind_scope(
-            &bind_call,
+            bind_call,
             copy_from.is_some() || copy_to.is_some(),
             legacy_peer,
         )?;
@@ -1409,7 +1476,7 @@ impl Dispatcher {
         let split_payloads: Option<Vec<Vec<u8>>> = match dto.split_tokens.as_ref() {
             None => None,
             Some(tokens) => {
-                let expected = self.split_bind_fingerprint(&bind_call);
+                let expected = self.split_bind_fingerprint(&opened);
                 let live_anchor = self.split_live_anchor();
                 let mut out = Vec::with_capacity(tokens.len());
                 for token in tokens {
@@ -1547,11 +1614,12 @@ impl Dispatcher {
                 // source reads lives in the execution-scoped store, keyed by
                 // `execution_id` + `finalize_state_id`.
                 let resume_blob = Some(self.exchange_blob(
+                    ctx,
                     "buffering_finalize",
                     bind_call.function_name.clone(),
                     &output_schema,
                     input_schema.as_ref(),
-                    &bind_call,
+                    &opened,
                     &dto,
                     &bparams.execution_id,
                     auto_apply,
@@ -1562,7 +1630,8 @@ impl Dispatcher {
                     current_filters,
                     filters,
                     project_to: Some(output_schema.clone()),
-                    resume_blob,
+                    resume: resume_blob,
+                    label: bind_call.function_name.clone(),
                     conditional_checked: false,
                     filter_history: Default::default(),
                 };
@@ -1588,7 +1657,17 @@ impl Dispatcher {
                 crate::framework_state::BufferingInit {
                     output_schema: output_schema.clone(),
                     input_schema: input_schema.clone(),
-                    arguments: bind_call.arguments.0.clone(),
+                    // The reference form, never a resolved value: an
+                    // externalized argument is resolved again (through the
+                    // object cache) by process / combine.
+                    arguments: match &opened.location {
+                        Some(location) => {
+                            crate::framework_state::StoredArguments::Location(location.clone())
+                        }
+                        None => crate::framework_state::StoredArguments::Inline(
+                            opened.arguments().to_vec(),
+                        ),
+                    },
                     secrets: bind_call.secrets.as_ref().map(|s| s.0.clone()),
                     logging: bp.arguments.named_bool("logging").unwrap_or(false),
                     copy_to: copy_to.clone(),
@@ -1604,7 +1683,8 @@ impl Dispatcher {
                 filters: None,
                 current_filters: None,
                 project_to: None,
-                resume_blob: None,
+                resume: None,
+                label: bind_call.function_name.clone(),
                 conditional_checked: false,
                 filter_history: Default::default(),
             };
@@ -1718,53 +1798,55 @@ impl Dispatcher {
                 // against 2.6s reading one row per turn, and 8.7s for the Python
                 // reference, which scans exactly one row per tick. Per-row
                 // storage lets the resume do the same.
-                let (inner, resume_blob): (Box<dyn TableProducer>, Option<Vec<u8>>) = if ctx.kind
-                    == Some(vgi_rpc::transport::TransportKind::Http)
-                    && batches.len() > 1
-                {
-                    // Keyed per STREAM, not per execution: a parallel query
-                    // opens several finalize substreams under one execution
-                    // id, and a shared key would let them drain each other's
-                    // batches (a wrong COUNT(*)).
-                    let flush_key = self.next_execution_id();
-                    let rows = batches
-                        .iter()
-                        .map(|b| encode_finalize_batch(b, &output_schema))
-                        .collect::<Result<Vec<_>>>()?;
-                    let remaining = rows.len() as i64;
-                    self.store
-                        .append_many(&execution_id, TIO_FINALIZE_NS, &flush_key, rows);
-                    let blob = self.exchange_blob(
-                        "table_in_out_finalize",
-                        bind_call.function_name.clone(),
-                        &output_schema,
-                        input_schema.as_ref(),
-                        &bind_call,
-                        &dto,
-                        &execution_id,
-                        false,
-                        &[],
-                    )?;
-                    (
-                        Box::new(FinalizeFlushProducer {
-                            store: self.store.clone(),
-                            scope: execution_id.clone(),
-                            key: flush_key,
-                            cursor: -1,
-                            remaining,
-                            function_name: bind_call.function_name.clone(),
-                        }),
-                        Some(blob),
-                    )
-                } else {
-                    (Box::new(VecProducer { batches, pos: 0 }), None)
-                };
+                let (inner, resume_blob): (Box<dyn TableProducer>, Option<StreamCursor>) =
+                    if ctx.kind == Some(vgi_rpc::transport::TransportKind::Http)
+                        && batches.len() > 1
+                    {
+                        // Keyed per STREAM, not per execution: a parallel query
+                        // opens several finalize substreams under one execution
+                        // id, and a shared key would let them drain each other's
+                        // batches (a wrong COUNT(*)).
+                        let flush_key = self.next_execution_id();
+                        let rows = batches
+                            .iter()
+                            .map(|b| encode_finalize_batch(b, &output_schema))
+                            .collect::<Result<Vec<_>>>()?;
+                        let remaining = rows.len() as i64;
+                        self.store
+                            .append_many(&execution_id, TIO_FINALIZE_NS, &flush_key, rows);
+                        let blob = self.exchange_blob(
+                            ctx,
+                            "table_in_out_finalize",
+                            bind_call.function_name.clone(),
+                            &output_schema,
+                            input_schema.as_ref(),
+                            &opened,
+                            &dto,
+                            &execution_id,
+                            false,
+                            &[],
+                        )?;
+                        (
+                            Box::new(FinalizeFlushProducer {
+                                store: self.store.clone(),
+                                scope: execution_id.clone(),
+                                key: flush_key,
+                                cursor: -1,
+                                remaining,
+                                function_name: bind_call.function_name.clone(),
+                            }),
+                            Some(blob),
+                        )
+                    } else {
+                        (Box::new(VecProducer { batches, pos: 0 }), None)
+                    };
                 let state = TableProducerState {
                     inner,
                     filters: None,
                     current_filters: None,
                     project_to: None,
-                    resume_blob,
+                    resume: resume_blob,
+                    label: bind_call.function_name.clone(),
                     conditional_checked: false,
                     filter_history: Default::default(),
                 };
@@ -1779,11 +1861,12 @@ impl Dispatcher {
                 opaque_data: None,
             })?;
             let blob = self.exchange_blob(
+                ctx,
                 "table_in_out",
                 bind_call.function_name.clone(),
                 &output_schema,
                 input_schema.as_ref(),
-                &bind_call,
+                &opened,
                 &dto,
                 &execution_id,
                 auto_apply,
@@ -1884,11 +1967,12 @@ impl Dispatcher {
             // A producer that can't serialize its position gets one turn to
             // finish in — see `TableProducerState::drains_in_one_turn`.
             let resume_blob = Some(self.exchange_blob(
+                ctx,
                 "table",
                 bind_call.function_name.clone(),
                 &output_schema,
                 None,
-                &bind_call,
+                &opened,
                 &dto,
                 &execution_id,
                 auto_apply,
@@ -1904,7 +1988,8 @@ impl Dispatcher {
                 current_filters: parsed_filters,
                 filters,
                 project_to,
-                resume_blob,
+                resume: resume_blob,
+                label: bind_call.function_name.clone(),
                 conditional_checked: false,
                 filter_history: Default::default(),
             };
@@ -1934,11 +2019,12 @@ impl Dispatcher {
         })?;
 
         let blob = self.exchange_blob(
+            ctx,
             "scalar",
             bind_call.function_name.clone(),
             &output_schema,
             input_schema.as_ref(),
-            &bind_call,
+            &opened,
             &dto,
             &execution_id,
             false,
@@ -1953,24 +2039,32 @@ impl Dispatcher {
         Ok(StreamResult::exchange(output_schema, in_schema, Box::new(state)).with_header(header))
     }
 
-    /// Build the encoded HTTP-continuation blob for a stateless exchange
-    /// stream (scalar / table-in-out). Carries everything needed to rebuild
-    /// the handler from an AEAD state token on any pooled HTTP worker.
+    /// Build the HTTP-continuation cursor for a stream, on its init turn.
+    ///
+    /// Everything the init decided goes into one [`StreamInit`], carried as
+    /// the cursor's `init: StateRef` (vgi `docs/large-values-3.4.md` §6):
+    /// created here, while the init request is handled, and only copied by
+    /// later turns. Small inits ride inline in the state token; a large one
+    /// (a big IN list, many join keys) is stored once and costs a small sealed
+    /// tag per turn. The init carries the `bind_call` exactly as the client
+    /// sent it, so an externalized argument stays a reference and sealed
+    /// attach / transaction values stay sealed; each turn opens and resolves
+    /// them again at its entry.
     #[allow(clippy::too_many_arguments)]
     fn exchange_blob(
         &self,
+        ctx: &CallContext,
         kind: &str,
         function_name: String,
         output_schema: &arrow_schema::SchemaRef,
         input_schema: Option<&arrow_schema::SchemaRef>,
-        bind_call: &BindRequest,
+        bind_call: &crate::arguments_ref::OpenedBindCall,
         dto: &InitRequest,
         execution_id: &[u8],
         auto_apply: bool,
         split_payloads: &[Vec<u8>],
-    ) -> Result<Vec<u8>> {
-        let blob = ExchangeBlob {
-            kind: kind.to_string(),
+    ) -> Result<StreamCursor> {
+        let init = StreamInit {
             function_name,
             output_schema: ipc::write_schema_ref(output_schema)?,
             filter_schema: dto.output_schema.0.clone(),
@@ -1978,17 +2072,10 @@ impl Dispatcher {
                 Some(s) => ipc::write_schema_ref(s)?,
                 None => Vec::new(),
             },
-            arguments: bind_call.arguments.0.clone(),
-            settings: bind_call.settings.clone().map(|b| b.0).unwrap_or_default(),
-            secrets: bind_call.secrets.clone().map(|b| b.0).unwrap_or_default(),
+            bind_call: dto.bind_call.bytes().to_vec(),
             execution_id: execution_id.to_vec(),
             substream_id: dto.substream_id.clone().map(|b| b.0).unwrap_or_default(),
             split_payloads: split_payloads.to_vec(),
-            attach_opaque_data: bind_call
-                .attach_opaque_data
-                .clone()
-                .map(|b| b.0)
-                .unwrap_or_default(),
             finalize_state_id: dto
                 .finalize_state_id
                 .clone()
@@ -2017,89 +2104,122 @@ impl Dispatcher {
                 .map(|b| b.0)
                 .collect(),
             auto_apply,
-            inner_resume: Vec::new(),
-            at_unit: bind_call.at_unit.clone().unwrap_or_default(),
-            at_value: bind_call.at_value.clone().unwrap_or_default(),
             catalog_name: self
                 .call_catalog(
                     bind_call
+                        .view
                         .attach_opaque_data
                         .as_ref()
                         .map(|b| b.0.as_slice()),
                 )
                 .to_string(),
-            schema_path: bind_call.schema_path.clone().unwrap_or_default(),
+        };
+        Ok(StreamCursor {
+            kind: kind.to_string(),
+            init: ctx.state_ref(vgi_rpc::stream_codec::bincode_encode(&init)?)?,
+            inner_resume: Vec::new(),
             filter_deltas: Vec::new(),
             filter_predicate_order: Vec::new(),
             continuation: TioContinuation::default(),
-            transaction_opaque_data: bind_call
-                .transaction_opaque_data
-                .clone()
-                .map(|b| b.0)
-                .unwrap_or_default(),
-        };
-        vgi_rpc::stream_codec::bincode_encode(&blob)
+        })
     }
 
-    /// Rebuild a stateless exchange stream from its HTTP-continuation blob.
-    /// Serves `init`'s state decoder (`VgiService::decode_init_state`) so a pooled HTTP
-    /// worker can resume a scalar / table-in-out exchange from an AEAD token.
+    /// Decode a stream's HTTP-continuation cursor. Serves `init`'s state
+    /// decoder (`VgiService::decode_init_state`).
+    ///
+    /// The decoder runs without a call context, so it only reads the cursor:
+    /// the returned state resolves `init: StateRef` and the arguments at the
+    /// turn's entry (`Dispatcher::rehydrate`), where the context exists.
     pub fn decode_init_exchange_state(
         &self,
         bytes: &[u8],
     ) -> Result<vgi_rpc::stream::StreamStateKind> {
-        let blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
-        let output_schema = ipc::read_schema(&blob.output_schema)?;
-        let filter_schema = if blob.filter_schema.is_empty() {
+        let cursor: StreamCursor = vgi_rpc::stream_codec::bincode_decode(bytes)?;
+        let disp = self
+            .self_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                RpcError::runtime_error(
+                    "cannot resume a stream: this dispatcher is not registered on a server",
+                )
+            })?;
+        Ok(match cursor.kind.as_str() {
+            "scalar" | "table_in_out" => {
+                vgi_rpc::stream::StreamStateKind::Exchange(Box::new(RehydratingExchange {
+                    disp,
+                    cursor,
+                    inner: None,
+                }))
+            }
+            _ => vgi_rpc::stream::StreamStateKind::Producer(Box::new(RehydratingProducer {
+                disp,
+                cursor,
+                inner: None,
+            })),
+        })
+    }
+
+    /// Rebuild a stream from its cursor on a continuation turn: resolve
+    /// `init`, open the embedded `bind_call` (sealed values for this caller,
+    /// argument reference through the object cache), re-resolve the function
+    /// and replay the cursor's per-turn fields.
+    fn rehydrate(
+        &self,
+        cursor: &StreamCursor,
+        ctx: &CallContext,
+    ) -> Result<vgi_rpc::stream::StreamStateKind> {
+        let init: StreamInit = vgi_rpc::stream_codec::bincode_decode(&ctx.resolve(&cursor.init)?)?;
+        let opened = self.open_bind_call(&init.bind_call, "StreamInit.bind_call", ctx)?;
+        let bind_call = &opened.view;
+        let output_schema = ipc::read_schema(&init.output_schema)?;
+        let filter_schema = if init.filter_schema.is_empty() {
             output_schema.clone()
         } else {
-            ipc::read_schema(&blob.filter_schema)?
+            ipc::read_schema(&init.filter_schema)?
         };
-        let input_schema = if blob.input_schema.is_empty() {
+        let input_schema = if init.input_schema.is_empty() {
             None
         } else {
-            Some(ipc::read_schema(&blob.input_schema)?)
+            Some(ipc::read_schema(&init.input_schema)?)
         };
-        let settings = if blob.settings.is_empty() {
-            crate::settings::Settings::default()
-        } else {
-            crate::settings::Settings::parse(&blob.settings)?
-        };
-        let secrets = if blob.secrets.is_empty() {
-            crate::secrets::Secrets::default()
-        } else {
-            crate::secrets::Secrets::parse(&blob.secrets)?
-        };
-        let pushdown = if blob.pushdown_filters.is_empty() {
+        let settings = parse_settings(&bind_call.settings)?;
+        let secrets = parse_secrets(&bind_call.secrets)?;
+        let pushdown = if init.pushdown_filters.is_empty() {
             None
         } else {
-            Some(blob.pushdown_filters.clone())
+            Some(init.pushdown_filters.clone())
         };
-        let mut args = crate::arguments::Arguments::parse(&blob.arguments)?;
+        let mut args = crate::arguments::Arguments::parse(opened.arguments())?;
+        let attach_opaque_data: Option<Vec<u8>> = bind_call
+            .attach_opaque_data
+            .clone()
+            .map(|b| b.0)
+            .filter(|v| !v.is_empty());
         let make_params = |args: crate::arguments::Arguments| ProcessParams {
             output_schema: output_schema.clone(),
             bind_output_schema: filter_schema.clone(),
             current_pushdown_filters: None,
             input_schema: input_schema.clone(),
-            execution_id: blob.execution_id.clone(),
-            // Folded into the blob so a rehydrated HTTP tick keeps the client's
+            execution_id: init.execution_id.clone(),
+            // Carried in the init so a rehydrated HTTP tick keeps the client's
             // per-substream identity (empty = the client sent none).
-            substream_id: Some(blob.substream_id.clone()).filter(|v| !v.is_empty()),
-            split_payloads: if blob.split_payloads.is_empty() {
+            substream_id: Some(init.substream_id.clone()).filter(|v| !v.is_empty()),
+            split_payloads: if init.split_payloads.is_empty() {
                 None
             } else {
-                Some(blob.split_payloads.clone())
+                Some(init.split_payloads.clone())
             },
-            bind_opaque_data: blob.init_opaque.clone(),
-            init_opaque_data: blob.plan_init_opaque.clone(),
+            bind_opaque_data: init.init_opaque.clone(),
+            init_opaque_data: init.plan_init_opaque.clone(),
             arguments: args,
             settings: settings.clone(),
             secrets: secrets.clone(),
-            auth_principal: None,
-            auth: vgi_rpc::AuthContext::anonymous(),
+            auth_principal: principal(ctx),
+            auth: ctx.auth.clone(),
             projection_ids: None,
             pushdown_filters: pushdown.clone(),
-            join_keys: blob.join_keys.clone(),
+            join_keys: init.join_keys.clone(),
             // The file-backed store is process-global; resumed states (e.g. a
             // distributed table-in-out's `process` appending partials, or a
             // work-queue producer) must keep access to it across HTTP
@@ -2111,76 +2231,81 @@ impl Dispatcher {
             order_by_limit: None,
             tablesample_percentage: None,
             tablesample_seed: None,
-            attach_opaque_data: Some(blob.attach_opaque_data.clone()).filter(|v| !v.is_empty()),
-            transaction_opaque_data: Some(blob.transaction_opaque_data.clone())
+            attach_opaque_data: attach_opaque_data.clone(),
+            transaction_opaque_data: bind_call
+                .transaction_opaque_data
+                .clone()
+                .map(|b| b.0)
                 .filter(|v| !v.is_empty()),
-            at_unit: Some(blob.at_unit.clone()).filter(|s| !s.is_empty()),
-            at_value: Some(blob.at_value.clone()).filter(|s| !s.is_empty()),
+            at_unit: bind_call.at_unit.clone().filter(|s| !s.is_empty()),
+            at_value: bind_call.at_value.clone().filter(|s| !s.is_empty()),
             // COPY-FROM producers drain fully (no HTTP continuation token is
             // issued), so a resumed stream never carries copy_from context.
             copy_from: None,
             // Conditional validators ride per-tick metadata — set per exchange
-            // tick (see TableInOutExchangeState), never rebuilt from the blob.
+            // tick (see TableInOutExchangeState), never rebuilt from the init.
             if_none_match: None,
             if_modified_since: None,
         };
-        // The `(catalog, schema)` folded into the blob is what keeps a rehydrated
-        // tick on the function the original bind resolved — an HTTP continuation
-        // carries no attach_opaque_data of its own, so the bytes replayed onto
-        // `ProcessParams` above are for the FUNCTION's use, not for resolution.
-        // An empty schema means the minting bind named none, which is only legal
-        // for a COPY handler — and a COPY-FROM producer drains fully, so it is
-        // never issued a continuation token in the first place.
-        let call = if blob.schema_path.is_empty() {
-            CallScope::copy_handler(&blob.catalog_name)
+        // The `(catalog, schema)` the original bind resolved is what keeps a
+        // rehydrated tick on the same function: the catalog was decided at
+        // init (it is not re-derived from the attach), the schema is the bind
+        // call's own. An empty schema means the minting bind named none, which
+        // is only legal for a COPY handler -- and a COPY-FROM producer drains
+        // fully, so it is never issued a continuation token in the first place.
+        let schema_path = bind_call.schema_path.clone().unwrap_or_default();
+        let call = if schema_path.is_empty() {
+            CallScope::copy_handler(&init.catalog_name)
         } else {
-            CallScope::qualified(&blob.catalog_name, &blob.schema_path)
+            CallScope::qualified(&init.catalog_name, &schema_path)
         };
-        if blob.kind == "buffering_finalize" {
-            let f = self.resolve_buffering(&blob.function_name, call)?;
+        let function_name = init.function_name.clone();
+        if cursor.kind == "buffering_finalize" {
+            let f = self.resolve_buffering(&function_name, call)?;
             args.remap_positional(&f.argument_specs());
             // Everything except the arguments comes back off the
             // execution-scoped store, through the SAME helpers the process /
             // combine RPCs use — those RPCs already rebuild this context from
             // scratch on a worker that never saw the bind, so reusing them
             // keeps one replay path instead of a second that can drift.
-            let init = self.buffering_init(&blob.execution_id)?;
+            let stored = self.buffering_init(&init.execution_id)?;
             let bparams = BufferingParams {
-                execution_id: blob.execution_id.clone(),
+                execution_id: init.execution_id.clone(),
                 storage: self.store.clone(),
                 output_schema: output_schema.clone(),
                 arguments: args,
                 settings,
                 secrets,
-                attach_opaque_data: Some(blob.attach_opaque_data.clone())
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| init.attach_opaque_data.clone()),
+                attach_opaque_data: attach_opaque_data
+                    .clone()
+                    .or_else(|| stored.attach_opaque_data.clone()),
                 batch_index: None,
-                copy_to: init.copy_to.clone(),
-                input_schema: input_schema.clone().or_else(|| init.input_schema.clone()),
+                copy_to: stored.copy_to.clone(),
+                input_schema: input_schema.clone().or_else(|| stored.input_schema.clone()),
                 logs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             };
-            let mut producer = f.finalize_producer(&bparams, blob.finalize_state_id.clone())?;
-            producer.restore_resume(&blob.inner_resume);
+            let mut producer = f.finalize_producer(&bparams, init.finalize_state_id.clone())?;
+            producer.restore_resume(&cursor.inner_resume);
             let mut current_filters = pushdown
                 .as_ref()
                 .map(|b| {
                     crate::pushdown::PushdownFilters::parse_with_join_keys_and_schema(
                         b,
-                        &blob.join_keys,
+                        &init.join_keys,
                         Some(filter_schema.clone()),
                     )
                 })
                 .transpose()?;
-            let filter_history = replay_filter_history(&blob, current_filters.as_mut())?;
-            let filters = blob.auto_apply.then(|| current_filters.clone()).flatten();
+            let filter_history = replay_filter_history(cursor, current_filters.as_mut())?;
+            let filters = init.auto_apply.then(|| current_filters.clone()).flatten();
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
                 TableProducerState {
                     inner: producer,
                     current_filters,
                     filters,
                     project_to: Some(output_schema.clone()),
-                    resume_blob: Some(bytes.to_vec()),
+                    resume: Some(cursor.clone()),
+                    label: function_name,
                     conditional_checked: false,
                     filter_history,
                 },
@@ -2191,27 +2316,26 @@ impl Dispatcher {
         // `finish()` drains accumulated partials, so a second call is not
         // required to return the same rows, and re-running it would risk both
         // duplicating and losing finalize output.
-        if blob.kind == "table_in_out_finalize" {
+        if cursor.kind == "table_in_out_finalize" {
             // Rebuild the CURSOR, not the flush. The batches stay in the state
             // log and the next one is read on demand, so this costs the same at
             // batch 5000 as at batch 1 — reconstructing the whole flush here to
             // emit one batch is what made an N-batch drain O(N^2).
             let mut producer = FinalizeFlushProducer {
                 store: self.store.clone(),
-                scope: blob.execution_id.clone(),
+                scope: init.execution_id.clone(),
                 key: Vec::new(),
                 cursor: -1,
                 remaining: 0,
-                function_name: blob.function_name.clone(),
+                function_name: function_name.clone(),
             };
-            producer.restore_resume(&blob.inner_resume);
+            producer.restore_resume(&cursor.inner_resume);
             if producer.key.is_empty() {
                 return Err(RpcError::runtime_error(format!(
-                    "cannot resume the FINALIZE flush for '{}': the continuation carries no \
-                     flush cursor. The cursor is written by the producer when the token is \
-                     minted, so a token without one was either minted by a worker build that \
-                     stored the flush differently or truncated in transit.",
-                    blob.function_name
+                    "cannot resume the FINALIZE flush for '{function_name}': the continuation \
+                     carries no flush cursor. The cursor is written by the producer when the \
+                     token is minted, so a token without one was either minted by a worker \
+                     build that stored the flush differently or truncated in transit."
                 )));
             }
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
@@ -2220,14 +2344,15 @@ impl Dispatcher {
                     filters: None,
                     current_filters: None,
                     project_to: None,
-                    resume_blob: Some(bytes.to_vec()),
+                    resume: Some(cursor.clone()),
+                    label: function_name,
                     conditional_checked: false,
                     filter_history: Default::default(),
                 },
             )));
         }
-        if blob.kind == "table" {
-            let f = self.resolve_table(&blob.function_name, &args, input_schema.as_ref(), call)?;
+        if cursor.kind == "table" {
+            let f = self.resolve_table(&function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let mut params = make_params(args);
             let mut parsed_filters = params
@@ -2241,30 +2366,31 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
-            let filter_history = replay_filter_history(&blob, parsed_filters.as_mut())?;
+            let filter_history = replay_filter_history(cursor, parsed_filters.as_mut())?;
             params.current_pushdown_filters = parsed_filters.clone();
-            let filters = blob.auto_apply.then(|| parsed_filters.clone()).flatten();
+            let filters = init.auto_apply.then(|| parsed_filters.clone()).flatten();
             let project_to = Some(output_schema.clone());
             let mut producer = f.producer(&params)?;
             // Restore the partial-chunk cursor so the producer resumes mid-chunk
             // (the chunk was destructively popped from the queue and lives only
             // in the token, not the queue).
-            producer.restore_resume(&blob.inner_resume);
+            producer.restore_resume(&cursor.inner_resume);
             return Ok(vgi_rpc::stream::StreamStateKind::Producer(Box::new(
                 TableProducerState {
                     inner: producer,
                     current_filters: parsed_filters,
                     filters,
                     project_to,
-                    resume_blob: Some(bytes.to_vec()),
+                    resume: Some(cursor.clone()),
+                    label: function_name,
                     conditional_checked: false,
                     filter_history,
                 },
             )));
         }
-        if blob.kind == "table_in_out" {
+        if cursor.kind == "table_in_out" {
             let f =
-                self.resolve_table_in_out(&blob.function_name, &args, input_schema.as_ref(), call)?;
+                self.resolve_table_in_out(&function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let mut params = make_params(args);
             let mut parsed_filters = params
@@ -2278,28 +2404,28 @@ impl Dispatcher {
                     )
                 })
                 .transpose()?;
-            let filter_history = replay_filter_history(&blob, parsed_filters.as_mut())?;
+            let filter_history = replay_filter_history(cursor, parsed_filters.as_mut())?;
             params.current_pushdown_filters = parsed_filters.clone();
-            let filters = blob.auto_apply.then_some(parsed_filters).flatten();
+            let filters = init.auto_apply.then_some(parsed_filters).flatten();
             Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
                 TableInOutExchangeState {
                     func: f,
                     params,
                     filters,
-                    continuation: blob.continuation.clone(),
-                    blob: bytes.to_vec(),
+                    continuation: cursor.continuation.clone(),
+                    blob: cursor.clone(),
                     filter_history,
                 },
             )))
         } else {
-            let f = self.resolve_scalar(&blob.function_name, &args, input_schema.as_ref(), call)?;
+            let f = self.resolve_scalar(&function_name, &args, input_schema.as_ref(), call)?;
             args.remap_positional(&f.argument_specs());
             let params = make_params(args);
             Ok(vgi_rpc::stream::StreamStateKind::Exchange(Box::new(
                 ScalarExchangeState {
                     func: f,
                     params,
-                    blob: bytes.to_vec(),
+                    blob: cursor.clone(),
                 },
             )))
         }
@@ -3479,9 +3605,13 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: CardinalityRequest = boxed(req)?;
-        let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
-        let bp = self.bind_params(&bind_call, ctx)?;
+        let opened = self.open_bind_call(
+            dto.bind_call.bytes(),
+            "TableFunctionCardinalityRequest.bind_call",
+            ctx,
+        )?;
+        let bind_call = &opened.view;
+        let bp = self.bind_params(bind_call, ctx)?;
         let card = self
             .tables
             .get(&bind_call.function_name)
@@ -3513,11 +3643,14 @@ impl Dispatcher {
     /// Minted AND verified by this same worker, so it needs self-consistency
     /// only — it does not have to agree with any client, which is why the
     /// cross-SDK byte fixtures do not cover it.
-    fn split_bind_fingerprint(&self, bind_call: &BindRequest) -> [u8; 16] {
+    fn split_bind_fingerprint(&self, opened: &crate::arguments_ref::OpenedBindCall) -> [u8; 16] {
+        let bind_call = &opened.view;
         crate::split_token::bind_fingerprint(
             bind_call.schema_path.as_deref().unwrap_or(&[]),
             &bind_call.function_name,
-            &bind_call.arguments.0,
+            // Inline bytes or the location's size + SHA-256, tagged (never
+            // the sealed ref): large-values spec §5a.
+            &opened.fingerprint_arguments(),
             bind_call
                 .settings
                 .as_ref()
@@ -3550,7 +3683,12 @@ impl Dispatcher {
         let raw: crate::projection::ProjectionRequest = wire::from_batch(
             &crate::projection::record(bytes.value(0), &vgi_protocol::generated::protocol_schemas::table_function_projection_request_schema())?
         )?;
-        let proposal = crate::projection::ProjectionProposal::decode(raw)?;
+        let mut proposal = crate::projection::ProjectionProposal::decode(raw)?;
+        // Open the bind call's sealed values and resolve its arguments into
+        // the overlay the function sees; the request's held bytes are not
+        // touched.
+        let opened = self.open_bind_dto(proposal.bind_call.clone(), false, &ctx.auth, Some(ctx))?;
+        proposal.bind_call = opened.view;
         let mut params = self.bind_params(&proposal.bind_call, ctx)?;
         let call = self.bind_scope(&proposal.bind_call, false, false)?;
         let function = self.resolve_table(
@@ -3582,9 +3720,13 @@ impl Dispatcher {
         let dto: TableFunctionPlanRequest = wire::from_batch(
             &crate::protocol::dtos::backfill_plan_request(request_inner_batch(req)?)?,
         )?;
-        let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
-        let bp = self.bind_params(&bind_call, ctx)?;
+        let opened = self.open_bind_call(
+            dto.bind_call.bytes(),
+            "TableFunctionPlanRequest.bind_call",
+            ctx,
+        )?;
+        let bind_call = &opened.view;
+        let bp = self.bind_params(bind_call, ctx)?;
 
         let outcome = self
             .tables
@@ -3673,7 +3815,7 @@ impl Dispatcher {
         // The framework stamps every token: an author cannot forget the
         // consistency anchor, cannot mis-bind the fingerprint, and never writes
         // crypto — and the envelope stays a private implementation detail.
-        let fingerprint = self.split_bind_fingerprint(&bind_call);
+        let fingerprint = self.split_bind_fingerprint(&opened);
         // A worker that names its version is taken at its word — it knows which
         // snapshot it planned against. One that leaves it unset gets the LIVE
         // version, never 0: minting 0 while redemption compares against the live
@@ -3794,8 +3936,13 @@ impl Dispatcher {
     ) -> Result<Option<RecordBatch>> {
         use crate::protocol::dtos::{DynamicToStringRequest, DynamicToStringResponse};
         let dto: DynamicToStringRequest = boxed(req)?;
-        let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
+        // Only the function name is read: the arguments are validated, never
+        // fetched (this RPC has no use for them).
+        let (bind_call, _) = decode_bind_call(
+            dto.bind_call.bytes(),
+            "TableFunctionDynamicToStringRequest.bind_call",
+        )?;
+        bind_call.validate_arguments()?;
         let pairs = self
             .tables
             .get(&bind_call.function_name)
@@ -3815,10 +3962,14 @@ impl Dispatcher {
         req: &Request,
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
-        let dto: CardinalityRequest = boxed(req)?;
-        let bind_call: BindRequest =
-            wire::from_batch(&backfill_bind_request(ipc::read_batch(&dto.bind_call.0)?)?.0)?;
-        let bp = self.bind_params(&bind_call, ctx)?;
+        let dto: TableFunctionStatisticsRequest = boxed(req)?;
+        let opened = self.open_bind_call(
+            dto.bind_call.bytes(),
+            "TableFunctionStatisticsRequest.bind_call",
+            ctx,
+        )?;
+        let bind_call = &opened.view;
+        let bp = self.bind_params(bind_call, ctx)?;
         let stats = self
             .tables
             .get(&bind_call.function_name)
@@ -4441,11 +4592,30 @@ impl Dispatcher {
 
     /// The call arguments the sink init recorded, remapped onto the
     /// function's declared positions (matching what `on_bind` saw).
+    ///
+    /// An externalized argument was recorded as its reference and is
+    /// resolved here through the object cache (one storage GET per object per
+    /// process, however many process calls arrive).
     fn buffering_arguments(
         init: &crate::framework_state::BufferingInit,
         f: &dyn TableBufferingFunction,
+        ctx: Option<&CallContext>,
     ) -> Result<crate::arguments::Arguments> {
-        let mut args = crate::arguments::Arguments::parse(&init.arguments)?;
+        let mut args = match &init.arguments {
+            crate::framework_state::StoredArguments::Inline(bytes) => {
+                crate::arguments::Arguments::parse(bytes)?
+            }
+            crate::framework_state::StoredArguments::Location(location) => {
+                let ctx = ctx.ok_or_else(|| {
+                    RpcError::runtime_error(
+                        "table-buffering: externalized arguments need the call's context",
+                    )
+                })?;
+                crate::arguments::Arguments::parse(&crate::arguments_ref::fetch_arguments(
+                    location, ctx,
+                )?)?
+            }
+        };
         args.remap_positional(&f.argument_specs());
         Ok(args)
     }
@@ -4518,7 +4688,7 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingProcessRequest = boxed(req)?;
-        let (response, logs) = self.buffering_process(dto)?;
+        let (response, logs) = self.buffering_process(dto, Some(ctx))?;
         Self::drain_buffering_logs(&logs, ctx);
         Ok(Some(wire::to_result_batch(response)?))
     }
@@ -4532,6 +4702,7 @@ impl Dispatcher {
     pub(crate) fn buffering_process(
         &self,
         dto: TableBufferingProcessRequest,
+        ctx: Option<&CallContext>,
     ) -> Result<(
         TableBufferingProcessResponse,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -4550,7 +4721,7 @@ impl Dispatcher {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
             output_schema: init.output_schema.clone(),
-            arguments: Self::buffering_arguments(&init, f.as_ref())?,
+            arguments: Self::buffering_arguments(&init, f.as_ref(), ctx)?,
             settings: crate::settings::Settings::default(),
             // Resolved secrets replayed from the sink-init (the process RPC carries
             // no bind_call) — lets a COPY-TO writer read CREATE SECRET creds.
@@ -4588,7 +4759,7 @@ impl Dispatcher {
         ctx: &CallContext,
     ) -> Result<Option<RecordBatch>> {
         let dto: TableBufferingCombineRequest = boxed(req)?;
-        let (response, logs) = self.buffering_combine(dto)?;
+        let (response, logs) = self.buffering_combine(dto, Some(ctx))?;
         Self::drain_buffering_logs(&logs, ctx);
         Ok(Some(wire::to_result_batch(response)?))
     }
@@ -4603,6 +4774,7 @@ impl Dispatcher {
     fn buffering_combine(
         &self,
         dto: TableBufferingCombineRequest,
+        ctx: Option<&CallContext>,
     ) -> Result<(
         TableBufferingCombineResponse,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -4620,7 +4792,7 @@ impl Dispatcher {
             execution_id: dto.execution_id.0.clone(),
             storage: self.store.clone(),
             output_schema: init.output_schema.clone(),
-            arguments: Self::buffering_arguments(&init, f.as_ref())?,
+            arguments: Self::buffering_arguments(&init, f.as_ref(), ctx)?,
             settings: crate::settings::Settings::default(),
             // Resolved secrets replayed from the sink-init (the combine RPC carries
             // no bind_call) — lets a COPY-TO writer's close() read CREATE SECRET creds.
@@ -5238,23 +5410,27 @@ impl Dispatcher {
     }
 }
 
-/// Serializable rebuild info for an exchange stream, so HTTP continuations can
-/// reconstruct the state from an AEAD token on any pooled worker.
+/// The immutable part of an HTTP-continued stream: everything its init turn
+/// decided, carried in the cursor as one `init: StateRef` (vgi
+/// `docs/large-values-3.4.md` §6) so a continuation can rebuild the stream on
+/// any pooled worker.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct ExchangeBlob {
-    pub kind: String, // "scalar" | "table_in_out"
+pub struct StreamInit {
     pub function_name: String,
     pub output_schema: Vec<u8>,
     #[serde(default)]
     pub filter_schema: Vec<u8>,
     pub input_schema: Vec<u8>, // empty = none
-    pub arguments: Vec<u8>,
-    pub settings: Vec<u8>,
-    pub secrets: Vec<u8>,
+    /// The init request's `bind_call`, exactly the bytes the client sent: the
+    /// arguments as it sent them (inline, or the `arguments_location`
+    /// reference), settings, secrets, the time-travel clause, the owning
+    /// schema, and the attach / transaction values still sealed. Each turn
+    /// opens and resolves it at its entry; a resolved argument or an opened
+    /// attach is never carried.
+    pub bind_call: Vec<u8>,
     pub execution_id: Vec<u8>,
-    /// Client-minted per-substream id (empty = none) — folded in so a resumed
-    /// HTTP tick keeps [`ProcessParams::substream_id`]. See
-    /// `InitRequest::substream_id`.
+    /// Client-minted per-substream id (empty = none), so a resumed HTTP tick
+    /// keeps [`ProcessParams::substream_id`]. See `InitRequest::substream_id`.
     pub substream_id: Vec<u8>,
     pub init_opaque: Vec<u8>,
     pub pushdown_filters: Vec<u8>, // empty = none
@@ -5264,21 +5440,12 @@ pub struct ExchangeBlob {
     /// no-op while byte-stream transports continue to work.
     pub join_keys: Vec<Vec<u8>>,
     pub auto_apply: bool,
-    /// Producer-only: the inner producer's partial-chunk cursor
-    /// ([`crate::table_function::TableProducer::encode_resume`]). Empty for
-    /// exchange states and producers between chunks.
-    pub inner_resume: Vec<u8>,
-    /// Time-travel `AT` clause carried so a resumed function-backed producer
-    /// still sees the version it was scanning (empty = no AT clause).
-    pub at_unit: String,
-    pub at_value: String,
-    /// The `(catalog, schema)` the original bind named. An HTTP continuation
-    /// arrives with no `attach_opaque_data`, so without these a rehydrated tick
-    /// would resolve the bare name and could land on a same-named function in
-    /// another schema or another catalog served by the same process.
+    /// The catalog the original bind resolved through (the attach is only
+    /// re-opened for the function's own use). Without it a rehydrated tick
+    /// could land on a same-named function in another catalog served by the
+    /// same process.
     pub catalog_name: String,
-    pub schema_path: Vec<String>,
-    /// The VERIFIED split payloads (envelope already stripped), folded in so a
+    /// The VERIFIED split payloads (envelope already stripped), so a
     /// rehydrated HTTP tick still knows which work it claimed.
     ///
     /// Load-bearing over HTTP: a producer is rebuilt from its params on every
@@ -5286,50 +5453,137 @@ pub struct ExchangeBlob {
     /// `split_payloads` at init would rebuild EMPTY without this and silently
     /// return no rows. Empty vec = not a split init.
     ///
-    /// Storing the stripped payloads rather than the tokens is safe because the
-    /// blob is itself AEAD-sealed into the continuation token; re-verifying
-    /// per continuation would only re-check bytes this worker already sealed.
+    /// Storing the stripped payloads rather than the tokens is safe because
+    /// the init is itself sealed (inline in the AEAD state token, or an AEAD
+    /// stored object); re-verifying per continuation would only re-check bytes
+    /// this worker already sealed.
     #[serde(default)]
     pub split_payloads: Vec<Vec<u8>>,
-    /// The plaintext per-ATTACH state the original bind carried. A continuation
-    /// arrives with none, and the `(catalog, schema)` pair below is enough to
-    /// re-RESOLVE the function — but not to re-CREATE it: a function that scopes
-    /// its storage by these bytes (the documented way to keep per-attach state
-    /// off a pooled worker's `self`) rebuilds against the wrong scope without
-    /// them, and silently returns another attach's rows or none at all.
-    #[serde(default)]
-    pub attach_opaque_data: Vec<u8>,
     /// Buffering-FINALIZE only: which combined state this source drains. The
     /// producer is rebuilt by re-running `finalize_producer` against the
     /// execution-scoped store, and this names the bucket to read — without it
     /// a continuation would rebuild a source pointed at nothing.
     #[serde(default)]
     pub finalize_state_id: Vec<u8>,
-    /// Plan-scoped opaque state. The older `init_opaque` field carries
-    /// bind-scoped state and is retained for continuation-token compatibility.
+    /// Plan-scoped opaque state. `init_opaque` carries bind-scoped state.
     #[serde(default)]
     pub plan_init_opaque: Vec<u8>,
+}
+
+/// An HTTP-continued stream's state token: the stream's [`StreamInit`] by
+/// reference, plus the fields that change per turn.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct StreamCursor {
+    /// `"scalar"`, `"table_in_out"`, `"table"`, `"table_in_out_finalize"` or
+    /// `"buffering_finalize"`: whether the stream rebuilds as a producer or
+    /// an exchange is decided before `init` is resolved.
+    pub kind: String,
+    /// The stream's [`StreamInit`] (bincode), created on the init turn.
+    pub init: vgi_rpc::StateRef,
+    /// Producer-only: the inner producer's partial-chunk cursor
+    /// ([`crate::table_function::TableProducer::encode_resume`]). Empty for
+    /// exchange states and producers between chunks.
+    pub inner_resume: Vec<u8>,
     /// The v2 filter deltas an HTTP continuation replays, in arrival order, to
     /// rebuild the stream's filters on whichever worker receives it. Compacted
     /// (see `pushdown::DeltaHistory`): only the deltas that installed a live
     /// `(id, revision)`, so the list is bounded by the number of predicate IDs
     /// rather than growing by one per tick.
-    #[serde(default)]
     pub filter_deltas: Vec<String>,
     /// The live predicate IDs in order, restored after replaying
     /// `filter_deltas` (a compacted replay cannot always reproduce it).
-    #[serde(default)]
     pub filter_predicate_order: Vec<String>,
     /// Table-in-out continued output: the pending reply's position, so a tick
     /// rebuilt on any worker can resume it. See [`TioContinuation`].
-    #[serde(default)]
     pub continuation: TioContinuation,
-    /// The plaintext transaction the original bind carried (empty = none), so
-    /// a resumed HTTP tick keeps [`ProcessParams::transaction_opaque_data`].
-    /// Like `attach_opaque_data` above, safe in the blob because the blob is
-    /// itself AEAD-sealed into the continuation token.
-    #[serde(default)]
-    pub transaction_opaque_data: Vec<u8>,
+}
+
+/// A producer decoded from a continuation cursor, rebuilt on its first turn
+/// (the decoder has no call context to resolve `init` and the arguments with).
+struct RehydratingProducer {
+    disp: Arc<Dispatcher>,
+    cursor: StreamCursor,
+    inner: Option<Box<dyn vgi_rpc::ProducerState>>,
+}
+
+impl RehydratingProducer {
+    fn ready(&mut self, ctx: &CallContext) -> Result<&mut Box<dyn vgi_rpc::ProducerState>> {
+        if self.inner.is_none() {
+            match self.disp.rehydrate(&self.cursor, ctx)? {
+                vgi_rpc::stream::StreamStateKind::Producer(state) => self.inner = Some(state),
+                vgi_rpc::stream::StreamStateKind::Exchange(_) => {
+                    return Err(RpcError::runtime_error(format!(
+                        "stream cursor of kind '{}' rebuilt as an exchange",
+                        self.cursor.kind
+                    )))
+                }
+            }
+        }
+        Ok(self.inner.as_mut().expect("rebuilt above"))
+    }
+}
+
+impl vgi_rpc::ProducerState for RehydratingProducer {
+    fn produce(&mut self, out: &mut OutputCollector, ctx: &CallContext) -> Result<()> {
+        self.ready(ctx)?.produce(out, ctx)
+    }
+    fn on_cancel(&mut self, ctx: &CallContext) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.on_cancel(ctx);
+        }
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        match &self.inner {
+            Some(inner) => inner.encode_state(),
+            None => vgi_rpc::stream_codec::bincode_encode(&self.cursor),
+        }
+    }
+}
+
+/// An exchange decoded from a continuation cursor, rebuilt on its first turn.
+struct RehydratingExchange {
+    disp: Arc<Dispatcher>,
+    cursor: StreamCursor,
+    inner: Option<Box<dyn ExchangeState>>,
+}
+
+impl RehydratingExchange {
+    fn ready(&mut self, ctx: &CallContext) -> Result<&mut Box<dyn ExchangeState>> {
+        if self.inner.is_none() {
+            match self.disp.rehydrate(&self.cursor, ctx)? {
+                vgi_rpc::stream::StreamStateKind::Exchange(state) => self.inner = Some(state),
+                vgi_rpc::stream::StreamStateKind::Producer(_) => {
+                    return Err(RpcError::runtime_error(format!(
+                        "stream cursor of kind '{}' rebuilt as a producer",
+                        self.cursor.kind
+                    )))
+                }
+            }
+        }
+        Ok(self.inner.as_mut().expect("rebuilt above"))
+    }
+}
+
+impl ExchangeState for RehydratingExchange {
+    fn exchange(
+        &mut self,
+        input: &RecordBatch,
+        out: &mut OutputCollector,
+        ctx: &CallContext,
+    ) -> Result<()> {
+        self.ready(ctx)?.exchange(input, out, ctx)
+    }
+    fn on_cancel(&mut self, ctx: &CallContext) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.on_cancel(ctx);
+        }
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        match &self.inner {
+            Some(inner) => inner.encode_state(),
+            None => vgi_rpc::stream_codec::bincode_encode(&self.cursor),
+        }
+    }
 }
 
 /// A table-in-out exchange's continued-output position (see
@@ -5352,7 +5606,7 @@ pub struct TioContinuation {
 struct ScalarExchangeState {
     func: Arc<dyn ScalarFunction>,
     params: ProcessParams,
-    blob: Vec<u8>,
+    blob: StreamCursor,
 }
 
 impl ExchangeState for ScalarExchangeState {
@@ -5380,7 +5634,7 @@ impl ExchangeState for ScalarExchangeState {
     }
 
     fn encode_state(&self) -> Result<Vec<u8>> {
-        Ok(self.blob.clone())
+        vgi_rpc::stream_codec::bincode_encode(&self.blob)
     }
 }
 
@@ -5547,7 +5801,7 @@ struct TableInOutExchangeState {
     func: Arc<dyn TableInOutFunction>,
     params: ProcessParams,
     filters: Option<crate::pushdown::PushdownFilters>,
-    blob: Vec<u8>,
+    blob: StreamCursor,
     /// The dynamic-filter deltas a continuation must replay (compacted).
     filter_history: crate::pushdown::DeltaHistory,
     /// Whether output is pending, and where it resumes.
@@ -5724,7 +5978,7 @@ impl ExchangeState for TableInOutExchangeState {
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
-        let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(&self.blob)?;
+        let mut blob = self.blob.clone();
         blob.filter_deltas = self.filter_history.deltas().to_vec();
         blob.filter_predicate_order = self.filter_history.order().to_vec();
         blob.continuation = self.continuation.clone();
@@ -5736,7 +5990,7 @@ impl ExchangeState for TableInOutExchangeState {
 /// compacted delta history its token carries, returning that history so the
 /// turn can keep recording into it.
 fn replay_filter_history(
-    blob: &ExchangeBlob,
+    blob: &StreamCursor,
     filters: Option<&mut crate::pushdown::PushdownFilters>,
 ) -> Result<crate::pushdown::DeltaHistory> {
     let history = crate::pushdown::DeltaHistory::from_parts(
@@ -5772,10 +6026,12 @@ struct TableProducerState {
     /// When set, narrow each (post-filter) batch to this projected schema —
     /// the producer emitted the full schema so filters could see all columns.
     project_to: Option<arrow_schema::SchemaRef>,
-    /// Rebuild blob for resuming this producer from an HTTP state token. `None`
+    /// Cursor for resuming this producer from an HTTP state token. `None`
     /// for producers that can't be rebuilt from bind params (buffering/finalize
     /// flushes), which always drain in one response.
-    resume_blob: Option<Vec<u8>>,
+    resume: Option<StreamCursor>,
+    /// The function's name, for diagnostics.
+    label: String,
     /// Whether the conditional-revalidation validators have been looked for yet.
     /// They only ever ride the first tick, so checking once keeps the per-batch
     /// hot path free of the two `tick_metadata` mutex acquisitions.
@@ -5795,18 +6051,12 @@ impl TableProducerState {
     /// not serialize a scan position — re-running the bind gets the producer
     /// back, but it restarts at row 0.
     fn drains_in_one_turn(&self) -> bool {
-        self.resume_blob.is_none() || !self.inner.resume_supported()
+        self.resume.is_none() || !self.inner.resume_supported()
     }
 
-    /// Best-effort function name for diagnostics, read back out of the rebuild
-    /// blob. `<unknown>` for the producers that have none, which is itself the
-    /// useful signal: it says the refusal came from a flush, not a scan.
+    /// Best-effort function name for diagnostics.
     fn producer_label(&self) -> String {
-        self.resume_blob
-            .as_ref()
-            .and_then(|b| vgi_rpc::stream_codec::bincode_decode::<ExchangeBlob>(b).ok())
-            .map(|b| b.function_name)
-            .unwrap_or_else(|| "<unknown>".to_string())
+        self.label.clone()
     }
 
     /// Pull one batch from the inner producer and emit it (post filter +
@@ -5903,7 +6153,7 @@ impl vgi_rpc::ProducerState for TableProducerState {
         Ok(())
     }
     fn encode_state(&self) -> Result<Vec<u8>> {
-        match &self.resume_blob {
+        match &self.resume {
             // No rebuild blob means this producer cannot be reconstructed for a
             // continuation turn. Returning empty bytes here would hand the
             // framework a cursor token that rebuilds from nothing — i.e. a
@@ -5939,10 +6189,11 @@ impl vgi_rpc::ProducerState for TableProducerState {
                  `vgi::resume_fields!(cursor, ...)` (or resume_supported/encode_resume/\
                  restore_resume).",
             )),
-            Some(bytes) => {
-                // Re-encode the (static) bind blob with the producer's CURRENT
-                // partial-chunk cursor so the continuation resumes mid-chunk.
-                let mut blob: ExchangeBlob = vgi_rpc::stream_codec::bincode_decode(bytes)?;
+            Some(cursor) => {
+                // The cursor (whose `init` is unchanged) with the producer's
+                // CURRENT partial-chunk position, so the continuation resumes
+                // mid-chunk.
+                let mut blob = cursor.clone();
                 blob.inner_resume = self.inner.encode_resume();
                 blob.filter_deltas = self.filter_history.deltas().to_vec();
                 blob.filter_predicate_order = self.filter_history.order().to_vec();
@@ -5955,6 +6206,23 @@ impl vgi_rpc::ProducerState for TableProducerState {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Decode a nested `bind_call` (an IPC stream of one `BindRequest` row),
+/// backfilling the optional columns older peers omit, without touching the
+/// bytes. Errors name `path` (large-values spec §3.3 rule 3). Returns whether
+/// the peer predates `schema_path`.
+pub(crate) fn decode_bind_call(bytes: &[u8], path: &str) -> Result<(BindRequest, bool)> {
+    let at = |e: RpcError| RpcError::type_error(format!("{path}: {}", e.message));
+    if bytes.is_empty() {
+        return Err(RpcError::type_error(format!(
+            "{path}: nested record value is empty"
+        )));
+    }
+    let (batch, legacy_peer) =
+        backfill_bind_request(ipc::read_batch(bytes).map_err(at)?).map_err(at)?;
+    let dto: BindRequest = wire::from_batch(&batch).map_err(at)?;
+    Ok((dto, legacy_peer))
+}
 
 /// Read a "boxed" DTO from the `request` binary column (IPC stream).
 /// Decode the IPC batch carried in the request's `request` binary column.
@@ -6361,15 +6629,18 @@ mod buffering_schema_tests {
         )])
         .unwrap();
         let err = d
-            .buffering_process(TableBufferingProcessRequest {
-                function_name: FixedOutput.name().to_string(),
-                execution_id: Bytes::from(b"no-init".to_vec()),
-                input_batch: Bytes::from(ipc::write_batch(&batch).unwrap()),
-                batch_index: None,
-                attach_opaque_data: None,
-                transaction_id: None,
-                schema_path: None,
-            })
+            .buffering_process(
+                TableBufferingProcessRequest {
+                    function_name: FixedOutput.name().to_string(),
+                    execution_id: Bytes::from(b"no-init".to_vec()),
+                    input_batch: Bytes::from(ipc::write_batch(&batch).unwrap()),
+                    batch_index: None,
+                    attach_opaque_data: None,
+                    transaction_id: None,
+                    schema_path: None,
+                },
+                None,
+            )
             .unwrap_err();
         assert!(err.message.contains("no init record"), "{}", err.message);
     }
@@ -6431,7 +6702,7 @@ mod buffering_schema_tests {
             crate::framework_state::BufferingInit {
                 output_schema: out,
                 input_schema: None,
-                arguments: Vec::new(),
+                arguments: crate::framework_state::StoredArguments::Inline(Vec::new()),
                 secrets: None,
                 logging: false,
                 copy_to: None,
@@ -6442,14 +6713,17 @@ mod buffering_schema_tests {
         .unwrap();
 
         let (response, logs) = d
-            .buffering_combine(TableBufferingCombineRequest {
-                function_name: "counting_combine".to_string(),
-                execution_id: Bytes::from(exec.clone()),
-                state_ids: Vec::new(),
-                attach_opaque_data: None,
-                transaction_id: None,
-                schema_path: None,
-            })
+            .buffering_combine(
+                TableBufferingCombineRequest {
+                    function_name: "counting_combine".to_string(),
+                    execution_id: Bytes::from(exec.clone()),
+                    state_ids: Vec::new(),
+                    attach_opaque_data: None,
+                    transaction_id: None,
+                    schema_path: None,
+                },
+                None,
+            )
             .expect("an empty combine succeeds");
         assert_eq!(*f.0.lock().unwrap(), Some(0), "combine saw the empty list");
         assert_eq!(response.finalize_state_ids.len(), 1);
@@ -8276,5 +8550,168 @@ mod catalog_contents_tests {
         );
         d.register_table_scoped(Arc::new(NoRows("t_scan")), FunctionScope::new("third", "x"));
         assert_eq!(scan_schema(&d), Some(path(&["main"])));
+    }
+}
+
+/// Wrapper rule 11 (vgi `docs/large-values-3.4.md` §3.3, nested-binary spec
+/// test 4): sealed values a `bind_call` carries are opened into the per-call
+/// overlay, never into the held bytes, so re-encoding the embedding request
+/// after opening emits exactly the bytes the client sent.
+#[cfg(test)]
+mod bind_call_rule11_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn bind_request(attach: Vec<u8>, transaction: Vec<u8>) -> BindRequest {
+        BindRequest {
+            function_name: "f".into(),
+            arguments: Some(Bytes::from(Vec::new())),
+            function_type: vgi_rpc::DictString("TABLE".into()),
+            input_schema: None,
+            settings: None,
+            secrets: None,
+            attach_opaque_data: Some(Bytes::from(attach)),
+            transaction_opaque_data: Some(Bytes::from(transaction)),
+            resolved_secrets_provided: false,
+            at_unit: None,
+            at_value: None,
+            copy_from: None,
+            copy_to: None,
+            schema_path: Some(vec!["main".into()]),
+            argument_names: None,
+            arguments_location: None,
+        }
+    }
+
+    #[test]
+    fn reencoded_bind_call_equals_the_received_bytes_after_opening() {
+        let alice = vgi_rpc::AuthContext::for_principal("bearer", "alice");
+        let sealer = crate::opaque::OpaqueSealer::new(b"rule-11-key".to_vec());
+        let attach = sealer.seal_attach(b"attach-plaintext", &alice);
+        let transaction = sealer.seal_transaction(b"tx-plaintext", &alice, &attach);
+        let bind_call =
+            ipc::write_batch(&wire::to_batch(bind_request(attach.clone(), transaction)).unwrap())
+                .unwrap();
+        let init = InitRequest {
+            bind_call: Nested::from_bytes(bind_call.clone()),
+            output_schema: Bytes::from(
+                ipc::write_schema_ref(&Arc::new(Schema::new(vec![Field::new(
+                    "n",
+                    DataType::Int64,
+                    true,
+                )])))
+                .unwrap(),
+            ),
+            bind_opaque_data: None,
+            projection_ids: None,
+            pushdown_filters: None,
+            join_keys: None,
+            split_tokens: None,
+            row_limit: None,
+            phase: None,
+            finalize_state_id: None,
+            execution_id: None,
+            init_opaque_data: None,
+            substream_id: None,
+            order_by_column_name: None,
+            order_by_direction: None,
+            order_by_null_order: None,
+            order_by_limit: None,
+            tablesample_percentage: None,
+            tablesample_seed: None,
+        };
+        let boxed_init = ipc::write_batch(&wire::to_batch(init).unwrap()).unwrap();
+        let request = Request {
+            method: "init".into(),
+            protocol: "vgi.v3".into(),
+            request_id: String::new(),
+            batch: RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "request",
+                    DataType::Binary,
+                    false,
+                )])),
+                vec![Arc::new(BinaryArray::from(vec![boxed_init.as_slice()]))],
+            )
+            .unwrap(),
+            metadata: Default::default(),
+        };
+
+        let mut d = Dispatcher::new("test");
+        d.opaque = Some(sealer);
+        // What every handler sees: the opened request (the sealer ran).
+        let opened_request = Request {
+            method: request.method.clone(),
+            protocol: request.protocol.clone(),
+            request_id: request.request_id.clone(),
+            batch: d
+                .opaque
+                .as_ref()
+                .unwrap()
+                .open_batch(&request.batch, &alice)
+                .unwrap(),
+            metadata: request.metadata.clone(),
+        };
+        let dto: InitRequest = boxed(&opened_request).unwrap();
+        assert_eq!(
+            dto.bind_call.bytes(),
+            bind_call.as_slice(),
+            "held bytes untouched"
+        );
+        // The overlay holds the plaintext...
+        let (decoded, legacy) =
+            decode_bind_call(dto.bind_call.bytes(), "InitRequest.bind_call").unwrap();
+        let opened = d.open_bind_dto(decoded, legacy, &alice, None).unwrap();
+        assert_eq!(
+            opened.view.attach_opaque_data.as_ref().unwrap().0,
+            b"attach-plaintext"
+        );
+        assert_eq!(
+            opened.view.transaction_opaque_data.as_ref().unwrap().0,
+            b"tx-plaintext"
+        );
+        // ...and re-encoding the embedding request (after opening, and after
+        // reading the lazily decoded value) emits the received bytes, sealed
+        // envelopes included.
+        dto.bind_call_value().unwrap();
+        let reencoded = wire::to_batch(dto).unwrap();
+        let column = reencoded
+            .column_by_name("bind_call")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        assert_eq!(column, bind_call);
+        let (still_sealed, _) = decode_bind_call(&column, "t").unwrap();
+        assert_eq!(still_sealed.attach_opaque_data.unwrap().0, attach);
+        // A different caller cannot open the overlay.
+        let (decoded, legacy) = decode_bind_call(&column, "t").unwrap();
+        let bob = vgi_rpc::AuthContext::for_principal("bearer", "bob");
+        assert!(d.open_bind_dto(decoded, legacy, &bob, None).is_err());
+    }
+
+    /// Exactly one of `arguments` / `arguments_location`: both null and both
+    /// set are `invalid_bind_request` (nested-binary spec test 3), refused
+    /// before any argument is fetched.
+    #[test]
+    fn both_or_neither_arguments_is_invalid_bind_request() {
+        let d = Dispatcher::new("test");
+        let anon = vgi_rpc::AuthContext::anonymous();
+        for name in ["bind-both-null.arrow", "bind-both-set.arrow"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../conformance/nested-binary")
+                .join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let (dto, legacy) = decode_bind_call(&bytes, "BindRequest").unwrap();
+            let err = d.open_bind_dto(dto, legacy, &anon, None).unwrap_err();
+            assert_eq!(err.error_kind(), "invalid_bind_request", "{name}");
+            assert_eq!(err.error_code(), "INVALID_ARGUMENT", "{name}");
+            assert_eq!(
+                err.message,
+                "BindRequest must set exactly one of 'arguments' and 'arguments_location'"
+            );
+        }
     }
 }

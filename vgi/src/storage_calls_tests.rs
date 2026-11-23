@@ -201,7 +201,7 @@ fn init_record(copy_to: Option<&str>, secret: Option<&str>) -> BufferingInit {
             DataType::Int64,
             true,
         )]))),
-        arguments: Vec::new(),
+        arguments: crate::framework_state::StoredArguments::Inline(Vec::new()),
         secrets: secret.map(secrets_blob),
         logging: false,
         copy_to: copy_to.map(|p| CopyToContext {
@@ -279,10 +279,10 @@ fn buffered_process_reads_storage_once_per_worker_then_never() {
     with_recorders(&mut sink);
     store.reset();
     for _ in 0..4 {
-        sink.buffering_process(process_req(&exec, Some(b"a"), None))
+        sink.buffering_process(process_req(&exec, Some(b"a"), None), None)
             .unwrap();
     }
-    sink.buffering_combine(combine_req(&exec)).unwrap();
+    sink.buffering_combine(combine_req(&exec), None).unwrap();
     assert_eq!(store.total(), 0, "{:?}", store.calls.lock().unwrap());
 
     // Another pooled worker: one read on its first call, then none.
@@ -291,10 +291,10 @@ fn buffered_process_reads_storage_once_per_worker_then_never() {
     store.reset();
     for _ in 0..4 {
         other
-            .buffering_process(process_req(&exec, Some(b"a"), None))
+            .buffering_process(process_req(&exec, Some(b"a"), None), None)
             .unwrap();
     }
-    other.buffering_combine(combine_req(&exec)).unwrap();
+    other.buffering_combine(combine_req(&exec), None).unwrap();
     assert_eq!(store.total(), 1, "{:?}", store.calls.lock().unwrap());
     assert_eq!(store.get("kv_get"), 1);
     // ...and it saw the whole context the sink recorded.
@@ -318,7 +318,7 @@ fn buffered_process_reads_storage_once_per_worker_then_never() {
         }))
         .unwrap();
     assert!(other
-        .buffering_process(process_req(&exec, Some(b"a"), None))
+        .buffering_process(process_req(&exec, Some(b"a"), None), None)
         .is_err());
 }
 
@@ -332,10 +332,11 @@ fn request_attach_and_schema_win_over_the_recorded_copies() {
         .unwrap();
 
     // The request names schema s2 and its own attach: both win.
-    d.buffering_process(process_req(&exec, Some(b"req-attach"), Some("s2")))
+    d.buffering_process(process_req(&exec, Some(b"req-attach"), Some("s2")), None)
         .unwrap();
     // A peer that omits both falls back to the recorded s1 / init-attach.
-    d.buffering_process(process_req(&exec, None, None)).unwrap();
+    d.buffering_process(process_req(&exec, None, None), None)
+        .unwrap();
 
     let seen = seen.lock().unwrap();
     assert_eq!(seen[0].0, "s2");
@@ -360,7 +361,7 @@ fn tampered_copy_to_path_is_rejected() {
     let attempt = |label: &str| {
         let mut d = worker(store.clone());
         let seen = with_recorders(&mut d);
-        let r = d.buffering_process(process_req(&exec, None, None));
+        let r = d.buffering_process(process_req(&exec, None, None), None);
         assert!(seen.lock().unwrap().is_empty(), "{label}: function ran");
         r.unwrap_err().message
     };
@@ -408,7 +409,7 @@ fn tampered_copy_to_path_is_rejected() {
     stranger.storage_seal_root = Some(b"another-key".to_vec());
     with_recorders(&mut stranger);
     assert!(stranger
-        .buffering_process(process_req(&exec, None, None))
+        .buffering_process(process_req(&exec, None, None), None)
         .is_err());
 }
 

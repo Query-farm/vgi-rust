@@ -22,6 +22,10 @@ pub use super::vgi_service::{not_implemented, VgiService};
 
 /// Register all VGI methods against `srv`, backed by `disp`.
 pub fn register(srv: &mut RpcServer, disp: Arc<Dispatcher>) {
+    // A stream resumed from an HTTP cursor is rebuilt on its first turn (it
+    // resolves `init: StateRef` and the arguments through that turn's call
+    // context), so the decoded state needs the dispatcher itself.
+    let _ = disp.self_ref.set(Arc::downgrade(&disp));
     super::vgi_service::register(srv, disp);
 }
 
@@ -93,8 +97,8 @@ impl VgiService for Dispatcher {
         self.with_opened(req, ctx, |req| self.handle_init(req, ctx))
     }
 
-    /// HTTP continuations rebuild the (stateless) exchange handler from an
-    /// AEAD state token.
+    /// HTTP continuations rebuild the stream from its sealed cursor (the
+    /// rebuild itself runs on the turn, see `Dispatcher::rehydrate`).
     fn decode_init_state(&self, state: &[u8]) -> Result<StreamStateKind> {
         self.decode_init_exchange_state(state)
     }

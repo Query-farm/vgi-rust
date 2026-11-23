@@ -215,7 +215,7 @@ fn init_body_for_schema(
     .unwrap();
     let bind = BindRequest {
         function_name: function.to_string(),
-        arguments: Bytes::from(args),
+        arguments: Some(Bytes::from(args)),
         function_type: DictString("TABLE".to_string()),
         input_schema: None,
         settings: None,
@@ -232,10 +232,11 @@ fn init_body_for_schema(
         // in the worker's own catalog under `main`.
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("count".to_string())]),
+        arguments_location: None,
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
-        bind_call: Bytes::from(bind_bytes),
+        bind_call: crate::protocol::dtos::Nested::from_bytes(bind_bytes),
         output_schema: Bytes::from(ipc::write_schema_ref(output_schema).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,
@@ -680,7 +681,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
     .unwrap();
     let bind = BindRequest {
         function_name: function.to_string(),
-        arguments: Bytes::from(args),
+        arguments: Some(Bytes::from(args)),
         function_type: DictString("TABLE_BUFFERING".to_string()),
         input_schema: None,
         settings: None,
@@ -697,6 +698,7 @@ fn bind_body(function: &str, path: &str, resolved_secrets_provided: bool) -> Vec
         // in the worker's own catalog under `main`.
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("path".to_string())]),
+        arguments_location: None,
     };
     let inner = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let req_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1022,7 +1024,7 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
     .unwrap();
     let bind = BindRequest {
         function_name: function.to_string(),
-        arguments: Bytes::from(args),
+        arguments: Some(Bytes::from(args)),
         function_type: DictString("TABLE".to_string()),
         // A table-in-out bind carries the input schema; FINALIZE reuses the
         // same bind call the INPUT phase used.
@@ -1038,10 +1040,11 @@ fn finalize_init_body_sized(function: &str, n_batches: i64, execution_id: &[u8])
         copy_to: None,
         schema_path: Some(vec![crate::catalog::MAIN_SCHEMA.to_string()]),
         argument_names: Some(vec![Some("count".to_string())]),
+        arguments_location: None,
     };
     let bind_bytes = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
     let init = InitRequest {
-        bind_call: Bytes::from(bind_bytes),
+        bind_call: crate::protocol::dtos::Nested::from_bytes(bind_bytes),
         output_schema: Bytes::from(ipc::write_schema_ref(&schema_n()).unwrap()),
         bind_opaque_data: None,
         projection_ids: None,

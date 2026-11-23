@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use vgi_protocol::generated::request_params as p;
-use vgi_rpc::{Bytes, Request, Result, RpcError};
+use vgi_rpc::{Bytes, DictString, Request, Result, RpcError};
 
 use crate::catalog::{
     self, attach_payload, CatSchema, CatTable, CatalogModel, CatalogTransactions, TableWrites,
@@ -552,41 +552,52 @@ fn a_writable_constrained_table_negotiates_the_enforce_profile() {
     assert!(available.write.is_empty());
 }
 
+/// The stream's `init: StateRef` carries the bind call as received, so the
+/// (sealed) transaction rides it to every HTTP continuation and is opened
+/// again there; it is never carried opened.
 #[test]
-fn the_exchange_blob_keeps_the_transaction_across_http_continuations() {
-    let blob = crate::dispatch::ExchangeBlob {
-        kind: "table_in_out".into(),
+fn the_stream_init_keeps_the_transaction_across_http_continuations() {
+    let bind = crate::protocol::dtos::BindRequest {
+        function_name: "f".into(),
+        arguments: Some(Bytes::from(Vec::new())),
+        function_type: DictString("TABLE_IN_OUT".into()),
+        input_schema: None,
+        settings: None,
+        secrets: None,
+        attach_opaque_data: Some(Bytes::from(vec![1; 8])),
+        transaction_opaque_data: Some(Bytes::from(vec![7; 16])),
+        resolved_secrets_provided: false,
+        at_unit: None,
+        at_value: None,
+        copy_from: None,
+        copy_to: None,
+        schema_path: Some(vec!["main".into()]),
+        argument_names: None,
+        arguments_location: None,
+    };
+    let bind_call = ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap();
+    let init = crate::dispatch::StreamInit {
         function_name: "f".into(),
         output_schema: Vec::new(),
         filter_schema: Vec::new(),
         input_schema: Vec::new(),
-        arguments: Vec::new(),
-        settings: Vec::new(),
-        secrets: Vec::new(),
+        bind_call: bind_call.clone(),
         execution_id: Vec::new(),
         substream_id: Vec::new(),
         init_opaque: Vec::new(),
         pushdown_filters: Vec::new(),
         join_keys: Vec::new(),
         auto_apply: false,
-        inner_resume: Vec::new(),
-        at_unit: String::new(),
-        at_value: String::new(),
         catalog_name: String::new(),
-        schema_path: Vec::new(),
         split_payloads: Vec::new(),
-        attach_opaque_data: Vec::new(),
         finalize_state_id: Vec::new(),
         plan_init_opaque: Vec::new(),
-        filter_deltas: Vec::new(),
-        filter_predicate_order: Vec::new(),
-        continuation: Default::default(),
-        transaction_opaque_data: vec![7; 16],
     };
-    let bytes = vgi_rpc::stream_codec::bincode_encode(&blob).unwrap();
-    let back: crate::dispatch::ExchangeBlob =
-        vgi_rpc::stream_codec::bincode_decode(&bytes).unwrap();
-    assert_eq!(back.transaction_opaque_data, vec![7; 16]);
+    let bytes = vgi_rpc::stream_codec::bincode_encode(&init).unwrap();
+    let back: crate::dispatch::StreamInit = vgi_rpc::stream_codec::bincode_decode(&bytes).unwrap();
+    assert_eq!(back.bind_call, bind_call, "carried byte for byte");
+    let (decoded, _) = crate::dispatch::decode_bind_call(&back.bind_call, "t").unwrap();
+    assert_eq!(decoded.transaction_opaque_data.unwrap().0, vec![7; 16]);
 }
 
 // ------------------------------------------------------- secret options
@@ -842,7 +853,7 @@ mod http {
     fn init_body(attach: &[u8], tx: &[u8]) -> Vec<u8> {
         let bind = crate::protocol::dtos::BindRequest {
             function_name: "tx_probe".to_string(),
-            arguments: Bytes::from(Vec::new()),
+            arguments: Some(Bytes::from(Vec::new())),
             function_type: DictString("TABLE".to_string()),
             input_schema: None,
             settings: None,
@@ -856,9 +867,12 @@ mod http {
             copy_to: None,
             schema_path: Some(vec!["main".to_string()]),
             argument_names: Some(Vec::new()),
+            arguments_location: None,
         };
         let init = crate::protocol::dtos::InitRequest {
-            bind_call: Bytes::from(ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap()),
+            bind_call: crate::protocol::dtos::Nested::from_bytes(
+                ipc::write_batch(&wire::to_batch(bind).unwrap()).unwrap(),
+            ),
             output_schema: Bytes::from(
                 ipc::write_schema_ref(&Arc::new(Schema::new(vec![Field::new(
                     "x",

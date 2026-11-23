@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use vgi_rpc::{Bytes, DictString, LargeBytes, Result, RpcError, UtcTimestamp, VgiArrow};
+use vgi_rpc::{Bytes, DictString, Result, RpcError, UtcTimestamp, VgiArrow};
 
 /// `map<utf8, utf8>` payload (Python-canonical `keys`/`values` child names).
 pub type StrMap = Vec<(String, String)>;
@@ -67,83 +67,23 @@ impl VgiArrow for InlineI64 {
 // bind
 // ---------------------------------------------------------------------------
 
-/// `CopyFromContext` — the `COPY ... FROM` context threaded onto a
-/// [`BindRequest`] when a bind/init opens a custom COPY-FROM scan. Present only
-/// for COPY-FROM (the `copy_from` field is `None` otherwise). Encoded on the
-/// wire as a nested **struct** column (not IPC binary), matching the Python
-/// `vgi.protocol.CopyFromContext`. The handler's options arrive through the
-/// normal [`BindRequest::arguments`], so they are not duplicated here.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct CopyFromContext {
-    /// The `FORMAT` name resolved at COPY bind time.
-    pub format: String,
-    /// The source path from the `COPY ... FROM 'path'` statement.
-    pub file_path: String,
-    /// IPC-serialized Arrow schema of the COPY target's columns (name + type,
-    /// in target order). The worker must bind its output to, and emit columns
-    /// whose types match, this schema exactly — DuckDB inserts no cast between
-    /// the scan and the INSERT.
-    pub expected_schema: Bytes,
-}
+// `CopyFromContext`, `CopyToContext`, `ArgumentsLocation`, `BindRequest` and
+// the six requests that embed `bind_call` are generated from the canonical
+// Python records (vgi `docs/large-values-3.4.md` §3): `bind_call` is a
+// raw-preserving [`Nested<BindRequest>`](crate::generated::protocol_types::Nested),
+// and `BindRequest.arguments` is nullable beside `arguments_location`.
+pub use crate::generated::protocol_types::{
+    ArgumentsLocation, BindRequest, CopyFromContext, CopyToContext, InitRequest, Nested,
+    TableFunctionCardinalityRequest, TableFunctionDynamicToStringRequest, TableFunctionPlanRequest,
+    TableFunctionProjectionRequest, TableFunctionStatisticsRequest,
+};
 
-/// `CopyToContext` — the `COPY ... TO` context threaded onto a [`BindRequest`]
-/// when a bind/init opens a custom COPY-TO sink. Present only for COPY-TO (the
-/// `copy_to` field is `None` otherwise). Encoded on the wire as a nested
-/// **struct** column (not IPC binary), matching the Python
-/// `vgi.protocol.CopyToContext`. The handler's options arrive through the normal
-/// [`BindRequest::arguments`]; the **source** columns ride the existing
-/// [`BindRequest::input_schema`], so neither is duplicated here.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct CopyToContext {
-    /// The `FORMAT` name resolved at COPY bind time.
-    pub format: String,
-    /// The destination path from the `COPY ... TO 'path'` statement.
-    pub file_path: String,
-}
-
-/// `BindRequest` — carried IPC-serialized inside the `request` binary column
-/// of `bind`, and as the nested `bind_call` struct of `init` / cardinality.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct BindRequest {
-    pub function_name: String,
-    pub arguments: Bytes,
-    pub function_type: DictString,
-    pub input_schema: Option<Bytes>,
-    pub settings: Option<Bytes>,
-    pub secrets: Option<Bytes>,
-    pub attach_opaque_data: Option<Bytes>,
-    pub transaction_opaque_data: Option<Bytes>,
-    pub resolved_secrets_provided: bool,
-    /// Time travel: the `AT (TIMESTAMP|VERSION ...)` clause for this scan,
-    /// threaded through from DuckDB's per-reference bind (both `None` when there
-    /// is no AT clause). For inline-bound (function-backed) tables the actual
-    /// `on_bind` RPC runs once at attach with no AT, so the per-scan AT is
-    /// carried on the bind request embedded in each `InitRequest` and read at
-    /// init. Additive nullable columns — the C++ always emits them.
-    pub at_unit: Option<String>,
-    pub at_value: Option<String>,
-    /// `COPY ... FROM` context, present only when the bind opens a custom
-    /// COPY-FROM reader. A nested struct column, like Python's
-    /// `CopyFromContext`. The DuckDB extension omits the column entirely for an
-    /// ordinary bind; [`backfill_bind_request`] appends a null one so the
-    /// by-name decode still succeeds.
-    pub copy_from: Option<CopyFromContext>,
-    /// `COPY ... TO` context, present only when the bind opens a custom COPY-TO
-    /// sink. Same omission/backfill rules as [`Self::copy_from`].
-    pub copy_to: Option<CopyToContext>,
-    /// Catalog schema that owns the function being bound. The extension sets it
-    /// from the schema entry the function was registered into, so a name
-    /// declared in two schemas of one catalog resolves to the right
-    /// implementation. `None` (an empty string on the wire) when the caller has
-    /// no schema to name — COPY handler binds are advertised at catalog level,
-    /// and a scan whose function resolved to a built-in carries none either.
-    /// Additive nullable column; the C++ always emits it as of protocol 1.1.0.
-    pub schema_path: Option<SchemaPath>,
-    /// One entry per logical call argument. Fixed arguments retain their
-    /// declared name, unnamed varargs are `None`, and named varargs retain the
-    /// caller-provided name. Outer `None` means names are unavailable.
-    pub argument_names: Option<Vec<Option<String>>>,
-}
+/// Request for `table_function_cardinality` (the generated
+/// [`TableFunctionCardinalityRequest`]).
+pub type CardinalityRequest = TableFunctionCardinalityRequest;
+/// Request for `table_function_dynamic_to_string` (the generated
+/// [`TableFunctionDynamicToStringRequest`]).
+pub type DynamicToStringRequest = TableFunctionDynamicToStringRequest;
 
 /// Backfill the [`BindRequest`] columns a *newer* protocol revision added, so a
 /// request from an older client still decodes.
@@ -176,6 +116,12 @@ pub fn backfill_bind_request(
                 <CopyFromContext as VgiArrow>::arrow_data_type(),
             ),
             ("copy_to", <CopyToContext as VgiArrow>::arrow_data_type()),
+            // Protocol 3.4: a peer that predates argument references never
+            // sends the column; its arguments are always inline.
+            (
+                "arguments_location",
+                <ArgumentsLocation as VgiArrow>::arrow_data_type(),
+            ),
         ],
     )?;
     Ok((batch, legacy_peer))
@@ -445,13 +391,18 @@ mod backfill_tests {
     }
 
     /// A 1.1.0 peer already sends schema_path; only the newer argument-names
-    /// column and the COPY-only `copy_from` / `copy_to` columns are
-    /// synthesized, without changing the legacy-peer classification.
+    /// column, the COPY-only `copy_from` / `copy_to` columns and the 3.4
+    /// `arguments_location` are synthesized, without changing the legacy-peer
+    /// classification.
     #[test]
     fn present_column_is_left_alone() {
         let (out, legacy) = backfill_bind_request(batch(true)).expect("backfill");
         assert!(!legacy);
-        assert_eq!(out.num_columns(), 5);
+        assert_eq!(out.num_columns(), 6);
+        assert!(out
+            .column_by_name("arguments_location")
+            .expect("column added")
+            .is_null(0));
         assert!(out
             .column_by_name("argument_names")
             .expect("column added")
@@ -574,112 +525,9 @@ pub struct BindResponse {
 // init
 // ---------------------------------------------------------------------------
 
-/// `InitRequest` — carried IPC-serialized inside the `request` binary column
-/// of `init`. `bind_call` is itself an IPC-serialized [`BindRequest`] (Python
-/// serializes nested dataclasses as binary), decoded separately.
-///
-/// Fields are declared in the canonical Python `InitRequest` order, so the
-/// derived schema is exactly the generated one (see `tests/request_dto_parity.rs`).
-#[derive(Debug, Clone, VgiArrow)]
-pub struct InitRequest {
-    pub bind_call: Bytes,
-    pub output_schema: Bytes,
-    pub bind_opaque_data: Option<Bytes>,
-    pub projection_ids: Option<Vec<i64>>,
-    pub pushdown_filters: Option<LargeBytes>,
-    pub join_keys: Option<Vec<LargeBytes>>,
-    /// The framework-stamped split envelopes this init redeems.
-    ///
-    /// A LIST, though DuckDB always sends exactly one: DataFusion's
-    /// `partition_count()` IS its concurrency, so it bin-packs at planning time
-    /// and must read a whole group per partition — without the list that is N
-    /// sequential inits per partition. A worker handed several concatenates
-    /// them into one stream in the order given.
-    pub split_tokens: Option<Vec<LargeBytes>>,
-    /// A plain fetch limit, distinct from `order_by_limit` (which is a field OF
-    /// the Top-N hint). Always `None` from DuckDB — `TableFunctionInitInput`
-    /// carries no limit; DataFusion supplies it via `TableProvider::scan`.
-    pub row_limit: Option<i64>,
-    pub phase: Option<DictString>,
-    pub finalize_state_id: Option<Bytes>,
-    pub execution_id: Option<Bytes>,
-    pub init_opaque_data: Option<Bytes>,
-    /// Per-substream identity for parallel streaming table-in-out functions.
-    ///
-    /// A streaming table-in-out is a per-substream map: under per-substream
-    /// worker fan-out the client (VGI extension) acquires an independent worker
-    /// per substream (per DuckDB PipelineExecutor). `substream_id` is a stable,
-    /// CLIENT-minted id for that substream, identical across this substream's
-    /// init / every process tick / finalize. Unlike a worker-minted
-    /// `execution_id`, it survives an HTTP load balancer dispatching each
-    /// request to an arbitrary backend: a finalize that lands on a different
-    /// backend than the process() calls can still key the substream's
-    /// accumulated state (in shared storage) by `substream_id`. It is folded
-    /// into the exchange rebuild blob (serialized into the HTTP state token) so
-    /// it is present on every rehydrated tick. `None` when the client did not
-    /// supply one (serial path, non-table-in-out functions, old clients).
-    pub substream_id: Option<Bytes>,
-    pub order_by_column_name: Option<String>,
-    pub order_by_direction: Option<DictString>,
-    pub order_by_null_order: Option<DictString>,
-    pub order_by_limit: Option<i64>,
-    pub tablesample_percentage: Option<f64>,
-    pub tablesample_seed: Option<i64>,
-}
-
 // ---------------------------------------------------------------------------
 // table_function_plan
 // ---------------------------------------------------------------------------
-
-/// `TableFunctionPlanRequest` — carried IPC-serialized inside the `request`
-/// binary column of `table_function_plan`.
-///
-/// Every field but `bind_call` is optional, and deliberately so: a client sends
-/// only the sizing inputs it actually has. The DuckDB extension, for instance,
-/// sends seven columns — it has no basis to invent a byte target it did not set,
-/// and `TableFunctionInitInput` carries no row limit at all — so a decoder that
-/// required the full field list would reject the primary client outright.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct TableFunctionPlanRequest {
-    pub bind_call: Bytes,
-    pub bind_opaque_data: Option<Bytes>,
-    /// Pushdown as it reached the scan. A plan is built from STATIC filters
-    /// only — join-key values land after planning, so they prune WITHIN a split
-    /// rather than deciding the split set.
-    pub projection_ids: Option<Vec<i64>>,
-    pub pushdown_filters: Option<LargeBytes>,
-    pub join_keys: Option<Vec<LargeBytes>>,
-    pub row_limit: Option<i64>,
-    /// The primary sizing lever: every engine is byte-driven.
-    pub target_split_bytes: Option<i64>,
-    /// The parallelism FLOOR — a small but expensive table still needs one
-    /// reader per thread, which a byte target alone would not give it.
-    pub min_splits: Option<i64>,
-    /// A PAGINATION cap, not a sizing hint. Conflating the two produces wrongly
-    /// sized splits.
-    pub max_splits_per_response: Option<i64>,
-    /// A place in the ENUMERATION of splits — NOT a place in the data (that is
-    /// `start_position`). A cursor lives for one plan call; a position is
-    /// checkpointed and must survive restarts, upgrades and key rotation.
-    pub cursor: Option<Bytes>,
-    /// Narrows FUTURE splits only; splits already emitted under a looser filter
-    /// stay valid. `filters_complete = false` says more narrowing may
-    /// arrive, so a worker may hold splits back.
-    pub refined_filters: Option<LargeBytes>,
-    /// Non-nullable, default `true` (Python `filters_complete: bool = True`);
-    /// [`backfill_plan_request`] supplies `true` when a peer omits it.
-    pub filters_complete: bool,
-    /// The range in the DATA. A null `end_position` means "as of now": the
-    /// worker resolves the frontier and reports it back.
-    pub start_position: Option<Bytes>,
-    pub end_position: Option<Bytes>,
-    pub order_by_column_name: Option<String>,
-    pub order_by_direction: Option<DictString>,
-    pub order_by_null_order: Option<DictString>,
-    pub order_by_limit: Option<i64>,
-    pub tablesample_percentage: Option<f64>,
-    pub tablesample_seed: Option<i64>,
-}
 
 /// `PlanResponse` — the reply to `table_function_plan`.
 ///
@@ -842,14 +690,6 @@ pub struct ClientCapabilities {
     pub query_pushdown: Option<crate::generated::protocol_types::ClientQueryCapabilities>,
 }
 
-/// Request for `table_function_cardinality` / `table_function_statistics`
-/// (boxes an IPC-serialized `BindRequest`).
-#[derive(Debug, Clone, VgiArrow)]
-pub struct CardinalityRequest {
-    pub bind_call: Bytes,
-    pub bind_opaque_data: Option<Bytes>,
-}
-
 /// Response for `table_function_cardinality`.
 #[derive(Debug, Clone, VgiArrow)]
 pub struct CardinalityResponse {
@@ -934,14 +774,6 @@ pub struct AggregateWindowDestructorRequest {
     /// RPC that re-resolves by name; `None` when the caller names no schema.
     /// Added in protocol 1.2.0.
     pub schema_path: Option<SchemaPath>,
-}
-
-/// `table_function_dynamic_to_string` — post-execution profiling info.
-#[derive(Debug, Clone, VgiArrow)]
-pub struct DynamicToStringRequest {
-    pub bind_call: Bytes,
-    pub bind_opaque_data: Option<Bytes>,
-    pub global_execution_id: Bytes,
 }
 
 /// `table_function_dynamic_to_string` result — ordered key/value pairs

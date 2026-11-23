@@ -21,7 +21,7 @@ use arrow_schema::SchemaRef;
 use vgi_rpc::{Result, RpcError};
 
 use crate::ipc;
-use crate::protocol::dtos::CopyToContext;
+use crate::protocol::dtos::{ArgumentsLocation, CopyToContext};
 
 /// Key/value key of the sealed [`BufferingInit`] record.
 pub(crate) const BUFFERING_INIT_KEY: &[u8] = b"_vgi/buffering_init";
@@ -43,8 +43,32 @@ const T_COPY_TO_FORMAT: u8 = 6;
 const T_COPY_TO_PATH: u8 = 7;
 const T_ATTACH: u8 = 8;
 const T_SCHEMA_PATH: u8 = 9;
+const T_ARGUMENTS_LOCATION: u8 = 10;
 
 const FLAG_LOGGING: u8 = 0x01;
+
+/// A bind's arguments as the client sent them: the bytes inline, or the
+/// protocol 3.4 reference (large-values spec §6: anything that persists an
+/// init request stores the reference, never a resolved argument).
+#[derive(Debug, Clone)]
+pub(crate) enum StoredArguments {
+    /// The `Arguments` IPC stream.
+    Inline(Vec<u8>),
+    /// Where the uploaded arguments live; resolved again on read.
+    Location(ArgumentsLocation),
+}
+
+impl PartialEq for StoredArguments {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Inline(a), Self::Inline(b)) => a == b,
+            (Self::Location(a), Self::Location(b)) => {
+                a.r#ref.0 == b.r#ref.0 && a.size == b.size && a.sha256 == b.sha256
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Everything a buffered function's `process` / `combine` / finalize resume
 /// needs from its bind, persisted once by the sink init.
@@ -54,8 +78,8 @@ pub(crate) struct BufferingInit {
     pub output_schema: SchemaRef,
     /// The bound input (source) schema.
     pub input_schema: Option<SchemaRef>,
-    /// The raw call arguments (`Arguments` IPC).
-    pub arguments: Vec<u8>,
+    /// The call arguments as the client sent them.
+    pub arguments: StoredArguments,
     /// The resolved secrets (`Secrets` IPC). The only field here that a
     /// process / combine request has no copy of at all, and the reason the
     /// record must be sealed.
@@ -124,7 +148,14 @@ impl BufferingInit {
         if let Some(s) = &self.input_schema {
             put_field(&mut out, T_INPUT_SCHEMA, &ipc::write_schema_ref(s)?);
         }
-        put_field(&mut out, T_ARGUMENTS, &self.arguments);
+        match &self.arguments {
+            StoredArguments::Inline(bytes) => put_field(&mut out, T_ARGUMENTS, bytes),
+            StoredArguments::Location(location) => put_field(
+                &mut out,
+                T_ARGUMENTS_LOCATION,
+                &ipc::write_batch(&crate::wire::to_batch(location.clone())?)?,
+            ),
+        }
         if let Some(s) = &self.secrets {
             put_field(&mut out, T_SECRETS, s);
         }
@@ -166,9 +197,18 @@ impl BufferingInit {
                     .map_err(|e| corrupt(WHAT, format!("input schema: {}", e.message)))
             })
             .transpose()?;
-        let arguments = take(T_ARGUMENTS)
-            .ok_or_else(|| corrupt(WHAT, "no arguments"))?
-            .to_vec();
+        let arguments = match (take(T_ARGUMENTS), take(T_ARGUMENTS_LOCATION)) {
+            (Some(bytes), None) => StoredArguments::Inline(bytes.to_vec()),
+            (None, Some(location)) => StoredArguments::Location(
+                ipc::read_batch(location)
+                    .and_then(|batch| crate::wire::from_batch(&batch))
+                    .map_err(|e| corrupt(WHAT, format!("arguments location: {}", e.message)))?,
+            ),
+            (None, None) => return Err(corrupt(WHAT, "no arguments")),
+            (Some(_), Some(_)) => {
+                return Err(corrupt(WHAT, "both inline arguments and a location"))
+            }
+        };
         let secrets = take(T_SECRETS).map(<[u8]>::to_vec);
         let flags = take(T_FLAGS).ok_or_else(|| corrupt(WHAT, "no flags"))?;
         let [flags] = flags else {
@@ -347,7 +387,7 @@ mod tests {
                 DataType::Int64,
                 true,
             )]))),
-            arguments: b"args".to_vec(),
+            arguments: StoredArguments::Inline(b"args".to_vec()),
             secrets: Some(b"secrets".to_vec()),
             logging: true,
             copy_to: Some(CopyToContext {
@@ -384,6 +424,27 @@ mod tests {
         let d = BufferingInit::decode(&minimal.encode().unwrap()).unwrap();
         assert!(d.input_schema.is_none() && d.secrets.is_none() && d.copy_to.is_none());
         assert!(!d.logging);
+    }
+
+    /// An externalized argument is persisted as its reference, and a record
+    /// with both forms (or neither) is corrupt.
+    #[test]
+    fn init_keeps_an_argument_reference() {
+        let location = ArgumentsLocation {
+            r#ref: vgi_rpc::Bytes(vec![7; 40]),
+            size: 8 << 20,
+            sha256: "0f".repeat(32),
+        };
+        let r = BufferingInit {
+            arguments: StoredArguments::Location(location),
+            ..sample()
+        };
+        let enc = r.encode().unwrap();
+        let d = BufferingInit::decode(&enc).unwrap();
+        assert_eq!(d.arguments, r.arguments);
+        let mut both = enc.clone();
+        put_field(&mut both, T_ARGUMENTS, b"args");
+        assert!(BufferingInit::decode(&both).is_err());
     }
 
     #[test]

@@ -403,7 +403,7 @@ impl VgiClient {
     ) -> Result<BoundFunction> {
         let request = BindRequest {
             function_name: spec.function_name.clone(),
-            arguments: spec.arguments.to_ipc()?,
+            arguments: Some(spec.arguments.to_ipc()?),
             function_type: DictString(spec.function_type.as_str().to_string()),
             input_schema: Some(Bytes(ipc::write_schema(input_schema)?)),
             settings: spec.settings.clone(),
@@ -417,6 +417,7 @@ impl VgiClient {
             copy_to: None,
             schema_path: spec.schema_path.clone(),
             argument_names: spec.argument_names.clone(),
+            arguments_location: None,
         };
         let bind_call = envelope(request)?;
         let response: BindResponse = call(
