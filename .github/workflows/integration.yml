@@ -30,13 +30,15 @@ env:
   # 5b8b7a2 is vgi protocol-3.4: protocol 3.4.0, upload URLs v2,
   # external_storage/upload_integrity.test and the client-upload counters
   # (puts_upload / client_uploads); it includes 91f8d63
-  # (scan_planning_predicates*.test over data.planned_events). TODO(release-wave).
-  VGI_REF: 5b8b7a2a7e4e587e15573ddd62cf1dbcdf6b357e
-  # The fake blob vendor with sized-PUT verification, the upload fault and the
-  # origin=client_upload counters (vgi-rpc-python protocol-3.4 f0fb675); the
-  # same pin as start_fake_blob_vendor.sh at 5b8b7a2.
+  # (scan_planning_predicates*.test over data.planned_events). e99683f adds
+  # protocol 3.4 argument references and the arguments_ref*.test files the
+  # vendor lane runs. TODO(release-wave).
+  VGI_REF: e99683f2af215c5a166697945e796c91d0cc66fe
+  # The fake blob vendor with sized-PUT verification, the upload fault, the
+  # origin=client_upload counters and the delete-object route (vgi-rpc-python
+  # 6a21ee3); the same pin as start_fake_blob_vendor.sh at e99683f.
   # TODO(release-wave).
-  VGI_RPC_FAKE_VENDOR_REF: f0fb6754ae5b70900ba21629a1e2d48eb2182774
+  VGI_RPC_FAKE_VENDOR_REF: 6a21ee3b2fb21d9c348c9b615fd97dce8e0bb852
   VGI_NATIVE_RUNNER_BRANCH: protocol-3.4
   # vgi protocol-3.4 with the Orchard hosted-mode conformance harness
   # (test/hosted/run_hosted_conformance.py). TODO(release-wave).

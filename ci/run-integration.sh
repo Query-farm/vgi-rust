@@ -274,6 +274,23 @@ case "$TRANSPORT" in
       # shellcheck source=/dev/null
       source "$VGI_SRC/test/start_fake_blob_vendor.sh" || {
         echo "::error::the fake blob vendor did not start"; exit 1; }
+      # Protocol 3.4 large values (vgi docs/testing/blob-test-catalog.md):
+      # this worker sends VGI-Arguments-Ref-Bytes, resolves
+      # arguments_location, serves the blob_param_* fixtures, and the pinned
+      # fake vendor has the delete-object route, so the arguments_ref*.test
+      # files run.
+      export VGI_WORKER_ARGUMENTS_REF=1 VGI_FAKE_VENDOR_DELETE_ROUTE=1
+      # The worker also carries its init as a vgi-rpc StateRef, but
+      # arguments_ref_state_ref.test (vgi e99683f) assumes its 1000-value IN
+      # list reaches the init of the table-in-out `echo`. DuckDB pushes no
+      # filter into a table-in-out, so this worker's init is ~4.5 KB raw,
+      # ~1.45 KB compressed, under the file's pinned 2048-byte inline limit,
+      # and stays inline (with the limit at 1024 it is stored once, a 125-byte
+      # tag per turn, and the file passes). Opt in once the file pins a limit
+      # below the init or pushes a filter that reaches it:
+      # VGI_WORKER_INIT_STATE_REF=1. TODO(release-wave).
+      export VGI_WORKER_INIT_STATE_REF="${VGI_WORKER_INIT_STATE_REF:-}"
+      [ -n "$VGI_WORKER_INIT_STATE_REF" ] || unset VGI_WORKER_INIT_STATE_REF
     fi
     # Whole-suite-over-HTTP. Every ATTACH goes over http://, so staging injected
     # `LOAD httpfs`. VGI_REQUIRE_LAUNCHER_TRANSPORT is deliberately unset (the
@@ -439,7 +456,29 @@ if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
     # One file at a time (the runner is serial): the files compare the
     # vendor's lane-wide counters and arm faults for the next download.
     echo "Running external_storage/* against the fake blob vendor ..."
-    run_unittest "test/sql/external_storage/*" || rc=$?
+    # A file that declares `# server-env: NAME=VALUE` in its head (the vgi
+    # runner's per-file worker environment, e.g. a cold object cache or a
+    # worker that does not advertise argument references) runs on its own
+    # worker booted with that environment, never on the shared one.
+    ENV_FILES=()
+    ENV_EXCLUDES=()
+    for f in test/sql/external_storage/*.test; do
+      if head -n 40 "$f" | grep -qE '^#[[:space:]]*server-env:'; then
+        ENV_FILES+=("$f")
+        ENV_EXCLUDES+=("~$f")
+      fi
+    done
+    run_unittest "test/sql/external_storage/*" "${ENV_EXCLUDES[@]}" || rc=$?
+    SHARED_WORKER="$VGI_TEST_WORKER"
+    for f in "${ENV_FILES[@]}"; do
+      mapfile -t kvs < <(head -n 40 "$f" | sed -n \
+        's/^#[[:space:]]*server-env:[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*\)[[:space:]]*$/\1/p')
+      echo "Running $f on its own worker (${kvs[*]}) ..."
+      boot_http_worker "$VGI_WORKER_BIN" "VGI_WORKER_CATALOG_NAME=example" "${kvs[@]}" || { rc=1; continue; }
+      export VGI_TEST_WORKER="http://localhost:${BOOTED_PORT}"
+      run_unittest "$f" || rc=$?
+    done
+    export VGI_TEST_WORKER="$SHARED_WORKER"
     echo "fake blob vendor counters: $(curl -fsS "$VGI_BLOB_VENDOR_URL/__stats__" 2>&1 | tr -s ' ')"
   fi
   echo "Running bearer_auth/* against a bearer-protected http worker ..."
