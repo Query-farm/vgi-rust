@@ -276,21 +276,10 @@ case "$TRANSPORT" in
         echo "::error::the fake blob vendor did not start"; exit 1; }
       # Protocol 3.4 large values (vgi docs/testing/blob-test-catalog.md):
       # this worker sends VGI-Arguments-Ref-Bytes, resolves
-      # arguments_location, serves the blob_param_* fixtures, and the pinned
-      # fake vendor has the delete-object route, so the arguments_ref*.test
-      # files run.
-      export VGI_WORKER_ARGUMENTS_REF=1 VGI_FAKE_VENDOR_DELETE_ROUTE=1
-      # The worker also carries its init as a vgi-rpc StateRef, but
-      # arguments_ref_state_ref.test (vgi e99683f) assumes its 1000-value IN
-      # list reaches the init of the table-in-out `echo`. DuckDB pushes no
-      # filter into a table-in-out, so this worker's init is ~4.5 KB raw,
-      # ~1.45 KB compressed, under the file's pinned 2048-byte inline limit,
-      # and stays inline (with the limit at 1024 it is stored once, a 125-byte
-      # tag per turn, and the file passes). Opt in once the file pins a limit
-      # below the init or pushes a filter that reaches it:
-      # VGI_WORKER_INIT_STATE_REF=1. TODO(release-wave).
-      export VGI_WORKER_INIT_STATE_REF="${VGI_WORKER_INIT_STATE_REF:-}"
-      [ -n "$VGI_WORKER_INIT_STATE_REF" ] || unset VGI_WORKER_INIT_STATE_REF
+      # arguments_location, serves the blob_param_* fixtures, carries its
+      # init as a vgi-rpc StateRef, and the pinned fake vendor has the
+      # delete-object route, so the arguments_ref*.test files run.
+      export VGI_WORKER_ARGUMENTS_REF=1 VGI_WORKER_INIT_STATE_REF=1 VGI_FAKE_VENDOR_DELETE_ROUTE=1
     fi
     # Whole-suite-over-HTTP. Every ATTACH goes over http://, so staging injected
     # `LOAD httpfs`. VGI_REQUIRE_LAUNCHER_TRANSPORT is deliberately unset (the
