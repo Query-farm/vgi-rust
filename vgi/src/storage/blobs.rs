@@ -206,6 +206,101 @@ impl BlobStore for vgi_rpc_s3::vendor::VendorBlobClient {
     }
 }
 
+/// Function-storage blobs in the operator's S3 bucket (`VGI_STORAGE_BACKEND=s3`),
+/// under `<prefix>fs/<object id>`. The object id is derived from the scope and
+/// the idempotency key, so a retried write reuses the object. Reads are
+/// verified against the reference's size and SHA-256. The worker never
+/// deletes (direct-storage contract v1, §6): `delete` and `delete_scope` are
+/// no-ops, and an operator who wants cleanup adds a lifecycle rule to `fs/`
+/// no shorter than the values' own lifetime.
+#[cfg(feature = "storage-s3")]
+pub struct S3BlobStore {
+    s3: vgi_rpc_s3::s3::S3Storage,
+}
+
+#[cfg(feature = "storage-s3")]
+impl S3BlobStore {
+    /// A blob store over `s3`.
+    pub fn new(s3: vgi_rpc_s3::s3::S3Storage) -> Self {
+        S3BlobStore { s3 }
+    }
+}
+
+#[cfg(feature = "storage-s3")]
+impl BlobStore for S3BlobStore {
+    fn put_bytes(
+        &self,
+        data: &[u8],
+        shard: &str,
+        execution_id: &str,
+        idempotency_key: &str,
+    ) -> Result<BlobRef, BlobError> {
+        use sha2::Digest as _;
+        let scope = sha2::Sha256::digest(
+            format!("{}\0{}\0{}", shard, execution_id, idempotency_key).as_bytes(),
+        );
+        let object_id = format!("fs.{}", hex_lower(&scope));
+        self.s3
+            .put_key(
+                &self.s3.fs_key(&object_id),
+                data,
+                "application/octet-stream",
+                None,
+            )
+            .map_err(|e| BlobError {
+                kind: BlobErrorKind::Other,
+                message: e.message,
+            })?;
+        Ok(BlobRef {
+            object_id,
+            size: data.len() as u64,
+            sha256: hex_lower(&sha2::Sha256::digest(data)),
+        })
+    }
+
+    fn get_bytes(&self, blob: &BlobRef) -> Result<Vec<u8>, BlobError> {
+        use sha2::Digest as _;
+        let cap = usize::try_from(blob.size).unwrap_or(usize::MAX);
+        let data = self
+            .s3
+            .get_key(&self.s3.fs_key(&blob.object_id), cap)
+            .map_err(|e| BlobError {
+                kind: BlobErrorKind::Other,
+                message: e.message,
+            })?
+            .ok_or_else(|| BlobError {
+                kind: BlobErrorKind::Missing,
+                message: format!("blob {} not found in the s3 bucket", blob.object_id),
+            })?;
+        if data.len() as u64 != blob.size {
+            return Err(BlobError {
+                kind: BlobErrorKind::SizeMismatch,
+                message: format!("expected {} bytes, got {}", blob.size, data.len()),
+            });
+        }
+        if hex_lower(&sha2::Sha256::digest(&data)) != blob.sha256.to_ascii_lowercase() {
+            return Err(BlobError {
+                kind: BlobErrorKind::Sha256Mismatch,
+                message: "sha256 mismatch".to_string(),
+            });
+        }
+        Ok(data)
+    }
+
+    fn delete(&self, _object_ids: &[String]) -> Result<(), BlobError> {
+        Ok(())
+    }
+
+    fn delete_scope(&self, _shard: &str, _execution_id: &str) -> Result<(), BlobError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "storage-s3")]
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(feature = "blob-vendor")]
 fn vendor_error(e: vgi_rpc_s3::vendor::VendorError) -> BlobError {
     let kind = match e.code.as_deref() {
@@ -439,26 +534,49 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-/// The vendor blob client from `VGI_BLOB_VENDOR_URL` and its token, or `None`
-/// when the URL is unset. Panics on a misconfiguration (a URL without a token,
-/// or a build without the `blob-vendor` feature): a worker must not start with
-/// a vendor it cannot use.
+/// The function-storage blob store of the selected storage backend
+/// (`VGI_STORAGE_BACKEND`, or the vendor / S3 bucket variables; see
+/// `vgi_rpc_s3::backend`), or `None` for no backend. Panics on a
+/// misconfiguration (a conflict, a vendor URL without a token, a backend this
+/// build lacks): a worker must not start with storage it cannot use.
 pub fn blob_store_from_env() -> Option<Arc<dyn BlobStore>> {
-    let url = std::env::var(ENV_VENDOR_URL).unwrap_or_default();
-    if url.trim().is_empty() {
-        return None;
-    }
     #[cfg(feature = "blob-vendor")]
     {
-        match vgi_rpc_s3::vendor::VendorBlobClient::from_env() {
-            Ok(Some(client)) => Some(Arc::new(client)),
-            Ok(None) => None,
-            Err(e) => panic!("{ENV_VENDOR_URL}: {}", e.message),
+        use vgi_rpc_s3::backend::Backend;
+        let lookup = |name: &str| std::env::var(name).ok();
+        match vgi_rpc_s3::backend::select_backend(&lookup)
+            .unwrap_or_else(|e| panic!("storage configuration: {}", e.message))
+        {
+            Backend::None => None,
+            Backend::Vendor => match vgi_rpc_s3::vendor::VendorBlobClient::from_env() {
+                Ok(Some(client)) => Some(Arc::new(client)),
+                Ok(None) => panic!("VGI_STORAGE_BACKEND=vendor needs {ENV_VENDOR_URL}"),
+                Err(e) => panic!("{ENV_VENDOR_URL}: {}", e.message),
+            },
+            #[cfg(feature = "storage-s3")]
+            Backend::S3 => {
+                let settings = vgi_rpc_s3::s3::S3Settings::from_env()
+                    .unwrap_or_else(|e| panic!("storage configuration: {}", e.message));
+                Some(Arc::new(S3BlobStore::new(vgi_rpc_s3::s3::S3Storage::new(
+                    settings,
+                ))))
+            }
+            #[cfg(not(feature = "storage-s3"))]
+            Backend::S3 => panic!(
+                "VGI_STORAGE_BACKEND=s3 needs vgi's `storage-s3` feature (a default feature)"
+            ),
+            Backend::Gcs => panic!(
+                "VGI_STORAGE_BACKEND=gcs: the Rust SDK has no GCS backend yet; use vendor or s3"
+            ),
         }
     }
     #[cfg(not(feature = "blob-vendor"))]
     {
-        panic!("{ENV_VENDOR_URL} is set but vgi was built without the `blob-vendor` feature")
+        let set = |n: &str| std::env::var(n).is_ok_and(|v| !v.trim().is_empty());
+        if set(ENV_VENDOR_URL) || set("VGI_STORAGE_S3_BUCKET") {
+            panic!("a storage backend is configured but vgi was built without the `blob-vendor` feature")
+        }
+        None
     }
 }
 
@@ -478,7 +596,10 @@ pub fn wrap_storage_from_env(
     }
     let blobs = blob_store_from_env();
     if enabled && blobs.is_none() {
-        panic!("{ENV_EXTERNALIZE}=1 needs the blob vendor: set {ENV_VENDOR_URL}");
+        panic!(
+            "{ENV_EXTERNALIZE}=1 needs a storage backend: set {ENV_VENDOR_URL} or \
+             VGI_STORAGE_S3_BUCKET"
+        );
     }
     let mut threshold = externalize_bytes_from_env();
     if let Some(cap) = max_value_bytes {

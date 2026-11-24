@@ -446,7 +446,8 @@ pub(crate) fn format_http_bind(host: &str, port: u16) -> String {
 ///
 /// - `VGI_RPC_MAX_REQUEST_BYTES`: advertised (`VGI-Max-Request-Bytes`) and
 ///   enforced (413) inline-request cap.
-/// - With the blob vendor (`VGI_BLOB_VENDOR_URL`, feature `blob-vendor`):
+/// - With a storage backend (the blob vendor, `VGI_BLOB_VENDOR_URL`, or the
+///   operator's S3 bucket, `VGI_STORAGE_S3_BUCKET`; feature `blob-vendor`):
 ///   `VGI-Upload-URL-Support: 2` with sized, checksummed upload URLs vended by
 ///   the vendor (`/v1/blobs/put`, purpose `rpc`), so a client sends a larger
 ///   request as an upload pointer carrying `vgi_rpc.location.sha256`, and
@@ -481,16 +482,21 @@ impl HttpRequestCaps {
             .or(hosted.then_some(crate::hosted::HOSTED_DEFAULT_MAX_REQUEST_BYTES));
         #[cfg(feature = "blob-vendor")]
         {
-            if let Some((cfg, storage)) = crate::blob_vendor::http_vendor() {
-                return HttpRequestCaps {
-                    max_request_bytes,
-                    max_upload_bytes: crate::blob_vendor::max_upload_bytes(),
-                    upload_url_provider: Some(storage.clone()),
-                    arguments_ref_bytes: crate::arguments_ref::advertised_arguments_ref_bytes(
-                        true,
-                        cfg.storage.object_store().is_some(),
-                    ),
-                };
+            // With VGI_STORAGE_S3_CHECKSUM=none the backend issues no upload
+            // grants: no upload-URL support, upload cap or argument references
+            // are advertised, but results are still externalized.
+            if let Some(storage) = crate::blob_vendor::http_storage() {
+                if let Some(provider) = &storage.upload_url_provider {
+                    return HttpRequestCaps {
+                        max_request_bytes,
+                        max_upload_bytes: crate::blob_vendor::max_upload_bytes(),
+                        upload_url_provider: Some(provider.clone()),
+                        arguments_ref_bytes: crate::arguments_ref::advertised_arguments_ref_bytes(
+                            true,
+                            storage.config.storage.object_store().is_some(),
+                        ),
+                    };
+                }
             }
         }
         HttpRequestCaps {

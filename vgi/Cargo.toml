@@ -16,7 +16,7 @@ categories = ["database", "api-bindings"]
 all-features = true
 
 [features]
-default = ["sqlite", "transport-http", "catalog-publication", "blob-vendor"]
+default = ["sqlite", "transport-http", "catalog-publication", "blob-vendor", "storage-s3"]
 # Durable single-file SQLite storage backend (bundles libsqlite3 — compiles C).
 sqlite = ["dep:rusqlite"]
 # HTTP client storage backend (talks to a vgi-storage-server); for multi-instance
@@ -42,6 +42,12 @@ transport-http = ["dep:tokio", "vgi-rpc/http", "dep:jsonwebtoken", "dep:ureq", "
 # every worker image with the vendor set, and a hosted worker built without it
 # refuses to start rather than serve without externalization.
 blob-vendor = ["transport-http", "dep:vgi-rpc-s3"]
+# Direct S3 storage (`VGI_STORAGE_BACKEND=s3` / `VGI_STORAGE_S3_BUCKET`): the
+# worker signs its own URLs against the operator's bucket (AWS S3 or any
+# S3-compatible service) with the standard AWS credential chain. Pulls
+# aws-config. A default feature, so every self-hosted worker can use its own
+# bucket from the environment alone.
+storage-s3 = ["blob-vendor", "vgi-rpc-s3/aws"]
 
 catalog-publication = ["vgi-rpc/external", "dep:zstd"]
 

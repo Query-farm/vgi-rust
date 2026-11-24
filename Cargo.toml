@@ -46,3 +46,17 @@ env_logger = "0.11"
 
 [profile.release]
 opt-level = 2
+
+
+# TODO(release-wave): switch to the vgi-rpc release the wave cuts and drop this
+# section. Until then every vgi-rpc-rust crate comes from the `protocol-3.4`
+# branch commit with direct S3 storage (vgi-rpc-s3's `aws` feature,
+# VGI_STORAGE_BACKEND) and the storage stall timeouts; patching them all keeps
+# one copy of each.
+[patch.crates-io]
+vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }
+vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }
+vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }
+vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }
+vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }
+vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "a501ffd7e497348480763fdb2b357fe52ad0b0e1" }

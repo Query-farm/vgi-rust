@@ -16,11 +16,18 @@
 #   HAYBARN_UNITTEST path to the haybarn-unittest binary
 #   VGI_WORKER_BIN   path to the built vgi-example-worker
 # Optional:
-#   TRANSPORT        stdio | launch | http | vendor   (default stdio)
+#   TRANSPORT        stdio | launch | http | vendor | s3   (default stdio)
 #                    vendor = the http lane with everything externalized through
 #                    a fake blob vendor (started by the VGI checkout's
 #                    test/start_fake_blob_vendor.sh, which needs `uvx`), plus
 #                    test/sql/external_storage/* (docs/testing/blob-test-catalog.md).
+#                    s3 = the http lane with everything externalized to an S3 bucket
+#                    the worker signs for itself (direct-storage contract v1): a RustFS
+#                    container (docker; needs the aws CLI), VGI_STORAGE_BACKEND=s3,
+#                    the vendor lane's thresholds. The external_storage files are not
+#                    run (they read the fake vendor's counters and arm its faults); the
+#                    lane instead fails unless results, objects and function-storage
+#                    blobs actually landed in the bucket.
 #   STAGE            scratch dir for the preprocessed test tree (default: mktemp)
 set -uo pipefail  # not -e: the suite exit code is managed explicitly (`|| rc=$?`)
 
@@ -75,7 +82,7 @@ fi
 # ---------------------------------------------------------------------------
 AWK_HTTP=0
 HTTP_SKIP=()
-if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
+if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ] || [ "$TRANSPORT" = "s3" ]; then
   AWK_HTTP=1
   # dynamic_filter.test used to be dropped here too, blamed on the prebuilt
   # binary. That was wrong: this SDK's HTTP server discarded a continuation
@@ -151,6 +158,7 @@ BG_PIDS=()
 cleanup() {
   for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
   if declare -F stop_fake_blob_vendor >/dev/null; then stop_fake_blob_vendor; fi
+  if [ -n "${S3_CONTAINER:-}" ]; then docker rm -fv "$S3_CONTAINER" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
@@ -265,7 +273,29 @@ case "$TRANSPORT" in
     export VGI_WRITABLE_TX_WORKER="launch:${WTX}"
     boot_versioned_http
     ;;
-  http | vendor)
+  http | vendor | s3)
+    if [ "$TRANSPORT" = "s3" ]; then
+      # A RustFS bucket the worker signs its own URLs for (VGI_STORAGE_BACKEND=s3,
+      # path style, static keys). Same thresholds as the vendor lane.
+      S3_IMAGE="${RUSTFS_IMAGE:-ghcr.io/rustfs/rustfs@sha256:29c02251c085cb04edce556304a9ec0f8fba0c40300266cf4f3d953783fe2450}"
+      S3_CONTAINER=$(docker run -d -p 127.0.0.1::9000 -e RUSTFS_ACCESS_KEY=vgilane -e RUSTFS_SECRET_KEY=vgilanesecret123 \
+        -e RUSTFS_CONSOLE_ENABLE=false -e RUSTFS_OBS_LOGGER_LEVEL=error "$S3_IMAGE") || {
+        echo "::error::could not start RustFS"; exit 1; }
+      S3_ENDPOINT="http://127.0.0.1:$(docker port "$S3_CONTAINER" 9000/tcp | head -1 | sed 's/.*://')"
+      for _ in $(seq 1 120); do curl -sf "$S3_ENDPOINT/health" >/dev/null && break; sleep 0.5; done
+      s3_aws() { env -u AWS_PROFILE -u AWS_SESSION_TOKEN AWS_CONFIG_FILE=/dev/null AWS_ACCESS_KEY_ID=vgilane \
+        AWS_SECRET_ACCESS_KEY=vgilanesecret123 aws --region us-east-1 --endpoint-url "$S3_ENDPOINT" "$@"; }
+      s3_aws s3 mb s3://vgi-lane >/dev/null || { echo "::error::could not create the lane bucket"; exit 1; }
+      export VGI_STORAGE_BACKEND=s3 VGI_STORAGE_S3_BUCKET=vgi-lane VGI_STORAGE_S3_PREFIX=lane/ \
+        VGI_STORAGE_S3_ENDPOINT="$S3_ENDPOINT" VGI_STORAGE_S3_ACCESS_KEY_ID=vgilane \
+        VGI_STORAGE_S3_SECRET_ACCESS_KEY=vgilanesecret123 VGI_STORAGE_S3_VERIFY=1 \
+        VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES="${VGI_RPC_EXTERNALIZE_THRESHOLD_BYTES:-4096}" \
+        VGI_RPC_MAX_REQUEST_BYTES="${VGI_RPC_MAX_REQUEST_BYTES:-32768}" \
+        VGI_RPC_MAX_UPLOAD_BYTES="${VGI_RPC_MAX_UPLOAD_BYTES:-268435456}" \
+        VGI_STORAGE_EXTERNALIZE=1 VGI_STORAGE_EXTERNALIZE_BYTES="${VGI_STORAGE_EXTERNALIZE_BYTES:-4096}" \
+        VGI_TEST_ALLOW_LOOPBACK_EXTERNAL_LOCATIONS=1 \
+        VGI_WORKER_ARGUMENTS_REF=1 VGI_WORKER_INIT_STATE_REF=1
+    fi
     if [ "$TRANSPORT" = "vendor" ]; then
       # Start the fake blob vendor before any worker boots, so every worker
       # inherits VGI_BLOB_VENDOR_URL and the lane's small thresholds: results
@@ -310,7 +340,7 @@ case "$TRANSPORT" in
       && export VGI_WRITABLE_TX_WORKER="http://localhost:${BOOTED_PORT}"
     ;;
   *)
-    echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http|vendor)"; exit 1 ;;
+    echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http|vendor|s3)"; exit 1 ;;
 esac
 
 cd "$STAGE" || {
@@ -381,6 +411,8 @@ case "$TRANSPORT" in
   http)   if [ "$WINDOWS" = "1" ]; then MIN_EXECUTED="${MIN_EXECUTED:-255}"; else MIN_EXECUTED="${MIN_EXECUTED:-260}"; fi ;;
   # The http suite plus the seven blob_test contract files.
   vendor) MIN_EXECUTED="${MIN_EXECUTED:-267}" ;;
+  # s3: the http suite only (the external_storage files are vendor-instrumented).
+  s3)     MIN_EXECUTED="${MIN_EXECUTED:-260}" ;;
 esac
 
 # run_unittest — invoke haybarn-unittest, streaming its output, and additionally
@@ -439,7 +471,7 @@ run_unittest() {
   return "$unittest_rc"
 }
 
-if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
+if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ] || [ "$TRANSPORT" = "s3" ]; then
   run_unittest "test/sql/integration/*" "~test/sql/integration/bearer_auth/*" || rc=$?
   if [ "$TRANSPORT" = "vendor" ]; then
     # One file at a time (the runner is serial): the files compare the
@@ -479,6 +511,19 @@ if [ "$TRANSPORT" = "http" ] || [ "$TRANSPORT" = "vendor" ]; then
     run_unittest "test/sql/integration/bearer_auth/*" ) || rc=$?
 else
   run_unittest "test/sql/integration/*" || rc=$?
+fi
+
+# The s3 lane's skip detector: storage that was never used reads as green (the
+# suite passes with everything inline), so require objects in each area.
+if [ "$TRANSPORT" = "s3" ]; then
+  for area in rpc obj fs; do
+    n=$({ s3_aws s3 ls --recursive "s3://vgi-lane/lane/$area/" || true; } | wc -l)
+    echo "s3 lane: $n objects under lane/$area/"
+    if [ "$n" -eq 0 ]; then
+      echo "::error::the s3 lane stored nothing under lane/$area/: the worker did not use the bucket"
+      rc=1
+    fi
+  done
 fi
 
 # Executed-case floor — reached on every lane that runs the suite (the

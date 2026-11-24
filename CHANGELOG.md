@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **`VGI_STORAGE_BACKEND`** = `vendor` | `s3` | `gcs` | `none` (inferred from
+  `VGI_BLOB_VENDOR_URL` / `VGI_STORAGE_S3_BUCKET` / `VGI_STORAGE_GCS_BUCKET`;
+  more than one set is refused). With `s3` (new default feature
+  `storage-s3`), an `--http` worker externalizes results, vends upload grants,
+  stores `StateRef` / argument objects and function-storage blobs
+  (`VGI_STORAGE_EXTERNALIZE=1`, under `<prefix>fs/`) in the operator's own
+  bucket, signing its own URLs (vgi-rpc-s3 `s3`; variables
+  `VGI_STORAGE_S3_*`, `VGI_STORAGE_URL_TTL_SECONDS`). `gcs` refuses to start
+  (no GCS signer in the Rust SDK yet). Orchard hosted mode with `s3` is
+  allowed and logged.
+- **`VGI_STORAGE_S3_CHECKSUM=none`**: no upload grants, no
+  `VGI-Upload-URL-Support` / `VGI-Max-Upload-Bytes` / `VGI-Arguments-Ref-Bytes`;
+  results and objects are still externalized.
+- **CI `s3` integration lane**: the http suite with everything externalized to a
+  RustFS bucket; fails unless results, objects and function-storage blobs
+  landed in the bucket.
+
 ## 0.53.0 (2026-11-23)
 
 - **Orchard hosted mode with the blob vendor.** `blob-vendor` is now a default

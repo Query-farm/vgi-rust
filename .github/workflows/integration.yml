@@ -103,7 +103,10 @@ jobs:
       matrix:
         # vendor = the http suite with everything externalized through vgi-rpc's
         # fake blob vendor, plus test/sql/external_storage/*.
-        transport: [stdio, launch, http, vendor]
+        # s3 = the http suite with everything externalized to a RustFS bucket
+        # the worker signs for itself (VGI_STORAGE_BACKEND=s3); fails unless
+        # objects landed in the bucket.
+        transport: [stdio, launch, http, vendor, s3]
     steps:
       - name: Checkout vgi-rust
         uses: actions/checkout@v5
@@ -123,6 +126,15 @@ jobs:
       - name: Install uv (the vendor lane runs the fake blob vendor with uvx)
         if: matrix.transport == 'vendor'
         uses: astral-sh/setup-uv@v6
+
+      - name: AWS CLI (the s3 lane creates its bucket with it)
+        if: matrix.transport == 's3'
+        run: |
+          command -v aws || {
+            curl -sSfL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$RUNNER_TEMP/awscli.zip"
+            unzip -q "$RUNNER_TEMP/awscli.zip" -d "$RUNNER_TEMP" && sudo "$RUNNER_TEMP/aws/install"
+          }
+          aws --version
 
       - name: Build example worker
         run: cargo build --release -p vgi-example-worker
