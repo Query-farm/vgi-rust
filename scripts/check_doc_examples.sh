@@ -70,6 +70,9 @@ arrow-schema = "59"
 
 [workspace]
 EOF
+# Carry the workspace's [patch.crates-io] (pre-release vgi-rpc pins) into the
+# example crate, or it resolves the published crates instead.
+awk '/^\[patch\.crates-io\]/{p=1} /^\[/{if(!/^\[patch\.crates-io\]/)p=0} p' "$REPO/Cargo.toml" >> "$WORK/Cargo.toml"
 
 echo "Compiling ${#names[@]} doc example(s)…"
 ( cd "$WORK" && cargo build --quiet )
