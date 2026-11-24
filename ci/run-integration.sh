@@ -514,9 +514,10 @@ else
 fi
 
 # The s3 lane's skip detector: storage that was never used reads as green (the
-# suite passes with everything inline), so require objects in each area.
+# suite passes with everything inline), so require objects under rpc/ (results, grants,
+# StateRef objects) and fs/ (function storage).
 if [ "$TRANSPORT" = "s3" ]; then
-  for area in rpc obj fs; do
+  for area in rpc fs; do
     n=$({ s3_aws s3 ls --recursive "s3://vgi-lane/lane/$area/" || true; } | wc -l)
     echo "s3 lane: $n objects under lane/$area/"
     if [ "$n" -eq 0 ]; then
