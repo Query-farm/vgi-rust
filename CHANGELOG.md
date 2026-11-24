@@ -7,7 +7,7 @@
   more than one set is refused). With `s3` (new default feature
   `storage-s3`), an `--http` worker externalizes results, vends upload grants,
   stores `StateRef` / argument objects and function-storage blobs
-  (`VGI_STORAGE_EXTERNALIZE=1`, under `<prefix>fs/`) in the operator's own
+  (`VGI_STORAGE_EXTERNALIZE=1`, under `<prefix>fs/<scope>/`, deleted best effort) in the operator's own
   bucket, signing its own URLs (vgi-rpc-s3 `s3`; variables
   `VGI_STORAGE_S3_*`, `VGI_STORAGE_URL_TTL_SECONDS`). `gcs` refuses to start
   (no GCS signer in the Rust SDK yet). Orchard hosted mode with `s3` is

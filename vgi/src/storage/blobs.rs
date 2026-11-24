@@ -207,12 +207,13 @@ impl BlobStore for vgi_rpc_s3::vendor::VendorBlobClient {
 }
 
 /// Function-storage blobs in the operator's S3 bucket (`VGI_STORAGE_BACKEND=s3`),
-/// under `<prefix>fs/<object id>`. The object id is derived from the scope and
-/// the idempotency key, so a retried write reuses the object. Reads are
-/// verified against the reference's size and SHA-256. The worker never
-/// deletes (direct-storage contract v1, §6): `delete` and `delete_scope` are
-/// no-ops, and an operator who wants cleanup adds a lifecycle rule to `fs/`
-/// no shorter than the values' own lifetime.
+/// under `<prefix>fs/<scope>/<object id>`, where `<scope>` hashes `(shard,
+/// execution id)` and the object id (`fs.<scope>.<hash>`) is derived from the
+/// scope and the idempotency key, so a retried write reuses the object. Reads
+/// are verified against the reference's size and SHA-256. Deletes are best
+/// effort (direct-storage contract v1, Addendum A): `delete` issues one DELETE
+/// per object, `delete_scope` lists `<scope>/` and deletes what it finds, and
+/// failures are ignored; a 2-day lifecycle rule on `fs/` is the backstop.
 #[cfg(feature = "storage-s3")]
 pub struct S3BlobStore {
     s3: vgi_rpc_s3::s3::S3Storage,
@@ -236,13 +237,14 @@ impl BlobStore for S3BlobStore {
         idempotency_key: &str,
     ) -> Result<BlobRef, BlobError> {
         use sha2::Digest as _;
-        let scope = sha2::Sha256::digest(
+        let scope = scope_dir(shard, execution_id);
+        let id = sha2::Sha256::digest(
             format!("{}\0{}\0{}", shard, execution_id, idempotency_key).as_bytes(),
         );
-        let object_id = format!("fs.{}", hex_lower(&scope));
+        let object_id = format!("fs.{scope}.{}", &hex_lower(&id)[..32]);
         self.s3
             .put_key(
-                &self.s3.fs_key(&object_id),
+                &self.key(&object_id),
                 data,
                 "application/octet-stream",
                 None,
@@ -263,7 +265,7 @@ impl BlobStore for S3BlobStore {
         let cap = usize::try_from(blob.size).unwrap_or(usize::MAX);
         let data = self
             .s3
-            .get_key(&self.s3.fs_key(&blob.object_id), cap)
+            .get_key(&self.key(&blob.object_id), cap)
             .map_err(|e| BlobError {
                 kind: BlobErrorKind::Other,
                 message: e.message,
@@ -287,13 +289,43 @@ impl BlobStore for S3BlobStore {
         Ok(data)
     }
 
-    fn delete(&self, _object_ids: &[String]) -> Result<(), BlobError> {
+    fn delete(&self, object_ids: &[String]) -> Result<(), BlobError> {
+        for id in object_ids {
+            self.s3.delete_key(&self.key(id));
+        }
         Ok(())
     }
 
-    fn delete_scope(&self, _shard: &str, _execution_id: &str) -> Result<(), BlobError> {
+    fn delete_scope(&self, shard: &str, execution_id: &str) -> Result<(), BlobError> {
+        let scope = scope_dir(shard, execution_id);
+        self.s3.delete_prefix(&self.s3.fs_key(&format!("{scope}/")));
         Ok(())
     }
+}
+
+#[cfg(feature = "storage-s3")]
+impl S3BlobStore {
+    /// The key of `object_id`: `<prefix>fs/<scope>/<object id>` for ids this
+    /// store minted (`fs.<scope>.<hash>`), else `<prefix>fs/<object id>`.
+    fn key(&self, object_id: &str) -> String {
+        match object_id
+            .strip_prefix("fs.")
+            .and_then(|r| r.split_once('.'))
+        {
+            Some((scope, _)) => self.s3.fs_key(&format!("{scope}/{object_id}")),
+            None => self.s3.fs_key(object_id),
+        }
+    }
+}
+
+/// The 32-hex-character directory of a `(shard, execution id)` scope.
+#[cfg(feature = "storage-s3")]
+fn scope_dir(shard: &str, execution_id: &str) -> String {
+    use sha2::Digest as _;
+    hex_lower(&sha2::Sha256::digest(
+        format!("{shard}\0{execution_id}").as_bytes(),
+    ))[..32]
+        .to_string()
 }
 
 #[cfg(feature = "storage-s3")]
