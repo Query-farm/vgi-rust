@@ -56,6 +56,8 @@ pub struct Worker {
     signing_key: Option<Vec<u8>>,
     /// Explicit root key for secret ATTACH options ([`Worker::attach_secret_key`]).
     attach_secret_key: Option<Vec<u8>>,
+    /// Override of the `vgi.v3` version window ([`Worker::protocol_version_range`]).
+    protocol_version_range: Option<String>,
     /// Read only by the HTTP transport.
     #[cfg_attr(not(feature = "transport-http"), allow(dead_code))]
     authenticate: Option<vgi_rpc::Authenticate>,
@@ -134,6 +136,7 @@ impl Worker {
             introspect_principals: None,
             grant_keys: None,
             signing_key: None,
+            protocol_version_range: None,
             attach_secret_key: None,
             authenticate: None,
         }
@@ -563,6 +566,16 @@ impl Worker {
         self.signing_key = Some(key.into());
     }
 
+    /// Override the `vgi.v3` window this worker accepts and advertises in
+    /// `VGI-Protocol-Versions` (`PROTOCOL_VERSIONS_V1.md` §5), e.g. `"3.3-3.3"`.
+    /// Default: exactly the protocol version this SDK speaks. For test fixtures
+    /// that impersonate an older or newer worker (`VGI_TEST_PROTOCOL_RANGE` in
+    /// the example worker); a production worker leaves it unset. A malformed
+    /// range stops the worker at startup.
+    pub fn protocol_version_range(&mut self, range: impl Into<String>) {
+        self.protocol_version_range = Some(range.into());
+    }
+
     /// The root key secret ATTACH options are encrypted under (see
     /// [`crate::attach_options`]); the AEAD key is its HKDF-SHA256 subkey.
     /// Optional: without it an HTTP worker uses its signing key and a stdio /
@@ -716,6 +729,11 @@ impl Worker {
             // `vgi_rpc.Reflection.v1` protocol, which every server hosts
             // unconditionally and addresses through the ordinary routing key.
             .add_protocols(extra)
+            .protocol_version_ranges(
+                self.protocol_version_range
+                    .iter()
+                    .map(|r| (VGI_PROTOCOL_NAME.to_string(), r.clone())),
+            )
             // Grant keys reach the server only through the identity built
             // above (HTTP only); the port must not read the environment
             // itself, or a stdio worker would grow `issue_grant`.

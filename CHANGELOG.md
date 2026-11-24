@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Protocol version negotiation** (`PROTOCOL_VERSIONS_V1`, vgi-rpc-rust
+  protocol-3.4): an `--http` worker sends `VGI-Protocol-Versions:
+  vgi.v3=3.4-3.4` (plus `vgi.attach_tickets.v1` when hosted) on every
+  response, hosted-mode 401s included, and the same value as
+  `vgi_rpc.protocol_versions` on reflection and refusals. Out-of-window
+  requests are refused with `protocol_version_unsupported`.
+  `Worker::protocol_version_range("3.3-3.4")` widens the accepted window; the
+  example worker reads it from `VGI_TEST_PROTOCOL_RANGE` (fixtures only).
 - **`VGI_STORAGE_BACKEND`** = `vendor` | `s3` | `gcs` | `none` (inferred from
   `VGI_BLOB_VENDOR_URL` / `VGI_STORAGE_S3_BUCKET` / `VGI_STORAGE_GCS_BUCKET`;
   more than one set is refused). With `s3` (new default feature

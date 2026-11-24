@@ -54,9 +54,9 @@ opt-level = 2
 # VGI_STORAGE_BACKEND) and the storage stall timeouts; patching them all keeps
 # one copy of each.
 [patch.crates-io]
-vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
-vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
-vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
-vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
-vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
-vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "8e2a3f45ef60671ac0dd2e00a5b83733d6bf4d19" }
+vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }
+vgi-rpc-macros = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }
+vgi-rpc-client = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }
+vgi-rpc-iroh = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }
+vgi-iroh-transport = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }
+vgi-rpc-s3 = { git = "https://github.com/Query-farm/vgi-rpc-rust", rev = "d16f135d8e665f018da6b9fe92e661a7eef329d2" }

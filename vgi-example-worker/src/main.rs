@@ -54,6 +54,14 @@ fn main() {
         std::env::var("VGI_WORKER_CATALOG_NAME").unwrap_or_else(|_| "example".into());
 
     let mut worker = Worker::new();
+    // Fixture switch (PROTOCOL_VERSIONS_V1.md §9): impersonate a worker with a
+    // different vgi.v3 window, e.g. VGI_TEST_PROTOCOL_RANGE=3.3-3.3, so the
+    // extension's ATTACH negotiation can be tested against an older worker.
+    if let Ok(range) = std::env::var("VGI_TEST_PROTOCOL_RANGE") {
+        if !range.trim().is_empty() {
+            worker.protocol_version_range(range.trim());
+        }
+    }
     // Advertise `catalog_contents` (protocol 2.1.0; the framework default) unless
     // VGI_CATALOG_CONTENTS=0, which forces the client back onto the per-schema
     // RPCs — so the integration suite can be run over both load paths.
