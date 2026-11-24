@@ -86,8 +86,8 @@ rest of this README covers the SDK itself.
 ```toml
 # Cargo.toml
 [dependencies]
-vgi = "0.51"
-vgi-rpc = "0.32"
+vgi = "0.53"
+vgi-rpc = "0.33"
 arrow-array = "59"
 arrow-schema = "59"
 ```

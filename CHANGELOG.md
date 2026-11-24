@@ -76,8 +76,7 @@
     refused with a 400.
   - A request pointer must carry `vgi_rpc.location.sha256`; the worker verifies
     the fetched bytes against it before decoding.
-  - Requires the unreleased vgi-rpc-rust `protocol-3.4` branch (pinned with
-    `[patch.crates-io]`, `TODO(release-wave)`).
+  - Requires vgi-rpc 0.33.0.
 
 - **Blob-vendor externalization** (feature `blob-vendor`; the example worker
   enables it). Port of vgi-python's `function_storage_blobs` and serve wiring:

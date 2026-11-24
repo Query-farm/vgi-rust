@@ -16,7 +16,8 @@ permissions:
   actions: read
 
 env:
-  # vgi protocol-3.4 (upload URLs v2, protocol 3.4.0). TODO(release-wave).
+  # vgi protocol-3.4 (upload URLs v2, protocol 3.4.0); stays pinned until the
+  # 3.4 extension ships.
   VGI_REF: 0283f91f98f69337708c9ce4c6a40706355d3aa5
   VGI_NATIVE_RUNNER_BRANCH: protocol-3.4
   CARGO_TERM_COLOR: always
@@ -99,8 +100,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Query-farm/vgi-rpc-python
-          # TODO(release-wave): back to main (unpinned) once protocol-3.4 is merged.
-          ref: protocol-3.4
+          ref: main
           path: vgi-rpc-python
 
       - uses: dtolnay/rust-toolchain@1.97.0

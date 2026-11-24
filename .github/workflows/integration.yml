@@ -33,16 +33,17 @@ env:
   # (scan_planning_predicates*.test over data.planned_events). 0283f91 adds
   # protocol 3.4 argument references and the arguments_ref*.test files the
   # vendor lane runs (arguments_ref_state_ref.test on a filtered producer
-  # scan). TODO(release-wave).
+  # scan). Stays pinned until the 3.4 extension ships.
   VGI_REF: 0283f91f98f69337708c9ce4c6a40706355d3aa5
   # The fake blob vendor with sized-PUT verification, the upload fault, the
-  # origin=client_upload counters and the delete-object route (vgi-rpc-python
-  # 6a21ee3); the same pin as start_fake_blob_vendor.sh at 0283f91.
-  # TODO(release-wave).
-  VGI_RPC_FAKE_VENDOR_REF: 6a21ee3b2fb21d9c348c9b615fd97dce8e0bb852
+  # origin=client_upload counters and the delete-object route: vgi-rpc-python
+  # 0.57.0, which contains 6a21ee3 (the pin start_fake_blob_vendor.sh uses at
+  # 0283f91).
+  VGI_RPC_FAKE_VENDOR_REF: v0.57.0
   VGI_NATIVE_RUNNER_BRANCH: protocol-3.4
   # vgi protocol-3.4 with the Orchard hosted-mode conformance harness
-  # (test/hosted/run_hosted_conformance.py). TODO(release-wave).
+  # (test/hosted/run_hosted_conformance.py). Stays pinned until the 3.4
+  # extension ships.
   VGI_HOSTED_REF: 0283f91f98f69337708c9ce4c6a40706355d3aa5
 
 jobs:
