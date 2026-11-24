@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.53.0 (2026-11-23)
 
 - **Orchard hosted mode with the blob vendor.** `blob-vendor` is now a default
   feature of `vgi`, so every HTTP worker image (vgi-starter-rust's included)
