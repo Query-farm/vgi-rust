@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.53.1 (2026-11-25)
+
+- vgi-rpc 0.33.1.
+
 - **Protocol version negotiation** (`PROTOCOL_VERSIONS_V1`, vgi-rpc-rust
   protocol-3.4): an `--http` worker sends `VGI-Protocol-Versions:
   vgi.v3=3.4-3.4` (plus `vgi.attach_tickets.v1` when hosted) on every
