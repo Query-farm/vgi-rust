@@ -257,8 +257,11 @@ impl Secrets {
     }
 
     /// The fields of the resolved secret whose `scope` is the longest prefix of
-    /// `path`. Use this when a worker requested secrets for several scopes (e.g.
-    /// one per cloud path / bucket) and must pick the right one per path. The
+    /// `path`, matched as DuckDB matches it (see [`scope_matches`]): an
+    /// authority-only scope such as `snmp://10.0.0.1` covers only that host and
+    /// paths under it, never `snmp://10.0.0.15` or `snmp://10.0.0.1:161`. Use
+    /// this when a worker requested secrets for several scopes (e.g. one per
+    /// cloud path / bucket) and must pick the right one per path. The
     /// connector serializes each secret's `scope` as a newline-joined list of
     /// prefixes; a secret with no (or empty) `scope` matches as a last-resort
     /// fallback (covers unscoped secrets and older connectors that don't send a
@@ -304,7 +307,7 @@ impl Secrets {
             match fields.get("scope") {
                 Some(scope) if !scope.is_empty() => {
                     for prefix in scope.split('\n').filter(|p| !p.is_empty()) {
-                        if path.starts_with(prefix)
+                        if scope_matches(prefix, path)
                             && best.is_none_or(|(blen, _)| prefix.len() > blen)
                         {
                             best = Some((prefix.len(), (name, fields)));
@@ -324,6 +327,61 @@ impl Secrets {
     pub fn field_for(&self, path: &str, field: &str) -> Option<String> {
         self.for_scope(path).and_then(|m| m.get(field).cloned())
     }
+}
+
+/// The URI authority of `text`, or `""`; mirrors DuckDB's
+/// `StringUtil::GetURIAuthority`.
+///
+/// `text` counts as a URI only if it contains `://` after a non-empty scheme
+/// and its first `/` or `\` is the one that starts that `://`. The authority
+/// runs from after `://` to the first `/`, `\`, `?` or `#` (or the end).
+/// Offsets are bytes, as in `std::string`; every delimiter is ASCII, so each
+/// slice boundary is also a UTF-8 character boundary.
+fn uri_authority(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let Some(scheme_end) = text.find("://") else {
+        return "";
+    };
+    if scheme_end == 0 {
+        return "";
+    }
+    let first_slash = bytes.iter().position(|&c| c == b'/' || c == b'\\');
+    if first_slash != Some(scheme_end + 1) {
+        return "";
+    }
+    let start = scheme_end + 3;
+    let end = bytes[start..]
+        .iter()
+        .position(|&c| matches!(c, b'/' | b'\\' | b'?' | b'#'))
+        .map_or(bytes.len(), |i| start + i);
+    &text[start..end]
+}
+
+/// Whether a secret scope `prefix` covers `path`, exactly as DuckDB decides.
+///
+/// A scope matches when it is a string prefix of `path`, except that an
+/// authority-only URI scope (`scheme://authority` with nothing after the
+/// authority) has an implicit trailing `/`: `snmp://10.0.0.1` covers
+/// `snmp://10.0.0.1` and `snmp://10.0.0.1/x` but not `snmp://10.0.0.15` or
+/// `snmp://10.0.0.1:161`, and `s3://bucket` no longer covers
+/// `s3://bucket-evil/`. This is DuckDB's `BaseSecret::MatchScore` as of the
+/// Haybarn 2.0.1 engine (upstream duckdb#28684). Matching it keeps a worker
+/// from choosing a secret DuckDB itself would not resolve for that path.
+/// An empty `prefix` is not a scope; the selectors treat unscoped secrets as
+/// the fallback separately.
+pub fn scope_matches(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() || !path.starts_with(prefix) {
+        return false;
+    }
+    let authority = uri_authority(prefix);
+    let authority_only = !authority.is_empty()
+        && prefix
+            .find("://")
+            .is_some_and(|i| prefix.len() == i + 3 + authority.len());
+    if !authority_only {
+        return true;
+    }
+    path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/'
 }
 
 /// Render a single array element as a string: strings as-is, booleans as
@@ -700,5 +758,142 @@ mod tests {
         assert_eq!(m.get("port").map(String::as_str), Some("7"));
         assert_eq!(m.get("use_ssl").map(String::as_str), Some("true"));
         assert!(!m.contains_key("api_key"), "null field is omitted");
+    }
+
+    // ---- scope matching: DuckDB's authority boundary (duckdb#28684) ----
+
+    /// The first 25 shared vectors, inline so the rule reads without the JSON.
+    #[test]
+    fn scope_matches_curated() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("snmp://10.0.0.1", "snmp://10.0.0.1", true),
+            ("snmp://10.0.0.1", "snmp://10.0.0.1/x", true),
+            ("snmp://10.0.0.1", "snmp://10.0.0.15", false),
+            ("snmp://10.0.0.1", "snmp://10.0.0.1:161", false),
+            ("s3://bucket", "s3://bucket/key", true),
+            ("s3://bucket", "s3://bucket-evil/key", false),
+            ("s3://bucket", "s3://bucket?x=1", false),
+            ("dlt://vgi_dlt_fixture", "dlt://vgi_dlt_fixture:shop", false),
+            ("dlt://vgi_dlt_fixture", "dlt://vgi_dlt_fixture/shop", true),
+            ("s3://bucket/", "s3://bucket/key", true),
+            ("s3://bucket/pre", "s3://bucket/prefix/x", true),
+            ("s3://bucket/pre", "s3://bucket/other", false),
+            ("https://h?a", "https://h?ab", true),
+            ("https://h#f", "https://h#fx", true),
+            ("a://b\\c", "a://b\\cd", true),
+            ("snmp://", "snmp://anything", true),
+            ("snmp://10.0.0.", "snmp://10.0.0.15:161", false),
+            ("foo", "foobar", true),
+            ("c:\\data", "c:\\data2\\x", true),
+            ("x:/y://z", "x:/y://zz", true),
+            ("s3://bucket", "s3://buck", false),
+            ("s3://bucket", "s3://bucket", true),
+            (
+                "vgi-conformance://host1",
+                "vgi-conformance://host1/data",
+                true,
+            ),
+            (
+                "vgi-conformance://host1",
+                "vgi-conformance://host10/data",
+                false,
+            ),
+            (
+                "vgi-conformance://host1",
+                "vgi-conformance://host1:9000",
+                false,
+            ),
+        ];
+        for &(scope, path, want) in cases {
+            assert_eq!(
+                scope_matches(scope, path),
+                want,
+                "scope {scope:?} path {path:?}"
+            );
+        }
+    }
+
+    /// Every case in `testdata/scope_match_vectors.json`, generated from
+    /// DuckDB's own C++ (Haybarn b2aa6ca) and shared by every VGI SDK.
+    #[test]
+    fn scope_matches_duckdb_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/scope_match_vectors.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() >= 3000, "only {} vectors", cases.len());
+        let mut mismatches = Vec::new();
+        for c in cases {
+            let scope = c["scope"].as_str().unwrap();
+            let path = c["path"].as_str().unwrap();
+            let want = c["match"].as_bool().unwrap();
+            if scope_matches(scope, path) != want {
+                mismatches.push(format!("scope {scope:?} path {path:?} want {want}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches: {mismatches:#?}",
+            mismatches.len()
+        );
+    }
+
+    #[test]
+    fn scope_matches_empty_prefix_is_not_a_scope() {
+        assert!(!scope_matches("", "s3://bucket/x"));
+    }
+
+    /// An authority-only scope covers its own host and paths under it, never a
+    /// longer host name or another port.
+    #[test]
+    fn for_scope_respects_authority_boundary() {
+        let s = secrets(&[
+            (
+                "host1",
+                secret(&[
+                    ("type", "snmp"),
+                    ("community", "host1"),
+                    ("scope", "snmp://10.0.0.1"),
+                ]),
+            ),
+            (
+                "host15",
+                secret(&[
+                    ("type", "snmp"),
+                    ("community", "host15"),
+                    ("scope", "snmp://10.0.0.15"),
+                ]),
+            ),
+            (
+                "default",
+                secret(&[("type", "snmp"), ("community", "default")]),
+            ),
+        ]);
+        for (path, want) in [
+            ("snmp://10.0.0.1/sys", "host1"),
+            ("snmp://10.0.0.15", "host15"),
+            ("snmp://10.0.0.1:161", "default"),
+        ] {
+            assert_eq!(
+                s.for_scope_of_type(path, "snmp")
+                    .and_then(|m| m.get("community"))
+                    .map(String::as_str),
+                Some(want),
+                "path {path:?}"
+            );
+            assert_eq!(
+                s.field_for(path, "community").as_deref(),
+                Some(want),
+                "path {path:?}"
+            );
+            assert_eq!(
+                s.lookup_for_scope_of_type(path, "snmp").map(|(n, _)| n),
+                Some(want),
+                "path {path:?}"
+            );
+        }
     }
 }

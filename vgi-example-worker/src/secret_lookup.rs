@@ -265,7 +265,8 @@ impl TableFunction for SecretValueByName {
 // ---------------------------------------------------------------------------
 
 /// A field of the `vgi_example` secret whose scope is the longest prefix of
-/// `path`, falling back to the unscoped one.
+/// `path` (authority-only scopes stop at the authority, as in
+/// `vgi::secrets::scope_matches`), falling back to the unscoped one.
 pub struct SecretValueForScope;
 impl TableFunction for SecretValueForScope {
     fn name(&self) -> &str {

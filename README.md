@@ -223,7 +223,8 @@ their unique DuckDB *name* (an unnamed `CREATE SECRET (TYPE s3, ...)` is
 `Secrets::get` / `lookup` (by type: unscoped first, else first by name),
 `Secrets::require` (fails the bind naming the type), `Secrets::named(name, type)`
 and `Secrets::for_scope_of_type(path, type)` (longest scope prefix, unscoped
-fallback). Declare requirements as `required_secrets: vec!["s3".into()]` or
+fallback; an authority-only scope such as `s3://bucket` stops at the
+authority, as in DuckDB, see `vgi::secrets::scope_matches`). Declare requirements as `required_secrets: vec!["s3".into()]` or
 `SecretLookup::of_type("s3").with_scope("s3://bucket/")`; a lookup with an empty
 type is rejected rather than silently sent.
 
