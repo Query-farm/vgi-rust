@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.53.2 (2026-11-25)
+
+Patch release; wire protocol stays 3.4 and vgi-rpc stays 0.33.1.
 
 - Secret scope matching now follows DuckDB 2.0.1's authority boundary
   (duckdb#28684). An authority-only scope such as `snmp://10.0.0.1` covers
